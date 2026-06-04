@@ -1,0 +1,9 @@
+include README.md
+include LICENSE
+include TODO.md
+include pyproject.toml
+recursive-include src/tag/assets *.yaml
+recursive-include src/tag/config *.yaml
+recursive-include src/tag/docs *.md
+recursive-include src/tag/patches *.patch
+recursive-include src/tag/vendor *.tar.gz
