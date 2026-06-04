@@ -1,0 +1,8 @@
+.pytest_cache/
+**/__pycache__/
+**/*.pyc
+dist/
+build/
+src/tag/__pycache__/
+src/tag_agent.egg-info/
+tests/
