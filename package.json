@@ -1,0 +1,38 @@
+{
+  "name": "tag-agent",
+  "version": "0.1.0",
+  "description": "TAG CLI launcher for Hermes-based orchestration with OpenRouter and Codex workflows.",
+  "license": "MIT",
+  "bin": {
+    "tag": "bin/tag.js"
+  },
+  "files": [
+    "bin",
+    "src/tag/*.py",
+    "src/tag/assets",
+    "src/tag/config",
+    "src/tag/docs",
+    "src/tag/patches",
+    "src/tag/vendor",
+    "README.md",
+    "LICENSE",
+    "MANIFEST.in",
+    "pyproject.toml"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "agents",
+    "cli",
+    "codex",
+    "hermes",
+    "openrouter",
+    "orchestration",
+    "python",
+    "tui"
+  ],
+  "scripts": {
+    "pack:check": "npm pack --dry-run"
+  }
+}
