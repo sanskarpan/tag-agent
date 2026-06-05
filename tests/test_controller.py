@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from copy import deepcopy
 import io
+import json
+import os
 from pathlib import Path
 
 
@@ -166,3 +168,130 @@ def test_build_parser_exposes_extended_hermes_surface():
         "update",
     ):
         assert command in help_text
+
+
+def test_hermes_root_falls_back_to_discovered_checkout(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    checkout = tmp_path / "cwd" / "hermes-agent-upstream"
+    (checkout / "ui-tui").mkdir(parents=True)
+    (checkout / "ui-tui" / "package.json").write_text("{}", encoding="utf-8")
+    (checkout / "pyproject.toml").write_text("[build-system]\nrequires=[]\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path / "cwd")
+    assert TAG.hermes_root(load_cfg()) == checkout.resolve()
+
+
+def test_cmd_submit_auto_bootstraps_when_hermes_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    cfg_path = TAG.config_path(None)
+    cfg = TAG.load_config(cfg_path)
+    calls = []
+    state = {"ready": False}
+
+    monkeypatch.setattr(TAG, "discover_local_hermes_checkout", lambda: None)
+    monkeypatch.setattr(
+        TAG,
+        "hermes_bin",
+        lambda cfg=None: (TAG.hermes_root(cfg) / ".venv" / "bin" / "hermes") if state["ready"] else (tmp_path / "missing-hermes"),
+    )
+
+    def fake_setup(args):
+        calls.append(("setup", args.skip_tui_build))
+        state["ready"] = True
+        return 0
+
+    monkeypatch.setattr(TAG, "cmd_setup", fake_setup)
+    monkeypatch.setattr(
+        TAG,
+        "run_chat_step",
+        lambda *_a, **_k: {
+            "profile": "researcher",
+            "status": "ok",
+            "prompt": "x",
+            "output": "ok",
+            "started_at": "a",
+            "finished_at": "b",
+            "duration_ms": 1,
+            "returncode": 0,
+            "model_ref": "openrouter/model",
+        },
+    )
+
+    args = TAG.argparse.Namespace(
+        config=str(cfg_path),
+        task_type="research",
+        prompt="Reply with exactly: smoke-ok",
+        title=None,
+        source="manual",
+        execution="direct",
+        master_profile=None,
+        worker_profile=[],
+        master_model=None,
+        verifier_model=None,
+        worker_model_override=[],
+        verify=False,
+        wait_seconds=0,
+        json=True,
+    )
+    assert TAG.cmd_submit(args) == 0
+    assert calls == [("setup", True)]
+
+
+def test_cmd_hermes_passthrough_auto_bootstraps_for_tui(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    cfg_path = TAG.config_path(None)
+    calls = []
+    state = {"ready": False}
+    monkeypatch.setattr(TAG, "discover_local_hermes_checkout", lambda: None)
+    monkeypatch.setattr(
+        TAG,
+        "cmd_setup",
+        lambda args: calls.append(("setup", args.skip_tui_build)) or state.__setitem__("ready", True) or 0,
+    )
+    monkeypatch.setattr(
+        TAG,
+        "hermes_bin",
+        lambda cfg=None: Path("/bin/echo") if state["ready"] else (tmp_path / "missing-hermes"),
+    )
+    monkeypatch.setattr(
+        TAG.subprocess,
+        "run",
+        lambda *a, **k: TAG.argparse.Namespace(returncode=0),
+    )
+    args = TAG.argparse.Namespace(config=str(cfg_path), profile="orchestrator", hermes_args=["--tui"])
+    assert TAG.cmd_hermes_passthrough(args) == 0
+    assert calls == [("setup", False)]
+
+
+def test_cmd_setup_auto_imports_existing_codex(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    codex_home = tmp_path / "real-codex"
+    codex_home.mkdir()
+    (codex_home / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("TAG_IMPORT_CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(TAG, "ensure_setup_prereqs", lambda *a, **k: None)
+    monkeypatch.setattr(TAG, "clone_or_update_hermes", lambda *a, **k: {"status": "existing"})
+    monkeypatch.setattr(TAG, "ensure_venv", lambda *a, **k: {"status": "existing"})
+    monkeypatch.setattr(TAG, "install_hermes_python", lambda *a, **k: {"status": "installed"})
+    monkeypatch.setattr(TAG, "apply_hermes_patch", lambda *a, **k: {"status": "already-applied"})
+    monkeypatch.setattr(TAG, "install_tui_dependencies", lambda *a, **k: {"status": "built"})
+    monkeypatch.setattr(
+        TAG,
+        "bootstrap_profiles",
+        lambda cfg: [
+            {"profile": "orchestrator", "status": "created"},
+            {"profile": "codex-runtime-master", "status": "created"},
+        ],
+    )
+    monkeypatch.setattr(TAG, "render_profiles", lambda *a, **k: [{"profile": "orchestrator"}])
+    imports = []
+    monkeypatch.setattr(
+        TAG,
+        "import_codex_into_profile",
+        lambda cfg, *, profile_name, source_codex_home: imports.append((profile_name, source_codex_home)) or {"profile": profile_name, "status": "imported"},
+    )
+    args = TAG.argparse.Namespace(config=None, refresh=False, skip_python_install=False, skip_tui_build=False, json=True)
+    assert TAG.cmd_setup(args) == 0
+    assert imports == [
+        ("orchestrator", codex_home.resolve()),
+        ("codex-runtime-master", codex_home.resolve()),
+    ]
