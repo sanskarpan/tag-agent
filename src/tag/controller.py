@@ -59,6 +59,35 @@ def hermes_checkout_kind(root: Path) -> str:
     return "bundled"
 
 
+def is_hermes_checkout(root: Path) -> bool:
+    return root.exists() and (root / "pyproject.toml").exists() and (root / "ui-tui" / "package.json").exists()
+
+
+def discover_local_hermes_checkout() -> Path | None:
+    candidates: list[Path] = []
+    cwd = Path.cwd().resolve()
+    candidates.extend([cwd / "hermes-agent-upstream", cwd.parent / "hermes-agent-upstream"])
+    package_candidates = [
+        package_root().parents[2] / "hermes-agent-upstream",
+        package_root().parents[3] / "hermes-agent-upstream" if len(package_root().parents) > 3 else None,
+    ]
+    candidates.extend(candidate for candidate in package_candidates if candidate is not None)
+    hermes_exec = shutil.which("hermes")
+    if hermes_exec:
+        exec_path = Path(hermes_exec).resolve()
+        if len(exec_path.parents) >= 3:
+            candidates.append(exec_path.parents[2])
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if is_hermes_checkout(resolved):
+            return resolved
+    return None
+
+
 def tag_home() -> Path:
     return Path(os.environ.get("TAG_HOME", str(DEFAULT_TAG_HOME))).expanduser().resolve()
 
@@ -105,10 +134,17 @@ def hermes_root(cfg: dict[str, Any] | None = None) -> Path:
     override = os.environ.get("TAG_HERMES_ROOT", "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    if cfg is not None:
-        value = str(cfg.get("upstream", {}).get("checkout_dir", DEFAULT_HERMES_CHECKOUT))
-        return resolve_home_relative(value)
-    return resolve_home_relative(DEFAULT_HERMES_CHECKOUT)
+    configured = resolve_home_relative(
+        str(cfg.get("upstream", {}).get("checkout_dir", DEFAULT_HERMES_CHECKOUT))
+        if cfg is not None
+        else DEFAULT_HERMES_CHECKOUT
+    )
+    if configured.exists():
+        return configured
+    discovered = discover_local_hermes_checkout()
+    if discovered is not None:
+        return discovered
+    return configured
 
 
 def hermes_bin(cfg: dict[str, Any] | None = None) -> Path:
@@ -131,7 +167,7 @@ def benchmark_suite_path(arg_value: str | None) -> Path:
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as fh:
+    with path.open("r", encoding="utf-8-sig") as fh:
         data = yaml.safe_load(fh) or {}
     if not isinstance(data, dict):
         raise SystemExit(f"Config at {path} must be a YAML object.")
@@ -201,10 +237,12 @@ def profile_exec_env(cfg: dict[str, Any], profile_name: str) -> dict[str, str]:
         ).split(",")
         if item.strip()
     }
-    if profile_name in passthrough_profiles and real_home:
-        env["HOME"] = os.environ.get("TAG_REAL_HOME", real_home)
+    if profile_name in passthrough_profiles:
+        env["HOME"] = os.environ.get(
+            "TAG_REAL_HOME", real_home or str(runtime_home(cfg))
+        )
         env["CODEX_HOME"] = os.environ.get(
-            "TAG_CODEX_HOME", str(Path(real_home) / ".codex")
+            "TAG_CODEX_HOME", str(Path(real_home).expanduser() / ".codex") if real_home else str(runtime_codex_home(cfg))
         )
     env["HERMES_HOME"] = str(profile_home(cfg, profile_name))
     for key, value in read_dotenv(profile_home(cfg, profile_name) / ".env").items():
@@ -224,6 +262,10 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
     ensure_runtime_dirs(cfg)
     conn = sqlite3.connect(runtime_db_path(cfg))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS runs (
@@ -362,8 +404,28 @@ def strip_json_fences(text: str) -> str:
 
 
 def merged_env_example(cfg: dict[str, Any], profile_name: str) -> str:
-    shared = cfg.get("env_examples", {}).get("shared", {})
-    per_profile = cfg.get("env_examples", {}).get("profiles", {}).get(profile_name, {})
+    env_examples = cfg.get("env_examples", {})
+    if env_examples is None:
+        env_examples = {}
+    if not isinstance(env_examples, dict):
+        raise SystemExit("Config field 'env_examples' must be a YAML object.")
+    shared = env_examples.get("shared", {})
+    profiles = env_examples.get("profiles", {})
+    if shared is None:
+        shared = {}
+    if profiles is None:
+        profiles = {}
+    if not isinstance(shared, dict):
+        raise SystemExit("Config field 'env_examples.shared' must be a YAML object.")
+    if not isinstance(profiles, dict):
+        raise SystemExit("Config field 'env_examples.profiles' must be a YAML object.")
+    per_profile = profiles.get(profile_name, {})
+    if per_profile is None:
+        per_profile = {}
+    if not isinstance(per_profile, dict):
+        raise SystemExit(
+            f"Config field 'env_examples.profiles.{profile_name}' must be a YAML object."
+        )
     lines: list[str] = []
     for key, value in {**shared, **per_profile}.items():
         lines.append(f"{key}={value}")
@@ -392,6 +454,20 @@ def configured_skins(cfg: dict[str, Any]) -> list[dict[str, Any]]:
             source_path = candidate.resolve() if candidate.exists() else resolve_home_relative(source)
         resolved.append({"name": str(name).strip(), "source": source_path})
     return resolved
+
+
+def nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return parsed
 
 
 def install_profile_skins(cfg: dict[str, Any], profile_name: str, force: bool) -> list[str]:
@@ -1056,6 +1132,85 @@ def install_tui_dependencies(cfg: dict[str, Any]) -> dict[str, Any]:
     return {"ui_tui": str(root / "ui-tui"), "status": "built"}
 
 
+def import_codex_into_profile(
+    cfg: dict[str, Any],
+    *,
+    profile_name: str,
+    source_codex_home: Path,
+) -> dict[str, Any]:
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, profile_name)
+    if not target_home.exists():
+        return {"profile": profile_name, "status": "profile-missing"}
+
+    env = hermes_env(cfg)
+    env["HERMES_HOME"] = str(target_home)
+    env["CODEX_HOME"] = str(source_codex_home.expanduser().resolve())
+
+    inline = textwrap.dedent(
+        """
+        import json
+        from hermes_cli.auth import _import_codex_cli_tokens, _save_codex_tokens
+
+        tokens = _import_codex_cli_tokens()
+        if not tokens:
+            raise SystemExit("No importable Codex CLI tokens found.")
+        _save_codex_tokens(tokens)
+        print(json.dumps({"imported": True}))
+        """
+    ).strip()
+
+    proc = subprocess.run(
+        [str(hermes_root(cfg) / ".venv" / "bin" / "python"), "-c", inline],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip() or "Codex import failed."
+        return {"profile": profile_name, "status": "failed", "message": message}
+    return {"profile": profile_name, "status": "imported", "codex_home": str(env["CODEX_HOME"])}
+
+
+def auto_import_codex_profiles(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    source_home = Path(
+        os.environ.get("TAG_IMPORT_CODEX_HOME", str(Path.home() / ".codex"))
+    ).expanduser().resolve()
+    if not (source_home / "auth.json").exists():
+        return [
+            {"profile": "orchestrator", "status": "skipped-no-auth"},
+            {"profile": "codex-runtime-master", "status": "skipped-no-auth"},
+        ]
+    results = []
+    for profile_name in ("orchestrator", "codex-runtime-master"):
+        results.append(
+            import_codex_into_profile(
+                cfg,
+                profile_name=profile_name,
+                source_codex_home=source_home,
+            )
+        )
+    return results
+
+
+def ensure_hermes_ready(
+    cfg: dict[str, Any],
+    *,
+    config_arg: str | None,
+    need_tui: bool,
+) -> None:
+    if hermes_bin(cfg).exists():
+        return
+    setup_args = argparse.Namespace(
+        config=config_arg,
+        refresh=False,
+        skip_python_install=False,
+        skip_tui_build=not need_tui,
+        json=False,
+    )
+    cmd_setup(setup_args)
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
     benchmark_path = benchmark_suite_path(None)
@@ -1077,6 +1232,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         "profiles": bootstrap_profiles(cfg),
         "rendered": render_profiles(cfg, force=True),
     }
+    steps["codex_import"] = auto_import_codex_profiles(cfg)
 
     if args.json:
         print(json.dumps(steps, indent=2))
@@ -1089,8 +1245,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 def cmd_hermes_passthrough(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
-    if not hermes_bin(cfg).exists():
-        raise SystemExit("Hermes is not installed yet. Run `tag setup` first.")
+    ensure_hermes_ready(
+        cfg,
+        config_arg=args.config,
+        need_tui="--tui" in args.hermes_args,
+    )
     env = profile_exec_env(cfg, args.profile) if args.profile else hermes_env(cfg)
     hermes_args = list(args.hermes_args)
     if hermes_args[:1] == ["--"]:
@@ -1272,6 +1431,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
     created = bootstrap_profiles(cfg)
     rendered = render_profiles(cfg, force=args.force)
     result = {"profiles": created, "rendered": rendered}
@@ -1331,6 +1491,7 @@ def cmd_env(args: argparse.Namespace) -> int:
 
 def cmd_import_codex(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
     profiles = cfg.get("profiles", {})
     if args.profile not in profiles:
         available = ", ".join(sorted(profiles))
@@ -1343,44 +1504,26 @@ def cmd_import_codex(args: argparse.Namespace) -> int:
             f"Profile home does not exist for '{args.profile}'. Run bootstrap first."
         )
 
-    env = hermes_env(cfg)
-    env["HERMES_HOME"] = str(target_home)
-    env["CODEX_HOME"] = str(
+    source_home = (
         Path(args.codex_home).expanduser().resolve()
         if args.codex_home
         else runtime_codex_home(cfg)
     )
-
-    inline = textwrap.dedent(
-        """
-        import json
-        from hermes_cli.auth import _import_codex_cli_tokens, _save_codex_tokens
-
-        tokens = _import_codex_cli_tokens()
-        if not tokens:
-            raise SystemExit("No importable Codex CLI tokens found.")
-        _save_codex_tokens(tokens)
-        print(json.dumps({"imported": True}))
-        """
-    ).strip()
-
-    proc = subprocess.run(
-        [str(hermes_root(cfg) / ".venv" / "bin" / "python"), "-c", inline],
-        env=env,
-        text=True,
-        capture_output=True,
+    result = import_codex_into_profile(
+        cfg,
+        profile_name=args.profile,
+        source_codex_home=source_home,
     )
-    if proc.returncode != 0:
-        message = proc.stderr.strip() or proc.stdout.strip() or "Codex import failed."
-        raise SystemExit(message)
+    if result["status"] != "imported":
+        raise SystemExit(str(result.get("message", "Codex import failed.")))
 
     if args.json:
         print(
             json.dumps(
                 {
                     "profile": args.profile,
-                    "codex_home": env["CODEX_HOME"],
-                    "hermes_home": env["HERMES_HOME"],
+                    "codex_home": str(source_home),
+                    "hermes_home": str(target_home),
                     "status": "imported",
                 },
                 indent=2,
@@ -1409,6 +1552,7 @@ def cmd_assignments(args: argparse.Namespace) -> int:
 def cmd_models(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
     ensure_profile_exists(cfg, args.profile)
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
     payload = load_model_inventory(cfg, args.profile)
     providers = payload.get("providers", [])
     if args.provider:
@@ -1476,6 +1620,7 @@ def cmd_set_model(args: argparse.Namespace) -> int:
 def cmd_submit(args: argparse.Namespace) -> int:
     cfg_path = config_path(args.config)
     cfg = load_config(cfg_path)
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
     prompt = args.prompt.strip()
     if not prompt:
         raise SystemExit("Prompt cannot be empty.")
@@ -1690,6 +1835,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
 def cmd_benchmark(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
     suite = load_benchmark_suite(benchmark_suite_path(args.suite))
     if args.case:
         selected = set(args.case)
@@ -1787,6 +1933,7 @@ def cmd_runs(args: argparse.Namespace) -> int:
 def cmd_openrouter_models(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
     ensure_profile_exists(cfg, args.profile)
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
     rows = load_openrouter_catalog(cfg, args.profile)
 
     if args.search:
@@ -1819,7 +1966,9 @@ def cmd_openrouter_models(args: argparse.Namespace) -> int:
     else:
         rows = sorted(rows, key=lambda row: str(row.get("id", "")))
 
-    if args.limit > 0:
+    if args.limit == 0:
+        rows = []
+    elif args.limit > 0:
         rows = rows[: args.limit]
 
     if args.ids_only:
@@ -1896,7 +2045,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     models.add_argument("--profile", required=True)
     models.add_argument("--provider", help="Filter to one provider slug")
-    models.add_argument("--limit", type=int, default=10)
+    models.add_argument("--limit", type=nonnegative_int, default=10)
     models.add_argument("--json", action="store_true")
     models.set_defaults(func=cmd_models)
 
@@ -1937,7 +2086,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--verify", action="store_true")
     submit.add_argument(
         "--wait-seconds",
-        type=int,
+        type=nonnegative_int,
         default=0,
         help="For Kanban submits, poll spawned tasks until completion or timeout",
     )
@@ -1955,7 +2104,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.set_defaults(func=cmd_benchmark)
 
     runs = sub.add_parser("runs", help="Show recent submit and benchmark runs")
-    runs.add_argument("--limit", type=int, default=20)
+    runs.add_argument("--limit", type=positive_int, default=20)
     runs.add_argument("--json", action="store_true")
     runs.set_defaults(func=cmd_runs)
 
@@ -1970,7 +2119,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("id", "prompt", "completion", "context"),
         default="id",
     )
-    openrouter_models.add_argument("--limit", type=int, default=20)
+    openrouter_models.add_argument("--limit", type=nonnegative_int, default=20)
     openrouter_models.add_argument("--ids-only", action="store_true")
     openrouter_models.add_argument("--json", action="store_true")
     openrouter_models.set_defaults(func=cmd_openrouter_models)
