@@ -1,0 +1,14 @@
+cases:
+  - id: exact-echo
+    prompt: "Reply with exactly: bench-ok"
+    expected_exact: bench-ok
+
+  - id: math-json
+    prompt: 'Return only compact JSON {"status":"ok","sum":42}'
+    expected_json:
+      status: ok
+      sum: 42
+
+  - id: bullet-format
+    prompt: "Reply with exactly these two lines and nothing else: - alpha\n- beta"
+    expected_regex: '(^|\n)- alpha\n- beta\s*$'
