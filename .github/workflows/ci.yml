@@ -29,24 +29,18 @@ jobs:
 
       - name: Install TAG in editable mode
         run: python -m pip install -e .[dev]
-        working-directory: tag
 
       - name: Run TAG tests
         run: pytest -q tests/test_controller.py
-        working-directory: tag
 
       - name: Build Python distributions
         run: python -m build
-        working-directory: tag
 
       - name: Pack npm distribution
         run: npm pack
-        working-directory: tag
 
       - name: Smoke-test Python CLI version
         run: python -m tag --version
-        working-directory: tag
 
       - name: Smoke-test npm launcher version
         run: node bin/tag.js --version
-        working-directory: tag
