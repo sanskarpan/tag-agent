@@ -1,0 +1,245 @@
+diff --git a/ui-tui/src/__tests__/theme.test.ts b/ui-tui/src/__tests__/theme.test.ts
+index d45576698..683193677 100644
+--- a/ui-tui/src/__tests__/theme.test.ts
++++ b/ui-tui/src/__tests__/theme.test.ts
+@@ -239,12 +239,33 @@ describe('fromSkin', () => {
+ 
+   it('overrides branding', async () => {
+     const { fromSkin } = await importThemeWithCleanEnv()
+-    const { brand } = fromSkin({}, { agent_name: 'TestBot', prompt_symbol: '$' })
++    const { brand } = fromSkin({}, { agent_name: 'TestBot', agent_icon: '◇', prompt_symbol: '$' })
+ 
+     expect(brand.name).toBe('TestBot')
++    expect(brand.icon).toBe('◇')
+     expect(brand.prompt).toBe('$')
+   })
+ 
++  it('maps status bar palette from skins', async () => {
++    const { fromSkin } = await importThemeWithCleanEnv()
++
++    const theme = fromSkin({
++      status_bar_bg: '#111111',
++      status_bar_text: '#eeeeee',
++      status_bar_good: '#00ff00',
++      status_bar_warn: '#ffaa00',
++      status_bar_bad: '#ff6600',
++      status_bar_critical: '#ff0000'
++    }, {})
++
++    expect(theme.color.statusBg).toBe('#111111')
++    expect(theme.color.statusFg).toBe('#eeeeee')
++    expect(theme.color.statusGood).toBe('#00ff00')
++    expect(theme.color.statusWarn).toBe('#ffaa00')
++    expect(theme.color.statusBad).toBe('#ff6600')
++    expect(theme.color.statusCritical).toBe('#ff0000')
++  })
++
+   it('normalizes skin prompt symbols to trimmed single-line text', async () => {
+     const { DEFAULT_THEME, fromSkin } = await importThemeWithCleanEnv()
+ 
+diff --git a/ui-tui/src/components/appChrome.tsx b/ui-tui/src/components/appChrome.tsx
+index 01f9595e6..661063671 100644
+--- a/ui-tui/src/components/appChrome.tsx
++++ b/ui-tui/src/components/appChrome.tsx
+@@ -338,6 +338,16 @@ const shortModelLabel = (model: string) =>
+     .replace(/\b(\d+)\s+(\d+)\b/g, '$1.$2')
+     .trim()
+ 
++const visibleProfileLabel = (profileName?: null | string) => {
++  const label = String(profileName ?? '').trim()
++
++  if (!label || label === 'default' || label === 'custom') {
++    return ''
++  }
++
++  return label.length <= 16 ? label : `${label.slice(0, 15)}…`
++}
++
+ const modelLabel = (model: string, effort?: string, fast?: boolean) =>
+   [shortModelLabel(model), effortLabel(effort), fast ? 'fast' : ''].filter(Boolean).join(' ')
+ 
+@@ -370,6 +380,7 @@ export function StatusRule({
+   cwdLabel,
+   cols,
+   busy,
++  profileName,
+   status,
+   statusColor,
+   model,
+@@ -402,6 +413,7 @@ export function StatusRule({
+ 
+   const bar = !segs.compactCtx && usage.context_max ? ctxBar(pct) : ''
+   const modelText = modelLabel(model, modelReasoningEffort, modelFast)
++  const profileText = visibleProfileLabel(profileName)
+ 
+   // Width of the must-keep left segments (indicator + model + context). They
+   // are pinned (never shrink) and reserved so the cwd/branch on the right
+@@ -410,6 +422,7 @@ export function StatusRule({
+   const essentialWidth =
+     stringWidth('─ ') +
+     (busy ? busyIndicatorWidth(indicatorStyle, turnStartedAt != null) : stringWidth(status)) +
++    (profileText ? stringWidth(' │ ') + stringWidth(profileText) : 0) +
+     stringWidth(' │ ') +
+     stringWidth(modelText) +
+     (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0)
+@@ -471,6 +484,12 @@ export function StatusRule({
+               {status}
+             </Text>
+           )}
++          {profileText ? (
++            <Text color={t.color.label} wrap="truncate-end">
++              {' │ '}
++              {profileText}
++            </Text>
++          ) : null}
+           <Text color={t.color.muted} wrap="truncate-end">
+             {' │ '}
+             {modelText}
+@@ -652,6 +671,7 @@ interface StatusRuleProps {
+   cwdLabel: string
+   model: string
+   modelFast?: boolean
++  profileName?: null | string
+   modelReasoningEffort?: string
+   indicatorStyle?: IndicatorStyle
+   sessionStartedAt?: null | number
+diff --git a/ui-tui/src/components/appLayout.tsx b/ui-tui/src/components/appLayout.tsx
+index 113735c49..2a3e92bc5 100644
+--- a/ui-tui/src/components/appLayout.tsx
++++ b/ui-tui/src/components/appLayout.tsx
+@@ -369,6 +369,7 @@ const StatusRulePane = memo(function StatusRulePane({
+         liveSessionCount={ui.liveSessionCount}
+         model={ui.info?.model ?? ''}
+         modelFast={ui.info?.fast || ui.info?.service_tier === 'priority'}
++        profileName={ui.info?.profile_name}
+         modelReasoningEffort={ui.info?.reasoning_effort}
+         onSessionCountClick={() => patchOverlayState({ sessions: true })}
+         sessionStartedAt={status.sessionStartedAt}
+diff --git a/ui-tui/src/components/branding.tsx b/ui-tui/src/components/branding.tsx
+index 4f2bbb5ea..83778f18f 100644
+--- a/ui-tui/src/components/branding.tsx
++++ b/ui-tui/src/components/branding.tsx
+@@ -82,6 +82,37 @@ function CompactBanner({ cols, t }: { cols: number; t: Theme }) {
+   )
+ }
+ 
++const visibleProfileName = (profileName?: string) => {
++  const label = String(profileName ?? '').trim()
++
++  if (!label || label === 'default' || label === 'custom') {
++    return ''
++  }
++
++  return label
++}
++
++const runtimeSummary = (info: SessionInfo) => {
++  const pieces: string[] = []
++
++  const profileName = visibleProfileName(info.profile_name)
++  const effort = String(info.reasoning_effort ?? '').trim().toLowerCase()
++
++  if (profileName) {
++    pieces.push(`profile ${profileName}`)
++  }
++
++  if (info.fast || info.service_tier === 'priority') {
++    pieces.push('priority')
++  }
++
++  if (effort && !['default', 'medium', 'normal'].includes(effort)) {
++    pieces.push(effort)
++  }
++
++  return pieces.join(' · ')
++}
++
+ export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
+   const term = useStdout().stdout?.columns ?? 80
+   const cols = Math.max(1, Math.min(term, maxWidth ?? term))
+@@ -166,6 +197,8 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
+   const w = Math.max(20, wide ? cols - leftW - 14 : cols - 12)
+   const lineBudget = Math.max(12, w - 2)
+   const strip = (s: string) => (s.endsWith('_tools') ? s.slice(0, -6) : s)
++  const profileName = visibleProfileName(info.profile_name)
++  const runtimeLabel = runtimeSummary(info)
+ 
+   // ── Local collapse state for each section ──
+   const [toolsOpen, setToolsOpen] = useState(true)
+@@ -289,6 +322,12 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
+             <Text color={t.color.muted}> · Nous Research</Text>
+           </Text>
+ 
++          {runtimeLabel ? (
++            <Text color={t.color.label} wrap="truncate-end">
++              {runtimeLabel}
++            </Text>
++          ) : null}
++
+           <Text color={t.color.muted} wrap="truncate-end">
+             {info.cwd || process.cwd()}
+           </Text>
+@@ -319,6 +358,11 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
+               {info.model.split('/').pop()}
+               <Text color={t.color.muted}> · Nous Research</Text>
+             </Text>
++            {runtimeLabel ? (
++              <Text color={t.color.label} wrap="truncate-end">
++                {runtimeLabel}
++              </Text>
++            ) : null}
+             <Text color={t.color.muted} wrap="truncate-end">
+               {info.cwd || process.cwd()}
+             </Text>
+@@ -390,6 +434,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
+           {toolsTotal} tools{' · '}
+           {skillsTotal} skills
+           {info.mcp_servers?.length ? ` · ${info.mcp_servers.length} MCP` : ''}
++          {profileName ? ` · ${profileName}` : ''}
+           {' · '}
+           <Text color={t.color.muted}>/help for commands</Text>
+         </Text>
+diff --git a/ui-tui/src/theme.ts b/ui-tui/src/theme.ts
+index 6d7426cae..4389de901 100644
+--- a/ui-tui/src/theme.ts
++++ b/ui-tui/src/theme.ts
+@@ -527,8 +527,10 @@ export function fromSkin(
+ 
+   const accent = c('ui_accent') ?? c('banner_accent') ?? d.color.accent
+   const bannerAccent = c('banner_accent') ?? c('banner_title') ?? d.color.accent
+-  const muted = c('banner_dim') ?? d.color.muted
++  const muted = c('ui_muted') ?? c('banner_dim') ?? d.color.muted
+   const completionBg = c('completion_menu_bg') ?? d.color.completionBg
++  const statusBg = c('status_bar_bg') ?? d.color.statusBg
++  const statusFg = c('status_bar_text') ?? d.color.statusFg
+ 
+   const completionCurrentBg =
+     c('completion_menu_current_bg') ??
+@@ -558,12 +560,12 @@ export function fromSkin(
+       sessionLabel: c('session_label') ?? muted,
+       sessionBorder: c('session_border') ?? muted,
+ 
+-      statusBg: d.color.statusBg,
+-      statusFg: d.color.statusFg,
+-      statusGood: c('ui_ok') ?? d.color.statusGood,
+-      statusWarn: c('ui_warn') ?? d.color.statusWarn,
+-      statusBad: d.color.statusBad,
+-      statusCritical: d.color.statusCritical,
++      statusBg,
++      statusFg,
++      statusGood: c('status_bar_good') ?? c('ui_ok') ?? d.color.statusGood,
++      statusWarn: c('status_bar_warn') ?? c('ui_warn') ?? d.color.statusWarn,
++      statusBad: c('status_bar_bad') ?? d.color.statusBad,
++      statusCritical: c('status_bar_critical') ?? d.color.statusCritical,
+       selectionBg: c('selection_bg') ?? c('completion_menu_current_bg') ?? (hasSkinColors ? completionCurrentBg : d.color.selectionBg),
+ 
+       diffAdded: d.color.diffAdded,
+@@ -575,7 +577,7 @@ export function fromSkin(
+ 
+     brand: {
+       name: branding.agent_name ?? d.brand.name,
+-      icon: d.brand.icon,
++      icon: cleanPromptSymbol(branding.agent_icon ?? branding.icon, d.brand.icon),
+       prompt: cleanPromptSymbol(branding.prompt_symbol, d.brand.prompt),
+       welcome: branding.welcome ?? d.brand.welcome,
+       goodbye: branding.goodbye ?? d.brand.goodbye,
