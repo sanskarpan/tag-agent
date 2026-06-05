@@ -1,0 +1,61 @@
+name: tag-control
+description: TAG control-room skin with indigo panels, cobalt prompts, and electric-blue accents.
+colors:
+  banner_border: "#44517A"
+  banner_title: "#8FA8FF"
+  banner_accent: "#52B6FF"
+  banner_dim: "#7587B3"
+  banner_text: "#E6EEFF"
+  ui_primary: "#8FA8FF"
+  ui_accent: "#52B6FF"
+  ui_border: "#44517A"
+  ui_text: "#E6EEFF"
+  ui_muted: "#7587B3"
+  ui_label: "#B7C7FF"
+  ui_ok: "#66D7A1"
+  ui_error: "#FF7D97"
+  ui_warn: "#7FD7FF"
+  prompt: "#8FA8FF"
+  input_rule: "#44517A"
+  response_border: "#52B6FF"
+  status_bar_bg: "#0D1324"
+  status_bar_text: "#DCE6FF"
+  status_bar_strong: "#52B6FF"
+  status_bar_dim: "#7587B3"
+  status_bar_good: "#66D7A1"
+  status_bar_warn: "#7FD7FF"
+  status_bar_bad: "#A88BFF"
+  status_bar_critical: "#FF7D97"
+  session_label: "#B7C7FF"
+  session_border: "#7587B3"
+  selection_bg: "#1D294A"
+  completion_menu_bg: "#0D1324"
+  completion_menu_current_bg: "#1D294A"
+  completion_menu_meta_bg: "#0A1020"
+  completion_menu_meta_current_bg: "#16254A"
+  shell_dollar: "#52B6FF"
+branding:
+  agent_name: "TAG Control"
+  agent_icon: "◈"
+  welcome: "TAG control plane online. Type your message or /help."
+  goodbye: "TAG control plane offline."
+  response_label: " ◈ TAG "
+  prompt_symbol: "›"
+  help_header: "[tag] Commands"
+tool_prefix: "│"
+banner_logo: |
+  [bold #52B6FF]████████╗ █████╗  ██████╗[/]
+  [bold #8FA8FF]╚══██╔══╝██╔══██╗██╔════╝[/]
+  [bold #B7C7FF]   ██║   ███████║██║  ███╗[/]
+  [bold #A88BFF]   ██║   ██╔══██║██║   ██║[/]
+  [bold #7FD7FF]   ██║   ██║  ██║╚██████╔╝[/]
+banner_hero: |
+  [#52B6FF]      ╭────────────╮[/]
+  [#8FA8FF]  ╭───┤ TAG        ├───╮[/]
+  [#7587B3]  │   ╰────┬───────╯   │[/]
+  [#B7C7FF]  │   ╭────┴────╮      │[/]
+  [#52B6FF]  ├───┤ CONTROL ├───┬──┤[/]
+  [#7587B3]  │   ╰────┬────╯   │  │[/]
+  [#A88BFF]  │   ╭────┴────╮   │  │[/]
+  [#66D7A1]  ╰───┤ AGENTS  ├───╯  │[/]
+  [#7587B3]      ╰─────────╯      │[/]
