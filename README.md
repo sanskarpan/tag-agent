@@ -69,6 +69,19 @@ Default behavior:
 7. bootstrap the default TAG profiles
 8. launch the orchestrator TUI
 
+The same managed bootstrap now happens automatically for non-TUI commands that
+need Hermes, for example:
+
+```bash
+tag submit --task-type mixed --execution direct --prompt "Reply with exactly: smoke-ok"
+tag benchmark --profile researcher --model-ref openrouter/deepseek/deepseek-v4-flash
+tag model --profile orchestrator -- list
+```
+
+For those commands, TAG provisions Hermes on demand and skips the TUI build if
+it is not needed, so `npm` is not required just to use submit/benchmark/model
+flows.
+
 If `tag` is started from a non-interactive context, it does not try to open the
 TUI blindly. It exits with a clear message and tells you to use `tag doctor`,
 `tag setup`, or `tag tui` from a real terminal.
@@ -140,6 +153,10 @@ export TAG_HOME=/some/other/location
 - TAG does not require a preinstalled Hermes checkout. By default it provisions
   Hermes from a bundled source snapshot and only falls back to `git clone` if
   that snapshot is unavailable.
+- If TAG can already discover a valid local Hermes source checkout, it will
+  reuse it automatically instead of forcing a second separate install.
+- If a real Codex CLI home already exists with `auth.json`, TAG imports that
+  into the managed orchestrator profiles automatically during setup.
 - The shipped patch only touches Hermes TUI skin handling and profile-aware
   chrome.
 - OpenRouter keys and Codex auth remain per-profile concerns.
