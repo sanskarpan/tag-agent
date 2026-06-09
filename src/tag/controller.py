@@ -16,9 +16,11 @@ import tarfile
 import textwrap
 import time
 import uuid
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, TextIO
 
 import yaml
@@ -102,8 +104,11 @@ def resolve_home_relative(value: str, *, base: Path | None = None) -> Path:
 def ensure_default_file(target: Path, source: Path) -> Path:
     if target.exists():
         return target
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    except PermissionError as exc:
+        raise SystemExit(f"Cannot initialize TAG file {target}: {exc.strerror or exc}") from exc
     return target
 
 
@@ -260,12 +265,24 @@ def ensure_runtime_dirs(cfg: dict[str, Any]) -> None:
 
 def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
     ensure_runtime_dirs(cfg)
-    conn = sqlite3.connect(runtime_db_path(cfg))
+    conn = sqlite3.connect(runtime_db_path(cfg), timeout=5)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    last_error: sqlite3.OperationalError | None = None
+    for _ in range(20):
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            last_error = None
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            last_error = exc
+            time.sleep(0.1)
+    if last_error is not None:
+        raise last_error
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS runs (
@@ -392,6 +409,22 @@ def normalize_chat_output(output: str) -> str:
             continue
         cleaned.append(line)
     return "\n".join(cleaned).strip()
+
+
+def infrastructure_failure_reason(output: str) -> str | None:
+    normalized = normalize_chat_output(output)
+    lowered = normalized.lower()
+    known_failures = (
+        "error: codex authentication failed",
+        "login looks expired or invalid",
+        "api call failed after",
+        "no api keys or providers found",
+        "it looks like hermes isn't configured yet",
+    )
+    for marker in known_failures:
+        if marker in lowered:
+            return marker
+    return None
 
 
 def strip_json_fences(text: str) -> str:
@@ -525,7 +558,11 @@ def bootstrap_profiles(cfg: dict[str, Any]) -> list[dict[str, str]]:
         description = str(profile.get("description", "")).strip()
         if description:
             cmd.extend(["--description", description])
-        run_hermes(cfg, *cmd)
+        try:
+            run_hermes(cfg, *cmd)
+        except subprocess.CalledProcessError as exc:
+            message = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+            raise SystemExit(f"Failed to create Hermes profile '{name}': {message}") from exc
         created.append({"profile": name, "status": "created"})
     return created
 
@@ -590,6 +627,10 @@ def resolve_route(cfg: dict[str, Any], task_type: str, master_override: str | No
 
 
 def parse_model_ref(value: str) -> tuple[str, str]:
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise SystemExit(
+            f"Invalid model reference '{value}'. Provider and model must not contain control characters."
+        )
     ref = value.strip()
     if "/" not in ref:
         raise SystemExit(
@@ -674,8 +715,18 @@ def load_openrouter_catalog(cfg: dict[str, Any], profile_name: str) -> list[dict
         "https://openrouter.ai/api/v1/models",
         headers={"Authorization": f"Bearer {api_key}"},
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(f"OpenRouter models request failed with HTTP {exc.code}.") from exc
+    except urllib.error.URLError as exc:
+        reason = exc.reason if exc.reason else "unknown network error"
+        raise SystemExit(f"OpenRouter models request failed: {reason}") from exc
+    except TimeoutError as exc:
+        raise SystemExit("OpenRouter models request timed out.") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit("OpenRouter models response was not valid JSON.") from exc
     rows = payload.get("data", [])
     if not isinstance(rows, list):
         raise SystemExit("Unexpected OpenRouter models payload.")
@@ -740,9 +791,10 @@ def run_chat_step(
         output = f"{output}\n{proc.stderr.strip()}".strip()
     profiles = cfg.get("profiles", {})
     model_cfg = profiles.get(profile_name, {}).get("config", {}).get("model", {})
+    failure_reason = infrastructure_failure_reason(output)
     return {
         "profile": profile_name,
-        "status": "ok" if proc.returncode == 0 else "error",
+        "status": "ok" if proc.returncode == 0 and not failure_reason else "error",
         "prompt": prompt,
         "output": output,
         "started_at": started.isoformat(),
@@ -750,6 +802,7 @@ def run_chat_step(
         "duration_ms": int((finished - started).total_seconds() * 1000),
         "returncode": proc.returncode,
         "model_ref": format_model_ref(model_cfg if isinstance(model_cfg, dict) else {}),
+        "failure_reason": failure_reason or "",
     }
 
 
@@ -968,7 +1021,7 @@ def patch_status(cfg: dict[str, Any]) -> str:
         check=False,
     )
     if reverse.returncode == 0:
-        return "applied"
+        return "prepatched" if hermes_checkout_kind(root) == "bundled" else "applied"
     forward = run_external(
         ["git", "apply", "--check", str(patch)],
         cwd=root,
@@ -1036,16 +1089,25 @@ def hermes_patch_path() -> Path:
 
 def safe_extract_tar_gz(archive: Path, target: Path) -> None:
     target_real = target.resolve()
-    with tarfile.open(archive, "r:gz") as tf:
-        members = tf.getmembers()
-        for member in members:
-            member_name = member.name
-            if member_name.startswith("/") or member_name.startswith(".."):
-                raise SystemExit(f"Bundled Hermes archive contains an unsafe entry: {member_name}")
-            dest = (target / member_name).resolve()
-            if target_real != dest and target_real not in dest.parents:
-                raise SystemExit(f"Bundled Hermes archive contains a path traversal entry: {member_name}")
-        tf.extractall(target)
+    try:
+        with tarfile.open(archive, "r:gz") as tf:
+            members = tf.getmembers()
+            for member in members:
+                member_name = member.name
+                pure = PurePosixPath(member_name)
+                if pure.is_absolute() or ".." in pure.parts:
+                    raise SystemExit(f"Bundled Hermes archive contains an unsafe entry: {member_name}")
+                if member.issym() or member.islnk():
+                    raise SystemExit(f"Bundled Hermes archive contains an unsupported link entry: {member_name}")
+                if not (member.isdir() or member.isfile()):
+                    raise SystemExit(f"Bundled Hermes archive contains an unsupported entry type: {member_name}")
+                dest = (target / member_name).resolve()
+                if target_real != dest and target_real not in dest.parents:
+                    raise SystemExit(f"Bundled Hermes archive contains a path traversal entry: {member_name}")
+            for member in members:
+                tf.extract(member, target)
+    except (tarfile.TarError, OSError) as exc:
+        raise SystemExit(f"Bundled Hermes archive could not be read: {archive}") from exc
 
 
 def extract_bundled_hermes(root: Path) -> dict[str, Any]:
@@ -1061,7 +1123,12 @@ def extract_bundled_hermes(root: Path) -> dict[str, Any]:
 
 
 def clone_or_update_hermes(cfg: dict[str, Any], *, refresh: bool) -> dict[str, Any]:
-    root = hermes_root(cfg)
+    override = os.environ.get("TAG_HERMES_ROOT", "").strip()
+    root = (
+        Path(override).expanduser().resolve()
+        if override
+        else resolve_home_relative(str(cfg.get("upstream", {}).get("checkout_dir", DEFAULT_HERMES_CHECKOUT)))
+    )
     repo = hermes_repo_url(cfg)
     ref = hermes_ref(cfg)
     archive = bundled_hermes_archive()
@@ -1112,7 +1179,8 @@ def apply_hermes_patch(cfg: dict[str, Any]) -> dict[str, Any]:
         check=False,
     )
     if reverse.returncode == 0:
-        return {"patch": str(patch), "status": "already-applied"}
+        status = "prepatched" if hermes_checkout_kind(root) == "bundled" else "already-applied"
+        return {"patch": str(patch), "status": status}
     forward = run_external(
         ["git", "apply", "--check", str(patch)],
         cwd=root,
@@ -1211,6 +1279,17 @@ def ensure_hermes_ready(
     cmd_setup(setup_args)
 
 
+def normalize_hermes_passthrough_args(args: list[str]) -> list[str]:
+    normalized = list(args)
+    if normalized[:1] == ["--"]:
+        normalized = normalized[1:]
+    if len(normalized) >= 2 and normalized[1] == "--":
+        normalized = [normalized[0], *normalized[2:]]
+    if not normalized:
+        return ["--help"]
+    return normalized
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
     benchmark_path = benchmark_suite_path(None)
@@ -1228,9 +1307,14 @@ def cmd_setup(args: argparse.Namespace) -> int:
     steps["patch"] = apply_hermes_patch(cfg)
     if not args.skip_tui_build:
         steps["tui"] = install_tui_dependencies(cfg)
+    if not hermes_bin(cfg).exists():
+        raise SystemExit(
+            "Hermes Python is not installed; cannot bootstrap profiles. "
+            "Re-run `tag setup` without `--skip-python-install`."
+        )
     steps["bootstrap"] = {
         "profiles": bootstrap_profiles(cfg),
-        "rendered": render_profiles(cfg, force=True),
+        "rendered": render_profiles(cfg, force=False),
     }
     steps["codex_import"] = auto_import_codex_profiles(cfg)
 
@@ -1251,9 +1335,13 @@ def cmd_hermes_passthrough(args: argparse.Namespace) -> int:
         need_tui="--tui" in args.hermes_args,
     )
     env = profile_exec_env(cfg, args.profile) if args.profile else hermes_env(cfg)
-    hermes_args = list(args.hermes_args)
-    if hermes_args[:1] == ["--"]:
-        hermes_args = hermes_args[1:]
+    raw_args = list(args.hermes_args)
+    hermes_args = normalize_hermes_passthrough_args(raw_args)
+    if getattr(args, "hermes_version", False):
+        if not raw_args:
+            hermes_args = ["--version"]
+        else:
+            hermes_args = ["--version", *hermes_args]
     proc = subprocess.run(
         [str(hermes_bin(cfg)), *hermes_args],
         env=env,
@@ -1264,19 +1352,41 @@ def cmd_hermes_passthrough(args: argparse.Namespace) -> int:
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
-    if not can_launch_interactive_tui() and os.environ.get("TAG_FORCE_TUI", "").strip() not in {"1", "true", "yes"}:
-        raise SystemExit(
-            "TAG TUI requires an interactive terminal. Use `tag doctor`, `tag setup`, "
-            "`tag submit ...`, or rerun in a real TTY. Set TAG_FORCE_TUI=1 to bypass this guard."
+    raw_args = list(args.hermes_args)
+    normalized_args = normalize_hermes_passthrough_args(raw_args)
+    if raw_args and normalized_args in (["--help"], ["-h"]):
+        passthrough = argparse.Namespace(
+            config=args.config,
+            profile=args.profile,
+            hermes_args=["--help"],
+            hermes_version=False,
         )
+        return cmd_hermes_passthrough(passthrough)
+    if not can_launch_interactive_tui() and os.environ.get("TAG_FORCE_TUI", "").strip() not in {"1", "true", "yes"}:
+        print(
+            "TAG TUI requires an interactive terminal. Use `tag doctor`, `tag setup`, "
+            "`tag submit ...`, or rerun in a real TTY. Set TAG_FORCE_TUI=1 to bypass this guard.",
+            file=sys.stderr,
+        )
+        return 2
     forwarded = ["--tui", *args.hermes_args]
-    passthrough = argparse.Namespace(config=args.config, profile=args.profile, hermes_args=forwarded)
+    passthrough = argparse.Namespace(
+        config=args.config,
+        profile=args.profile,
+        hermes_args=forwarded,
+        hermes_version=False,
+    )
     return cmd_hermes_passthrough(passthrough)
 
 
 def cmd_hermes_command(args: argparse.Namespace, command_name: str) -> int:
     forwarded = [command_name, *args.hermes_args]
-    passthrough = argparse.Namespace(config=args.config, profile=args.profile, hermes_args=forwarded)
+    passthrough = argparse.Namespace(
+        config=args.config,
+        profile=args.profile,
+        hermes_args=forwarded,
+        hermes_version=False,
+    )
     return cmd_hermes_passthrough(passthrough)
 
 
@@ -1507,7 +1617,9 @@ def cmd_import_codex(args: argparse.Namespace) -> int:
     source_home = (
         Path(args.codex_home).expanduser().resolve()
         if args.codex_home
-        else runtime_codex_home(cfg)
+        else Path(
+            os.environ.get("TAG_IMPORT_CODEX_HOME", str(runtime_codex_home(cfg)))
+        ).expanduser().resolve()
     )
     result = import_codex_into_profile(
         cfg,
@@ -1836,7 +1948,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
 def cmd_benchmark(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
     ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
-    suite = load_benchmark_suite(benchmark_suite_path(args.suite))
+    suite_path = benchmark_suite_path(args.suite)
+    try:
+        suite = load_benchmark_suite(suite_path)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Benchmark suite not found: {suite_path}") from exc
     if args.case:
         selected = set(args.case)
         suite = [case for case in suite if case.get("id") in selected]
@@ -2135,6 +2251,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     hermes_cmd = sub.add_parser("hermes", help="Pass raw arguments through to the managed Hermes binary")
     hermes_cmd.add_argument("--profile", help="Run Hermes inside one TAG profile home")
+    hermes_cmd.add_argument("--version", dest="hermes_version", action="store_true", help="Show the managed Hermes version")
     hermes_cmd.add_argument("hermes_args", nargs=argparse.REMAINDER)
     hermes_cmd.set_defaults(func=cmd_hermes_passthrough)
 
