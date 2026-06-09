@@ -471,6 +471,9 @@ def test_bootstrap_profiles_wraps_hermes_errors(tmp_path, monkeypatch):
 
 def test_cmd_setup_auto_imports_existing_codex(tmp_path, monkeypatch):
     monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    fake_bin = tmp_path / "tag-home" / "managed" / "hermes-agent-upstream" / ".venv" / "bin" / "hermes"
+    fake_bin.parent.mkdir(parents=True, exist_ok=True)
+    fake_bin.write_text("", encoding="utf-8")
     codex_home = tmp_path / "real-codex"
     codex_home.mkdir()
     (codex_home / "auth.json").write_text("{}", encoding="utf-8")
@@ -490,6 +493,7 @@ def test_cmd_setup_auto_imports_existing_codex(tmp_path, monkeypatch):
         ],
     )
     monkeypatch.setattr(TAG, "render_profiles", lambda *a, **k: [{"profile": "orchestrator"}])
+    monkeypatch.setattr(TAG, "hermes_bin", lambda cfg=None: fake_bin)
     imports = []
     monkeypatch.setattr(
         TAG,
@@ -506,6 +510,9 @@ def test_cmd_setup_auto_imports_existing_codex(tmp_path, monkeypatch):
 
 def test_cmd_setup_does_not_force_rerender(tmp_path, monkeypatch):
     monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    fake_bin = tmp_path / "tag-home" / "managed" / "hermes-agent-upstream" / ".venv" / "bin" / "hermes"
+    fake_bin.parent.mkdir(parents=True, exist_ok=True)
+    fake_bin.write_text("", encoding="utf-8")
     monkeypatch.setattr(TAG, "ensure_setup_prereqs", lambda *a, **k: None)
     monkeypatch.setattr(TAG, "clone_or_update_hermes", lambda *a, **k: {"status": "existing"})
     monkeypatch.setattr(TAG, "ensure_venv", lambda *a, **k: {"status": "existing"})
@@ -523,6 +530,7 @@ def test_cmd_setup_does_not_force_rerender(tmp_path, monkeypatch):
         "render_profiles",
         lambda cfg, force: seen.setdefault("force", force) or [{"profile": "orchestrator"}],
     )
+    monkeypatch.setattr(TAG, "hermes_bin", lambda cfg=None: fake_bin)
     monkeypatch.setattr(TAG, "auto_import_codex_profiles", lambda *_a, **_k: [])
     args = TAG.argparse.Namespace(config=None, refresh=False, skip_python_install=False, skip_tui_build=False, json=True)
     assert TAG.cmd_setup(args) == 0
