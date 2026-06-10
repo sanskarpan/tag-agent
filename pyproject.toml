@@ -34,7 +34,13 @@ dependencies = [
 dev = [
   "build>=1.2.2",
   "pytest>=8.0",
+  "twine>=6.1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/sanskarpan/tag-agent"
+Repository = "https://github.com/sanskarpan/tag-agent.git"
+Issues = "https://github.com/sanskarpan/tag-agent/issues"
 
 [project.scripts]
 tag = "tag.controller:main"

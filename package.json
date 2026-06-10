@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "TAG CLI launcher for Hermes-based orchestration with OpenRouter and Codex workflows.",
   "license": "MIT",
+  "homepage": "https://github.com/sanskarpan/tag-agent#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanskarpan/tag-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sanskarpan/tag-agent/issues"
+  },
   "bin": {
     "tag": "bin/tag.js"
   },
