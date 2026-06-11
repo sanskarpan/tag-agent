@@ -3,13 +3,12 @@
 TAG is a standalone orchestration layer on top of Hermes. It packages the work
 done in this workspace into one installable CLI with:
 
-- a bundled Hermes source snapshot for first-run provisioning
-- managed Hermes bootstrap
-- shipped Hermes TUI patching
-- a custom `tag-control` skin
-- profile-based master/worker orchestration
-- OpenRouter worker routing
-- Codex import and runtime support
+- a bundled Hermes source snapshot (v0.16.0) for first-run provisioning
+- managed Hermes bootstrap with full TAG branding
+- shipped Hermes TUI patching and custom `tag-control` skin
+- profile-based master/worker orchestration (orchestrator, researcher, coder, reviewer)
+- OpenRouter worker routing and Codex import/runtime support
+- credential import from Claude Code, Gemini CLI, Continue.dev, and Mistral Vibe
 - direct execution, Kanban execution, and benchmark history
 
 ## Install
@@ -43,7 +42,7 @@ For a build artifact install:
 
 ```bash
 python -m build
-pip install dist/tag_agent-0.1.0-py3-none-any.whl
+pip install dist/tag_agent-0.2.0-py3-none-any.whl
 ```
 
 For an npm artifact check:
@@ -109,6 +108,10 @@ tag submit --task-type mixed --execution direct --prompt "Reply with exactly: sm
 tag benchmark --profile researcher --model-ref openrouter/deepseek/deepseek-v4-flash
 tag runs
 tag import-codex --profile orchestrator --codex-home ~/.codex
+tag import-claude --profile orchestrator
+tag import-gemini --profile orchestrator
+tag import-continue --profile orchestrator
+tag import-mistral --profile orchestrator
 tag chat --profile orchestrator -- --help
 tag config --profile orchestrator -- edit
 tag gateway --profile orchestrator -- start
@@ -157,6 +160,14 @@ export TAG_HOME=/some/other/location
   reuse it automatically instead of forcing a second separate install.
 - If a real Codex CLI home already exists with `auth.json`, TAG imports that
   into the managed orchestrator profiles automatically during setup.
+- `tag import-claude` detects `ANTHROPIC_API_KEY`, `~/.claude/.credentials.json`,
+  and `~/.claude.json` and writes the key into the target profile's `.env`.
+- `tag import-gemini` detects `GEMINI_API_KEY`, `~/.config/gemini/credentials.json`,
+  and Gemini CLI's `application_default_credentials.json`.
+- `tag import-continue` parses `~/.continue/config.json` and extracts API keys
+  for all configured model providers (Anthropic, OpenAI, Gemini, Mistral, etc.).
+- `tag import-mistral` reads `~/.config/mistral/credentials` or
+  `~/.mistral/credentials` and writes `MISTRAL_API_KEY` into the target profile.
 - The shipped patch only touches Hermes TUI skin handling and profile-aware
   chrome.
 - OpenRouter keys and Codex auth remain per-profile concerns.
@@ -177,9 +188,11 @@ TAG currently has three layers of command surface:
 
 1. Native TAG orchestration commands
    - `setup`, `doctor`, `bootstrap`, `route`, `submit`, `benchmark`, `runs`
-2. High-value managed Hermes wrappers
+2. Credential import commands
+   - `import-codex`, `import-claude`, `import-gemini`, `import-continue`, `import-mistral`
+3. High-value managed Hermes wrappers
    - `chat`, `gateway`, `kanban`, `model`, `profile`, `status`, `config`, `sessions`, `skills`, `plugins`, `tools`, `mcp`, `logs`, `dashboard`, `memory`, `completion`, `prompt-size`, `update`, `tui`
-3. Full escape hatch
+4. Full escape hatch
    - `tag hermes -- ...`
 
 This means TAG does not reimplement all of Hermes. Instead, it owns the
