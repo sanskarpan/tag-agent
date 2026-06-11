@@ -1,7 +1,7 @@
 {
   "name": "tag-agent",
-  "version": "0.2.0",
-  "description": "TAG CLI launcher for Hermes-based orchestration with OpenRouter and Codex workflows.",
+  "version": "0.3.0",
+  "description": "Orchestrate AI agents from your terminal.",
   "license": "MIT",
   "homepage": "https://github.com/sanskarpan/tag-agent#readme",
   "repository": {
@@ -32,9 +32,14 @@
   },
   "keywords": [
     "agents",
+    "ai",
+    "anthropic",
     "cli",
     "codex",
+    "gemini",
     "hermes",
+    "llm",
+    "openai",
     "openrouter",
     "orchestration",
     "python",
