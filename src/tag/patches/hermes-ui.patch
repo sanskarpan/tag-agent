@@ -1,245 +1,1444 @@
-diff --git a/ui-tui/src/__tests__/theme.test.ts b/ui-tui/src/__tests__/theme.test.ts
-index d45576698..683193677 100644
---- a/ui-tui/src/__tests__/theme.test.ts
-+++ b/ui-tui/src/__tests__/theme.test.ts
-@@ -239,12 +239,33 @@ describe('fromSkin', () => {
+diff --git a/agent/system_prompt.py b/agent/system_prompt.py
+index 4038716df..b125241de 100644
+--- a/agent/system_prompt.py
++++ b/agent/system_prompt.py
+@@ -238,7 +238,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None)
+             # Probe failure must never block prompt build.
+             pass
  
-   it('overrides branding', async () => {
-     const { fromSkin } = await importThemeWithCleanEnv()
--    const { brand } = fromSkin({}, { agent_name: 'TestBot', prompt_symbol: '$' })
-+    const { brand } = fromSkin({}, { agent_name: 'TestBot', agent_icon: '◇', prompt_symbol: '$' })
+-    # Active-profile hint — names the Hermes profile the agent is running
++    # Active-profile hint — names the TAG profile the agent is running
+     # under so it doesn't conflate ~/.hermes/skills/ (default profile) with
+     # ~/.hermes/profiles/<active>/skills/ (this profile's). Deterministic
+     # for the lifetime of the agent — profile name doesn't change
+@@ -252,7 +252,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None)
+         active_profile = "default"
+     if active_profile == "default":
+         stable_parts.append(
+-            "Active Hermes profile: default. Other profiles (if any) live "
++            "Active TAG profile: default. Other profiles (if any) live "
+             "under ~/.hermes/profiles/<name>/. Each profile has its own "
+             "skills/, plugins/, cron/, and memories/ that affect a different "
+             "session than this one. Do not modify another profile's "
+@@ -261,7 +261,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None)
+         )
+     else:
+         stable_parts.append(
+-            f"Active Hermes profile: {active_profile}. This session reads "
++            f"Active TAG profile: {active_profile}. This session reads "
+             f"and writes ~/.hermes/profiles/{active_profile}/. The default "
+             f"profile's data lives at ~/.hermes/skills/, ~/.hermes/plugins/, "
+             f"~/.hermes/cron/, ~/.hermes/memories/ — those belong to a "
+@@ -271,6 +271,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None)
+             f"refuse such writes by default; pass cross_profile=True only "
+             f"after explicit direction."
+         )
++    stable_parts.append(
++        "When giving the user CLI instructions in this environment, prefer "
++        "`tag ...` commands over equivalent `hermes ...` commands."
++    )
++    stable_parts.append(
++        "When speaking to the user about this product, refer to it as TAG, "
++        "not Hermes."
++    )
  
-     expect(brand.name).toBe('TestBot')
-+    expect(brand.icon).toBe('◇')
-     expect(brand.prompt).toBe('$')
-   })
+     platform_key = (agent.platform or "").lower().strip()
+     if platform_key in PLATFORM_HINTS:
+diff --git a/cli.py b/cli.py
+index 000778b75..00391c0e8 100644
+--- a/cli.py
++++ b/cli.py
+@@ -1,8 +1,8 @@
+ #!/usr/bin/env python3
+ """
+-Hermes Agent CLI - Interactive Terminal Interface
++Interactive terminal runtime for the current agent shell.
  
-+  it('maps status bar palette from skins', async () => {
-+    const { fromSkin } = await importThemeWithCleanEnv()
+-A beautiful command-line interface for the Hermes Agent, inspired by Claude Code.
++A beautiful command-line interface for the active runtime brand, inspired by Claude Code.
+ Features ASCII art branding, interactive REPL, toolset selection, and rich formatting.
+ 
+ Usage:
+@@ -46,6 +46,27 @@ from typing import List, Dict, Any, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
 +
-+    const theme = fromSkin({
-+      status_bar_bg: '#111111',
-+      status_bar_text: '#eeeeee',
-+      status_bar_good: '#00ff00',
-+      status_bar_warn: '#ffaa00',
-+      status_bar_bad: '#ff6600',
-+      status_bar_critical: '#ff0000'
-+    }, {})
++def _runtime_brand_name() -> str:
++    return "TAG" if (os.environ.get("HERMES_BIN_LABEL") or "").strip().lower() == "tag" else "Hermes"
 +
-+    expect(theme.color.statusBg).toBe('#111111')
-+    expect(theme.color.statusFg).toBe('#eeeeee')
-+    expect(theme.color.statusGood).toBe('#00ff00')
-+    expect(theme.color.statusWarn).toBe('#ffaa00')
-+    expect(theme.color.statusBad).toBe('#ff6600')
-+    expect(theme.color.statusCritical).toBe('#ff0000')
-+  })
 +
-   it('normalizes skin prompt symbols to trimmed single-line text', async () => {
-     const { DEFAULT_THEME, fromSkin } = await importThemeWithCleanEnv()
- 
-diff --git a/ui-tui/src/components/appChrome.tsx b/ui-tui/src/components/appChrome.tsx
-index 01f9595e6..661063671 100644
---- a/ui-tui/src/components/appChrome.tsx
-+++ b/ui-tui/src/components/appChrome.tsx
-@@ -338,6 +338,16 @@ const shortModelLabel = (model: string) =>
-     .replace(/\b(\d+)\s+(\d+)\b/g, '$1.$2')
-     .trim()
- 
-+const visibleProfileLabel = (profileName?: null | string) => {
-+  const label = String(profileName ?? '').trim()
++def _runtime_agent_name() -> str:
++    return "TAG" if _runtime_brand_name() == "TAG" else "Hermes Agent"
 +
-+  if (!label || label === 'default' || label === 'custom') {
-+    return ''
-+  }
 +
-+  return label.length <= 16 ? label : `${label.slice(0, 15)}…`
-+}
++def _runtime_cli_label() -> str:
++    return (os.environ.get("HERMES_BIN_LABEL") or "hermes").strip() or "hermes"
 +
- const modelLabel = (model: string, effort?: string, fast?: boolean) =>
-   [shortModelLabel(model), effortLabel(effort), fast ? 'fast' : ''].filter(Boolean).join(' ')
++
++def _runtime_cli_command(*parts: str) -> str:
++    return " ".join([_runtime_cli_label(), *[part for part in parts if part]]).strip()
++
++
++def _runtime_env_label() -> str:
++    label = (os.environ.get("HERMES_ENV_LABEL") or "").strip()
++    return label or "~/.hermes/.env"
++
+ # Suppress startup messages for clean CLI experience
+ os.environ["HERMES_QUIET"] = "1"  # Our own modules
  
-@@ -370,6 +380,7 @@ export function StatusRule({
-   cwdLabel,
-   cols,
-   busy,
-+  profileName,
-   status,
-   statusColor,
-   model,
-@@ -402,6 +413,7 @@ export function StatusRule({
+@@ -163,7 +184,7 @@ from hermes_cli.banner import _format_context_length, format_banner_version_labe
+ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
  
-   const bar = !segs.compactCtx && usage.context_max ? ctxBar(pct) : ''
-   const modelText = modelLabel(model, modelReasoningEffort, modelFast)
-+  const profileText = visibleProfileLabel(profileName)
  
-   // Width of the must-keep left segments (indicator + model + context). They
-   // are pinned (never shrink) and reserved so the cwd/branch on the right
-@@ -410,6 +422,7 @@ export function StatusRule({
-   const essentialWidth =
-     stringWidth('─ ') +
-     (busy ? busyIndicatorWidth(indicatorStyle, turnStartedAt != null) : stringWidth(status)) +
-+    (profileText ? stringWidth(' │ ') + stringWidth(profileText) : 0) +
-     stringWidth(' │ ') +
-     stringWidth(modelText) +
-     (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0)
-@@ -471,6 +484,12 @@ export function StatusRule({
-               {status}
-             </Text>
-           )}
-+          {profileText ? (
-+            <Text color={t.color.label} wrap="truncate-end">
-+              {' │ '}
-+              {profileText}
-+            </Text>
-+          ) : null}
-           <Text color={t.color.muted} wrap="truncate-end">
-             {' │ '}
-             {modelText}
-@@ -652,6 +671,7 @@ interface StatusRuleProps {
-   cwdLabel: string
-   model: string
-   modelFast?: boolean
-+  profileName?: null | string
-   modelReasoningEffort?: string
-   indicatorStyle?: IndicatorStyle
-   sessionStartedAt?: null | number
-diff --git a/ui-tui/src/components/appLayout.tsx b/ui-tui/src/components/appLayout.tsx
-index 113735c49..2a3e92bc5 100644
---- a/ui-tui/src/components/appLayout.tsx
-+++ b/ui-tui/src/components/appLayout.tsx
-@@ -369,6 +369,7 @@ const StatusRulePane = memo(function StatusRulePane({
-         liveSessionCount={ui.liveSessionCount}
-         model={ui.info?.model ?? ''}
-         modelFast={ui.info?.fast || ui.info?.service_tier === 'priority'}
-+        profileName={ui.info?.profile_name}
-         modelReasoningEffort={ui.info?.reasoning_effort}
-         onSessionCountClick={() => patchOverlayState({ sessions: true })}
-         sessionStartedAt={status.sessionStartedAt}
-diff --git a/ui-tui/src/components/branding.tsx b/ui-tui/src/components/branding.tsx
-index 4f2bbb5ea..83778f18f 100644
---- a/ui-tui/src/components/branding.tsx
-+++ b/ui-tui/src/components/branding.tsx
-@@ -82,6 +82,37 @@ function CompactBanner({ cols, t }: { cols: number; t: Theme }) {
-   )
+-# Load .env from ~/.hermes/.env first, then project root as dev fallback.
++# Load the active runtime env file first, then project root as dev fallback.
+ # User-managed env files should override stale shell exports on restart.
+ from hermes_constants import get_hermes_home, display_hermes_home
+ from hermes_cli.browser_connect import (
+@@ -2885,7 +2906,7 @@ def _build_compact_banner() -> str:
+         line1 = "⚕ NOUS HERMES - AI Agent Framework"
+         tiny_line = "⚕ NOUS HERMES"
+     else:
+-        agent_name = _skin.get_branding("agent_name", "Hermes Agent") if _skin else "Hermes Agent"
++        agent_name = _skin.get_branding("agent_name", _runtime_agent_name()) if _skin else _runtime_agent_name()
+         line1 = f"{agent_name} - AI Agent Framework"
+         tiny_line = agent_name
+ 
+@@ -2893,7 +2914,7 @@ def _build_compact_banner() -> str:
+         from hermes_cli import __release_date__ as _release_date
+         from hermes_cli import __version__ as _version
+ 
+-        version_line = f"Hermes Agent v{_version} ({_release_date})"
++        version_line = f"{_runtime_agent_name()} v{_version} ({_release_date})"
+     else:
+         version_line = format_banner_version_label()
+ 
+@@ -3070,7 +3091,7 @@ def save_config_value(key_path: str, value: any) -> bool:
+ 
+ class HermesCLI:
+     """
+-    Interactive CLI for the Hermes Agent.
++    Interactive CLI for the current runtime brand.
+     
+     Provides a REPL interface with rich formatting, command history,
+     and tool execution capabilities.
+@@ -4947,11 +4968,11 @@ class HermesCLI:
+                 )
+             else:
+                 print("\n⚠️  Provider resolver returned an empty API key. "
+-                      "Set OPENROUTER_API_KEY or run: hermes setup")
++                      f"Set OPENROUTER_API_KEY or run: {_runtime_cli_command('setup')}")
+                 return False
+         if not isinstance(base_url, str) or not base_url:
+             print("\n⚠️  Provider resolver returned an empty base URL. "
+-                  "Check your provider config or run: hermes setup")
++                  f"Check your provider config or run: {_runtime_cli_command('setup')}")
+             return False
+ 
+         credentials_changed = api_key != self.api_key or base_url != self.base_url
+@@ -5139,12 +5160,15 @@ class HermesCLI:
+                 if _quiet_mode:
+                     print(f"Session not found: {self.session_id}", file=sys.stderr)
+                     print(
+-                        "Use a session ID from a previous CLI run (hermes sessions list).",
++                        f"Use a session ID from a previous CLI run ({_runtime_cli_command('sessions', 'list')}).",
+                         file=sys.stderr,
+                     )
+                 else:
+                     _cprint(f"\033[1;31mSession not found: {self.session_id}{_RST}")
+-                    _cprint(f"{_DIM}Use a session ID from a previous CLI run (hermes sessions list).{_RST}")
++                    _cprint(
++                        f"{_DIM}Use a session ID from a previous CLI run "
++                        f"({_runtime_cli_command('sessions', 'list')}).{_RST}"
++                    )
+                 return False
+             # If the requested session is the (empty) head of a compression
+             # chain, walk to the descendant that actually holds the messages.
+@@ -5406,7 +5430,7 @@ class HermesCLI:
+             self._console_print()
+             self._console_print(
+                 "[bold yellow]⚠  Nous Research Hermes 3 & 4 models are NOT agentic and are not "
+-                "designed for use with Hermes Agent.[/]"
++                f"designed for use with {_runtime_agent_name()}.[/]"
+             )
+             self._console_print(
+                 "[dim]   They lack tool-calling capabilities required for agent workflows. "
+@@ -5492,7 +5516,7 @@ class HermesCLI:
+             )
+             self._console_print(
+                 "[dim]Use a session ID from a previous CLI run "
+-                "(hermes sessions list).[/]"
++                f"({_runtime_cli_command('sessions', 'list')}).[/]"
+             )
+             return False
+ 
+@@ -6204,7 +6228,9 @@ class HermesCLI:
+                     if len(item["tools"]) > 2:
+                         tools_str += f", +{len(item['tools'])-2} more"
+                     self._console_print(f"   [dim]• {item['name']}[/] [dim italic]({', '.join(item['missing_vars'])})[/]")
+-                self._console_print("[dim]   Run 'hermes setup' to configure[/]")
++                self._console_print(
++                    f"[dim]   Run '{_runtime_cli_command('setup')}' to configure[/]"
++                )
+         except Exception:
+             pass  # Don't crash on import errors
+     
+@@ -6289,7 +6315,7 @@ class HermesCLI:
+         is_running = bool(getattr(self, "_agent_running", False))
+ 
+         lines = [
+-            "Hermes CLI Status",
++            f"{_runtime_agent_name()} CLI Status",
+             "",
+             f"Session ID: {self.session_id}",
+             f"Path: {display_hermes_home()}",
+@@ -6362,7 +6388,7 @@ class HermesCLI:
+                     f"{_escape(desc)} [dim]({skill_count} skills)[/]"
+                 )
+ 
+-        _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")
++        _cprint(f"\n  {_DIM}Tip: Just type your message to chat with {_runtime_brand_name()}!{_RST}")
+         _cprint(f"  {_DIM}Multi-line: Alt+Enter for a new line{_RST}")
+         _cprint(f"  {_DIM}Draft editor: Ctrl+G (Alt+G in VSCode/Cursor){_RST}")
+         if _is_termux_environment():
+@@ -6686,7 +6712,7 @@ class HermesCLI:
+                 )
+                 continue
+ 
+-            print(f"\n  [Hermes #{visible_index}]")
++            print(f"\n  [{_runtime_brand_name()} #{visible_index}]")
+             tool_calls = msg.get("tool_calls") or []
+             if content_text:
+                 preview = content_text[:preview_limit]
+@@ -6969,7 +6995,9 @@ class HermesCLI:
+             self._session_db.fail_handoff(self.session_id, "timed out waiting for gateway")
+         except Exception:
+             pass
+-        _cprint("  Timed out waiting for the gateway. Is `hermes gateway` running?")
++        _cprint(
++            f"  Timed out waiting for the gateway. Is `{_runtime_cli_command('gateway')}` running?"
++        )
+         _cprint("  Your CLI session is intact.")
+         return True
+ 
+@@ -7002,7 +7030,9 @@ class HermesCLI:
+                 # #34584.
+                 self._pending_resume_sessions = self._list_recent_sessions(limit=10)
+                 return
+-            _cprint("  Tip:   Use /history or `hermes sessions list` to find sessions.")
++            _cprint(
++                f"  Tip:   Use /history or `{_runtime_cli_command('sessions', 'list')}` to find sessions."
++            )
+             return
+ 
+         # Any explicit /resume <target> supersedes a previously-armed bare
+@@ -7032,7 +7062,9 @@ class HermesCLI:
+         session_meta = self._session_db.get_session(target_id)
+         if not session_meta:
+             _cprint(f"  Session not found: {target}")
+-            _cprint("  Use /history or `hermes sessions list` to see available sessions.")
++            _cprint(
++                f"  Use /history or `{_runtime_cli_command('sessions', 'list')}` to see available sessions."
++            )
+             return
+ 
+         # If the target is the empty head of a compression chain, redirect to
+@@ -7358,7 +7390,8 @@ class HermesCLI:
+                 }, f, indent=2, ensure_ascii=False)
+             print(f"(^_^)v Conversation snapshot saved to: {path}")
+             if self.session_id:
+-                print(f"       Resume the live session with: hermes --resume {self.session_id}")
++                cli_label = os.environ.get("HERMES_BIN_LABEL", "hermes").strip() or "hermes"
++                print(f"       Resume the live session with: {cli_label} --resume {self.session_id}")
+         except Exception as e:
+             print(f"(x_x) Failed to save: {e}")
+     
+@@ -10541,10 +10574,10 @@ class HermesCLI:
+         run_debug_share(args)
+ 
+     def _handle_update_command(self) -> bool:
+-        """Handle /update — update Hermes Agent to the latest version.
++        """Handle /update — update the current runtime to the latest version.
+ 
+         In the classic CLI this exits the session and relaunches as
+-        ``hermes update`` so the user sees update output directly and gets
++        ``<runtime> update`` so the user sees update output directly and gets
+         the new version on next launch.
+ 
+         Returns ``True`` when the update was confirmed (caller should trigger
+@@ -10555,7 +10588,7 @@ class HermesCLI:
+         from hermes_cli.config import is_managed, format_managed_message
+ 
+         if is_managed():
+-            print(f"  ✗ {format_managed_message('update Hermes Agent')}")
++            print(f"  ✗ {format_managed_message(f'update {_runtime_agent_name()}')}")
+             return False
+ 
+         # Use the prompt_toolkit-native modal so the confirmation panel
+@@ -10563,12 +10596,12 @@ class HermesCLI:
+         # with the prompt_toolkit event loop (same pattern as
+         # _confirm_destructive_slash).
+         choices = [
+-            ("once", "Update Now", "exit the current session and update Hermes Agent"),
++            ("once", "Update Now", f"exit the current session and update {_runtime_agent_name()}"),
+             ("cancel", "Cancel", "keep the current session"),
+         ]
+         raw = self._prompt_text_input_modal(
+-            title="⚕  Update Hermes Agent",
+-            detail="This will exit the current session and run `hermes update`.",
++            title=f"⚕  Update {_runtime_agent_name()}",
++            detail=f"This will exit the current session and run `{_runtime_cli_command('update')}`.",
+             choices=choices,
+         )
+         if raw is None:
+@@ -12917,6 +12950,7 @@ class HermesCLI:
+                 except Exception:
+                     pass
+ 
++            cli_label = os.environ.get("HERMES_BIN_LABEL", "hermes").strip() or "hermes"
+             print("Resume this session with:")
+             # Session IDs are profile-constrained, so the resume hint must
+             # include `-p <profile>` for non-default profiles. Without this,
+@@ -12931,9 +12965,9 @@ class HermesCLI:
+             profile_flag = (
+                 "" if _active_profile in ("default", "custom") else f" -p {_active_profile}"
+             )
+-            print(f"  hermes --resume {self.session_id}{profile_flag}")
++            print(f"  {cli_label} --resume {self.session_id}{profile_flag}")
+             if session_title:
+-                print(f"  hermes -c \"{session_title}\"{profile_flag}")
++                print(f"  {cli_label} -c \"{session_title}\"{profile_flag}")
+             print()
+             print(f"Session:        {self.session_id}")
+             if session_title:
+@@ -13202,10 +13236,13 @@ class HermesCLI:
+         try:
+             from hermes_cli.skin_engine import get_active_skin
+             _welcome_skin = get_active_skin()
+-            _welcome_text = _welcome_skin.get_branding("welcome", "Welcome to Hermes Agent! Type your message or /help for commands.")
++            _welcome_text = _welcome_skin.get_branding(
++                "welcome",
++                f"Welcome to {_runtime_agent_name()}! Type your message or /help for commands.",
++            )
+             _welcome_color = _welcome_skin.get_color("banner_text", "#FFF8DC")
+         except Exception:
+-            _welcome_text = "Welcome to Hermes Agent! Type your message or /help for commands."
++            _welcome_text = f"Welcome to {_runtime_agent_name()}! Type your message or /help for commands."
+             _welcome_color = "#FFF8DC"
+         self._console_print(f"[{_welcome_color}]{_welcome_text}[/]")
+ 
+@@ -14043,7 +14080,7 @@ class HermesCLI:
+             import signal as _sig
+             from prompt_toolkit.application import run_in_terminal
+             from hermes_cli.skin_engine import get_active_skin
+-            agent_name = get_active_skin().get_branding("agent_name", "Hermes Agent")
++            agent_name = get_active_skin().get_branding("agent_name", _runtime_agent_name())
+             msg = f"\n{agent_name} has been suspended. Run `fg` to bring {agent_name} back."
+             def _suspend():
+                 os.write(1, msg.encode())
+@@ -14582,7 +14619,7 @@ class HermesCLI:
+                 else f"  {other_num_prefix}. Other (type your answer)"
+             )
+             preview_lines.extend(_wrap_panel_text(other_label, 60, subsequent_indent="    "))
+-            box_width = _panel_box_width("Hermes needs your input", preview_lines)
++            box_width = _panel_box_width(f"{_runtime_brand_name()} needs your input", preview_lines)
+             inner_text_width = max(8, box_width - 2)
+ 
+             # Pre-wrap choices + Other option — these are mandatory.
+@@ -14677,8 +14714,9 @@ class HermesCLI:
+             lines = []
+             # Box top border
+             lines.append(('class:clarify-border', '╭─ '))
+-            lines.append(('class:clarify-title', 'Hermes needs your input'))
+-            lines.append(('class:clarify-border', ' ' + ('─' * max(0, box_width - len("Hermes needs your input") - 3)) + '╮\n'))
++            _clarify_title = f"{_runtime_brand_name()} needs your input"
++            lines.append(('class:clarify-title', _clarify_title))
++            lines.append(('class:clarify-border', ' ' + ('─' * max(0, box_width - len(_clarify_title) - 3)) + '╮\n'))
+             if not use_compact_chrome:
+                 _append_blank_panel_line(lines, 'class:clarify-border', box_width)
+ 
+@@ -15454,7 +15492,7 @@ class HermesCLI:
+             print(
+                 "Error: stdin (fd 0) is not available.\n"
+                 "This can happen with certain Python installations (e.g. uv-managed cPython on macOS).\n"
+-                "Try reinstalling Python via pyenv or Homebrew, then re-run: hermes setup"
++                f"Try reinstalling Python via pyenv or Homebrew, then re-run: {_runtime_cli_command('setup')}"
+             )
+             _run_cleanup()
+             self._print_exit_summary()
+@@ -15521,7 +15559,7 @@ class HermesCLI:
+                     f"\nError: stdin is not usable ({_stdin_err}).\n"
+                     "This can happen with certain Python installations (e.g. uv-managed cPython on macOS)\n"
+                     "where kqueue cannot register fd 0.\n"
+-                    "Try reinstalling Python via pyenv or Homebrew, then re-run: hermes setup"
++                    f"Try reinstalling Python via pyenv or Homebrew, then re-run: {_runtime_cli_command('setup')}"
+                 )
+             else:
+                 raise
+@@ -15723,7 +15761,7 @@ def main(
+     ignore_rules: bool = False,
+ ):
+     """
+-    Hermes Agent CLI - Interactive AI Assistant
++    Interactive AI assistant CLI
+     
+     Args:
+         query: Single query to execute (then exit). Alias: -q
+@@ -15774,7 +15812,7 @@ def main(
+     if gateway:
+         import asyncio
+         from gateway.run import start_gateway
+-        print("Starting Hermes Gateway (messaging platforms)...")
++        print(f"Starting {_runtime_brand_name()} Gateway (messaging platforms)...")
+         asyncio.run(start_gateway())
+         return
+ 
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 021905c3e..48d666f62 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -441,6 +441,20 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
+     ),
  }
  
-+const visibleProfileName = (profileName?: string) => {
-+  const label = String(profileName ?? '').trim()
-+
-+  if (!label || label === 'default' || label === 'custom') {
-+    return ''
-+  }
-+
-+  return label
++# Some provider slugs are intentionally excluded from PROVIDER_REGISTRY because
++# runtime resolution relies on treating them as special cases. UI-facing setup
++# surfaces still need enough metadata to configure them, so keep those hints in
++# a separate fallback map instead of polluting runtime provider resolution.
++_PICKER_PROVIDER_FALLBACKS: Dict[str, ProviderConfig] = {
++    "openrouter": ProviderConfig(
++        id="openrouter",
++        name="OpenRouter",
++        auth_type="api_key",
++        inference_base_url=OPENROUTER_BASE_URL,
++        api_key_env_vars=("OPENROUTER_API_KEY",),
++    ),
 +}
 +
-+const runtimeSummary = (info: SessionInfo) => {
-+  const pieces: string[] = []
+ # Auto-extend PROVIDER_REGISTRY with any api-key provider registered in
+ # providers/ that is not already declared above.  New providers only need a
+ # plugins/model-providers/<name>/ plugin — no edits to this file required.
+@@ -476,6 +490,20 @@ except Exception:
+     pass
+ 
+ 
++def get_picker_provider_config(provider: str) -> Optional[ProviderConfig]:
++    """Return auth metadata for picker/dashboard provider setup flows.
 +
-+  const profileName = visibleProfileName(info.profile_name)
-+  const effort = String(info.reasoning_effort ?? '').trim().toLowerCase()
++    This intentionally includes providers like OpenRouter that are NOT in
++    PROVIDER_REGISTRY because runtime resolution relies on treating them as
++    special cases. UI surfaces that need auth_type and env-var hints should use
++    this helper instead of reading PROVIDER_REGISTRY directly.
++    """
++    slug = (provider or "").strip().lower()
++    if not slug:
++        return None
++    return PROVIDER_REGISTRY.get(slug) or _PICKER_PROVIDER_FALLBACKS.get(slug)
 +
-+  if (profileName) {
-+    pieces.push(`profile ${profileName}`)
++
+ # =============================================================================
+ # Anthropic Key Helper
+ # =============================================================================
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index 48fc4e928..266f1226d 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -36,7 +36,6 @@ from __future__ import annotations
+ from dataclasses import dataclass, replace
+ from typing import Optional
+ 
+-
+ # ─── Public types ───────────────────────────────────────────────────────
+ 
+ 
+@@ -248,7 +247,7 @@ def _apply_picker_hints(rows: list[dict]) -> None:
+     the unconfigured skeleton rows from ``_append_unconfigured_rows`` get
+     the picker's setup-hint shape.
+     """
+-    from hermes_cli.auth import PROVIDER_REGISTRY
++    from hermes_cli.auth import get_picker_provider_config
+ 
+     for row in rows:
+         if "authenticated" in row:
+@@ -262,13 +261,9 @@ def _apply_picker_hints(rows: list[dict]) -> None:
+         row["authenticated"] = not is_skeleton
+         if not is_skeleton or row.get("is_user_defined"):
+             continue
+-        cfg = PROVIDER_REGISTRY.get(row["slug"])
++        cfg = get_picker_provider_config(str(row.get("slug", "")))
+         auth_type = cfg.auth_type if cfg else "api_key"
+-        key_env = (
+-            cfg.api_key_env_vars[0]
+-            if (cfg and cfg.api_key_env_vars)
+-            else ""
+-        )
++        key_env = cfg.api_key_env_vars[0] if (cfg and cfg.api_key_env_vars) else ""
+         row["auth_type"] = auth_type
+         row["key_env"] = key_env
+         row["warning"] = (
+diff --git a/tests/gateway/test_model_picker_gateway.py b/tests/gateway/test_model_picker_gateway.py
+new file mode 100644
+index 000000000..d278f6935
+--- /dev/null
++++ b/tests/gateway/test_model_picker_gateway.py
+@@ -0,0 +1,75 @@
++from __future__ import annotations
++
++import importlib
++import os
++import sys
++
++from hermes_cli.inventory import ConfigContext
++
++
++def _reload_server(monkeypatch, hermes_home):
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.delenv("HERMES_MANAGED", raising=False)
++    sys.modules.pop("tui_gateway.server", None)
++    import tui_gateway.server as server
++
++    return importlib.reload(server)
++
++
++def test_model_save_key_supports_openrouter_fallback(monkeypatch, tmp_path):
++    server = _reload_server(monkeypatch, tmp_path)
++    monkeypatch.setattr(
++        "hermes_cli.inventory.load_picker_context",
++        lambda: ConfigContext(
++            current_provider="",
++            current_model="",
++            current_base_url="",
++            user_providers={},
++            custom_providers=[],
++        ),
++    )
++    monkeypatch.setattr(
++        "hermes_cli.inventory.build_models_payload",
++        lambda ctx, **kwargs: {
++            "providers": [
++                {
++                    "slug": "openrouter",
++                    "name": "OpenRouter",
++                    "models": ["anthropic/claude-haiku-4.5"],
++                    "total_models": 1,
++                    "authenticated": True,
++                }
++            ]
++        },
++    )
++
++    result = server._methods["model.save_key"](
++        "rid-1",
++        {"slug": "openrouter", "api_key": "sk-or-test-key"},
++    )
++
++    assert "error" not in result
++    provider = result["result"]["provider"]
++    assert provider["slug"] == "openrouter"
++    assert provider["authenticated"] is True
++    assert (tmp_path / ".env").read_text(encoding="utf-8") == "OPENROUTER_API_KEY=sk-or-test-key\n"
++    assert os.environ["OPENROUTER_API_KEY"] == "sk-or-test-key"
++
++
++def test_model_disconnect_removes_openrouter_fallback_env(monkeypatch, tmp_path):
++    server = _reload_server(monkeypatch, tmp_path)
++    env_path = tmp_path / ".env"
++    env_path.write_text("OPENROUTER_API_KEY=sk-or-test-key\nKEEP_ME=1\n", encoding="utf-8")
++    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-key")
++    monkeypatch.setattr("hermes_cli.auth.clear_provider_auth", lambda slug: False)
++
++    result = server._methods["model.disconnect"](
++        "rid-2",
++        {"slug": "openrouter"},
++    )
++
++    assert "error" not in result
++    assert result["result"]["slug"] == "openrouter"
++    assert result["result"]["disconnected"] is True
++    assert env_path.read_text(encoding="utf-8") == "KEEP_ME=1\n"
++    assert "OPENROUTER_API_KEY" not in os.environ
+diff --git a/tests/hermes_cli/test_inventory.py b/tests/hermes_cli/test_inventory.py
+index e51c62a27..6e2c8e274 100644
+--- a/tests/hermes_cli/test_inventory.py
++++ b/tests/hermes_cli/test_inventory.py
+@@ -375,6 +375,22 @@ def test_picker_hints_api_key_warning_format():
+     assert anthropic["warning"].startswith("paste ")
+ 
+ 
++def test_picker_hints_openrouter_uses_fallback_key_env():
++    rows = []
++    ctx = _empty_ctx()
++    with _list_auth_returning(rows):
++        payload = build_models_payload(
++            ctx, include_unconfigured=True, picker_hints=True,
++        )
++    openrouter = next(
++        r for r in payload["providers"] if r["slug"] == "openrouter"
++    )
++    assert openrouter["authenticated"] is False
++    assert openrouter["auth_type"] == "api_key"
++    assert openrouter["key_env"] == "OPENROUTER_API_KEY"
++    assert openrouter["warning"] == "paste OPENROUTER_API_KEY to activate"
++
++
+ # ─── canonical_order ───────────────────────────────────────────────────
+ 
+ 
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 4dd9592a7..bce920b52 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -3756,7 +3756,7 @@ def _(rid, params: dict) -> dict:
+     provider = getattr(agent, "provider", None) or "unknown"
+     model = getattr(agent, "model", None) or "(unknown)"
+     lines = [
+-        "Hermes TUI Status",
++        f"{_runtime_cli_label().upper()} TUI Status",
+         "",
+         f"Session ID: {key}",
+         f"Path: {display_hermes_home()}",
+@@ -6272,7 +6272,7 @@ def _(rid, params: dict) -> dict:
+                     "provider": provider,
+                     "model": runtime.get("model"),
+                     "source": source,
+-                    "error": "No Hermes provider is configured.",
++                    "error": f"No {_runtime_cli_label().upper()} provider is configured.",
+                 },
+             )
+ 
+@@ -6572,19 +6572,41 @@ def _(rid, params: dict) -> dict:
+         return _err(rid, 5020, str(e))
+ 
+ 
++def _runtime_cli_label() -> str:
++    label = (os.environ.get("HERMES_BIN_LABEL") or "").strip()
++    if label:
++        return label
++    hermes_bin = (os.environ.get("HERMES_BIN") or "").strip()
++    if hermes_bin:
++        base = os.path.basename(hermes_bin.strip())
++        if base:
++            return base
++    return "hermes"
++
++
++def _runtime_cli_command(*parts: str) -> str:
++    return " ".join([_runtime_cli_label(), *[part for part in parts if part]]).strip()
++
++
++def _runtime_env_label() -> str:
++    label = (os.environ.get("HERMES_ENV_LABEL") or "").strip()
++    return label or "~/.hermes/.env"
++
++
+ def _cli_exec_blocked(argv: list[str]) -> str | None:
+     """Return user hint if this argv must not run headless in the gateway process."""
+     if not argv:
+-        return "bare `hermes` is interactive — use `/hermes chat -q …` or run `hermes` in another terminal"
++        cli = _runtime_cli_label()
++        return f"bare `{cli}` is interactive — use `{_runtime_cli_command('chat', '-q', '…')}` or run `{cli}` in another terminal"
+     a0 = argv[0].lower()
+     if a0 == "setup":
+-        return "`hermes setup` needs a full terminal — run it outside the TUI"
++        return f"`{_runtime_cli_command('setup')}` needs a full terminal — run it outside the TUI"
+     if a0 == "gateway":
+-        return "`hermes gateway` is long-running — run it in another terminal"
++        return f"`{_runtime_cli_command('gateway')}` is long-running — run it in another terminal"
+     if a0 == "sessions" and len(argv) > 1 and argv[1].lower() == "browse":
+-        return "`hermes sessions browse` is interactive — use /resume here, or run browse in another terminal"
++        return f"`{_runtime_cli_command('sessions', 'browse')}` is interactive — use /resume here, or run browse in another terminal"
+     if a0 == "config" and len(argv) > 1 and argv[1].lower() == "edit":
+-        return "`hermes config edit` needs $EDITOR in a real terminal"
++        return f"`{_runtime_cli_command('config', 'edit')}` needs $EDITOR in a real terminal"
+     return None
+ 
+ 
+@@ -7527,7 +7549,7 @@ def _(rid, params: dict) -> dict:
+     model.options entries) on success.
+     """
+     try:
+-        from hermes_cli.auth import PROVIDER_REGISTRY
++        from hermes_cli.auth import get_picker_provider_config
+         from hermes_cli.config import is_managed, save_env_value
+         from hermes_cli.inventory import build_models_payload, load_picker_context
+ 
+@@ -7539,7 +7561,7 @@ def _(rid, params: dict) -> dict:
+         if is_managed():
+             return _err(rid, 4006, "managed install — credentials are read-only")
+ 
+-        pconfig = PROVIDER_REGISTRY.get(slug)
++        pconfig = get_picker_provider_config(slug)
+         if not pconfig:
+             return _err(rid, 4002, f"unknown provider: {slug}")
+         if pconfig.auth_type != "api_key":
+@@ -7547,12 +7569,12 @@ def _(rid, params: dict) -> dict:
+                 rid,
+                 4003,
+                 f"{pconfig.name} uses {pconfig.auth_type} auth — "
+-                f"run `hermes model` to configure",
++                f"run `{_runtime_cli_command('model')}` to configure",
+             )
+         if not pconfig.api_key_env_vars:
+             return _err(rid, 4004, f"no env var defined for {pconfig.name}")
+ 
+-        # Save the key to ~/.hermes/.env
++        # Save the key to the active env file.
+         env_var = pconfig.api_key_env_vars[0]
+         save_env_value(env_var, api_key)
+         # Also set in current process so the refreshed inventory sees it.
+@@ -7607,14 +7629,14 @@ def _(rid, params: dict) -> dict:
+     Returns success status and the provider's slug.
+     """
+     try:
+-        from hermes_cli.auth import PROVIDER_REGISTRY, clear_provider_auth
++        from hermes_cli.auth import clear_provider_auth, get_picker_provider_config
+         from hermes_cli.config import remove_env_value
+ 
+         slug = (params.get("slug") or "").strip()
+         if not slug:
+             return _err(rid, 4001, "slug is required")
+ 
+-        pconfig = PROVIDER_REGISTRY.get(slug)
++        pconfig = get_picker_provider_config(slug)
+         cleared_env = False
+         cleared_auth = False
+ 
+diff --git a/ui-tui/src/__tests__/brandingBanner.test.tsx b/ui-tui/src/__tests__/brandingBanner.test.tsx
+new file mode 100644
+index 000000000..1ae715bc7
+--- /dev/null
++++ b/ui-tui/src/__tests__/brandingBanner.test.tsx
+@@ -0,0 +1,162 @@
++import { renderSync } from '@hermes/ink'
++import React from 'react'
++import { readFileSync } from 'node:fs'
++import { resolve } from 'node:path'
++import { PassThrough } from 'node:stream'
++import { describe, expect, it } from 'vitest'
++
++import { StatusRule } from '../components/appChrome.js'
++import { SessionPanel } from '../components/branding.js'
++import { stripAnsi } from '../lib/text.js'
++import { DEFAULT_THEME, fromSkin } from '../theme.js'
++import type { SessionInfo } from '../types.js'
++
++const TAG_SKIN = resolve(import.meta.dirname, '../../../../tag/src/tag/assets/skins/tag-control.yaml')
++
++const extractBlockScalar = (source: string, key: string) => {
++  const marker = `${key}: |`
++  const start = source.indexOf(marker)
++
++  if (start === -1) {
++    throw new Error(`Missing block scalar: ${key}`)
 +  }
 +
-+  if (info.fast || info.service_tier === 'priority') {
-+    pieces.push('priority')
++  const lines = source.slice(start + marker.length).split('\n').slice(1)
++  const collected: string[] = []
++
++  for (const line of lines) {
++    if (!line.startsWith('  ')) {
++      break
++    }
++    collected.push(line.slice(2))
 +  }
 +
-+  if (effort && !['default', 'medium', 'normal'].includes(effort)) {
-+    pieces.push(effort)
-+  }
-+
-+  return pieces.join(' · ')
++  return collected.join('\n')
 +}
 +
- export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
-   const term = useStdout().stdout?.columns ?? 80
-   const cols = Math.max(1, Math.min(term, maxWidth ?? term))
-@@ -166,6 +197,8 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
-   const w = Math.max(20, wide ? cols - leftW - 14 : cols - 12)
-   const lineBudget = Math.max(12, w - 2)
-   const strip = (s: string) => (s.endsWith('_tools') ? s.slice(0, -6) : s)
-+  const profileName = visibleProfileName(info.profile_name)
-+  const runtimeLabel = runtimeSummary(info)
- 
-   // ── Local collapse state for each section ──
-   const [toolsOpen, setToolsOpen] = useState(true)
-@@ -289,6 +322,12 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
-             <Text color={t.color.muted}> · Nous Research</Text>
-           </Text>
- 
-+          {runtimeLabel ? (
-+            <Text color={t.color.label} wrap="truncate-end">
-+              {runtimeLabel}
-+            </Text>
-+          ) : null}
++const renderToText = (node: React.ReactElement, columns: number) => {
++  const stdout = new PassThrough()
++  const stdin = new PassThrough()
++  const stderr = new PassThrough()
++  let output = ''
 +
-           <Text color={t.color.muted} wrap="truncate-end">
-             {info.cwd || process.cwd()}
-           </Text>
-@@ -319,6 +358,11 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
-               {info.model.split('/').pop()}
-               <Text color={t.color.muted}> · Nous Research</Text>
++  Object.assign(stdout, { columns, isTTY: false, rows: 24 })
++  Object.assign(stdin, { isTTY: false })
++  Object.assign(stderr, { isTTY: false })
++  stdout.on('data', chunk => {
++    output += chunk.toString()
++  })
++
++  const instance = renderSync(node, {
++    patchConsole: false,
++    stderr: stderr as NodeJS.WriteStream,
++    stdin: stdin as NodeJS.ReadStream,
++    stdout: stdout as NodeJS.WriteStream
++  })
++
++  instance.unmount()
++  instance.cleanup()
++
++  return stripAnsi(output)
++    .replace(/\r/g, '')
++    .split('\n')
++    .filter(Boolean)
++}
++
++const skinDoc = readFileSync(TAG_SKIN, 'utf8')
++const bannerHero = extractBlockScalar(skinDoc, 'banner_hero')
++
++const panelInfo: SessionInfo = {
++  cwd: '/tmp/tag',
++  model: 'openrouter/deepseek/deepseek-v4-flash',
++  profile_name: 'researcher',
++  skills: { core: ['routing', 'verification'] },
++  tools: { shell_tools: ['exec', 'read'] },
++  version: '0.15.1'
++}
++
++const statusProps = {
++  bgCount: 0,
++  busy: false,
++  cols: 120,
++  cwdLabel: '~/tag',
++  liveSessionCount: 0,
++  model: 'openrouter/deepseek/deepseek-v4-flash',
++  sessionStartedAt: null,
++  showCost: false,
++  status: 'ready',
++  statusColor: DEFAULT_THEME.color.ok,
++  t: DEFAULT_THEME,
++  turnStartedAt: null,
++  usage: { context_max: 200_000, context_percent: 25, context_used: 50_000, total: 50_000 },
++  voiceLabel: ''
++}
++
++function StatusHarness({ cols }: { cols: number }) {
++  return StatusRule({ ...statusProps, cols })
++}
++
++describe('TAG banner hero layout', () => {
++  it('stays within the available banner width at 40 and 120 columns', () => {
++    const theme = fromSkin({}, {}, undefined, bannerHero)
++
++    for (const columns of [40, 120]) {
++      const lines = renderToText(
++        React.createElement(SessionPanel, {
++          info: panelInfo,
++          sid: 'session-123',
++          t: theme
++        }),
++        columns
++      )
++      const maxWidth = Math.max(...lines.map(line => line.length))
++
++      expect(maxWidth).toBeLessThanOrEqual(columns)
++      if (columns === 120) {
++        expect(lines.join('\n')).toContain('TAG')
++        expect(lines.join('\n')).toContain('CONTROL')
++        expect(lines.join('\n')).toContain('AGENTS')
++      }
++    }
++  })
++})
++
++describe('Status bar resize stress', () => {
++  it('survives 100 rapid narrow/wide rerenders without freezing', () => {
++    const stdout = new PassThrough()
++    const stdin = new PassThrough()
++    const stderr = new PassThrough()
++    let output = ''
++
++    Object.assign(stdout, { columns: 120, isTTY: false, rows: 24 })
++    Object.assign(stdin, { isTTY: false })
++    Object.assign(stderr, { isTTY: false })
++    stdout.on('data', chunk => {
++      output += chunk.toString()
++    })
++
++    const instance = renderSync(React.createElement(StatusHarness, { cols: 120 }), {
++      patchConsole: false,
++      stderr: stderr as NodeJS.WriteStream,
++      stdin: stdin as NodeJS.ReadStream,
++      stdout: stdout as NodeJS.WriteStream
++    })
++
++    const started = Date.now()
++    for (let i = 0; i < 100; i += 1) {
++      const cols = i % 2 === 0 ? 40 : 120
++      Object.assign(stdout, { columns: cols, rows: cols === 40 ? 24 : 30 })
++      instance.rerender(React.createElement(StatusHarness, { cols }))
++    }
++    const elapsedMs = Date.now() - started
++
++    instance.unmount()
++    instance.cleanup()
++
++    const rendered = stripAnsi(output)
++
++    expect(rendered).toContain('ready')
++    expect(rendered).toContain('deepseek v4 flash')
++    expect(elapsedMs).toBeLessThan(2000)
++  })
++})
+diff --git a/ui-tui/src/__tests__/createGatewayEventHandler.test.ts b/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
+index 121b9011c..a81ef8a06 100644
+--- a/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
++++ b/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
+@@ -641,6 +641,7 @@ describe('createGatewayEventHandler', () => {
+   it('shows setup panel for missing provider startup error', () => {
+     const appended: Msg[] = []
+     const onEvent = createGatewayEventHandler(buildCtx(appended))
++    vi.stubEnv('HERMES_BIN_LABEL', 'tag')
+ 
+     onEvent({
+       payload: {
+@@ -656,6 +657,44 @@ describe('createGatewayEventHandler', () => {
+       panelData: { title: 'Setup Required' },
+       role: 'system'
+     })
++    expect(appended[0]?.panelData?.sections?.[1]?.rows?.[2]?.[1]).toContain('`tag setup`')
++  })
++
++  it('rewrites CLI branding in assistant output for TAG-managed sessions', () => {
++    const appended: Msg[] = []
++    const onEvent = createGatewayEventHandler(buildCtx(appended))
++    vi.stubEnv('HERMES_BIN_LABEL', 'tag')
++    vi.stubEnv('HERMES_ENV_LABEL', 'the active TAG profile env file')
++
++    onEvent({
++      payload: { text: 'Run `hermes auth add openrouter` or edit ~/.hermes/.env first.' },
++      type: 'message.complete'
++    } as any)
++
++    expect(appended).toContainEqual(
++      expect.objectContaining({
++        role: 'assistant',
++        text: 'Run `tag auth add openrouter` or edit the active TAG profile env file first.'
++      })
++    )
++  })
++
++  it('normalizes hermes-agent labels in assistant output for TAG-managed sessions', () => {
++    const appended: Msg[] = []
++    const onEvent = createGatewayEventHandler(buildCtx(appended))
++    vi.stubEnv('HERMES_BIN_LABEL', 'tag')
++
++    onEvent({
++      payload: { text: '  │ 📚 skill     hermes-agent  0.0s' },
++      type: 'message.complete'
++    } as any)
++
++    expect(appended).toContainEqual(
++      expect.objectContaining({
++        role: 'assistant',
++        text: '│ 📚 skill     tag-agent  0.0s'
++      })
++    )
+   })
+ 
+   it('on gateway.ready with no STARTUP_RESUME_ID and auto_resume off, forges a new session', async () => {
+diff --git a/ui-tui/src/__tests__/theme.test.ts b/ui-tui/src/__tests__/theme.test.ts
+index d45576698..0ea402136 100644
+--- a/ui-tui/src/__tests__/theme.test.ts
++++ b/ui-tui/src/__tests__/theme.test.ts
+@@ -15,6 +15,7 @@ const RELEVANT_ENV = [
+   'HERMES_TUI_LIGHT',
+   'HERMES_TUI_THEME',
+   'HERMES_TUI_BACKGROUND',
++  'HERMES_BIN_LABEL',
+   'COLORFGBG',
+   'COLORTERM',
+   'TERM_PROGRAM'
+@@ -48,6 +49,13 @@ describe('DEFAULT_THEME', () => {
+     expect(DEFAULT_THEME.brand.tool).toBe('┊')
+   })
+ 
++  it('adopts TAG branding when launched through TAG-managed env', async () => {
++    const { DEFAULT_THEME } = await importThemeWithEnv({ HERMES_BIN_LABEL: 'tag' })
++
++    expect(DEFAULT_THEME.brand.name).toBe('TAG')
++    expect(DEFAULT_THEME.brand.icon).toBe('◈')
++  })
++
+   it('has color palette', async () => {
+     const { DEFAULT_THEME } = await importThemeWithCleanEnv()
+ 
+diff --git a/ui-tui/src/__tests__/useSubmission.test.ts b/ui-tui/src/__tests__/useSubmission.test.ts
+new file mode 100644
+index 000000000..11366d04c
+--- /dev/null
++++ b/ui-tui/src/__tests__/useSubmission.test.ts
+@@ -0,0 +1,30 @@
++import { describe, expect, it } from 'vitest'
++
++import { resolveCompletionSubmission } from '../app/useSubmission.js'
++
++describe('resolveCompletionSubmission', () => {
++  it('marks exact slash-command completions for immediate submit on Enter', () => {
++    expect(resolveCompletionSubmission('/mo', 1, '/model')).toEqual({
++      next: '/model',
++      submitExactSlash: true
++    })
++  })
++
++  it('treats gateway slash completion payloads without a leading slash as executable commands', () => {
++    expect(resolveCompletionSubmission('/mo', 1, 'model')).toEqual({
++      next: '/model',
++      submitExactSlash: true
++    })
++  })
++
++  it('keeps non-slash completions as insert-only suggestions', () => {
++    expect(resolveCompletionSubmission('@rea', 0, '@readme.md')).toEqual({
++      next: '@readme.md',
++      submitExactSlash: false
++    })
++  })
++
++  it('does nothing when the completion does not change the current input', () => {
++    expect(resolveCompletionSubmission('/model', 1, '/model')).toBeNull()
++  })
++})
+diff --git a/ui-tui/src/app/createGatewayEventHandler.ts b/ui-tui/src/app/createGatewayEventHandler.ts
+index 7636eb694..bc7cf237f 100644
+--- a/ui-tui/src/app/createGatewayEventHandler.ts
++++ b/ui-tui/src/app/createGatewayEventHandler.ts
+@@ -9,6 +9,7 @@ import type {
+   GatewaySkin,
+   SessionMostRecentResponse
+ } from '../gatewayTypes.js'
++import { rewriteCliHints } from '../lib/externalCli.js'
+ import { rpcErrorMessage } from '../lib/rpc.js'
+ import { topLevelSubagents } from '../lib/subagentTree.js'
+ import { formatAbandonedClarify, formatToolCall, stripAnsi } from '../lib/text.js'
+@@ -22,6 +23,7 @@ import { turnController } from './turnController.js'
+ import { getUiState, patchUiState } from './uiStore.js'
+ 
+ const NO_PROVIDER_RE = /\bNo (?:LLM|inference) provider configured\b/i
++const rewriteMsgText = (msg: Msg): Msg => (msg.text ? { ...msg, text: rewriteCliHints(msg.text) } : msg)
+ 
+ const statusFromBusy = () => (getUiState().busy ? 'running…' : 'ready')
+ 
+@@ -877,7 +879,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
+ 
+         if (!wasInterrupted) {
+           const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
+-          msgs.forEach(appendMessage)
++          msgs.map(rewriteMsgText).forEach(appendMessage)
+ 
+           if (bellOnComplete && stdout?.isTTY) {
+             stdout.write('\x07')
+@@ -897,7 +899,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
+         turnController.recordError()
+ 
+         {
+-          const message = String(ev.payload?.message || 'unknown error')
++          const message = rewriteCliHints(String(ev.payload?.message || 'unknown error'))
+ 
+           turnController.pushActivity(message, 'error')
+ 
+diff --git a/ui-tui/src/app/setupHandoff.ts b/ui-tui/src/app/setupHandoff.ts
+index 21338c95e..f621728e9 100644
+--- a/ui-tui/src/app/setupHandoff.ts
++++ b/ui-tui/src/app/setupHandoff.ts
+@@ -1,7 +1,7 @@
+ import type { RunExternalProcess } from '@hermes/ink'
+ 
+ import type { SetupStatusResponse } from '../gatewayTypes.js'
+-import type { LaunchResult } from '../lib/externalCli.js'
++import { formatCliCommand, rewriteCliHints, type LaunchResult } from '../lib/externalCli.js'
+ 
+ import type { SlashHandlerContext } from './interfaces.js'
+ import { patchUiState } from './uiStore.js'
+@@ -17,7 +17,7 @@ export interface RunExternalSetupOptions {
+ export async function runExternalSetup({ args, ctx, done, launcher, suspend }: RunExternalSetupOptions) {
+   const { gateway, session, transcript } = ctx
+ 
+-  transcript.sys(`launching \`hermes ${args.join(' ')}\`…`)
++  transcript.sys(`launching \`${formatCliCommand(args)}\`…`)
+   patchUiState({ status: 'setup running…' })
+ 
+   let result: LaunchResult = { code: null }
+@@ -27,14 +27,14 @@ export async function runExternalSetup({ args, ctx, done, launcher, suspend }: R
+   })
+ 
+   if (result.error) {
+-    transcript.sys(`error launching hermes: ${result.error}`)
++    transcript.sys(`error launching ${rewriteCliHints('hermes')}: ${result.error}`)
+     patchUiState({ status: 'setup required' })
+ 
+     return
+   }
+ 
+   if (result.code !== 0) {
+-    transcript.sys(`hermes ${args[0]} exited with code ${result.code}`)
++    transcript.sys(`${formatCliCommand(args.slice(0, 1))} exited with code ${result.code}`)
+     patchUiState({ status: 'setup required' })
+ 
+     return
+diff --git a/ui-tui/src/app/slash/commands/core.ts b/ui-tui/src/app/slash/commands/core.ts
+index 5c021dbcd..4c1b0defc 100644
+--- a/ui-tui/src/app/slash/commands/core.ts
++++ b/ui-tui/src/app/slash/commands/core.ts
+@@ -14,6 +14,7 @@ import type {
+   SessionUndoResponse
+ } from '../../../gatewayTypes.js'
+ import { writeClipboardText } from '../../../lib/clipboard.js'
++import { formatCliCommand } from '../../../lib/externalCli.js'
+ import { writeOsc52Clipboard } from '../../../lib/osc52.js'
+ import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } from '../../../lib/terminalSetup.js'
+ import type { Msg, PanelSection } from '../../../types.js'
+@@ -22,6 +23,8 @@ import { patchOverlayState } from '../../overlayStore.js'
+ import { patchUiState } from '../../uiStore.js'
+ import type { SlashCommand } from '../types.js'
+ 
++const runtimeAssistantLabel = () => (((process.env.HERMES_BIN_LABEL || '').trim().toLowerCase() === 'tag') ? 'TAG' : 'Hermes')
++
+ const flagFromArg = (arg: string, current: boolean): boolean | null => {
+   if (!arg) {
+     return !current
+@@ -111,17 +114,17 @@ export const coreCommands: SlashCommand[] = [
+ 
+   {
+     aliases: ['exit'],
+-    help: 'exit hermes',
++    help: 'exit the current TAG session',
+     name: 'quit',
+     run: (_arg, ctx) => ctx.session.die()
+   },
+ 
+   {
+-    help: 'update Hermes Agent to the latest version (exits TUI)',
++    help: 'update the managed runtime to the latest version (exits TUI)',
+     name: 'update',
+     run: (_arg, ctx) => {
+-      ctx.transcript.sys('exiting TUI to run update...')
+-      // Exit code 42 signals the Python wrapper to exec `hermes update`.
++      ctx.transcript.sys(`exiting TUI to run ${formatCliCommand(['update'])}...`)
++      // Exit code 42 signals the Python wrapper to exec `tag update`.
+       // Use dieWithCode for proper cleanup (gateway kill + Ink unmount).
+       setTimeout(() => ctx.session.dieWithCode(42), 100)
+     }
+@@ -462,7 +465,7 @@ export const coreCommands: SlashCommand[] = [
+       const preview = Math.max(80, parseInt(arg, 10) || 400)
+ 
+       const lines = items.map((m, i) => {
+-        const tag = m.role === 'user' ? `You #${i + 1}` : `Hermes #${i + 1}`
++        const tag = m.role === 'user' ? `You #${i + 1}` : `${runtimeAssistantLabel()} #${i + 1}`
+         const body = m.text.trim() || (m.tools?.length ? `(${m.tools.length} tool calls)` : '(empty)')
+         const clipped = body.length > preview ? `${body.slice(0, preview).trimEnd()}…` : body
+ 
+diff --git a/ui-tui/src/app/slash/commands/ops.ts b/ui-tui/src/app/slash/commands/ops.ts
+index 791a96c1d..b5629707a 100644
+--- a/ui-tui/src/app/slash/commands/ops.ts
++++ b/ui-tui/src/app/slash/commands/ops.ts
+@@ -121,7 +121,7 @@ export const opsCommands: SlashCommand[] = [
+   },
+ 
+   {
+-    help: 're-read ~/.hermes/.env into the running gateway (CLI parity)',
++    help: 're-read the active profile env file into the running gateway (CLI parity)',
+     name: 'reload',
+     run: (_arg, ctx) => {
+       ctx.gateway
+diff --git a/ui-tui/src/app/slash/commands/setup.ts b/ui-tui/src/app/slash/commands/setup.ts
+index bf1a29c68..6549bcf8c 100644
+--- a/ui-tui/src/app/slash/commands/setup.ts
++++ b/ui-tui/src/app/slash/commands/setup.ts
+@@ -1,12 +1,12 @@
+ import { withInkSuspended } from '@hermes/ink'
+ 
+-import { launchHermesCommand } from '../../../lib/externalCli.js'
++import { formatCliCommand, launchHermesCommand } from '../../../lib/externalCli.js'
+ import { runExternalSetup } from '../../setupHandoff.js'
+ import type { SlashCommand } from '../types.js'
+ 
+ export const setupCommands: SlashCommand[] = [
+   {
+-    help: 'run full setup wizard (launches `hermes setup`)',
++    help: `run full setup wizard (launches \`${formatCliCommand(['setup'])}\`)`,
+     name: 'setup',
+     run: (arg, ctx) =>
+       void runExternalSetup({
+diff --git a/ui-tui/src/app/uiStore.ts b/ui-tui/src/app/uiStore.ts
+index cacca23bd..4060eac8c 100644
+--- a/ui-tui/src/app/uiStore.ts
++++ b/ui-tui/src/app/uiStore.ts
+@@ -6,6 +6,8 @@ import { DEFAULT_THEME } from '../theme.js'
+ 
+ import { DEFAULT_INDICATOR_STYLE, type UiState } from './interfaces.js'
+ 
++const runtimeStatusLabel = () => ((process.env.HERMES_BIN_LABEL?.trim() || '').toLowerCase() === 'tag' ? 'TAG' : 'hermes')
++
+ const buildUiState = (): UiState => ({
+   bgTasks: new Set(),
+   busy: false,
+@@ -25,7 +27,7 @@ const buildUiState = (): UiState => ({
+   showCost: false,
+   showReasoning: false,
+   sid: null,
+-  status: 'summoning hermes…',
++  status: `summoning ${runtimeStatusLabel()}…`,
+   statusBar: 'top',
+   streaming: true,
+   theme: DEFAULT_THEME,
+diff --git a/ui-tui/src/app/useMainApp.ts b/ui-tui/src/app/useMainApp.ts
+index d5bc706fa..202897f19 100644
+--- a/ui-tui/src/app/useMainApp.ts
++++ b/ui-tui/src/app/useMainApp.ts
+@@ -552,7 +552,11 @@ export function useMainApp(gw: GatewayClient) {
+ 
+   const tabCwd = ui.info?.cwd
+ 
+-  useTerminalTitle(model ? `${marker} ${model}${tabCwd ? ` · ${shortCwd(tabCwd, 24)}` : ''}` : 'Hermes')
++  useTerminalTitle(
++    model
++      ? `${marker} ${model}${tabCwd ? ` · ${shortCwd(tabCwd, 24)}` : ''}`
++      : ((process.env.HERMES_BIN_LABEL?.trim() || '').toLowerCase() === 'tag' ? 'TAG' : 'Hermes')
++  )
+ 
+   useEffect(() => {
+     if (!ui.sid || !stdout) {
+diff --git a/ui-tui/src/app/useSubmission.ts b/ui-tui/src/app/useSubmission.ts
+index aaf48291c..0a2f7b259 100644
+--- a/ui-tui/src/app/useSubmission.ts
++++ b/ui-tui/src/app/useSubmission.ts
+@@ -38,6 +38,33 @@ const expandSnips = (snips: PasteSnippet[]) => {
+ const spliceMatches = (text: string, matches: RegExpMatchArray[], results: string[]) =>
+   matches.reduceRight((acc, m, i) => acc.slice(0, m.index!) + results[i] + acc.slice(m.index! + m[0].length), text)
+ 
++export const resolveCompletionSubmission = (
++  value: string,
++  replaceIndex: number,
++  rowText: string | null | undefined
++): { next: string; submitExactSlash: boolean } | null => {
++  if (!rowText) {
++    return null
++  }
++
++  const text = value.startsWith('/') && rowText.startsWith('/') ? rowText.slice(1) : rowText
++  const next = value.slice(0, replaceIndex) + text
++
++  if (next === value) {
++    return null
++  }
++
++  const trimmed = next.trim()
++  const normalizedSlashCompletion =
++    value.startsWith('/') && rowText.trim() ? (rowText.trim().startsWith('/') ? rowText.trim() : `/${rowText.trim()}`) : ''
++
++  return {
++    next,
++    submitExactSlash:
++      looksLikeSlashCommand(trimmed) && (trimmed === rowText.trim() || (!!normalizedSlashCompletion && trimmed === normalizedSlashCompletion))
++  }
++}
++
+ export function useSubmission(opts: UseSubmissionOptions) {
+   const {
+     appendMessage,
+@@ -354,14 +381,15 @@ export function useSubmission(opts: UseSubmissionOptions) {
+     (value: string) => {
+       if (composerState.completions.length) {
+         const row = composerState.completions[composerState.compIdx]
++        const resolved = resolveCompletionSubmission(value, composerState.compReplace, row?.text)
+ 
+-        if (row?.text) {
+-          const text = value.startsWith('/') && row.text.startsWith('/') ? row.text.slice(1) : row.text
+-          const next = value.slice(0, composerState.compReplace) + text
+-
+-          if (next !== value) {
+-            return composerActions.setInput(next)
++        if (resolved) {
++          if (resolved.submitExactSlash) {
++            lastEmptyAt.current = 0
++            return dispatchSubmission(resolved.next)
+           }
++
++          return composerActions.setInput(resolved.next)
+         }
+       }
+ 
+diff --git a/ui-tui/src/components/appLayout.tsx b/ui-tui/src/components/appLayout.tsx
+index b93e2045c..735aeaa54 100644
+--- a/ui-tui/src/components/appLayout.tsx
++++ b/ui-tui/src/components/appLayout.tsx
+@@ -175,6 +175,7 @@ const ComposerPane = memo(function ComposerPane({
+ }: Pick<AppLayoutProps, 'actions' | 'composer' | 'status'>) {
+   const ui = useStore($uiState)
+   const isBlocked = useStore($isBlocked)
++  const overlay = useStore($overlayState)
+   const sh = (composer.inputBuf[0] ?? composer.input).startsWith('!')
+   const promptText = composerPromptText(ui.theme.brand.prompt, ui.info?.profile_name, sh, TERMUX_TUI_MODE, composer.cols)
+   const promptWidth = composerPromptWidth(promptText)
+@@ -182,6 +183,17 @@ const ComposerPane = memo(function ComposerPane({
+   const inputColumns = stableComposerColumns(composer.cols, promptWidth, TERMUX_TUI_MODE)
+   const inputHeight = inputVisualHeight(composer.input, inputColumns)
+   const inputMouseRef = useRef<null | TextInputMouseApi>(null)
++  const modalOverlayActive = Boolean(
++    overlay.approval ||
++    overlay.clarify ||
++    overlay.confirm ||
++    overlay.modelPicker ||
++    overlay.pager ||
++    overlay.secret ||
++    overlay.sessions ||
++    overlay.skillsHub ||
++    overlay.sudo
++  )
+ 
+   const captureInputDrag = (e: GutterMouseEvent) => {
+     if (e.button !== 0) {
+@@ -307,6 +319,7 @@ const ComposerPane = memo(function ComposerPane({
+                 {/* Reserve the transcript scrollbar gutter too so typing never rewraps when the scrollbar column repaints. */}
+                 <TextInput
+                   columns={inputColumns}
++                  focus={!modalOverlayActive}
+                   mouseApiRef={inputMouseRef}
+                   onChange={composer.updateInput}
+                   onPaste={composer.handleTextPaste}
+diff --git a/ui-tui/src/components/branding.tsx b/ui-tui/src/components/branding.tsx
+index 4f2bbb5ea..bf679870d 100644
+--- a/ui-tui/src/components/branding.tsx
++++ b/ui-tui/src/components/branding.tsx
+@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
+ import unicodeSpinners from 'unicode-animations'
+ 
+ import { artWidth, caduceus, CADUCEUS_WIDTH, logo, LOGO_WIDTH } from '../banner.js'
++import { cliLabel, rewriteCliHints } from '../lib/externalCli.js'
+ import { flat } from '../lib/text.js'
+ import type { Theme } from '../theme.js'
+ import type { PanelSection, SessionInfo } from '../types.js'
+@@ -402,7 +403,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
+               - run{' '}
              </Text>
-+            {runtimeLabel ? (
-+              <Text color={t.color.label} wrap="truncate-end">
-+                {runtimeLabel}
-+              </Text>
-+            ) : null}
-             <Text color={t.color.muted} wrap="truncate-end">
-               {info.cwd || process.cwd()}
+             <Text bold color={t.color.warn}>
+-              {info.update_command || 'hermes update'}
++              {rewriteCliHints(info.update_command || `${cliLabel()} update`)}
              </Text>
-@@ -390,6 +434,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
-           {toolsTotal} tools{' · '}
-           {skillsTotal} skills
-           {info.mcp_servers?.length ? ` · ${info.mcp_servers.length} MCP` : ''}
-+          {profileName ? ` · ${profileName}` : ''}
-           {' · '}
-           <Text color={t.color.muted}>/help for commands</Text>
+             <Text bold={false} color={t.color.warn} dimColor>
+               {' '}
+diff --git a/ui-tui/src/components/modelPicker.tsx b/ui-tui/src/components/modelPicker.tsx
+index c18fbe9f0..50f9fa147 100644
+--- a/ui-tui/src/components/modelPicker.tsx
++++ b/ui-tui/src/components/modelPicker.tsx
+@@ -5,6 +5,7 @@ import { providerDisplayNames } from '../domain/providers.js'
+ import { TUI_SESSION_MODEL_FLAG } from '../domain/slash.js'
+ import type { GatewayClient } from '../gatewayClient.js'
+ import type { ModelOptionProvider, ModelOptionsResponse } from '../gatewayTypes.js'
++import { cliEnvLabel, formatCliCommand, rewriteCliHints } from '../lib/externalCli.js'
+ import { fuzzyRank } from '../lib/fuzzy.js'
+ import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
+ import type { Theme } from '../theme.js'
+@@ -241,7 +242,7 @@ export function ModelPicker({ allowPersistGlobal = true, gw, onCancel, onSelect,
+                         authenticated: false,
+                         models: [],
+                         total_models: 0,
+-                        warning: p.key_env ? `paste ${p.key_env} to activate` : 'run `hermes model` to configure'
++                        warning: p.key_env ? `paste ${p.key_env} to activate` : `run \`${formatCliCommand(['model'])}\` to configure`
+                       }
+                     : p
+                 )
+@@ -410,7 +411,7 @@ export function ModelPicker({ allowPersistGlobal = true, gw, onCancel, onSelect,
          </Text>
+ 
+         <Text color={t.color.muted} wrap="truncate-end">
+-          Paste your API key below (saved to ~/.hermes/.env)
++          Paste your API key below (saved to {cliEnvLabel()})
+         </Text>
+ 
+         <Text color={t.color.muted} wrap="truncate-end">
+@@ -517,7 +518,7 @@ export function ModelPicker({ allowPersistGlobal = true, gw, onCancel, onSelect,
+           {filter ? `filter: ${filter}▎` : 'type to filter · ↑/↓ select'}
+         </Text>
+         <Text color={t.color.label} wrap="truncate-end">
+-          {provider?.warning ? `warning: ${provider.warning}` : ' '}
++          {provider?.warning ? `warning: ${rewriteCliHints(provider.warning)}` : ' '}
+         </Text>
+         <Text color={t.color.muted} wrap="truncate-end">
+           {offset > 0 ? ` ↑ ${offset} more` : ' '}
+diff --git a/ui-tui/src/content/setup.ts b/ui-tui/src/content/setup.ts
+index 49dd9aa24..15b1ba079 100644
+--- a/ui-tui/src/content/setup.ts
++++ b/ui-tui/src/content/setup.ts
+@@ -1,16 +1,17 @@
+ import type { PanelSection } from '../types.js'
++import { formatCliCommand } from '../lib/externalCli.js'
+ 
+ export const SETUP_REQUIRED_TITLE = 'Setup Required'
+ 
+ export const buildSetupRequiredSections = (): PanelSection[] => [
+   {
+-    text: 'Hermes needs a model provider before the TUI can start a session.'
++    text: 'TAG needs a model provider before the TUI can start a session.'
+   },
+   {
+     rows: [
+       ['/model', 'configure provider + model in-place'],
+       ['/setup', 'run full first-time setup wizard in-place'],
+-      ['Ctrl+C', 'exit and run `hermes setup` manually']
++      ['Ctrl+C', `exit and run \`${formatCliCommand(['setup'])}\` manually`]
+     ],
+     title: 'Actions'
+   }
+diff --git a/ui-tui/src/lib/externalCli.ts b/ui-tui/src/lib/externalCli.ts
+index 7ff88f2b8..5e32db389 100644
+--- a/ui-tui/src/lib/externalCli.ts
++++ b/ui-tui/src/lib/externalCli.ts
+@@ -6,6 +6,40 @@ export interface LaunchResult {
+ }
+ 
+ const resolveHermesBin = () => process.env.HERMES_BIN?.trim() || 'hermes'
++const resolveCliLabel = () => {
++  const explicit = process.env.HERMES_BIN_LABEL?.trim()
++
++  if (explicit) {
++    return explicit
++  }
++
++  const bin = process.env.HERMES_BIN?.trim()
++  const base = bin?.split(/[\\/]/).at(-1)?.trim()
++
++  return base || 'hermes'
++}
++
++const runtimeEnvLabel = () =>
++  process.env.HERMES_ENV_LABEL?.trim() || (resolveCliLabel() === 'tag' ? 'the active TAG profile env file' : '~/.hermes/.env')
++
++const replaceBareCommand = (text: string) => text.replace(/\bhermes\b/gi, resolveCliLabel())
++
++export const cliLabel = () => resolveCliLabel()
++export const cliEnvLabel = () => runtimeEnvLabel()
++export const formatCliCommand = (args: readonly string[] | string[]) => replaceBareCommand(`hermes ${args.join(' ')}`.trim())
++export const rewriteCliHints = (text: string) =>
++  text
++    .replace(/`([^`\n]*\bhermes\b[^`\n]*)`/gi, (_match, inner) => `\`${replaceBareCommand(inner)}\``)
++    .replace(/'([^'\n]*\bhermes\b[^'\n]*)'/gi, (_match, inner) => `'${replaceBareCommand(inner)}'`)
++    .replace(/\bhermes (?=(auth|config|model|setup|update|gateway|sessions|doctor|tools|portal|status|plugins|skills|mcp|logs|memory|completion|prompt-size)\b)/gi, `${resolveCliLabel()} `)
++    .replace(/\bHermes\/tag\b/gi, 'TAG')
++    .replace(/\btag\/tag\b/gi, 'tag')
++    .replace(/\bHermes Agent\b/gi, 'TAG')
++    .replace(/\bhermes-agent\b/gi, 'tag-agent')
++    .replace(/\bthis Hermes profile\b/gi, 'this TAG profile')
++    .replace(/\bActive Hermes profile\b/gi, 'Active TAG profile')
++    .replace(/\bHermes profile\b/gi, 'TAG profile')
++    .replace(/~\/\.hermes\/\.env/g, runtimeEnvLabel())
+ 
+ export const launchHermesCommand = (args: string[]): Promise<LaunchResult> =>
+   new Promise(resolve => {
 diff --git a/ui-tui/src/theme.ts b/ui-tui/src/theme.ts
-index 6d7426cae..4389de901 100644
+index 6d7426cae..8cd5bdd01 100644
 --- a/ui-tui/src/theme.ts
 +++ b/ui-tui/src/theme.ts
-@@ -527,8 +527,10 @@ export function fromSkin(
+@@ -236,12 +236,16 @@ function normalizeAnsiForeground(color: string): string {
  
-   const accent = c('ui_accent') ?? c('banner_accent') ?? d.color.accent
-   const bannerAccent = c('banner_accent') ?? c('banner_title') ?? d.color.accent
--  const muted = c('banner_dim') ?? d.color.muted
-+  const muted = c('ui_muted') ?? c('banner_dim') ?? d.color.muted
-   const completionBg = c('completion_menu_bg') ?? d.color.completionBg
-+  const statusBg = c('status_bar_bg') ?? d.color.statusBg
-+  const statusFg = c('status_bar_text') ?? d.color.statusFg
+ // ── Defaults ─────────────────────────────────────────────────────────
  
-   const completionCurrentBg =
-     c('completion_menu_current_bg') ??
-@@ -558,12 +560,12 @@ export function fromSkin(
-       sessionLabel: c('session_label') ?? muted,
-       sessionBorder: c('session_border') ?? muted,
- 
--      statusBg: d.color.statusBg,
--      statusFg: d.color.statusFg,
--      statusGood: c('ui_ok') ?? d.color.statusGood,
--      statusWarn: c('ui_warn') ?? d.color.statusWarn,
--      statusBad: d.color.statusBad,
--      statusCritical: d.color.statusCritical,
-+      statusBg,
-+      statusFg,
-+      statusGood: c('status_bar_good') ?? c('ui_ok') ?? d.color.statusGood,
-+      statusWarn: c('status_bar_warn') ?? c('ui_warn') ?? d.color.statusWarn,
-+      statusBad: c('status_bar_bad') ?? d.color.statusBad,
-+      statusCritical: c('status_bar_critical') ?? d.color.statusCritical,
-       selectionBg: c('selection_bg') ?? c('completion_menu_current_bg') ?? (hasSkinColors ? completionCurrentBg : d.color.selectionBg),
- 
-       diffAdded: d.color.diffAdded,
-@@ -575,7 +577,7 @@ export function fromSkin(
- 
-     brand: {
-       name: branding.agent_name ?? d.brand.name,
--      icon: d.brand.icon,
-+      icon: cleanPromptSymbol(branding.agent_icon ?? branding.icon, d.brand.icon),
-       prompt: cleanPromptSymbol(branding.prompt_symbol, d.brand.prompt),
-       welcome: branding.welcome ?? d.brand.welcome,
-       goodbye: branding.goodbye ?? d.brand.goodbye,
++const runtimeCliLabel = () => (process.env.HERMES_BIN_LABEL?.trim() || '').toLowerCase()
++const runtimeBrandName = () => (runtimeCliLabel() === 'tag' ? 'TAG' : 'Hermes Agent')
++const runtimeBrandIcon = () => (runtimeCliLabel() === 'tag' ? '◈' : '⚕')
++
+ const BRAND: ThemeBrand = {
+-  name: 'Hermes Agent',
+-  icon: '⚕',
++  name: runtimeBrandName(),
++  icon: runtimeBrandIcon(),
+   prompt: '❯',
+   welcome: 'Type your message or /help for commands.',
+-  goodbye: 'Goodbye! ⚕',
++  goodbye: `Goodbye! ${runtimeBrandIcon()}`,
+   tool: '┊',
+   helpHeader: '(^_^)? Commands'
+ }
