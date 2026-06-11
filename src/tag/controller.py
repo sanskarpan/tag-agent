@@ -1818,6 +1818,554 @@ def auto_import_mistral_profiles(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+# ---------- opencode credential import ----------
+
+_OPENCODE_PROVIDER_ENV_MAP: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "google": "GEMINI_API_KEY",
+    "google-vertex-ai": "GEMINI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "xai": "XAI_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "fireworks": "FIREWORKS_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "perplexity": "PERPLEXITY_API_KEY",
+    "cohere": "COHERE_API_KEY",
+    "nvidia": "NVIDIA_API_KEY",
+    "github": "GITHUB_TOKEN",
+}
+
+
+def _detect_opencode_credentials(
+    source_data_dir: Path | None = None,
+) -> dict[str, str]:
+    """Detect API keys in ~/.local/share/opencode/auth.json.
+
+    opencode writes: {"<provider-id>": {"type": "api", "key": "<key>"}}
+    Returns a dict mapping env var names to key values.
+    """
+    data_dir = source_data_dir or (Path.home() / ".local" / "share" / "opencode")
+    auth_file = data_dir / "auth.json"
+    found: dict[str, str] = {}
+    if not auth_file.exists():
+        return found
+    try:
+        data = json.loads(auth_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return found
+    for provider_id, cred in data.items():
+        if not isinstance(cred, dict) or cred.get("type") != "api":
+            continue
+        key = (cred.get("key") or "").strip()
+        env_var = _OPENCODE_PROVIDER_ENV_MAP.get(provider_id.lower())
+        if key and env_var and env_var not in found:
+            found[env_var] = key
+    return found
+
+
+def import_opencode_into_profile(
+    cfg: dict[str, Any],
+    *,
+    profile_name: str,
+    source_data_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Import API keys from opencode auth.json into a TAG-managed Hermes profile."""
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, profile_name)
+    if not target_home.exists():
+        return {"profile": profile_name, "status": "profile-missing"}
+    keys = _detect_opencode_credentials(source_data_dir)
+    if not keys:
+        return {"profile": profile_name, "status": "skipped-no-auth"}
+    env_file = target_home / ".env"
+    for env_var, value in keys.items():
+        _upsert_env_line(env_file, env_var, value)
+    return {
+        "profile": profile_name,
+        "status": "imported",
+        "mode": "api_keys",
+        "providers_imported": list(keys.keys()),
+    }
+
+
+def auto_import_opencode_profiles(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Auto-import opencode API keys into all profiles during setup."""
+    keys = _detect_opencode_credentials()
+    if not keys:
+        return [{"profile": p, "status": "skipped-no-auth"} for p in cfg.get("profiles", {})]
+    return [import_opencode_into_profile(cfg, profile_name=p) for p in cfg.get("profiles", {})]
+
+
+# ---------- Zed editor credential import ----------
+
+
+def _detect_zed_credentials(
+    source_zed_config: Path | None = None,
+) -> dict[str, str]:
+    """Detect API keys from Zed editor's settings.json.
+
+    Zed stores most keys in the OS keychain, but users may set api_key under
+    language_models.<provider> in settings.json for custom endpoints or older
+    configs. Also checks standard env vars that Zed reads.
+    Returns a dict mapping env var names to key values.
+    """
+    zed_settings = source_zed_config or (Path.home() / ".config" / "zed" / "settings.json")
+    found: dict[str, str] = {}
+
+    zed_provider_env_map = {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "google": "GEMINI_API_KEY",
+        "mistral": "MISTRAL_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "xai": "XAI_API_KEY",
+        "groq": "GROQ_API_KEY",
+        "ollama": None,
+    }
+
+    if zed_settings.exists():
+        try:
+            data = json.loads(zed_settings.read_text(encoding="utf-8"))
+            lm = data.get("language_models") or {}
+            for provider, cfg_block in lm.items():
+                if not isinstance(cfg_block, dict):
+                    continue
+                key = (cfg_block.get("api_key") or "").strip()
+                env_var = zed_provider_env_map.get(provider.lower())
+                if key and env_var and env_var not in found:
+                    found[env_var] = key
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return found
+
+
+def import_zed_into_profile(
+    cfg: dict[str, Any],
+    *,
+    profile_name: str,
+    source_zed_config: Path | None = None,
+) -> dict[str, Any]:
+    """Import API keys from Zed editor settings into a TAG-managed Hermes profile."""
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, profile_name)
+    if not target_home.exists():
+        return {"profile": profile_name, "status": "profile-missing"}
+    keys = _detect_zed_credentials(source_zed_config)
+    if not keys:
+        return {"profile": profile_name, "status": "skipped-no-auth"}
+    env_file = target_home / ".env"
+    for env_var, value in keys.items():
+        _upsert_env_line(env_file, env_var, value)
+    return {
+        "profile": profile_name,
+        "status": "imported",
+        "mode": "api_keys",
+        "providers_imported": list(keys.keys()),
+    }
+
+
+def auto_import_zed_profiles(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Auto-import Zed API keys into all profiles during setup."""
+    keys = _detect_zed_credentials()
+    if not keys:
+        return [{"profile": p, "status": "skipped-no-auth"} for p in cfg.get("profiles", {})]
+    return [import_zed_into_profile(cfg, profile_name=p) for p in cfg.get("profiles", {})]
+
+
+# ---------- GitHub Copilot credential import ----------
+
+
+def _detect_copilot_credentials(
+    source_gh_config: Path | None = None,
+) -> dict[str, Any]:
+    """Detect GitHub OAuth token from the gh CLI credential store.
+
+    Reads ~/.config/gh/hosts.yml, field github.com.oauth_token.
+    Returns dict with keys: github_token, source.
+    """
+    result: dict[str, Any] = {"github_token": None, "source": None}
+
+    gh_token = os.environ.get("GITHUB_TOKEN", "").strip() or os.environ.get("GH_TOKEN", "").strip()
+    if gh_token:
+        result["github_token"] = gh_token
+        return result
+
+    hosts_file = source_gh_config or (Path.home() / ".config" / "gh" / "hosts.yml")
+    if hosts_file.exists():
+        try:
+            data = yaml.safe_load(hosts_file.read_text(encoding="utf-8")) or {}
+            token = (
+                (data.get("github.com") or {}).get("oauth_token", "")
+                or (data.get("github.com") or {}).get("token", "")
+            ).strip()
+            if token:
+                result["github_token"] = token
+                result["source"] = str(hosts_file)
+        except Exception:
+            pass
+
+    return result
+
+
+def import_copilot_into_profile(
+    cfg: dict[str, Any],
+    *,
+    profile_name: str,
+    source_gh_config: Path | None = None,
+) -> dict[str, Any]:
+    """Import GitHub OAuth token from gh CLI into a TAG-managed Hermes profile.
+
+    Writes GITHUB_TOKEN to the profile .env so Hermes can reach GitHub Copilot
+    and GitHub Models APIs via OpenAI-compatible endpoints.
+    """
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, profile_name)
+    if not target_home.exists():
+        return {"profile": profile_name, "status": "profile-missing"}
+    creds = _detect_copilot_credentials(source_gh_config)
+    if not creds["github_token"]:
+        return {"profile": profile_name, "status": "skipped-no-auth"}
+    _upsert_env_line(target_home / ".env", "GITHUB_TOKEN", creds["github_token"])
+    return {
+        "profile": profile_name,
+        "status": "imported",
+        "mode": "oauth_token",
+        "provider": "github-copilot",
+        "source": creds.get("source"),
+    }
+
+
+def auto_import_copilot_profiles(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Auto-import GitHub Copilot token into all profiles during setup."""
+    creds = _detect_copilot_credentials()
+    if not creds["github_token"]:
+        return [{"profile": p, "status": "skipped-no-auth"} for p in cfg.get("profiles", {})]
+    return [import_copilot_into_profile(cfg, profile_name=p) for p in cfg.get("profiles", {})]
+
+
+# ---------- Aider credential import ----------
+
+_AIDER_YAML_KEY_MAP: dict[str, str] = {
+    "openai-api-key": "OPENAI_API_KEY",
+    "anthropic-api-key": "ANTHROPIC_API_KEY",
+    "gemini-api-key": "GEMINI_API_KEY",
+    "deepseek-api-key": "DEEPSEEK_API_KEY",
+    "openrouter-api-key": "OPENROUTER_API_KEY",
+    "mistral-api-key": "MISTRAL_API_KEY",
+    "groq-api-key": "GROQ_API_KEY",
+    "xai-api-key": "XAI_API_KEY",
+    "cohere-api-key": "COHERE_API_KEY",
+    "perplexity-api-key": "PERPLEXITY_API_KEY",
+}
+
+_AIDER_API_KEY_PREFIX_MAP: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "xai": "XAI_API_KEY",
+    "cohere": "COHERE_API_KEY",
+    "perplexity": "PERPLEXITY_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "fireworks": "FIREWORKS_API_KEY",
+}
+
+
+def _detect_aider_credentials(
+    source_home: Path | None = None,
+) -> dict[str, str]:
+    """Detect API keys from Aider config files.
+
+    Checks, in order:
+      1. ~/.aider.conf.yml  (YAML, openai-api-key / anthropic-api-key / api-key list)
+      2. ~/.env             (standard KEY=VALUE, Aider reads this by default)
+      3. ~/.aider.env       (explicit Aider-only dotenv)
+
+    Returns a dict mapping env var names to key values.
+    """
+    base = source_home or Path.home()
+    found: dict[str, str] = {}
+
+    aider_yaml = base / ".aider.conf.yml"
+    if aider_yaml.exists():
+        try:
+            data = yaml.safe_load(aider_yaml.read_text(encoding="utf-8")) or {}
+            for yaml_key, env_var in _AIDER_YAML_KEY_MAP.items():
+                val = (str(data.get(yaml_key) or "")).strip()
+                if val and env_var not in found:
+                    found[env_var] = val
+            api_key_list = data.get("api-key") or []
+            if isinstance(api_key_list, list):
+                for entry in api_key_list:
+                    entry = (str(entry) or "").strip()
+                    if "=" in entry:
+                        prefix, _, val = entry.partition("=")
+                        env_var = _AIDER_API_KEY_PREFIX_MAP.get(prefix.strip().lower())
+                        if val.strip() and env_var and env_var not in found:
+                            found[env_var] = val.strip()
+        except Exception:
+            pass
+
+    for dotenv_path in (base / ".env", base / ".aider.env"):
+        if dotenv_path.exists():
+            for env_var in (
+                "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+                "OPENROUTER_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY",
+                "DEEPSEEK_API_KEY", "XAI_API_KEY", "PERPLEXITY_API_KEY",
+                "COHERE_API_KEY", "TOGETHER_API_KEY", "FIREWORKS_API_KEY",
+            ):
+                val = read_dotenv(dotenv_path).get(env_var, "").strip()
+                if val and env_var not in found:
+                    found[env_var] = val
+
+    return found
+
+
+def import_aider_into_profile(
+    cfg: dict[str, Any],
+    *,
+    profile_name: str,
+    source_home: Path | None = None,
+) -> dict[str, Any]:
+    """Import API keys from Aider config into a TAG-managed Hermes profile."""
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, profile_name)
+    if not target_home.exists():
+        return {"profile": profile_name, "status": "profile-missing"}
+    keys = _detect_aider_credentials(source_home)
+    if not keys:
+        return {"profile": profile_name, "status": "skipped-no-auth"}
+    env_file = target_home / ".env"
+    for env_var, value in keys.items():
+        _upsert_env_line(env_file, env_var, value)
+    return {
+        "profile": profile_name,
+        "status": "imported",
+        "mode": "api_keys",
+        "providers_imported": list(keys.keys()),
+    }
+
+
+def auto_import_aider_profiles(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Auto-import Aider API keys into all profiles during setup."""
+    keys = _detect_aider_credentials()
+    if not keys:
+        return [{"profile": p, "status": "skipped-no-auth"} for p in cfg.get("profiles", {})]
+    return [import_aider_into_profile(cfg, profile_name=p) for p in cfg.get("profiles", {})]
+
+
+# ---------- AWS / Amazon Q credential import ----------
+
+
+def _detect_aws_credentials(
+    source_aws_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Detect AWS credentials from ~/.aws/credentials and ~/.aws/config.
+
+    Reads the [default] profile by default. Useful for Amazon Q Developer,
+    Amazon Bedrock, and Kiro IDE which all use standard AWS credentials.
+    Returns dict with: access_key_id, secret_access_key, session_token,
+    region, source.
+    """
+    result: dict[str, Any] = {
+        "access_key_id": None,
+        "secret_access_key": None,
+        "session_token": None,
+        "region": None,
+        "source": None,
+    }
+
+    result["access_key_id"] = os.environ.get("AWS_ACCESS_KEY_ID", "").strip() or None
+    result["secret_access_key"] = os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip() or None
+    result["session_token"] = os.environ.get("AWS_SESSION_TOKEN", "").strip() or None
+    result["region"] = os.environ.get("AWS_DEFAULT_REGION", "").strip() or None
+
+    aws_dir = source_aws_dir or (Path.home() / ".aws")
+    credentials_file = aws_dir / "credentials"
+    config_file = aws_dir / "config"
+
+    def _read_ini_section(path: Path, section: str) -> dict[str, str]:
+        try:
+            import configparser
+            cp = configparser.ConfigParser()
+            cp.read(str(path))
+            if cp.has_section(section):
+                return dict(cp[section])
+        except Exception:
+            pass
+        return {}
+
+    if credentials_file.exists() and not result["access_key_id"]:
+        creds = _read_ini_section(credentials_file, "default")
+        result["access_key_id"] = creds.get("aws_access_key_id", "").strip() or None
+        result["secret_access_key"] = creds.get("aws_secret_access_key", "").strip() or None
+        result["session_token"] = creds.get("aws_session_token", "").strip() or None
+        if result["access_key_id"]:
+            result["source"] = str(credentials_file)
+
+    if config_file.exists() and not result["region"]:
+        cfg_data = _read_ini_section(config_file, "default")
+        result["region"] = cfg_data.get("region", "").strip() or None
+
+    return result
+
+
+def import_aws_into_profile(
+    cfg: dict[str, Any],
+    *,
+    profile_name: str,
+    source_aws_dir: Path | None = None,
+    aws_profile: str = "default",
+) -> dict[str, Any]:
+    """Import AWS credentials into a TAG-managed Hermes profile.
+
+    Writes AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and optionally
+    AWS_SESSION_TOKEN and AWS_DEFAULT_REGION to the profile .env.
+    These are required for Amazon Bedrock and Amazon Q Developer access.
+    """
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, profile_name)
+    if not target_home.exists():
+        return {"profile": profile_name, "status": "profile-missing"}
+
+    creds = _detect_aws_credentials(source_aws_dir)
+    if not creds["access_key_id"] or not creds["secret_access_key"]:
+        return {"profile": profile_name, "status": "skipped-no-auth"}
+
+    env_file = target_home / ".env"
+    _upsert_env_line(env_file, "AWS_ACCESS_KEY_ID", creds["access_key_id"])
+    _upsert_env_line(env_file, "AWS_SECRET_ACCESS_KEY", creds["secret_access_key"])
+    if creds["session_token"]:
+        _upsert_env_line(env_file, "AWS_SESSION_TOKEN", creds["session_token"])
+    if creds["region"]:
+        _upsert_env_line(env_file, "AWS_DEFAULT_REGION", creds["region"])
+
+    return {
+        "profile": profile_name,
+        "status": "imported",
+        "mode": "access_key",
+        "provider": "aws-bedrock",
+        "source": creds.get("source"),
+    }
+
+
+def auto_import_aws_profiles(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Auto-import AWS credentials into all profiles during setup."""
+    creds = _detect_aws_credentials()
+    if not creds["access_key_id"] or not creds["secret_access_key"]:
+        return [{"profile": p, "status": "skipped-no-auth"} for p in cfg.get("profiles", {})]
+    return [import_aws_into_profile(cfg, profile_name=p) for p in cfg.get("profiles", {})]
+
+
+# ---------- Cursor IDE credential import ----------
+
+
+def _detect_cursor_credentials(
+    source_cursor_dir: Path | None = None,
+) -> dict[str, str]:
+    """Detect API keys stored in Cursor's globalStorage/state.vscdb SQLite database.
+
+    Cursor stores user-entered BYOK (bring-your-own-key) API keys in a SQLite
+    ItemTable. Known key patterns are searched; API key values are matched by
+    their well-known prefixes (sk-, sk-ant-, AIza-).
+
+    Returns a dict mapping env var names to key values.
+    """
+    import sqlite3
+
+    found: dict[str, str] = {}
+
+    if source_cursor_dir:
+        db_candidates = [source_cursor_dir / "state.vscdb"]
+    else:
+        db_candidates = [
+            Path.home() / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb",
+            Path.home() / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb",
+        ]
+
+    db_path = next((p for p in db_candidates if p.exists()), None)
+    if not db_path:
+        return found
+
+    known_key_map = {
+        "openai.apiKey": "OPENAI_API_KEY",
+        "cursor.openaiApiKey": "OPENAI_API_KEY",
+        "anthropic.apiKey": "ANTHROPIC_API_KEY",
+        "cursor.anthropicApiKey": "ANTHROPIC_API_KEY",
+        "gemini.apiKey": "GEMINI_API_KEY",
+        "cursor.googleApiKey": "GEMINI_API_KEY",
+    }
+
+    api_key_value_patterns: list[tuple[str, str]] = [
+        ("sk-ant-", "ANTHROPIC_API_KEY"),
+        ("sk-or-", "OPENROUTER_API_KEY"),
+        ("AIza", "GEMINI_API_KEY"),
+    ]
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute("SELECT key, value FROM ItemTable").fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return found
+
+    for db_key, db_value in rows:
+        if not db_value or not isinstance(db_value, str):
+            continue
+        value = db_value.strip()
+        env_var = known_key_map.get(db_key)
+        if env_var and value and env_var not in found:
+            found[env_var] = value
+            continue
+        for prefix, env_var in api_key_value_patterns:
+            if value.startswith(prefix) and env_var not in found:
+                found[env_var] = value
+                break
+
+    return found
+
+
+def import_cursor_into_profile(
+    cfg: dict[str, Any],
+    *,
+    profile_name: str,
+    source_cursor_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Import API keys from Cursor's local SQLite store into a TAG-managed profile."""
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, profile_name)
+    if not target_home.exists():
+        return {"profile": profile_name, "status": "profile-missing"}
+    keys = _detect_cursor_credentials(source_cursor_dir)
+    if not keys:
+        return {"profile": profile_name, "status": "skipped-no-auth"}
+    env_file = target_home / ".env"
+    for env_var, value in keys.items():
+        _upsert_env_line(env_file, env_var, value)
+    return {
+        "profile": profile_name,
+        "status": "imported",
+        "mode": "api_keys",
+        "providers_imported": list(keys.keys()),
+    }
+
+
+def auto_import_cursor_profiles(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Auto-import Cursor IDE API keys into all profiles during setup."""
+    keys = _detect_cursor_credentials()
+    if not keys:
+        return [{"profile": p, "status": "skipped-no-auth"} for p in cfg.get("profiles", {})]
+    return [import_cursor_into_profile(cfg, profile_name=p) for p in cfg.get("profiles", {})]
+
+
 def ensure_hermes_ready(
     cfg: dict[str, Any],
     *,
@@ -2380,6 +2928,128 @@ def cmd_import_mistral(args: argparse.Namespace) -> int:
         return 0
     print(f"Imported Mistral credentials into profile '{args.profile}'.")
     return 0
+
+
+def _cmd_import_generic(
+    args: argparse.Namespace,
+    *,
+    import_fn: Any,
+    no_auth_msg: str,
+    source_path_attr: str | None,
+    display_name: str,
+    extra_kwargs: dict[str, Any] | None = None,
+) -> int:
+    cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    profiles = cfg.get("profiles", {})
+    if args.profile not in profiles:
+        available = ", ".join(sorted(profiles))
+        raise SystemExit(f"Unknown profile '{args.profile}'. Available: {available}")
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, args.profile)
+    if not target_home.exists():
+        raise SystemExit(
+            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first."
+        )
+    kwargs: dict[str, Any] = {"profile_name": args.profile}
+    if source_path_attr and getattr(args, source_path_attr, None):
+        raw = getattr(args, source_path_attr)
+        kwargs[source_path_attr] = Path(raw).expanduser().resolve()
+    if extra_kwargs:
+        kwargs.update(extra_kwargs)
+    result = import_fn(cfg, **kwargs)
+    if result["status"] == "skipped-no-auth":
+        raise SystemExit(no_auth_msg)
+    if result["status"] == "profile-missing":
+        raise SystemExit(f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.")
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    providers = result.get("providers_imported")
+    if providers:
+        print(f"Imported {display_name} credentials into profile '{args.profile}' ({', '.join(providers)}).")
+    else:
+        mode = result.get("mode", "")
+        print(f"Imported {display_name} credentials into profile '{args.profile}' (mode: {mode}).")
+    if "tos_warning" in result:
+        print(f"WARNING: {result['tos_warning']}")
+    return 0
+
+
+def cmd_import_opencode(args: argparse.Namespace) -> int:
+    return _cmd_import_generic(
+        args,
+        import_fn=import_opencode_into_profile,
+        no_auth_msg="No opencode credentials found. Expected ~/.local/share/opencode/auth.json.",
+        source_path_attr="opencode_data_dir",
+        display_name="opencode",
+    )
+
+
+def cmd_import_zed(args: argparse.Namespace) -> int:
+    return _cmd_import_generic(
+        args,
+        import_fn=import_zed_into_profile,
+        no_auth_msg=(
+            "No API keys found in Zed settings. Zed stores keys in the OS keychain by default; "
+            "set keys via Zed's Agent Settings panel and ensure they are also exported as standard "
+            "env vars (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.)."
+        ),
+        source_path_attr="zed_config",
+        display_name="Zed",
+    )
+
+
+def cmd_import_copilot(args: argparse.Namespace) -> int:
+    return _cmd_import_generic(
+        args,
+        import_fn=import_copilot_into_profile,
+        no_auth_msg=(
+            "No GitHub token found. Run `gh auth login` to authenticate the gh CLI, "
+            "or set GITHUB_TOKEN in your environment."
+        ),
+        source_path_attr="gh_config",
+        display_name="GitHub Copilot",
+    )
+
+
+def cmd_import_aider(args: argparse.Namespace) -> int:
+    return _cmd_import_generic(
+        args,
+        import_fn=import_aider_into_profile,
+        no_auth_msg=(
+            "No Aider credentials found. Expected ~/.aider.conf.yml, ~/.env, or ~/.aider.env "
+            "with at least one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, etc."
+        ),
+        source_path_attr="aider_home",
+        display_name="Aider",
+    )
+
+
+def cmd_import_aws(args: argparse.Namespace) -> int:
+    return _cmd_import_generic(
+        args,
+        import_fn=import_aws_into_profile,
+        no_auth_msg=(
+            "No AWS credentials found. Run `aws configure` or set AWS_ACCESS_KEY_ID and "
+            "AWS_SECRET_ACCESS_KEY in your environment."
+        ),
+        source_path_attr="aws_dir",
+        display_name="AWS Bedrock",
+    )
+
+
+def cmd_import_cursor(args: argparse.Namespace) -> int:
+    return _cmd_import_generic(
+        args,
+        import_fn=import_cursor_into_profile,
+        no_auth_msg=(
+            "No API keys found in Cursor's local storage. Add API keys via Cursor Settings → "
+            "Models (BYOK) and ensure Cursor has been run at least once."
+        ),
+        source_path_attr="cursor_dir",
+        display_name="Cursor",
+    )
 
 
 def cmd_assignments(args: argparse.Namespace) -> int:
@@ -3047,6 +3717,78 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_mistral.add_argument("--json", action="store_true")
     import_mistral.set_defaults(func=cmd_import_mistral)
+
+    import_opencode = sub.add_parser(
+        "import-opencode",
+        help="Import API keys from opencode (~/.local/share/opencode/auth.json) into a TAG-managed profile",
+    )
+    import_opencode.add_argument("--profile", required=True)
+    import_opencode.add_argument(
+        "--opencode-data-dir",
+        help="Path to opencode data dir (default: ~/.local/share/opencode)",
+    )
+    import_opencode.add_argument("--json", action="store_true")
+    import_opencode.set_defaults(func=cmd_import_opencode)
+
+    import_zed = sub.add_parser(
+        "import-zed",
+        help="Import API keys from Zed editor settings.json into a TAG-managed profile",
+    )
+    import_zed.add_argument("--profile", required=True)
+    import_zed.add_argument(
+        "--zed-config",
+        help="Path to Zed settings.json (default: ~/.config/zed/settings.json)",
+    )
+    import_zed.add_argument("--json", action="store_true")
+    import_zed.set_defaults(func=cmd_import_zed)
+
+    import_copilot = sub.add_parser(
+        "import-copilot",
+        help="Import GitHub OAuth token from gh CLI into a TAG-managed profile",
+    )
+    import_copilot.add_argument("--profile", required=True)
+    import_copilot.add_argument(
+        "--gh-config",
+        help="Path to gh CLI hosts.yml (default: ~/.config/gh/hosts.yml)",
+    )
+    import_copilot.add_argument("--json", action="store_true")
+    import_copilot.set_defaults(func=cmd_import_copilot)
+
+    import_aider = sub.add_parser(
+        "import-aider",
+        help="Import API keys from Aider config (~/.aider.conf.yml or ~/.env) into a TAG-managed profile",
+    )
+    import_aider.add_argument("--profile", required=True)
+    import_aider.add_argument(
+        "--aider-home",
+        help="Base directory for Aider config files (default: ~)",
+    )
+    import_aider.add_argument("--json", action="store_true")
+    import_aider.set_defaults(func=cmd_import_aider)
+
+    import_aws = sub.add_parser(
+        "import-aws",
+        help="Import AWS credentials (~/.aws/credentials) for Amazon Bedrock / Q Developer into a TAG-managed profile",
+    )
+    import_aws.add_argument("--profile", required=True)
+    import_aws.add_argument(
+        "--aws-dir",
+        help="Path to AWS config directory (default: ~/.aws)",
+    )
+    import_aws.add_argument("--json", action="store_true")
+    import_aws.set_defaults(func=cmd_import_aws)
+
+    import_cursor = sub.add_parser(
+        "import-cursor",
+        help="Import BYOK API keys from Cursor IDE's local SQLite store into a TAG-managed profile",
+    )
+    import_cursor.add_argument("--profile", required=True)
+    import_cursor.add_argument(
+        "--cursor-dir",
+        help="Path to Cursor globalStorage directory containing state.vscdb",
+    )
+    import_cursor.add_argument("--json", action="store_true")
+    import_cursor.set_defaults(func=cmd_import_cursor)
 
     hermes_cmd = sub.add_parser("hermes", help="Pass raw arguments through to the managed runtime binary")
     hermes_cmd.add_argument("--profile", help="Run the managed runtime inside one TAG profile home")

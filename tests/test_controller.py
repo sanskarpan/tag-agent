@@ -1138,5 +1138,293 @@ def test_build_parser_exposes_all_import_commands():
     for action in p._actions:
         if hasattr(action, "_name_parser_map"):
             cmds = action._name_parser_map
-    for cmd in ("import-codex", "import-claude", "import-gemini", "import-continue", "import-mistral"):
+    for cmd in (
+        "import-codex", "import-claude", "import-gemini", "import-continue", "import-mistral",
+        "import-opencode", "import-zed", "import-copilot", "import-aider", "import-aws", "import-cursor",
+    ):
         assert cmd in cmds, f"{cmd} subcommand missing from parser"
+
+
+# ---------- opencode credential import ----------
+
+
+def test_detect_opencode_reads_auth_json(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({
+        "anthropic": {"type": "api", "key": "sk-ant-opencode-test"},
+        "openai": {"type": "api", "key": "sk-openai-test"},
+        "github": {"type": "oauth", "access": "ghp_abc"},  # should be skipped (not "api")
+        "groq": {"type": "api", "key": "gsk_groq_test"},
+    }))
+    result = TAG._detect_opencode_credentials(source_data_dir=tmp_path)
+    assert result["ANTHROPIC_API_KEY"] == "sk-ant-opencode-test"
+    assert result["OPENAI_API_KEY"] == "sk-openai-test"
+    assert result["GROQ_API_KEY"] == "gsk_groq_test"
+    assert "GITHUB_TOKEN" not in result  # oauth type skipped
+
+
+def test_detect_opencode_empty_when_missing(tmp_path):
+    result = TAG._detect_opencode_credentials(source_data_dir=tmp_path)
+    assert result == {}
+
+
+def test_import_opencode_writes_env_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+    cfg = TAG.load_config(ROOT / "src" / "tag" / "config" / "default.yaml")
+    TAG.profile_home(cfg, "researcher").mkdir(parents=True)
+    auth_dir = tmp_path / "opencode"
+    auth_dir.mkdir()
+    (auth_dir / "auth.json").write_text(json.dumps({
+        "anthropic": {"type": "api", "key": "sk-ant-oc-test"},
+        "openai": {"type": "api", "key": "sk-oc-test"},
+    }))
+    result = TAG.import_opencode_into_profile(cfg, profile_name="researcher", source_data_dir=auth_dir)
+    assert result["status"] == "imported"
+    assert "ANTHROPIC_API_KEY" in result["providers_imported"]
+    env = TAG.read_dotenv(TAG.profile_home(cfg, "researcher") / ".env")
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant-oc-test"
+    assert env["OPENAI_API_KEY"] == "sk-oc-test"
+
+
+# ---------- Zed credential import ----------
+
+
+def test_detect_zed_reads_settings_json(tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "language_models": {
+            "anthropic": {"api_key": "sk-ant-zed-test"},
+            "openai": {"api_key": "sk-zed-openai", "api_url": "https://api.openai.com/v1"},
+        }
+    }))
+    result = TAG._detect_zed_credentials(source_zed_config=settings)
+    assert result["ANTHROPIC_API_KEY"] == "sk-ant-zed-test"
+    assert result["OPENAI_API_KEY"] == "sk-zed-openai"
+
+
+def test_detect_zed_empty_when_no_api_keys(tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"language_models": {"anthropic": {}}}))
+    result = TAG._detect_zed_credentials(source_zed_config=settings)
+    assert result == {}
+
+
+def test_import_zed_writes_env_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+    cfg = TAG.load_config(ROOT / "src" / "tag" / "config" / "default.yaml")
+    TAG.profile_home(cfg, "coder").mkdir(parents=True)
+    settings = tmp_path / "zed_settings.json"
+    settings.write_text(json.dumps({
+        "language_models": {"anthropic": {"api_key": "sk-ant-zed-import"}}
+    }))
+    result = TAG.import_zed_into_profile(cfg, profile_name="coder", source_zed_config=settings)
+    assert result["status"] == "imported"
+    env = TAG.read_dotenv(TAG.profile_home(cfg, "coder") / ".env")
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant-zed-import"
+
+
+# ---------- GitHub Copilot credential import ----------
+
+
+def test_detect_copilot_reads_gh_hosts_yml(tmp_path, monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    hosts = tmp_path / "hosts.yml"
+    hosts.write_text("github.com:\n    oauth_token: ghp_testtoken123\n    user: testuser\n")
+    result = TAG._detect_copilot_credentials(source_gh_config=hosts)
+    assert result["github_token"] == "ghp_testtoken123"
+    assert result["source"] == str(hosts)
+
+
+def test_detect_copilot_env_var_takes_priority(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_from_env")
+    result = TAG._detect_copilot_credentials(source_gh_config=tmp_path / "nonexistent.yml")
+    assert result["github_token"] == "ghp_from_env"
+
+
+def test_detect_copilot_empty_when_nothing(tmp_path, monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    result = TAG._detect_copilot_credentials(source_gh_config=tmp_path / "nonexistent.yml")
+    assert result["github_token"] is None
+
+
+def test_import_copilot_writes_github_token(tmp_path, monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+    cfg = TAG.load_config(ROOT / "src" / "tag" / "config" / "default.yaml")
+    TAG.profile_home(cfg, "researcher").mkdir(parents=True)
+    hosts = tmp_path / "hosts.yml"
+    hosts.write_text("github.com:\n    oauth_token: ghp_copilot_test\n")
+    result = TAG.import_copilot_into_profile(cfg, profile_name="researcher", source_gh_config=hosts)
+    assert result["status"] == "imported"
+    assert result["provider"] == "github-copilot"
+    env = TAG.read_dotenv(TAG.profile_home(cfg, "researcher") / ".env")
+    assert env["GITHUB_TOKEN"] == "ghp_copilot_test"
+
+
+# ---------- Aider credential import ----------
+
+
+def test_detect_aider_reads_yaml_config(tmp_path):
+    conf = tmp_path / ".aider.conf.yml"
+    conf.write_text("openai-api-key: sk-aider-openai\nanthropic-api-key: sk-ant-aider\n")
+    result = TAG._detect_aider_credentials(source_home=tmp_path)
+    assert result["OPENAI_API_KEY"] == "sk-aider-openai"
+    assert result["ANTHROPIC_API_KEY"] == "sk-ant-aider"
+
+
+def test_detect_aider_reads_api_key_list(tmp_path):
+    conf = tmp_path / ".aider.conf.yml"
+    conf.write_text("api-key:\n  - groq=gsk_aider_groq\n  - openrouter=sk-or-aider\n")
+    result = TAG._detect_aider_credentials(source_home=tmp_path)
+    assert result["GROQ_API_KEY"] == "gsk_aider_groq"
+    assert result["OPENROUTER_API_KEY"] == "sk-or-aider"
+
+
+def test_detect_aider_reads_dotenv(tmp_path):
+    (tmp_path / ".env").write_text("OPENAI_API_KEY=sk-aider-dotenv\nDEEPSEEK_API_KEY=ds-aider\n")
+    result = TAG._detect_aider_credentials(source_home=tmp_path)
+    assert result["OPENAI_API_KEY"] == "sk-aider-dotenv"
+    assert result["DEEPSEEK_API_KEY"] == "ds-aider"
+
+
+def test_import_aider_writes_multiple_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+    cfg = TAG.load_config(ROOT / "src" / "tag" / "config" / "default.yaml")
+    TAG.profile_home(cfg, "researcher").mkdir(parents=True)
+    conf = tmp_path / "aider_home"
+    conf.mkdir()
+    (conf / ".aider.conf.yml").write_text(
+        "openai-api-key: sk-aider-test\nanthropic-api-key: sk-ant-aider-test\n"
+    )
+    result = TAG.import_aider_into_profile(cfg, profile_name="researcher", source_home=conf)
+    assert result["status"] == "imported"
+    env = TAG.read_dotenv(TAG.profile_home(cfg, "researcher") / ".env")
+    assert env["OPENAI_API_KEY"] == "sk-aider-test"
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant-aider-test"
+
+
+# ---------- AWS credential import ----------
+
+
+def test_detect_aws_reads_credentials_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    creds = tmp_path / "credentials"
+    creds.write_text(
+        "[default]\naws_access_key_id = AKIATEST\naws_secret_access_key = testsecret\n"
+    )
+    result = TAG._detect_aws_credentials(source_aws_dir=tmp_path)
+    assert result["access_key_id"] == "AKIATEST"
+    assert result["secret_access_key"] == "testsecret"
+    assert result["source"] == str(creds)
+
+
+def test_detect_aws_env_var_takes_priority(tmp_path, monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAFROMENV")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secretfromenv")
+    result = TAG._detect_aws_credentials(source_aws_dir=tmp_path)
+    assert result["access_key_id"] == "AKIAFROMENV"
+    assert result["secret_access_key"] == "secretfromenv"
+
+
+def test_detect_aws_empty_when_missing(tmp_path, monkeypatch):
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    result = TAG._detect_aws_credentials(source_aws_dir=tmp_path)
+    assert result["access_key_id"] is None
+    assert result["secret_access_key"] is None
+
+
+def test_import_aws_writes_env_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+    cfg = TAG.load_config(ROOT / "src" / "tag" / "config" / "default.yaml")
+    TAG.profile_home(cfg, "researcher").mkdir(parents=True)
+    aws_dir = tmp_path / "aws"
+    aws_dir.mkdir()
+    (aws_dir / "credentials").write_text(
+        "[default]\naws_access_key_id = AKIATEST123\naws_secret_access_key = topsecret\n"
+    )
+    (aws_dir / "config").write_text("[default]\nregion = us-east-1\n")
+    result = TAG.import_aws_into_profile(cfg, profile_name="researcher", source_aws_dir=aws_dir)
+    assert result["status"] == "imported"
+    assert result["provider"] == "aws-bedrock"
+    env = TAG.read_dotenv(TAG.profile_home(cfg, "researcher") / ".env")
+    assert env["AWS_ACCESS_KEY_ID"] == "AKIATEST123"
+    assert env["AWS_SECRET_ACCESS_KEY"] == "topsecret"
+    assert env["AWS_DEFAULT_REGION"] == "us-east-1"
+
+
+def test_import_aws_skipped_when_no_credentials(tmp_path, monkeypatch):
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+    cfg = TAG.load_config(ROOT / "src" / "tag" / "config" / "default.yaml")
+    TAG.profile_home(cfg, "researcher").mkdir(parents=True)
+    result = TAG.import_aws_into_profile(cfg, profile_name="researcher", source_aws_dir=tmp_path)
+    assert result["status"] == "skipped-no-auth"
+
+
+# ---------- Cursor IDE credential import ----------
+
+
+def test_detect_cursor_reads_sqlite(tmp_path):
+    import sqlite3
+    db_path = tmp_path / "state.vscdb"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)")
+    conn.execute("INSERT INTO ItemTable VALUES (?, ?)", ("openai.apiKey", "sk-cursor-test"))
+    conn.execute("INSERT INTO ItemTable VALUES (?, ?)", ("anthropic.apiKey", "sk-ant-cursor"))
+    conn.execute("INSERT INTO ItemTable VALUES (?, ?)", ("unrelated.key", "some-value"))
+    conn.commit()
+    conn.close()
+    result = TAG._detect_cursor_credentials(source_cursor_dir=tmp_path)
+    assert result["OPENAI_API_KEY"] == "sk-cursor-test"
+    assert result["ANTHROPIC_API_KEY"] == "sk-ant-cursor"
+    assert "unrelated.key" not in result
+
+
+def test_detect_cursor_empty_when_no_db(tmp_path):
+    result = TAG._detect_cursor_credentials(source_cursor_dir=tmp_path)
+    assert result == {}
+
+
+def test_detect_cursor_fallback_value_pattern(tmp_path):
+    import sqlite3
+    db_path = tmp_path / "state.vscdb"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)")
+    conn.execute("INSERT INTO ItemTable VALUES (?, ?)", ("some.unknown.key", "sk-ant-fallback-test"))
+    conn.commit()
+    conn.close()
+    result = TAG._detect_cursor_credentials(source_cursor_dir=tmp_path)
+    assert result.get("ANTHROPIC_API_KEY") == "sk-ant-fallback-test"
+
+
+def test_import_cursor_writes_env_file(tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+    cfg = TAG.load_config(ROOT / "src" / "tag" / "config" / "default.yaml")
+    TAG.profile_home(cfg, "coder").mkdir(parents=True)
+    cursor_dir = tmp_path / "cursor_storage"
+    cursor_dir.mkdir()
+    db_path = cursor_dir / "state.vscdb"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)")
+    conn.execute("INSERT INTO ItemTable VALUES (?, ?)", ("openai.apiKey", "sk-cursor-import-test"))
+    conn.commit()
+    conn.close()
+    result = TAG.import_cursor_into_profile(cfg, profile_name="coder", source_cursor_dir=cursor_dir)
+    assert result["status"] == "imported"
+    env = TAG.read_dotenv(TAG.profile_home(cfg, "coder") / ".env")
+    assert env["OPENAI_API_KEY"] == "sk-cursor-import-test"
