@@ -31,6 +31,7 @@ except Exception:  # pragma: no cover - fallback for direct file loading in test
     __version__ = "0.1.0"
 
 APP_NAME = "TAG"
+CLI_LABEL = "tag"
 DEFAULT_TAG_HOME = Path("~/.tag").expanduser()
 DEFAULT_HERMES_CHECKOUT = "managed/hermes-agent-upstream"
 MIN_PYTHON = (3, 11)
@@ -92,6 +93,23 @@ def discover_local_hermes_checkout() -> Path | None:
 
 def tag_home() -> Path:
     return Path(os.environ.get("TAG_HOME", str(DEFAULT_TAG_HOME))).expanduser().resolve()
+
+
+def tag_cli_label() -> str:
+    return os.environ.get("TAG_CLI_LABEL", CLI_LABEL).strip() or CLI_LABEL
+
+
+def tag_cli_bin() -> str:
+    override = os.environ.get("TAG_BIN", "").strip()
+    if override:
+        return override
+    argv0 = Path(sys.argv[0]).expanduser()
+    if argv0.exists():
+        return str(argv0.resolve())
+    found = shutil.which(tag_cli_label())
+    if found:
+        return found
+    return tag_cli_label()
 
 
 def resolve_home_relative(value: str, *, base: Path | None = None) -> Path:
@@ -224,10 +242,15 @@ def hermes_env(cfg: dict[str, Any]) -> dict[str, str]:
     home_dir = runtime_home(cfg)
     hhome = Path(os.environ.get("TAG_HERMES_HOME", home_dir / ".hermes"))
     codex_home = runtime_codex_home(cfg)
+    tui_dir = hermes_root(cfg) / "ui-tui"
     env = os.environ.copy()
     env["HOME"] = str(home_dir)
     env["HERMES_HOME"] = str(hhome)
     env["CODEX_HOME"] = str(codex_home)
+    env["HERMES_BIN"] = tag_cli_bin()
+    env["HERMES_BIN_LABEL"] = tag_cli_label()
+    env["HERMES_ENV_LABEL"] = "the active TAG profile env file"
+    env["HERMES_TUI_DIR"] = str(tui_dir)
     env["PATH"] = f"{hermes_root(cfg) / '.venv' / 'bin'}:{env.get('PATH', '')}"
     return env
 
@@ -363,6 +386,26 @@ def read_dotenv(path: Path) -> dict[str, str]:
     return values
 
 
+def _upsert_env_line(env_file: Path, key: str, value: str) -> None:
+    """Write or replace KEY=VALUE in an .env file without disturbing other lines."""
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    lines = env_file.read_text(encoding="utf-8").splitlines() if env_file.exists() else []
+    prefix = f"{key}="
+    new_line = f"{key}={value}"
+    replaced = False
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(prefix) or stripped.lstrip("# ").startswith(prefix):
+            out.append(new_line)
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(new_line)
+    env_file.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
 def run_profile_python(
     cfg: dict[str, Any],
     profile_name: str,
@@ -411,6 +454,43 @@ def normalize_chat_output(output: str) -> str:
     return "\n".join(cleaned).strip()
 
 
+def rewrite_cli_hints(text: str) -> str:
+    if not text:
+        return text
+    label = tag_cli_label()
+
+    def replace_inner(inner: str) -> str:
+        return re.sub(r"\bhermes\b", label, inner, flags=re.IGNORECASE)
+
+    rewritten = re.sub(
+        r"`([^`\n]*\bhermes\b[^`\n]*)`",
+        lambda match: f"`{replace_inner(match.group(1))}`",
+        text,
+        flags=re.IGNORECASE,
+    )
+    rewritten = re.sub(
+        r"'([^'\n]*\bhermes\b[^'\n]*)'",
+        lambda match: f"'{replace_inner(match.group(1))}'",
+        rewritten,
+        flags=re.IGNORECASE,
+    )
+    rewritten = re.sub(
+        r"\bhermes (?=(auth|config|model|setup|update|gateway|sessions|doctor|tools|portal|status|plugins|skills|mcp|logs|memory|completion|prompt-size|chat|--resume|-c)\b)",
+        f"{label} ",
+        rewritten,
+        flags=re.IGNORECASE,
+    )
+    rewritten = re.sub(r"\bHermes/tag\b", "TAG", rewritten, flags=re.IGNORECASE)
+    rewritten = re.sub(r"\btag/tag\b", "tag", rewritten, flags=re.IGNORECASE)
+    rewritten = re.sub(r"\bHermes Agent\b", "TAG", rewritten, flags=re.IGNORECASE)
+    rewritten = re.sub(r"\bhermes-agent\b", "tag-agent", rewritten, flags=re.IGNORECASE)
+    rewritten = re.sub(r"\bthis Hermes profile\b", "this TAG profile", rewritten, flags=re.IGNORECASE)
+    rewritten = re.sub(r"\bActive Hermes profile\b", "Active TAG profile", rewritten, flags=re.IGNORECASE)
+    rewritten = re.sub(r"\bHermes profile\b", "TAG profile", rewritten, flags=re.IGNORECASE)
+    rewritten = rewritten.replace("~/.hermes/.env", "the active TAG profile env file")
+    return rewritten
+
+
 def infrastructure_failure_reason(output: str) -> str | None:
     normalized = normalize_chat_output(output)
     lowered = normalized.lower()
@@ -419,6 +499,7 @@ def infrastructure_failure_reason(output: str) -> str | None:
         "login looks expired or invalid",
         "api call failed after",
         "no api keys or providers found",
+        "it looks like the managed runtime isn't configured yet",
         "it looks like hermes isn't configured yet",
     )
     for marker in known_failures:
@@ -562,7 +643,7 @@ def bootstrap_profiles(cfg: dict[str, Any]) -> list[dict[str, str]]:
             run_hermes(cfg, *cmd)
         except subprocess.CalledProcessError as exc:
             message = exc.stderr.strip() or exc.stdout.strip() or str(exc)
-            raise SystemExit(f"Failed to create Hermes profile '{name}': {message}") from exc
+            raise SystemExit(f"Failed to create TAG-managed profile '{name}': {message}") from exc
         created.append({"profile": name, "status": "created"})
     return created
 
@@ -1032,14 +1113,26 @@ def patch_status(cfg: dict[str, Any]) -> str:
     return "diverged"
 
 
+def workspace_node_module_manifest(root: Path, package: str) -> Path:
+    scoped_parts = package.split("/")
+    candidates = (
+        root / "node_modules" / Path(*scoped_parts) / "package.json",
+        root / "ui-tui" / "node_modules" / Path(*scoped_parts) / "package.json",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
 def doctor_prerequisites(cfg: dict[str, Any]) -> dict[str, Any]:
     git = tool_path("git")
     npm = tool_path("npm")
     python = sys.executable
     root = hermes_root(cfg)
     tui_dist = root / "ui-tui" / "dist" / "entry.js"
-    tui_react = root / "ui-tui" / "node_modules" / "react" / "package.json"
-    tui_vitest = root / "ui-tui" / "node_modules" / "vitest" / "package.json"
+    tui_react = workspace_node_module_manifest(root, "react")
+    tui_vitest = workspace_node_module_manifest(root, "vitest")
     python_bin = setup_python_bin(cfg)
 
     report: dict[str, Any] = {
@@ -1071,7 +1164,7 @@ def ensure_setup_prereqs(cfg: dict[str, Any], *, need_npm: bool, need_git: bool)
     if not prereqs["python_runtime_supported"]:
         version = prereqs["python"]["version"]
         raise SystemExit(
-            "TAG currently requires Python >=3.11 and <3.14 because Hermes does. "
+            "TAG currently requires Python >=3.11 and <3.14 because the managed runtime does. "
             f"Current runtime: {version}."
         )
 
@@ -1195,8 +1288,20 @@ def apply_hermes_patch(cfg: dict[str, Any]) -> dict[str, Any]:
 
 def install_tui_dependencies(cfg: dict[str, Any]) -> dict[str, Any]:
     root = hermes_root(cfg)
-    run_external(["npm", "--prefix", "ui-tui", "install", "--no-package-lock"], cwd=root)
-    run_external(["npm", "--prefix", "ui-tui", "run", "build"], cwd=root)
+    run_external(
+        [
+            "npm",
+            "install",
+            "--workspace",
+            "ui-tui",
+            "--silent",
+            "--no-fund",
+            "--no-audit",
+            "--progress=false",
+        ],
+        cwd=root,
+    )
+    run_external(["npm", "run", "build", "--workspace", "ui-tui"], cwd=root)
     return {"ui_tui": str(root / "ui-tui"), "status": "built"}
 
 
@@ -1261,6 +1366,458 @@ def auto_import_codex_profiles(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return results
 
 
+# ---------- Claude Code credential import ----------
+
+
+def _detect_claude_code_credentials(
+    source_home: Path | None = None,
+) -> dict[str, Any]:
+    """Detect available Claude Code credentials on the local machine.
+
+    Checks, in order:
+      1. ANTHROPIC_API_KEY env var (safest — no ToS risk)
+      2. ~/.claude/.credentials.json  (OAuth, Linux/Windows/SSH)
+      3. ~/.claude.json               (OAuth, macOS app-state fallback)
+
+    Returns a dict with keys: api_key, oauth_token, oauth_expires_at, source.
+    """
+    result: dict[str, Any] = {
+        "api_key": None,
+        "oauth_token": None,
+        "oauth_expires_at": None,
+        "source": None,
+    }
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        result["api_key"] = api_key
+
+    claude_home = source_home or (Path.home() / ".claude")
+
+    creds_file = claude_home / ".credentials.json"
+    if creds_file.exists():
+        try:
+            data = json.loads(creds_file.read_text(encoding="utf-8"))
+            oauth = data.get("claudeAiOauth") or {}
+            token = (oauth.get("accessToken") or "").strip()
+            if token:
+                result["oauth_token"] = token
+                result["oauth_expires_at"] = oauth.get("expiresAt")
+                result["source"] = str(creds_file)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if not result["oauth_token"]:
+        dot_claude_json = Path.home() / ".claude.json"
+        if dot_claude_json.exists():
+            try:
+                data = json.loads(dot_claude_json.read_text(encoding="utf-8"))
+                oauth = data.get("claudeAiOauth") or data.get("oauthAccount") or {}
+                token = (oauth.get("accessToken") or "").strip()
+                if token:
+                    result["oauth_token"] = token
+                    result["oauth_expires_at"] = oauth.get("expiresAt")
+                    result["source"] = str(dot_claude_json)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    return result
+
+
+def import_claude_into_profile(
+    cfg: dict[str, Any],
+    *,
+    profile_name: str,
+    source_claude_home: Path | None = None,
+    use_oauth: bool = False,
+) -> dict[str, Any]:
+    """Import Claude Code / Anthropic credentials into a TAG-managed Hermes profile.
+
+    API key (ANTHROPIC_API_KEY) is always preferred — zero ToS risk.
+    OAuth token (CLAUDE_CODE_OAUTH_TOKEN) is only written when use_oauth=True;
+    Anthropic prohibits use of claude auth login tokens in third-party tools
+    as of early 2026 and actively suspends violating accounts.
+    """
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, profile_name)
+    if not target_home.exists():
+        return {"profile": profile_name, "status": "profile-missing"}
+
+    creds = _detect_claude_code_credentials(source_claude_home)
+
+    if creds["api_key"]:
+        _upsert_env_line(target_home / ".env", "ANTHROPIC_API_KEY", creds["api_key"])
+        return {
+            "profile": profile_name,
+            "status": "imported",
+            "mode": "api_key",
+            "provider": "anthropic",
+        }
+
+    if use_oauth and creds["oauth_token"]:
+        _upsert_env_line(target_home / ".env", "CLAUDE_CODE_OAUTH_TOKEN", creds["oauth_token"])
+        return {
+            "profile": profile_name,
+            "status": "imported",
+            "mode": "oauth",
+            "provider": "anthropic",
+            "source": creds["source"],
+            "tos_warning": (
+                "Anthropic prohibits use of claude auth login OAuth tokens in "
+                "third-party tools. Set ANTHROPIC_API_KEY for ToS-compliant access."
+            ),
+        }
+
+    return {"profile": profile_name, "status": "skipped-no-auth"}
+
+
+def auto_import_claude_profiles(
+    cfg: dict[str, Any],
+    *,
+    use_oauth: bool = False,
+) -> list[dict[str, Any]]:
+    """Auto-import Claude/Anthropic credentials into all non-Codex profiles during setup."""
+    creds = _detect_claude_code_credentials()
+    if not creds["api_key"] and not (use_oauth and creds["oauth_token"]):
+        return [
+            {"profile": p, "status": "skipped-no-auth"}
+            for p in cfg.get("profiles", {})
+            if p != "codex-runtime-master"
+        ]
+    return [
+        import_claude_into_profile(cfg, profile_name=p, use_oauth=use_oauth)
+        for p in cfg.get("profiles", {})
+        if p != "codex-runtime-master"
+    ]
+
+
+# ---------- Gemini CLI credential import ----------
+
+
+def _detect_gemini_credentials(
+    source_home: Path | None = None,
+) -> dict[str, Any]:
+    """Detect available Gemini CLI credentials on the local machine.
+
+    Checks, in order:
+      1. GEMINI_API_KEY env var (safest — no ToS risk)
+      2. ~/.gemini/.env          (GEMINI_API_KEY stored by gemini CLI)
+      3. ~/.gemini/oauth_creds.json  (OAuth, use_oauth=True only)
+
+    Returns a dict with keys:
+      api_key, oauth_token, refresh_token, oauth_expiry_ms, source.
+    """
+    result: dict[str, Any] = {
+        "api_key": None,
+        "oauth_token": None,
+        "refresh_token": None,
+        "oauth_expiry_ms": None,
+        "source": None,
+    }
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if api_key:
+        result["api_key"] = api_key
+
+    gemini_home = source_home or (Path.home() / ".gemini")
+
+    if not result["api_key"]:
+        gemini_dotenv = gemini_home / ".env"
+        key = read_dotenv(gemini_dotenv).get("GEMINI_API_KEY", "").strip()
+        if key:
+            result["api_key"] = key
+
+    oauth_file = gemini_home / "oauth_creds.json"
+    if oauth_file.exists():
+        try:
+            data = json.loads(oauth_file.read_text(encoding="utf-8"))
+            token = (data.get("access_token") or "").strip()
+            refresh = (data.get("refresh_token") or "").strip()
+            if token or refresh:
+                result["oauth_token"] = token or None
+                result["refresh_token"] = refresh or None
+                result["oauth_expiry_ms"] = data.get("expiry_date")
+                result["source"] = str(oauth_file)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return result
+
+
+def import_gemini_into_profile(
+    cfg: dict[str, Any],
+    *,
+    profile_name: str,
+    source_gemini_home: Path | None = None,
+    use_oauth: bool = False,
+) -> dict[str, Any]:
+    """Import Gemini CLI / Google API credentials into a TAG-managed Hermes profile.
+
+    API key (GEMINI_API_KEY) is always preferred — zero ToS risk.
+    OAuth tokens from ~/.gemini/oauth_creds.json are written to Hermes's
+    google_oauth.json store only when use_oauth=True. Google explicitly bans
+    piggybacking on Gemini CLI OAuth (enforced with account suspensions since
+    March 2026). Use GEMINI_API_KEY from https://aistudio.google.com/app/apikey
+    for ToS-compliant access.
+    """
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, profile_name)
+    if not target_home.exists():
+        return {"profile": profile_name, "status": "profile-missing"}
+
+    creds = _detect_gemini_credentials(source_gemini_home)
+
+    if creds["api_key"]:
+        _upsert_env_line(target_home / ".env", "GEMINI_API_KEY", creds["api_key"])
+        return {
+            "profile": profile_name,
+            "status": "imported",
+            "mode": "api_key",
+            "provider": "gemini",
+        }
+
+    if use_oauth and (creds["oauth_token"] or creds["refresh_token"]):
+        google_oauth_dir = target_home / "auth"
+        google_oauth_dir.mkdir(parents=True, exist_ok=True)
+        google_oauth_file = google_oauth_dir / "google_oauth.json"
+        existing: dict[str, Any] = {}
+        if google_oauth_file.exists():
+            try:
+                existing = json.loads(google_oauth_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+        existing.update({
+            "access_token": creds["oauth_token"] or "",
+            "refresh_token": creds["refresh_token"] or "",
+            "expiry_date": creds["oauth_expiry_ms"],
+            "source": "gemini-cli-import",
+        })
+        google_oauth_file.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        return {
+            "profile": profile_name,
+            "status": "imported",
+            "mode": "oauth",
+            "provider": "google-gemini-cli",
+            "source": creds["source"],
+            "tos_warning": (
+                "Google explicitly prohibits piggybacking on Gemini CLI OAuth tokens "
+                "in third-party tools and began enforcing bans in March 2026. "
+                "Use GEMINI_API_KEY from https://aistudio.google.com/app/apikey "
+                "for ToS-compliant access."
+            ),
+        }
+
+    return {"profile": profile_name, "status": "skipped-no-auth"}
+
+
+def auto_import_gemini_profiles(
+    cfg: dict[str, Any],
+    *,
+    use_oauth: bool = False,
+) -> list[dict[str, Any]]:
+    """Auto-import Gemini credentials into all profiles during setup."""
+    creds = _detect_gemini_credentials()
+    if not creds["api_key"] and not (use_oauth and (creds["oauth_token"] or creds["refresh_token"])):
+        return [
+            {"profile": p, "status": "skipped-no-auth"}
+            for p in cfg.get("profiles", {})
+        ]
+    return [
+        import_gemini_into_profile(cfg, profile_name=p, use_oauth=use_oauth)
+        for p in cfg.get("profiles", {})
+    ]
+
+
+# ---------- Continue.dev credential import ----------
+
+# Maps Continue provider slugs to the Hermes env var name
+_CONTINUE_PROVIDER_ENV_MAP: dict[str, str] = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "google": "GEMINI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "xai": "XAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "huggingface": "HF_TOKEN",
+    "nvidia": "NVIDIA_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "cohere": "COHERE_API_KEY",
+    "fireworks": "FIREWORKS_API_KEY",
+    "perplexity": "PERPLEXITY_API_KEY",
+}
+
+
+def _detect_continue_credentials(
+    source_home: Path | None = None,
+) -> dict[str, str]:
+    """Detect API keys stored in a Continue.dev config file.
+
+    Reads ~/.continue/config.yaml (new format) or ~/.continue/config.json
+    (deprecated format) and extracts provider→apiKey mappings.
+
+    Returns a dict mapping Hermes env var names to key values.
+    Keys stored as 'localEnv:VAR_NAME' references are resolved from the
+    current environment; entries without resolvable values are skipped.
+    """
+    continue_home = source_home or (Path.home() / ".continue")
+    found: dict[str, str] = {}
+
+    def _resolve_key(raw: str) -> str | None:
+        raw = (raw or "").strip()
+        if raw.startswith("localEnv:"):
+            return os.environ.get(raw[len("localEnv:"):], "").strip() or None
+        return raw or None
+
+    def _extract_from_models(models: list[Any]) -> None:
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            provider = (model.get("provider") or "").strip().lower()
+            api_key = _resolve_key(model.get("apiKey") or model.get("api_key") or "")
+            env_var = _CONTINUE_PROVIDER_ENV_MAP.get(provider)
+            if env_var and api_key and env_var not in found:
+                found[env_var] = api_key
+
+    yaml_cfg = continue_home / "config.yaml"
+    json_cfg = continue_home / "config.json"
+
+    if yaml_cfg.exists():
+        try:
+            data = yaml.safe_load(yaml_cfg.read_text(encoding="utf-8")) or {}
+            _extract_from_models(data.get("models") or [])
+        except Exception:
+            pass
+
+    if json_cfg.exists():
+        try:
+            data = json.loads(json_cfg.read_text(encoding="utf-8"))
+            _extract_from_models(data.get("models") or [])
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return found
+
+
+def import_continue_into_profile(
+    cfg: dict[str, Any],
+    *,
+    profile_name: str,
+    source_continue_home: Path | None = None,
+) -> dict[str, Any]:
+    """Import API keys from a Continue.dev config into a TAG-managed Hermes profile.
+
+    Reads ~/.continue/config.yaml (or config.json) and writes each discovered
+    provider API key to the profile's .env file. Only env-var style keys are
+    written — no OAuth tokens are involved, so there is no ToS risk.
+    """
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, profile_name)
+    if not target_home.exists():
+        return {"profile": profile_name, "status": "profile-missing"}
+
+    keys = _detect_continue_credentials(source_continue_home)
+    if not keys:
+        return {"profile": profile_name, "status": "skipped-no-auth"}
+
+    env_file = target_home / ".env"
+    for env_var, value in keys.items():
+        _upsert_env_line(env_file, env_var, value)
+
+    return {
+        "profile": profile_name,
+        "status": "imported",
+        "mode": "api_keys",
+        "providers_imported": list(keys.keys()),
+    }
+
+
+def auto_import_continue_profiles(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Auto-import Continue.dev API keys into all profiles during setup."""
+    keys = _detect_continue_credentials()
+    if not keys:
+        return [
+            {"profile": p, "status": "skipped-no-auth"}
+            for p in cfg.get("profiles", {})
+        ]
+    return [
+        import_continue_into_profile(cfg, profile_name=p)
+        for p in cfg.get("profiles", {})
+    ]
+
+
+# ---------- Mistral Vibe credential import ----------
+
+
+def _detect_mistral_credentials(
+    source_home: Path | None = None,
+) -> dict[str, Any]:
+    """Detect Mistral API key from Mistral Vibe CLI config.
+
+    Checks, in order:
+      1. MISTRAL_API_KEY env var
+      2. ~/.vibe/.env (written by `mistral-vibe` CLI on first auth)
+    """
+    result: dict[str, Any] = {"api_key": None, "source": None}
+
+    api_key = os.environ.get("MISTRAL_API_KEY", "").strip()
+    if api_key:
+        result["api_key"] = api_key
+        return result
+
+    vibe_home = source_home or (Path.home() / ".vibe")
+    vibe_dotenv = vibe_home / ".env"
+    if vibe_dotenv.exists():
+        key = read_dotenv(vibe_dotenv).get("MISTRAL_API_KEY", "").strip()
+        if key:
+            result["api_key"] = key
+            result["source"] = str(vibe_dotenv)
+
+    return result
+
+
+def import_mistral_into_profile(
+    cfg: dict[str, Any],
+    *,
+    profile_name: str,
+    source_vibe_home: Path | None = None,
+) -> dict[str, Any]:
+    """Import Mistral API key from the Mistral Vibe CLI into a TAG-managed profile."""
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, profile_name)
+    if not target_home.exists():
+        return {"profile": profile_name, "status": "profile-missing"}
+
+    creds = _detect_mistral_credentials(source_vibe_home)
+    if not creds["api_key"]:
+        return {"profile": profile_name, "status": "skipped-no-auth"}
+
+    _upsert_env_line(target_home / ".env", "MISTRAL_API_KEY", creds["api_key"])
+    return {
+        "profile": profile_name,
+        "status": "imported",
+        "mode": "api_key",
+        "provider": "mistral",
+        "source": creds.get("source"),
+    }
+
+
+def auto_import_mistral_profiles(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Auto-import Mistral API key into all profiles during setup."""
+    creds = _detect_mistral_credentials()
+    if not creds["api_key"]:
+        return [
+            {"profile": p, "status": "skipped-no-auth"}
+            for p in cfg.get("profiles", {})
+        ]
+    return [
+        import_mistral_into_profile(cfg, profile_name=p)
+        for p in cfg.get("profiles", {})
+    ]
+
+
 def ensure_hermes_ready(
     cfg: dict[str, Any],
     *,
@@ -1309,7 +1866,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         steps["tui"] = install_tui_dependencies(cfg)
     if not hermes_bin(cfg).exists():
         raise SystemExit(
-            "Hermes Python is not installed; cannot bootstrap profiles. "
+            "The managed runtime Python is not installed; cannot bootstrap profiles. "
             "Re-run `tag setup` without `--skip-python-install`."
         )
     steps["bootstrap"] = {
@@ -1317,6 +1874,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
         "rendered": render_profiles(cfg, force=False),
     }
     steps["codex_import"] = auto_import_codex_profiles(cfg)
+    steps["claude_import"] = auto_import_claude_profiles(cfg)
+    steps["gemini_import"] = auto_import_gemini_profiles(cfg)
+    steps["continue_import"] = auto_import_continue_profiles(cfg)
+    steps["mistral_import"] = auto_import_mistral_profiles(cfg)
 
     if args.json:
         print(json.dumps(steps, indent=2))
@@ -1337,17 +1898,41 @@ def cmd_hermes_passthrough(args: argparse.Namespace) -> int:
     env = profile_exec_env(cfg, args.profile) if args.profile else hermes_env(cfg)
     raw_args = list(args.hermes_args)
     hermes_args = normalize_hermes_passthrough_args(raw_args)
+    wants_help = any(arg in {"--help", "-h"} for arg in hermes_args)
     if getattr(args, "hermes_version", False):
         if not raw_args:
             hermes_args = ["--version"]
         else:
             hermes_args = ["--version", *hermes_args]
+            wants_help = True
+    interactive_passthrough = (
+        "--tui" in hermes_args
+        or (
+            hermes_args[:1] in (["gateway"], ["dashboard"])
+            and not wants_help
+        )
+        or (
+            hermes_args[:1] == ["chat"]
+            and "-q" not in hermes_args
+            and "--query" not in hermes_args
+            and not wants_help
+        )
+    )
+    capture_output = not interactive_passthrough
     proc = subprocess.run(
         [str(hermes_bin(cfg)), *hermes_args],
         env=env,
         text=True,
         check=False,
+        capture_output=capture_output,
     )
+    if capture_output:
+        stdout = getattr(proc, "stdout", "")
+        stderr = getattr(proc, "stderr", "")
+        if stdout:
+            print(rewrite_cli_hints(stdout), end="")
+        if stderr:
+            print(rewrite_cli_hints(stderr), end="", file=sys.stderr)
     return int(proc.returncode)
 
 
@@ -1477,7 +2062,7 @@ def cmd_default(args: argparse.Namespace) -> int:
     if not can_launch_interactive_tui():
         print(
             "TAG detected a non-interactive shell, so it will not auto-launch the TUI.\n"
-            "Run `tag doctor` to inspect the install, `tag setup` to bootstrap Hermes, "
+            "Run `tag doctor` to inspect the install, `tag setup` to bootstrap the managed runtime, "
             "or `tag submit ...` / `tag hermes ...` for non-interactive usage.",
             file=sys.stderr,
         )
@@ -1644,6 +2229,156 @@ def cmd_import_codex(args: argparse.Namespace) -> int:
         return 0
 
     print(f"Imported Codex credentials into profile '{args.profile}'.")
+    return 0
+
+
+def cmd_import_claude(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    profiles = cfg.get("profiles", {})
+    if args.profile not in profiles:
+        available = ", ".join(sorted(profiles))
+        raise SystemExit(f"Unknown profile '{args.profile}'. Available: {available}")
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, args.profile)
+    if not target_home.exists():
+        raise SystemExit(
+            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first."
+        )
+    source_home = (
+        Path(args.claude_home).expanduser().resolve()
+        if getattr(args, "claude_home", None)
+        else None
+    )
+    result = import_claude_into_profile(
+        cfg,
+        profile_name=args.profile,
+        source_claude_home=source_home,
+        use_oauth=getattr(args, "use_oauth", False),
+    )
+    if result["status"] == "skipped-no-auth":
+        raise SystemExit(
+            "No Claude credentials found. Set ANTHROPIC_API_KEY or use "
+            "`tag import-claude --use-oauth` to import from claude auth login."
+        )
+    if result["status"] == "profile-missing":
+        raise SystemExit(f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.")
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    mode = result.get("mode", "unknown")
+    print(f"Imported Claude credentials into profile '{args.profile}' (mode: {mode}).")
+    if "tos_warning" in result:
+        print(f"WARNING: {result['tos_warning']}")
+    return 0
+
+
+def cmd_import_gemini(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    profiles = cfg.get("profiles", {})
+    if args.profile not in profiles:
+        available = ", ".join(sorted(profiles))
+        raise SystemExit(f"Unknown profile '{args.profile}'. Available: {available}")
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, args.profile)
+    if not target_home.exists():
+        raise SystemExit(
+            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first."
+        )
+    source_home = (
+        Path(args.gemini_home).expanduser().resolve()
+        if getattr(args, "gemini_home", None)
+        else None
+    )
+    result = import_gemini_into_profile(
+        cfg,
+        profile_name=args.profile,
+        source_gemini_home=source_home,
+        use_oauth=getattr(args, "use_oauth", False),
+    )
+    if result["status"] == "skipped-no-auth":
+        raise SystemExit(
+            "No Gemini credentials found. Set GEMINI_API_KEY (from "
+            "https://aistudio.google.com/app/apikey) or use "
+            "`tag import-gemini --use-oauth` to import from ~/.gemini/oauth_creds.json."
+        )
+    if result["status"] == "profile-missing":
+        raise SystemExit(f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.")
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    mode = result.get("mode", "unknown")
+    print(f"Imported Gemini credentials into profile '{args.profile}' (mode: {mode}).")
+    if "tos_warning" in result:
+        print(f"WARNING: {result['tos_warning']}")
+    return 0
+
+
+def cmd_import_continue(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    profiles = cfg.get("profiles", {})
+    if args.profile not in profiles:
+        available = ", ".join(sorted(profiles))
+        raise SystemExit(f"Unknown profile '{args.profile}'. Available: {available}")
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, args.profile)
+    if not target_home.exists():
+        raise SystemExit(
+            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first."
+        )
+    source_home = (
+        Path(args.continue_home).expanduser().resolve()
+        if getattr(args, "continue_home", None)
+        else None
+    )
+    result = import_continue_into_profile(cfg, profile_name=args.profile, source_continue_home=source_home)
+    if result["status"] == "skipped-no-auth":
+        raise SystemExit(
+            "No Continue.dev config found with API keys. "
+            "Expected ~/.continue/config.yaml or ~/.continue/config.json."
+        )
+    if result["status"] == "profile-missing":
+        raise SystemExit(f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.")
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    providers = ", ".join(result.get("providers_imported") or [])
+    print(f"Imported Continue.dev credentials into profile '{args.profile}' ({providers}).")
+    return 0
+
+
+def cmd_import_mistral(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    profiles = cfg.get("profiles", {})
+    if args.profile not in profiles:
+        available = ", ".join(sorted(profiles))
+        raise SystemExit(f"Unknown profile '{args.profile}'. Available: {available}")
+    ensure_runtime_dirs(cfg)
+    target_home = profile_home(cfg, args.profile)
+    if not target_home.exists():
+        raise SystemExit(
+            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first."
+        )
+    source_home = (
+        Path(args.vibe_home).expanduser().resolve()
+        if getattr(args, "vibe_home", None)
+        else None
+    )
+    result = import_mistral_into_profile(cfg, profile_name=args.profile, source_vibe_home=source_home)
+    if result["status"] == "skipped-no-auth":
+        raise SystemExit(
+            "No Mistral credentials found. Set MISTRAL_API_KEY or ensure "
+            "`mistral-vibe` has written ~/.vibe/.env."
+        )
+    if result["status"] == "profile-missing":
+        raise SystemExit(f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.")
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    print(f"Imported Mistral credentials into profile '{args.profile}'.")
     return 0
 
 
@@ -2111,14 +2846,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command")
 
-    setup = sub.add_parser("setup", help="Provision Hermes, apply TAG patches, build the TUI, and bootstrap profiles")
-    setup.add_argument("--refresh", action="store_true", help="Fetch and update an existing Hermes checkout")
+    setup = sub.add_parser("setup", help="Provision the managed runtime, apply TAG patches, build the TUI, and bootstrap profiles")
+    setup.add_argument("--refresh", action="store_true", help="Fetch and update an existing managed runtime checkout")
     setup.add_argument("--skip-python-install", action="store_true")
     setup.add_argument("--skip-tui-build", action="store_true")
     setup.add_argument("--json", action="store_true")
     setup.set_defaults(func=cmd_setup)
 
-    doctor = sub.add_parser("doctor", help="Validate local TAG and Hermes paths")
+    doctor = sub.add_parser("doctor", help="Validate local TAG paths and the managed runtime")
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(func=cmd_doctor)
 
@@ -2242,111 +2977,175 @@ def build_parser() -> argparse.ArgumentParser:
 
     import_codex = sub.add_parser(
         "import-codex",
-        help="Import existing Codex CLI credentials into a Hermes profile",
+        help="Import existing Codex CLI credentials into a TAG-managed profile",
     )
     import_codex.add_argument("--profile", required=True)
     import_codex.add_argument("--codex-home", help="Path to the source CODEX_HOME")
     import_codex.add_argument("--json", action="store_true")
     import_codex.set_defaults(func=cmd_import_codex)
 
-    hermes_cmd = sub.add_parser("hermes", help="Pass raw arguments through to the managed Hermes binary")
-    hermes_cmd.add_argument("--profile", help="Run Hermes inside one TAG profile home")
-    hermes_cmd.add_argument("--version", dest="hermes_version", action="store_true", help="Show the managed Hermes version")
+    import_claude = sub.add_parser(
+        "import-claude",
+        help="Import Claude Code / Anthropic API credentials into a TAG-managed profile",
+    )
+    import_claude.add_argument("--profile", required=True)
+    import_claude.add_argument(
+        "--claude-home",
+        help="Path to source ~/.claude directory (default: ~/.claude)",
+    )
+    import_claude.add_argument(
+        "--use-oauth",
+        action="store_true",
+        help=(
+            "Import the OAuth session token from `claude auth login`. "
+            "Anthropic prohibits this in third-party tools; ANTHROPIC_API_KEY is preferred."
+        ),
+    )
+    import_claude.add_argument("--json", action="store_true")
+    import_claude.set_defaults(func=cmd_import_claude)
+
+    import_gemini = sub.add_parser(
+        "import-gemini",
+        help="Import Gemini CLI / Google API credentials into a TAG-managed profile",
+    )
+    import_gemini.add_argument("--profile", required=True)
+    import_gemini.add_argument(
+        "--gemini-home",
+        help="Path to source ~/.gemini directory (default: ~/.gemini)",
+    )
+    import_gemini.add_argument(
+        "--use-oauth",
+        action="store_true",
+        help=(
+            "Import OAuth tokens from ~/.gemini/oauth_creds.json. "
+            "Google prohibits this in third-party tools; GEMINI_API_KEY is preferred."
+        ),
+    )
+    import_gemini.add_argument("--json", action="store_true")
+    import_gemini.set_defaults(func=cmd_import_gemini)
+
+    import_continue = sub.add_parser(
+        "import-continue",
+        help="Import API keys from a Continue.dev config into a TAG-managed profile",
+    )
+    import_continue.add_argument("--profile", required=True)
+    import_continue.add_argument(
+        "--continue-home",
+        help="Path to source ~/.continue directory (default: ~/.continue)",
+    )
+    import_continue.add_argument("--json", action="store_true")
+    import_continue.set_defaults(func=cmd_import_continue)
+
+    import_mistral = sub.add_parser(
+        "import-mistral",
+        help="Import Mistral API key from the Mistral Vibe CLI into a TAG-managed profile",
+    )
+    import_mistral.add_argument("--profile", required=True)
+    import_mistral.add_argument(
+        "--vibe-home",
+        help="Path to source ~/.vibe directory (default: ~/.vibe)",
+    )
+    import_mistral.add_argument("--json", action="store_true")
+    import_mistral.set_defaults(func=cmd_import_mistral)
+
+    hermes_cmd = sub.add_parser("hermes", help="Pass raw arguments through to the managed runtime binary")
+    hermes_cmd.add_argument("--profile", help="Run the managed runtime inside one TAG profile home")
+    hermes_cmd.add_argument("--version", dest="hermes_version", action="store_true", help="Show the managed runtime version")
     hermes_cmd.add_argument("hermes_args", nargs=argparse.REMAINDER)
     hermes_cmd.set_defaults(func=cmd_hermes_passthrough)
 
-    chat = sub.add_parser("chat", help="Run Hermes chat inside a TAG profile")
+    chat = sub.add_parser("chat", help="Run chat inside a TAG profile")
     chat.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     chat.add_argument("hermes_args", nargs=argparse.REMAINDER)
     chat.set_defaults(func=cmd_chat)
 
-    gateway = sub.add_parser("gateway", help="Run Hermes gateway commands inside a TAG profile")
+    gateway = sub.add_parser("gateway", help="Run gateway commands inside a TAG profile")
     gateway.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     gateway.add_argument("hermes_args", nargs=argparse.REMAINDER)
     gateway.set_defaults(func=cmd_gateway)
 
-    kanban = sub.add_parser("kanban", help="Run Hermes Kanban commands inside a TAG profile")
+    kanban = sub.add_parser("kanban", help="Run Kanban commands inside a TAG profile")
     kanban.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     kanban.add_argument("hermes_args", nargs=argparse.REMAINDER)
     kanban.set_defaults(func=cmd_kanban)
 
-    model = sub.add_parser("model", help="Run Hermes model commands inside a TAG profile")
+    model = sub.add_parser("model", help="Run model commands inside a TAG profile")
     model.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     model.add_argument("hermes_args", nargs=argparse.REMAINDER)
     model.set_defaults(func=cmd_model)
 
-    profile = sub.add_parser("profile", help="Run Hermes profile commands in the managed TAG environment")
+    profile = sub.add_parser("profile", help="Run profile commands in the managed TAG environment")
     profile.add_argument("--profile", help="Optional active profile home override")
     profile.add_argument("hermes_args", nargs=argparse.REMAINDER)
     profile.set_defaults(func=cmd_profile)
 
-    status = sub.add_parser("status", help="Run Hermes status inside a TAG profile")
+    status = sub.add_parser("status", help="Run status inside a TAG profile")
     status.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     status.add_argument("hermes_args", nargs=argparse.REMAINDER)
     status.set_defaults(func=cmd_status)
 
-    config_cmd = sub.add_parser("config", help="Run Hermes config inside a TAG profile")
+    config_cmd = sub.add_parser("config", help="Run config inside a TAG profile")
     config_cmd.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     config_cmd.add_argument("hermes_args", nargs=argparse.REMAINDER)
     config_cmd.set_defaults(func=cmd_config)
 
-    sessions = sub.add_parser("sessions", help="Run Hermes sessions inside a TAG profile")
+    sessions = sub.add_parser("sessions", help="Run sessions inside a TAG profile")
     sessions.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     sessions.add_argument("hermes_args", nargs=argparse.REMAINDER)
     sessions.set_defaults(func=cmd_sessions)
 
-    skills = sub.add_parser("skills", help="Run Hermes skills inside a TAG profile")
+    skills = sub.add_parser("skills", help="Run skills inside a TAG profile")
     skills.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     skills.add_argument("hermes_args", nargs=argparse.REMAINDER)
     skills.set_defaults(func=cmd_skills)
 
-    plugins = sub.add_parser("plugins", help="Run Hermes plugins inside a TAG profile")
+    plugins = sub.add_parser("plugins", help="Run plugins inside a TAG profile")
     plugins.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     plugins.add_argument("hermes_args", nargs=argparse.REMAINDER)
     plugins.set_defaults(func=cmd_plugins)
 
-    tools_cmd = sub.add_parser("tools", help="Run Hermes tools inside a TAG profile")
+    tools_cmd = sub.add_parser("tools", help="Run tools inside a TAG profile")
     tools_cmd.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     tools_cmd.add_argument("hermes_args", nargs=argparse.REMAINDER)
     tools_cmd.set_defaults(func=cmd_tools)
 
-    mcp = sub.add_parser("mcp", help="Run Hermes MCP commands inside a TAG profile")
+    mcp = sub.add_parser("mcp", help="Run MCP commands inside a TAG profile")
     mcp.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     mcp.add_argument("hermes_args", nargs=argparse.REMAINDER)
     mcp.set_defaults(func=cmd_mcp)
 
-    logs = sub.add_parser("logs", help="Run Hermes logs inside a TAG profile")
+    logs = sub.add_parser("logs", help="Run logs inside a TAG profile")
     logs.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     logs.add_argument("hermes_args", nargs=argparse.REMAINDER)
     logs.set_defaults(func=cmd_logs)
 
-    dashboard = sub.add_parser("dashboard", help="Run Hermes dashboard inside a TAG profile")
+    dashboard = sub.add_parser("dashboard", help="Run dashboard inside a TAG profile")
     dashboard.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     dashboard.add_argument("hermes_args", nargs=argparse.REMAINDER)
     dashboard.set_defaults(func=cmd_dashboard)
 
-    memory = sub.add_parser("memory", help="Run Hermes memory inside a TAG profile")
+    memory = sub.add_parser("memory", help="Run memory inside a TAG profile")
     memory.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     memory.add_argument("hermes_args", nargs=argparse.REMAINDER)
     memory.set_defaults(func=cmd_memory)
 
-    completion = sub.add_parser("completion", help="Run Hermes completion inside a TAG profile")
+    completion = sub.add_parser("completion", help="Run completion inside a TAG profile")
     completion.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     completion.add_argument("hermes_args", nargs=argparse.REMAINDER)
     completion.set_defaults(func=cmd_completion)
 
-    prompt_size = sub.add_parser("prompt-size", help="Run Hermes prompt-size inside a TAG profile")
+    prompt_size = sub.add_parser("prompt-size", help="Run prompt-size inside a TAG profile")
     prompt_size.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     prompt_size.add_argument("hermes_args", nargs=argparse.REMAINDER)
     prompt_size.set_defaults(func=cmd_prompt_size)
 
-    update = sub.add_parser("update", help="Run Hermes update inside a TAG profile")
+    update = sub.add_parser("update", help="Run update inside a TAG profile")
     update.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     update.add_argument("--json", action="store_true", help="When TAG manages the update locally, emit JSON")
     update.add_argument("hermes_args", nargs=argparse.REMAINDER)
     update.set_defaults(func=cmd_update)
 
-    tui = sub.add_parser("tui", help="Launch the managed Hermes TUI through TAG")
+    tui = sub.add_parser("tui", help="Launch the managed TUI through TAG")
     tui.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     tui.add_argument("hermes_args", nargs=argparse.REMAINDER)
     tui.set_defaults(func=cmd_tui)
