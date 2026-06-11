@@ -79,6 +79,21 @@ def test_normalize_chat_output_strips_runtime_noise():
     assert TAG.normalize_chat_output(output) == "bench-ok"
 
 
+def test_rewrite_cli_hints_prefers_tag_commands():
+    rewritten = TAG.rewrite_cli_hints(
+        "Run `hermes auth add openrouter`, or edit ~/.hermes/.env for this Hermes profile.\n"
+        "Use the proper Hermes/tag auth/config flow.\n"
+        "Resume this session with:\n  hermes --resume abc123\n"
+        "  │ 📚 skill     hermes-agent  0.0s"
+    )
+    assert "`tag auth add openrouter`" in rewritten
+    assert "the active TAG profile env file" in rewritten
+    assert "this TAG profile" in rewritten
+    assert "proper TAG auth/config flow" in rewritten
+    assert "tag --resume abc123" in rewritten
+    assert "skill     tag-agent" in rewritten
+
+
 def test_infrastructure_failure_reason_detects_codex_auth_failure():
     output = (
         "⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only\n"
@@ -140,6 +155,21 @@ def test_doctor_prerequisites_reports_missing_checkout(tmp_path, monkeypatch):
     assert report["tui_vitest_installed"] is False
 
 
+def test_doctor_prerequisites_detects_hoisted_workspace_deps(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    root = tmp_path / "managed-hermes"
+    monkeypatch.setenv("TAG_HERMES_ROOT", str(root))
+    (root / "node_modules" / "react").mkdir(parents=True)
+    (root / "node_modules" / "vitest").mkdir(parents=True)
+    (root / "node_modules" / "react" / "package.json").write_text("{}", encoding="utf-8")
+    (root / "node_modules" / "vitest" / "package.json").write_text("{}", encoding="utf-8")
+
+    report = TAG.doctor_prerequisites(load_cfg())
+
+    assert report["tui_react_installed"] is True
+    assert report["tui_vitest_installed"] is True
+
+
 def test_patch_status_marks_bundled_prepatched(tmp_path, monkeypatch):
     monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
     bundled_root = tmp_path / "bundled-hermes"
@@ -162,6 +192,17 @@ def test_patch_status_marks_bundled_prepatched(tmp_path, monkeypatch):
 
     monkeypatch.setattr(TAG, "run_external", fake_run_external)
     assert TAG.patch_status(load_cfg()) == "prepatched"
+
+
+def test_hermes_env_exposes_tag_cli_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    monkeypatch.setenv("TAG_BIN", "/tmp/fake-tag")
+    cfg = load_cfg()
+    env = TAG.hermes_env(cfg)
+    assert env["HERMES_BIN"] == "/tmp/fake-tag"
+    assert env["HERMES_BIN_LABEL"] == "tag"
+    assert env["HERMES_ENV_LABEL"] == "the active TAG profile env file"
+    assert env["HERMES_TUI_DIR"] == str(TAG.hermes_root(cfg) / "ui-tui")
 
 
 def test_bundled_hermes_archive_exists():
@@ -207,6 +248,14 @@ def test_build_parser_exposes_extended_hermes_surface():
         "update",
     ):
         assert command in help_text
+    hermes_help = next(
+        choice.format_help()
+        for action in parser._actions
+        if isinstance(action, TAG.argparse._SubParsersAction)
+        for name, choice in action.choices.items()
+        if name == "hermes"
+    )
+    assert "managed runtime" in hermes_help
 
 
 def test_hermes_root_falls_back_to_discovered_checkout(tmp_path, monkeypatch):
@@ -390,7 +439,7 @@ def test_cmd_setup_skip_python_install_fails_cleanly(tmp_path, monkeypatch):
         skip_tui_build=True,
         json=True,
     )
-    with pytest.raises(SystemExit, match="Hermes Python is not installed; cannot bootstrap profiles"):
+    with pytest.raises(SystemExit, match="managed runtime Python is not installed; cannot bootstrap profiles"):
         TAG.cmd_setup(args)
 
 
@@ -449,6 +498,61 @@ def test_cmd_hermes_passthrough_supports_version_flag(tmp_path, monkeypatch):
     assert seen["cmd"] == ["/bin/echo", "--version"]
 
 
+def test_cmd_hermes_passthrough_rewrites_short_lived_output(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    cfg_path = TAG.config_path(None)
+    monkeypatch.setattr(TAG, "ensure_hermes_ready", lambda *a, **k: None)
+    monkeypatch.setattr(TAG, "hermes_bin", lambda *_a, **_k: Path("/bin/echo"))
+
+    def fake_run(cmd, **kwargs):
+        assert kwargs["capture_output"] is True
+        return TAG.argparse.Namespace(
+            returncode=0,
+            stdout="Resume this session with:\n  hermes --resume abc123\nthis Hermes profile\n",
+            stderr="Set OPENROUTER_API_KEY in ~/.hermes/.env\n",
+        )
+
+    monkeypatch.setattr(TAG.subprocess, "run", fake_run)
+    args = TAG.argparse.Namespace(
+        config=str(cfg_path),
+        profile="orchestrator",
+        hermes_args=["chat", "-q", "hello"],
+        hermes_version=False,
+    )
+    assert TAG.cmd_hermes_passthrough(args) == 0
+    captured = capsys.readouterr()
+    assert "tag --resume abc123" in captured.out
+    assert "this TAG profile" in captured.out
+    assert "the active TAG profile env file" in captured.err
+
+
+def test_cmd_hermes_passthrough_captures_chat_help_for_rewrite(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    cfg_path = TAG.config_path(None)
+    monkeypatch.setattr(TAG, "ensure_hermes_ready", lambda *a, **k: None)
+    monkeypatch.setattr(TAG, "hermes_bin", lambda *_a, **_k: Path("/bin/echo"))
+
+    def fake_run(cmd, **kwargs):
+        assert kwargs["capture_output"] is True
+        return TAG.argparse.Namespace(
+            returncode=0,
+            stdout="Start an interactive chat session with Hermes Agent\nRun `hermes setup`\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(TAG.subprocess, "run", fake_run)
+    args = TAG.argparse.Namespace(
+        config=str(cfg_path),
+        profile="orchestrator",
+        hermes_args=["chat", "--help"],
+        hermes_version=False,
+    )
+    assert TAG.cmd_hermes_passthrough(args) == 0
+    captured = capsys.readouterr()
+    assert "Start an interactive chat session with TAG" in captured.out
+    assert "Run `tag setup`" in captured.out
+
+
 def test_bootstrap_profiles_wraps_hermes_errors(tmp_path, monkeypatch):
     monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
     cfg = deepcopy(load_cfg())
@@ -465,7 +569,7 @@ def test_bootstrap_profiles_wraps_hermes_errors(tmp_path, monkeypatch):
         stderr="invalid profile name",
     )
     monkeypatch.setattr(TAG, "run_hermes", lambda *_a, **_k: (_ for _ in ()).throw(err))
-    with pytest.raises(SystemExit, match="Failed to create Hermes profile 'bad/name'"):
+    with pytest.raises(SystemExit, match="Failed to create TAG-managed profile 'bad/name'"):
         TAG.bootstrap_profiles(cfg)
 
 
@@ -535,6 +639,43 @@ def test_cmd_setup_does_not_force_rerender(tmp_path, monkeypatch):
     args = TAG.argparse.Namespace(config=None, refresh=False, skip_python_install=False, skip_tui_build=False, json=True)
     assert TAG.cmd_setup(args) == 0
     assert seen["force"] is False
+
+
+def test_install_tui_dependencies_uses_workspace_root_commands(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    root = tmp_path / "managed-hermes"
+    root.mkdir()
+    monkeypatch.setenv("TAG_HERMES_ROOT", str(root))
+    calls: list[tuple[list[str], Path | None]] = []
+
+    def fake_run_external(cmd, *, cwd=None, **kwargs):
+        calls.append((cmd, cwd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(TAG, "run_external", fake_run_external)
+
+    result = TAG.install_tui_dependencies(load_cfg())
+
+    assert result["status"] == "built"
+    assert calls == [
+        (
+            [
+                "npm",
+                "install",
+                "--workspace",
+                "ui-tui",
+                "--silent",
+                "--no-fund",
+                "--no-audit",
+                "--progress=false",
+            ],
+            root,
+        ),
+        (
+            ["npm", "run", "build", "--workspace", "ui-tui"],
+            root,
+        ),
+    ]
 
 
 def test_open_db_tolerates_concurrent_initialization(tmp_path, monkeypatch):
@@ -656,3 +797,346 @@ def test_load_openrouter_catalog_http_and_json_failures(tmp_path, monkeypatch):
     monkeypatch.setattr(TAG.urllib.request, "urlopen", lambda *a, **k: FakeResp())
     with pytest.raises(SystemExit, match="OpenRouter models response was not valid JSON."):
         TAG.load_openrouter_catalog(cfg, "researcher")
+
+
+# ---------- _upsert_env_line ----------
+
+
+def test_upsert_env_line_creates_file(tmp_path):
+    env_file = tmp_path / ".env"
+    TAG._upsert_env_line(env_file, "ANTHROPIC_API_KEY", "sk-ant-test")
+    assert "ANTHROPIC_API_KEY=sk-ant-test" in env_file.read_text()
+
+
+def test_upsert_env_line_replaces_existing(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("ANTHROPIC_API_KEY=old-key\nOTHER=val\n")
+    TAG._upsert_env_line(env_file, "ANTHROPIC_API_KEY", "new-key")
+    lines = env_file.read_text().splitlines()
+    assert "ANTHROPIC_API_KEY=new-key" in lines
+    assert "ANTHROPIC_API_KEY=old-key" not in lines
+    assert "OTHER=val" in lines
+
+
+def test_upsert_env_line_appends_when_absent(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("EXISTING=yes\n")
+    TAG._upsert_env_line(env_file, "NEW_KEY", "value123")
+    text = env_file.read_text()
+    assert "EXISTING=yes" in text
+    assert "NEW_KEY=value123" in text
+
+
+# ---------- _detect_claude_code_credentials ----------
+
+
+def test_detect_claude_picks_up_api_key_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-key")
+    result = TAG._detect_claude_code_credentials(source_home=tmp_path)
+    assert result["api_key"] == "sk-ant-api-key"
+    assert result["oauth_token"] is None
+
+
+def test_detect_claude_reads_credentials_json(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    creds_file = tmp_path / ".credentials.json"
+    creds_file.write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-abc", "expiresAt": 9999999999000}}),
+        encoding="utf-8",
+    )
+    result = TAG._detect_claude_code_credentials(source_home=tmp_path)
+    assert result["oauth_token"] == "sk-ant-oat01-abc"
+    assert result["oauth_expires_at"] == 9999999999000
+    assert result["source"] == str(creds_file)
+
+
+def test_detect_claude_returns_empty_when_nothing_found(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    result = TAG._detect_claude_code_credentials(source_home=tmp_path)
+    assert result["api_key"] is None
+    assert result["oauth_token"] is None
+
+
+# ---------- import_claude_into_profile ----------
+
+
+def test_import_claude_api_key_writes_env_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-real-key")
+    cfg = load_cfg()
+    profile_dir = TAG.profile_home(cfg, "researcher")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    result = TAG.import_claude_into_profile(cfg, profile_name="researcher")
+    assert result["status"] == "imported"
+    assert result["mode"] == "api_key"
+    assert result["provider"] == "anthropic"
+    env_vals = TAG.read_dotenv(profile_dir / ".env")
+    assert env_vals.get("ANTHROPIC_API_KEY") == "sk-ant-real-key"
+
+
+def test_import_claude_oauth_requires_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    source = tmp_path / "claude"
+    (source / ".credentials.json").parent.mkdir(parents=True, exist_ok=True)
+    (source / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-tok"}}),
+        encoding="utf-8",
+    )
+    cfg = load_cfg()
+    # Without use_oauth: should skip
+    profile_dir = TAG.profile_home(cfg, "researcher")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    result = TAG.import_claude_into_profile(cfg, profile_name="researcher", source_claude_home=source)
+    assert result["status"] == "skipped-no-auth"
+
+    # With use_oauth: should import and carry tos_warning
+    result2 = TAG.import_claude_into_profile(
+        cfg, profile_name="researcher", source_claude_home=source, use_oauth=True
+    )
+    assert result2["status"] == "imported"
+    assert result2["mode"] == "oauth"
+    assert "tos_warning" in result2
+    env_vals = TAG.read_dotenv(profile_dir / ".env")
+    assert env_vals.get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oat01-tok"
+
+
+def test_import_claude_skips_missing_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
+    cfg = load_cfg()
+    # profile dir not created — should return profile-missing, not crash
+    result = TAG.import_claude_into_profile(cfg, profile_name="researcher")
+    assert result["status"] == "profile-missing"
+
+
+# ---------- _detect_gemini_credentials ----------
+
+
+def test_detect_gemini_picks_up_api_key_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "AIzaSy-test-key")
+    result = TAG._detect_gemini_credentials(source_home=tmp_path)
+    assert result["api_key"] == "AIzaSy-test-key"
+    assert result["oauth_token"] is None
+
+
+def test_detect_gemini_reads_dotenv(tmp_path, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    (tmp_path / ".env").write_text("GEMINI_API_KEY=AIzaSy-from-file\n", encoding="utf-8")
+    result = TAG._detect_gemini_credentials(source_home=tmp_path)
+    assert result["api_key"] == "AIzaSy-from-file"
+
+
+def test_detect_gemini_reads_oauth_creds(tmp_path, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    oauth = {
+        "access_token": "ya29.access",
+        "refresh_token": "1//refresh",
+        "expiry_date": 9999000000000,
+    }
+    (tmp_path / "oauth_creds.json").write_text(json.dumps(oauth), encoding="utf-8")
+    result = TAG._detect_gemini_credentials(source_home=tmp_path)
+    assert result["oauth_token"] == "ya29.access"
+    assert result["refresh_token"] == "1//refresh"
+    assert result["oauth_expiry_ms"] == 9999000000000
+
+
+# ---------- import_gemini_into_profile ----------
+
+
+def test_import_gemini_api_key_writes_env_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    monkeypatch.setenv("GEMINI_API_KEY", "AIzaSy-real")
+    cfg = load_cfg()
+    profile_dir = TAG.profile_home(cfg, "researcher")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    result = TAG.import_gemini_into_profile(cfg, profile_name="researcher")
+    assert result["status"] == "imported"
+    assert result["mode"] == "api_key"
+    assert result["provider"] == "gemini"
+    env_vals = TAG.read_dotenv(profile_dir / ".env")
+    assert env_vals.get("GEMINI_API_KEY") == "AIzaSy-real"
+
+
+def test_import_gemini_oauth_writes_google_oauth_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    source = tmp_path / "gemini"
+    source.mkdir()
+    oauth = {"access_token": "ya29.x", "refresh_token": "1//r", "expiry_date": 9999000000000}
+    (source / "oauth_creds.json").write_text(json.dumps(oauth), encoding="utf-8")
+    cfg = load_cfg()
+    profile_dir = TAG.profile_home(cfg, "coder")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    # Without use_oauth: skip
+    result = TAG.import_gemini_into_profile(cfg, profile_name="coder", source_gemini_home=source)
+    assert result["status"] == "skipped-no-auth"
+
+    # With use_oauth: write google_oauth.json and include tos_warning
+    result2 = TAG.import_gemini_into_profile(
+        cfg, profile_name="coder", source_gemini_home=source, use_oauth=True
+    )
+    assert result2["status"] == "imported"
+    assert result2["mode"] == "oauth"
+    assert result2["provider"] == "google-gemini-cli"
+    assert "tos_warning" in result2
+    google_oauth_file = profile_dir / "auth" / "google_oauth.json"
+    assert google_oauth_file.exists()
+    stored = json.loads(google_oauth_file.read_text())
+    assert stored["access_token"] == "ya29.x"
+    assert stored["refresh_token"] == "1//r"
+
+
+# ---------- build_parser exposes new import commands ----------
+
+
+def test_build_parser_exposes_import_claude_and_import_gemini():
+    p = TAG.build_parser()
+    cmds = {}
+    for action in p._actions:
+        if hasattr(action, "_name_parser_map"):
+            cmds = action._name_parser_map
+    assert "import-claude" in cmds, "import-claude subcommand missing from parser"
+    assert "import-gemini" in cmds, "import-gemini subcommand missing from parser"
+    # Verify --use-oauth flag exists on both
+    claude_p = cmds["import-claude"]
+    gemini_p = cmds["import-gemini"]
+    claude_opts = {a.option_strings[0] for a in claude_p._actions if a.option_strings}
+    gemini_opts = {a.option_strings[0] for a in gemini_p._actions if a.option_strings}
+    assert "--use-oauth" in claude_opts
+    assert "--use-oauth" in gemini_opts
+
+
+# ---------- _detect_continue_credentials ----------
+
+
+def test_detect_continue_reads_yaml_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config = {
+        "models": [
+            {"provider": "openai", "model": "gpt-4o", "apiKey": "sk-openai-abc"},
+            {"provider": "anthropic", "model": "claude-3-5-sonnet", "apiKey": "sk-ant-abc"},
+            {"provider": "deepseek", "model": "deepseek-coder", "apiKey": "sk-ds-abc"},
+        ]
+    }
+    (tmp_path / "config.yaml").write_text(
+        "\n".join([
+            "models:",
+            "  - provider: openai",
+            "    model: gpt-4o",
+            "    apiKey: sk-openai-abc",
+            "  - provider: anthropic",
+            "    model: claude-3-5-sonnet",
+            "    apiKey: sk-ant-abc",
+            "  - provider: deepseek",
+            "    model: deepseek-coder",
+            "    apiKey: sk-ds-abc",
+        ]),
+        encoding="utf-8",
+    )
+    result = TAG._detect_continue_credentials(source_home=tmp_path)
+    assert result.get("OPENAI_API_KEY") == "sk-openai-abc"
+    assert result.get("ANTHROPIC_API_KEY") == "sk-ant-abc"
+    assert result.get("DEEPSEEK_API_KEY") == "sk-ds-abc"
+
+
+def test_detect_continue_reads_json_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    cfg = {
+        "models": [
+            {"provider": "mistral", "model": "mistral-large", "apiKey": "sk-ms-abc"},
+            {"provider": "xai", "model": "grok-2", "apiKey": "xai-abc"},
+        ]
+    }
+    (tmp_path / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    result = TAG._detect_continue_credentials(source_home=tmp_path)
+    assert result.get("MISTRAL_API_KEY") == "sk-ms-abc"
+    assert result.get("XAI_API_KEY") == "xai-abc"
+
+
+def test_detect_continue_resolves_localenv_references(tmp_path, monkeypatch):
+    monkeypatch.setenv("MY_OPENAI_KEY", "sk-from-env")
+    (tmp_path / "config.yaml").write_text(
+        "models:\n  - provider: openai\n    apiKey: localEnv:MY_OPENAI_KEY\n",
+        encoding="utf-8",
+    )
+    result = TAG._detect_continue_credentials(source_home=tmp_path)
+    assert result.get("OPENAI_API_KEY") == "sk-from-env"
+
+
+def test_detect_continue_empty_when_no_config(tmp_path, monkeypatch):
+    result = TAG._detect_continue_credentials(source_home=tmp_path)
+    assert result == {}
+
+
+# ---------- import_continue_into_profile ----------
+
+
+def test_import_continue_writes_multiple_env_vars(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    source = tmp_path / "continue"
+    source.mkdir()
+    (source / "config.yaml").write_text(
+        "models:\n"
+        "  - provider: openai\n    apiKey: sk-openai-test\n"
+        "  - provider: mistral\n    apiKey: sk-mistral-test\n",
+        encoding="utf-8",
+    )
+    cfg = load_cfg()
+    profile_dir = TAG.profile_home(cfg, "researcher")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    result = TAG.import_continue_into_profile(cfg, profile_name="researcher", source_continue_home=source)
+    assert result["status"] == "imported"
+    assert "OPENAI_API_KEY" in result["providers_imported"]
+    assert "MISTRAL_API_KEY" in result["providers_imported"]
+    env_vals = TAG.read_dotenv(profile_dir / ".env")
+    assert env_vals.get("OPENAI_API_KEY") == "sk-openai-test"
+    assert env_vals.get("MISTRAL_API_KEY") == "sk-mistral-test"
+
+
+# ---------- _detect_mistral_credentials ----------
+
+
+def test_detect_mistral_picks_up_env_var(tmp_path, monkeypatch):
+    monkeypatch.setenv("MISTRAL_API_KEY", "sk-mistral-env")
+    result = TAG._detect_mistral_credentials(source_home=tmp_path)
+    assert result["api_key"] == "sk-mistral-env"
+
+
+def test_detect_mistral_reads_vibe_dotenv(tmp_path, monkeypatch):
+    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    (tmp_path / ".env").write_text("MISTRAL_API_KEY=sk-mistral-vibe\n", encoding="utf-8")
+    result = TAG._detect_mistral_credentials(source_home=tmp_path)
+    assert result["api_key"] == "sk-mistral-vibe"
+    assert result["source"] is not None
+
+
+# ---------- import_mistral_into_profile ----------
+
+
+def test_import_mistral_writes_env_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "tag-home"))
+    monkeypatch.setenv("MISTRAL_API_KEY", "sk-mistral-real")
+    cfg = load_cfg()
+    profile_dir = TAG.profile_home(cfg, "coder")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    result = TAG.import_mistral_into_profile(cfg, profile_name="coder")
+    assert result["status"] == "imported"
+    assert result["provider"] == "mistral"
+    env_vals = TAG.read_dotenv(profile_dir / ".env")
+    assert env_vals.get("MISTRAL_API_KEY") == "sk-mistral-real"
+
+
+# ---------- build_parser exposes all import commands ----------
+
+
+def test_build_parser_exposes_all_import_commands():
+    p = TAG.build_parser()
+    cmds = {}
+    for action in p._actions:
+        if hasattr(action, "_name_parser_map"):
+            cmds = action._name_parser_map
+    for cmd in ("import-codex", "import-claude", "import-gemini", "import-continue", "import-mistral"):
+        assert cmd in cmds, f"{cmd} subcommand missing from parser"
