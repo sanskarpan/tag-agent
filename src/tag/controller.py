@@ -6024,7 +6024,7 @@ def cmd_hooks(args: argparse.Namespace) -> int:
 
     if sub == "test":
         event_type = args.event_type
-        payload = {"event_type": event_type, "test": "true", "timestamp": str(dt.datetime.utcnow())}
+        payload = {"event_type": event_type, "test": "true", "timestamp": str(dt.datetime.now(dt.timezone.utc))}
         fired = _fire_hooks(cfg, event_type, payload)
         print_success(f"Fired {fired} hook(s) for event '{event_type}'")
         return 0
