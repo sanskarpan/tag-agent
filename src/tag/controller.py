@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,56 @@ try:
     from tag import __version__
 except Exception:  # pragma: no cover - fallback for direct file loading in tests
     __version__ = "0.1.0"
+
+try:
+    from tag.tui_output import (
+        chat_spinner,
+        get_console,
+        make_benchmark_progress,
+        make_submit_progress,
+        print_doctor_report,
+        print_error,
+        print_success,
+        print_warning,
+        send_desktop_notification,
+    )
+
+    _TUI_OUTPUT_AVAILABLE = True
+except Exception:  # pragma: no cover — tui_output not importable in all test environments
+    _TUI_OUTPUT_AVAILABLE = False
+
+    def get_console():  # type: ignore[misc]
+        return None
+
+    def print_error(msg: str) -> None:  # type: ignore[misc]
+        print(f"error: {msg}", file=sys.stderr)
+
+    def print_success(msg: str) -> None:  # type: ignore[misc]
+        print(msg)
+
+    def print_warning(msg: str) -> None:  # type: ignore[misc]
+        print(f"warning: {msg}", file=sys.stderr)
+
+    def print_doctor_report(groups: dict) -> None:  # type: ignore[misc]
+        for group, checks in groups.items():
+            print(f"\n{group.upper()}")
+            for c in checks:
+                st = c.get("status", "pass")
+                icon = {"pass": "✓", "warn": "⚠", "fail": "✗"}.get(st, "?")
+                print(f"  {icon} {c.get('name','?'):<28} {c.get('message','')}")
+
+    def send_desktop_notification(title: str, message: str) -> None:  # type: ignore[misc]
+        pass
+
+    def chat_spinner(profile: str, model: str):  # type: ignore[misc]
+        import contextlib
+        return contextlib.nullcontext()
+
+    def make_benchmark_progress():  # type: ignore[misc]
+        return None
+
+    def make_submit_progress():  # type: ignore[misc]
+        return None
 
 APP_NAME = "TAG"
 CLI_LABEL = "tag"
@@ -125,7 +176,7 @@ def ensure_default_file(target: Path, source: Path) -> Path:
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
-    except PermissionError as exc:
+    except (PermissionError, NotADirectoryError) as exc:
         raise SystemExit(f"Cannot initialize TAG file {target}: {exc.strerror or exc}") from exc
     return target
 
@@ -190,8 +241,11 @@ def benchmark_suite_path(arg_value: str | None) -> Path:
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8-sig") as fh:
-        data = yaml.safe_load(fh) or {}
+    try:
+        with path.open("r", encoding="utf-8-sig") as fh:
+            data = yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        raise SystemExit(f"Config file not found: {path}")
     if not isinstance(data, dict):
         raise SystemExit(f"Config at {path} must be a YAML object.")
     return data
@@ -275,6 +329,18 @@ def profile_exec_env(cfg: dict[str, Any], profile_name: str) -> dict[str, str]:
     env["HERMES_HOME"] = str(profile_home(cfg, profile_name))
     for key, value in read_dotenv(profile_home(cfg, profile_name) / ".env").items():
         env[key] = value
+    # PRD-002: inject memory journal as system prompt prefix when DB exists
+    db_path = runtime_db_path(cfg)
+    if db_path.exists():
+        try:
+            _db = sqlite3.connect(str(db_path), timeout=2)
+            _db.row_factory = sqlite3.Row
+            prefix = journal_to_prompt_prefix(_db, profile_name)
+            _db.close()
+            if prefix:
+                env["HERMES_SYSTEM_INJECT"] = prefix
+        except Exception:  # pragma: no cover — DB not yet initialised or locked
+            pass
     return env
 
 
@@ -337,9 +403,230 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
           extra_json TEXT NOT NULL,
           FOREIGN KEY(run_id) REFERENCES runs(id)
         );
+
+        CREATE TABLE IF NOT EXISTS memory_journal (
+          id          TEXT PRIMARY KEY,
+          profile     TEXT NOT NULL,
+          key         TEXT NOT NULL,
+          value       TEXT NOT NULL,
+          scope       TEXT NOT NULL DEFAULT 'profile',
+          created_at  TEXT NOT NULL,
+          expires_at  TEXT,
+          UNIQUE(profile, key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mj_profile ON memory_journal(profile);
+
+        CREATE TABLE IF NOT EXISTS queue_jobs (
+          id          TEXT PRIMARY KEY,
+          profile     TEXT NOT NULL,
+          task        TEXT NOT NULL,
+          task_type   TEXT NOT NULL DEFAULT 'mixed',
+          status      TEXT NOT NULL DEFAULT 'queued',
+          priority    INTEGER NOT NULL DEFAULT 5,
+          created_at  TEXT NOT NULL,
+          started_at  TEXT,
+          finished_at TEXT,
+          pid         INTEGER,
+          result_path TEXT,
+          exit_code   INTEGER,
+          error       TEXT,
+          notify      INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_qj_status ON queue_jobs(status, priority, created_at);
         """
     )
     return conn
+
+
+# ---------------------------------------------------------------------------
+# PRD-002: Memory Journal helpers
+# ---------------------------------------------------------------------------
+
+def journal_save(
+    db: sqlite3.Connection,
+    profile: str,
+    key: str,
+    value: str,
+    *,
+    ttl_days: int | None = None,
+) -> str:
+    """Upsert a key→value fact. Returns the row id."""
+    # Strip null bytes — they corrupt display and are never meaningful in text facts
+    key = key.replace("\x00", "").strip()
+    value = value.replace("\x00", "")
+    if not key:
+        raise ValueError("journal key must not be empty")
+    entry_id = uuid.uuid4().hex[:12]
+    now = utc_now()
+    expires_at: str | None = None
+    if ttl_days is not None:
+        if ttl_days <= 0:
+            raise ValueError(f"ttl_days must be positive, got {ttl_days}")
+        import datetime
+        expires_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=ttl_days)
+        expires_at = expires_dt.isoformat()
+    db.execute(
+        """INSERT INTO memory_journal(id, profile, key, value, scope, created_at, expires_at)
+           VALUES(?,?,?,?,'profile',?,?)
+           ON CONFLICT(profile, key) DO UPDATE SET
+             value=excluded.value, expires_at=excluded.expires_at, created_at=excluded.created_at""",
+        (entry_id, profile, key, value, now, expires_at),
+    )
+    db.commit()
+    existing = db.execute(
+        "SELECT id FROM memory_journal WHERE profile=? AND key=?", (profile, key)
+    ).fetchone()
+    return existing[0] if existing else entry_id
+
+
+def journal_list(
+    db: sqlite3.Connection,
+    profile: str,
+    *,
+    include_global: bool = True,
+) -> list[dict[str, Any]]:
+    """Return all non-expired entries for profile (plus global if include_global)."""
+    now = utc_now()
+    if include_global:
+        rows = db.execute(
+            """SELECT id, profile, key, value, scope, created_at, expires_at
+               FROM memory_journal
+               WHERE (profile=? OR profile='*')
+                 AND (expires_at IS NULL OR expires_at > ?)
+               ORDER BY created_at""",
+            (profile, now),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            """SELECT id, profile, key, value, scope, created_at, expires_at
+               FROM memory_journal
+               WHERE profile=?
+                 AND (expires_at IS NULL OR expires_at > ?)
+               ORDER BY created_at""",
+            (profile, now),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def journal_forget(db: sqlite3.Connection, entry_id: str) -> bool:
+    """Delete entry by id. Returns True if deleted."""
+    cursor = db.execute("DELETE FROM memory_journal WHERE id=?", (entry_id,))
+    db.commit()
+    return cursor.rowcount > 0
+
+
+def journal_clear(db: sqlite3.Connection, profile: str) -> int:
+    """Delete all non-global entries for profile. Returns count deleted."""
+    cursor = db.execute(
+        "DELETE FROM memory_journal WHERE profile=? AND profile != '*'", (profile,)
+    )
+    db.commit()
+    return cursor.rowcount
+
+
+def journal_to_prompt_prefix(db: sqlite3.Connection, profile: str) -> str | None:
+    """Format non-expired journal entries as a system-prompt injection block."""
+    entries = journal_list(db, profile)
+    if not entries:
+        return None
+    lines = ["## Persistent Context (TAG Memory Journal)"]
+    for e in entries:
+        lines.append(f"- {e['key']}: {e['value']}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# PRD-008: Queue job helpers
+# ---------------------------------------------------------------------------
+
+def queue_insert_job(
+    db: sqlite3.Connection,
+    job_id: str,
+    profile: str,
+    task: str,
+    *,
+    task_type: str = "mixed",
+    priority: int = 5,
+    notify: bool = True,
+) -> None:
+    db.execute(
+        """INSERT INTO queue_jobs(id, profile, task, task_type, status, priority, created_at, notify)
+           VALUES(?,?,?,?,'queued',?,?,?)""",
+        (job_id, profile, task, task_type, priority, utc_now(), 1 if notify else 0),
+    )
+    db.commit()
+
+
+def queue_update_pid(db: sqlite3.Connection, job_id: str, pid: int) -> None:
+    db.execute("UPDATE queue_jobs SET pid=? WHERE id=?", (pid, job_id))
+    db.commit()
+
+
+def queue_update_status(db: sqlite3.Connection, job_id: str, status: str) -> None:
+    db.execute(
+        "UPDATE queue_jobs SET status=?, finished_at=? WHERE id=?",
+        (status, utc_now(), job_id),
+    )
+    db.commit()
+
+
+def queue_get_job(db: sqlite3.Connection, job_id: str) -> dict[str, Any] | None:
+    row = db.execute("SELECT * FROM queue_jobs WHERE id=?", (job_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def queue_list_jobs(
+    db: sqlite3.Connection,
+    *,
+    status: str | None = None,
+    profile: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    query = "SELECT * FROM queue_jobs WHERE 1=1"
+    params: list[Any] = []
+    if status:
+        query += " AND status=?"
+        params.append(status)
+    if profile:
+        query += " AND profile=?"
+        params.append(profile)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    return [dict(r) for r in db.execute(query, params).fetchall()]
+
+
+def queue_clear_completed(db: sqlite3.Connection) -> int:
+    cursor = db.execute(
+        "DELETE FROM queue_jobs WHERE status IN ('done','failed','cancelled')"
+    )
+    db.commit()
+    return cursor.rowcount
+
+
+def launch_queue_worker(cfg: dict[str, Any], job_id: str) -> int:
+    """Launch queue worker as a detached process. Returns PID."""
+    python = sys.executable
+    config_arg = str(config_path(None))
+    db_arg = str(runtime_db_path(cfg))
+    cmd = [
+        python,
+        "-m",
+        "tag.queue_worker",
+        "--job-id",
+        job_id,
+        "--config",
+        config_arg,
+        "--db",
+        db_arg,
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    return proc.pid
 
 
 def run_hermes(cfg: dict[str, Any], *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -358,6 +645,7 @@ def run_profile_hermes(
     profile_name: str,
     *args: str,
     check: bool = True,
+    timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     ensure_runtime_dirs(cfg)
     return subprocess.run(
@@ -366,6 +654,7 @@ def run_profile_hermes(
         text=True,
         capture_output=True,
         check=check,
+        timeout=timeout,
     )
 
 
@@ -386,8 +675,19 @@ def read_dotenv(path: Path) -> dict[str, str]:
     return values
 
 
+def _sanitize_env_value(value: str) -> str:
+    """Strip characters that would break .env line format or enable injection.
+
+    Newlines would create additional KEY=VALUE entries; null bytes corrupt
+    the file on some platforms. Strip both. Callers should validate further
+    if they expect a specific format (e.g. URL, token).
+    """
+    return value.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").replace("\x00", "")
+
+
 def _upsert_env_line(env_file: Path, key: str, value: str) -> None:
     """Write or replace KEY=VALUE in an .env file without disturbing other lines."""
+    value = _sanitize_env_value(value)
     env_file.parent.mkdir(parents=True, exist_ok=True)
     lines = env_file.read_text(encoding="utf-8").splitlines() if env_file.exists() else []
     prefix = f"{key}="
@@ -605,15 +905,115 @@ def install_profile_skins(cfg: dict[str, Any], profile_name: str, force: bool) -
     return installed
 
 
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge override into base. Used by render_profiles (PRD-010)."""
+    result = dict(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def _apply_memory_config(
+    profile_cfg: dict[str, Any],
+    env_file: Path,
+    memory_section: dict[str, Any],
+) -> None:
+    """PRD-001: Write memory backend config keys into profile_cfg dict."""
+    provider = memory_section.get("provider", "none")
+    if not provider or provider == "none":
+        return
+
+    profile_cfg["memory"] = {"provider": provider}
+
+    if provider == "supermemory":
+        sm = memory_section.get("supermemory", {})
+        if sm.get("session_ingest"):
+            profile_cfg["memory"]["session_ingest"] = True
+            _upsert_env_line(env_file, "SUPERMEMORY_SESSION_INGEST", "1")
+
+    elif provider == "honcho":
+        honcho = memory_section.get("honcho", {})
+        base_url = honcho.get("base_url", "http://localhost:8001")
+        app_name = honcho.get("app_name", "tag")
+        profile_cfg["memory"]["base_url"] = base_url
+        profile_cfg["memory"]["app_name"] = app_name
+
+    elif provider == "local":
+        pass  # hermes-local-memory plugin picks up {"provider": "local"}
+
+
 def render_profiles(cfg: dict[str, Any], force: bool) -> list[dict[str, str]]:
     results: list[dict[str, str]] = []
     profiles = cfg.get("profiles", {})
     for name, profile in profiles.items():
         home = profile_home(cfg, name)
         config_file = home / "config.yaml"
+        env_file = home / ".env"
         env_example = home / ".env.example"
-        profile_cfg = profile.get("config", {})
-        write_yaml(config_file, profile_cfg, force=force)
+
+        # PRD-010: deep-merge with existing config to preserve panel edits
+        existing: dict[str, Any] = {}
+        if config_file.exists() and not force:
+            try:
+                existing = yaml.safe_load(config_file.read_text()) or {}
+            except yaml.YAMLError:
+                existing = {}
+
+        profile_cfg = dict(profile.get("config", {}))
+
+        # PRD-001: apply memory backend config
+        memory_section = profile_cfg.pop("memory", None)
+        if memory_section:
+            _apply_memory_config(profile_cfg, env_file, memory_section)
+
+        # PRD-001: apply gateway config
+        gateway_section = profile_cfg.pop("gateway", None)
+        if gateway_section and gateway_section.get("enabled"):
+            profile_cfg["gateway"] = {"use_gateway": True}
+            if tools := gateway_section.get("tools"):
+                profile_cfg["gateway"]["allowed_tools"] = tools
+
+        # PRD-005: apply execution backend config
+        exec_section = profile_cfg.pop("execution", None)
+        if exec_section:
+            backend = exec_section.get("backend", "local")
+            if backend != "local":
+                exec_out: dict[str, Any] = {"backend": backend}
+                if backend == "docker":
+                    docker_cfg = exec_section.get("docker", {})
+                    exec_out["docker"] = {
+                        "image": docker_cfg.get("image", "ubuntu:22.04"),
+                        "auto_pull": docker_cfg.get("auto_pull", True),
+                    }
+                    if volumes := docker_cfg.get("extra_volumes"):
+                        exec_out["docker"]["extra_volumes"] = volumes
+                elif backend == "ssh":
+                    ssh_cfg = exec_section.get("ssh", {})
+                    exec_out["ssh"] = {
+                        "host": ssh_cfg.get("host", ""),
+                        "user": ssh_cfg.get("user", ""),
+                        "port": ssh_cfg.get("port", 22),
+                        "key_file": str(Path(ssh_cfg.get("key_file", "~/.ssh/id_rsa")).expanduser()),
+                        "remote_work_dir": ssh_cfg.get("remote_work_dir", "/tmp/tag-agent"),
+                    }
+                elif backend == "modal":
+                    modal_cfg = exec_section.get("modal", {})
+                    exec_out["modal"] = {
+                        "app_name": modal_cfg.get("app_name", f"tag-{name}"),
+                        "gpu": modal_cfg.get("gpu", ""),
+                    }
+                elif backend == "daytona":
+                    daytona_cfg = exec_section.get("daytona", {})
+                    exec_out["daytona"] = {
+                        "workspace_id": daytona_cfg.get("workspace_id", ""),
+                    }
+                profile_cfg["execution"] = exec_out
+
+        merged_cfg = _deep_merge(existing, profile_cfg)
+        write_yaml(config_file, merged_cfg, force=True)
         write_text(env_example, merged_env_example(cfg, name), force=force)
         installed_skins = install_profile_skins(cfg, name, force=force)
         results.append(
@@ -888,7 +1288,10 @@ def run_chat_step(
 
 
 def load_benchmark_suite(path: Path) -> list[dict[str, Any]]:
-    payload = load_config(path)
+    try:
+        payload = load_config(path)
+    except SystemExit:
+        raise FileNotFoundError(path)
     cases = payload.get("cases", [])
     if not isinstance(cases, list):
         raise SystemExit(f"Benchmark suite at {path} must contain a 'cases' list.")
@@ -2575,12 +2978,674 @@ def cmd_logs(args: argparse.Namespace) -> int:
     return cmd_hermes_command(args, "logs")
 
 
+def _dashboard_snapshot(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Read current TAG state for dashboard display — pure SQLite, no hermes."""
+    snap: dict[str, Any] = {"runs": [], "queue": [], "journal_count": 0, "kanban": {}}
+    try:
+        db = open_db(cfg)
+        # Recent runs (last 20)
+        rows = db.execute(
+            "SELECT id AS run_id, kind, task_type, master_profile, status, "
+            "created_at FROM runs ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+        snap["runs"] = [dict(r) for r in rows]
+        # Queue jobs
+        snap["queue"] = queue_list_jobs(db, status=None)
+        # Journal entry count across all profiles
+        snap["journal_count"] = db.execute(
+            "SELECT COUNT(*) FROM memory_journal"
+        ).fetchone()[0]
+        db.close()
+    except Exception:
+        pass
+
+    # Per-profile kanban summary (direct SQLite reads, no hermes)
+    kanban_by_profile: dict[str, Any] = {}
+    for pname in cfg.get("profiles", {}):
+        try:
+            kpath = _kanban.profile_kanban_db_path(cfg, pname)
+            if not kpath.exists():
+                continue
+            kconn = _kanban.open_db(kpath)
+            tasks = _kanban.list_tasks(kconn)
+            kconn.close()
+            by_status: dict[str, int] = {}
+            for t in tasks:
+                by_status[t["status"]] = by_status.get(t["status"], 0) + 1
+            kanban_by_profile[pname] = {"total": len(tasks), "by_status": by_status}
+        except Exception:
+            pass
+    snap["kanban"] = kanban_by_profile
+    return snap
+
+
+def _render_dashboard_plain(snap: dict[str, Any], profile: str) -> None:
+    """Print a static dashboard snapshot (fallback when Rich unavailable)."""
+    import datetime
+    print(f"\n=== TAG Dashboard  (profile: {profile}) ===")
+
+    runs = snap.get("runs", [])
+    print(f"\nRuns ({len(runs)} recent):")
+    if runs:
+        print(f"  {'ID':<10} {'KIND':<10} {'PROFILE':<16} {'STATUS':<12} WHEN")
+        for r in runs[:10]:
+            try:
+                ts = datetime.datetime.fromisoformat(r.get("created_at") or "").strftime("%H:%M")
+            except Exception:
+                ts = "?"
+            print(f"  {r['run_id']:<10} {r['kind']:<10} {r['master_profile']:<16} "
+                  f"{r['status']:<12} {ts}")
+    else:
+        print("  (none)")
+
+    queue = snap.get("queue", [])
+    print(f"\nQueue ({len(queue)} jobs):")
+    if queue:
+        for j in queue[:8]:
+            print(f"  [{j['id']}] {j['status']:<10} {j.get('task','')[:40]}")
+    else:
+        print("  (empty)")
+
+    print(f"\nMemory journal entries: {snap.get('journal_count', 0)}")
+
+    kanban = snap.get("kanban", {})
+    if kanban:
+        print("\nKanban boards:")
+        for pname, info in kanban.items():
+            by_s = info.get("by_status", {})
+            parts = ", ".join(f"{s}:{n}" for s, n in by_s.items())
+            print(f"  {pname}: {info['total']} tasks  [{parts}]")
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
-    return cmd_hermes_command(args, "dashboard")
+    """TAG-native live dashboard — reads directly from TAG's SQLite state (PRD-010).
+
+    No hermes binary dependency. Shows runs, queue, journal, and kanban
+    board status for all profiles. Refreshes every few seconds.
+    Use --no-browser to suppress the browser open (legacy flag, kept for
+    CLI compat; dashboard is terminal-only).
+    """
+    cfg = load_config(config_path(args.config))
+    profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+    if profile not in cfg.get("profiles", {}):
+        print(f"warning: unknown profile '{profile}'", file=sys.stderr)
+    refresh_secs = getattr(args, "port", None) or 3  # --port reused as refresh interval
+    # Note: --port is repurposed here as refresh_seconds for the live view.
+    # A value ≥10 is assumed to be a port (legacy hermes mode); ≤9 is refresh rate.
+    if isinstance(refresh_secs, int) and refresh_secs >= 10:
+        refresh_secs = 3
+
+    try:
+        from rich.console import Console
+        from rich.live import Live
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich import box
+        import datetime
+
+        console = Console()
+
+        def make_layout() -> Panel:
+            snap = _dashboard_snapshot(cfg)
+
+            run_table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan",
+                              expand=True, min_width=60)
+            run_table.add_column("ID", width=10)
+            run_table.add_column("Kind", width=10)
+            run_table.add_column("Profile", width=16)
+            run_table.add_column("Status", width=12)
+            run_table.add_column("When", width=8)
+            for r in snap.get("runs", [])[:8]:
+                try:
+                    ts = datetime.datetime.fromisoformat(r.get("created_at") or "").strftime("%H:%M")
+                except Exception:
+                    ts = "?"
+                s = r["status"]
+                style = "green" if s == "completed" else "red" if s == "failed" else "yellow"
+                run_table.add_row(r["run_id"], r["kind"], r["master_profile"],
+                                  f"[{style}]{s}[/{style}]", ts)
+
+            q_table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan",
+                            expand=True, min_width=60)
+            q_table.add_column("Job", width=10)
+            q_table.add_column("Status", width=12)
+            q_table.add_column("Task", width=40)
+            for j in snap.get("queue", [])[:6]:
+                s = j["status"]
+                style = "green" if s == "done" else "red" if s in ("failed","cancelled") else "yellow"
+                q_table.add_row(j["id"], f"[{style}]{s}[/{style}]", (j.get("task") or "")[:40])
+
+            kb_table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan",
+                             expand=True, min_width=40)
+            kb_table.add_column("Profile", width=16)
+            kb_table.add_column("Total", width=6)
+            kb_table.add_column("Ready/Running", width=14)
+            kb_table.add_column("Done", width=6)
+            for pname, info in snap.get("kanban", {}).items():
+                by_s = info.get("by_status", {})
+                active = by_s.get("ready", 0) + by_s.get("running", 0)
+                done = by_s.get("done", 0)
+                kb_table.add_row(pname, str(info["total"]), str(active), str(done))
+
+            from rich.columns import Columns
+            from rich.text import Text
+            header = Text(
+                f"TAG Dashboard  ·  profile: {profile}  ·  "
+                f"journal entries: {snap.get('journal_count', 0)}  ·  "
+                f"Press Ctrl+C to exit",
+                style="bold",
+            )
+            from rich.layout import Layout
+            layout = Layout()
+            layout.split_column(
+                Layout(header, size=1),
+                Layout(Panel(run_table, title="[bold]Runs[/bold]"), name="runs"),
+                Layout(
+                    Columns([
+                        Panel(q_table, title="[bold]Queue[/bold]"),
+                        Panel(kb_table, title="[bold]Kanban[/bold]"),
+                    ]),
+                    name="bottom",
+                    size=12,
+                ),
+            )
+            return Panel(layout, title="[bold blue]TAG[/bold blue]", border_style="blue")
+
+        with Live(make_layout(), console=console, refresh_per_second=0.5,
+                  screen=True) as live:
+            while True:
+                time.sleep(refresh_secs)
+                live.update(make_layout())
+
+    except KeyboardInterrupt:
+        pass
+    except ImportError:
+        # Rich not available — static snapshot
+        snap = _dashboard_snapshot(cfg)
+        _render_dashboard_plain(snap, profile)
+    return 0
 
 
 def cmd_memory(args: argparse.Namespace) -> int:
     return cmd_hermes_command(args, "memory")
+
+
+# ---------------------------------------------------------------------------
+# PRD-002: Memory Journal command
+# ---------------------------------------------------------------------------
+
+def cmd_memory_journal(args: argparse.Namespace) -> int:
+    """Tag-native cross-session memory journal (key→value facts per profile)."""
+    cfg = load_config(config_path(args.config))
+    ensure_runtime_dirs(cfg)
+    db = open_db(cfg)
+    sub = getattr(args, "mj_subcommand", None) or "list"
+    profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+
+    if sub == "save":
+        entry_id = journal_save(db, profile, args.key, args.value, ttl_days=getattr(args, "ttl_days", None))
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps({"id": entry_id, "profile": profile, "key": args.key}))
+        else:
+            print(f"saved: {entry_id}")
+        return 0
+
+    if sub == "list":
+        entries = journal_list(db, profile)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(entries, indent=2))
+            return 0
+        if not entries:
+            print(f"No memory journal entries for profile '{profile}'.")
+            return 0
+        for e in entries:
+            exp = f" (expires {e['expires_at'][:10]})" if e.get("expires_at") else ""
+            print(f"  [{e['id']}] {e['key']}: {e['value']}{exp}")
+        return 0
+
+    if sub == "forget":
+        deleted = journal_forget(db, args.entry_id)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps({"deleted": deleted}))
+        else:
+            print("deleted" if deleted else "not found")
+        return 0 if deleted else 1
+
+    if sub == "clear":
+        if not getattr(args, "confirm", False):
+            print("Pass --confirm to clear all journal entries for this profile.")
+            db.close()
+            return 1
+        count = journal_clear(db, profile)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps({"cleared": count}))
+        else:
+            print(f"cleared {count} entries")
+        return 0
+
+    db.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-008: Background task queue command
+# ---------------------------------------------------------------------------
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    """Background task queue — submit, list, result, cancel."""
+    cfg = load_config(config_path(args.config))
+    ensure_runtime_dirs(cfg)
+    db = open_db(cfg)
+    sub = getattr(args, "queue_subcommand", "list")
+
+    if sub == "add":
+        task_text = (args.task or "").replace("\x00", "").strip()
+        if not task_text:
+            db.close()
+            print("error: task text must not be empty.", file=sys.stderr)
+            return 1
+        job_id = uuid.uuid4().hex[:8]
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        task_type = getattr(args, "task_type", "mixed") or "mixed"
+        priority_arg = getattr(args, "priority", None)
+        priority = priority_arg if priority_arg is not None else 5
+        if not (1 <= priority <= 10):
+            db.close()
+            print(f"error: --priority must be between 1 and 10, got {priority}.", file=sys.stderr)
+            return 1
+        notify = not getattr(args, "no_notify", False)
+        queue_insert_job(db, job_id, profile, task_text, task_type=task_type, priority=priority, notify=notify)
+        pid = launch_queue_worker(cfg, job_id)
+        queue_update_pid(db, job_id, pid)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps({"job_id": job_id, "pid": pid, "status": "queued"}))
+        else:
+            print(f"queued: {job_id}  (worker pid {pid})")
+        return 0
+
+    if sub == "list":
+        status_filter = getattr(args, "status_filter", None)
+        limit = getattr(args, "limit", 50) or 50
+        jobs = queue_list_jobs(db, status=status_filter, limit=limit + 1)
+        total_indicator = len(jobs) > limit
+        if total_indicator:
+            jobs = jobs[:limit]
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(jobs, indent=2))
+            return 0
+        if not jobs:
+            print("No jobs in queue.")
+            return 0
+        print(f"  {'ID':<10} {'STATUS':<12} {'PROFILE':<16} {'TASK'}")
+        print("  " + "─" * 70)
+        for j in jobs:
+            task_short = (j.get("task") or "")[:40]
+            print(f"  {j['id']:<10} {j['status']:<12} {j.get('profile','?'):<16} {task_short}")
+        if total_indicator:
+            print(f"  (showing {limit} of more — use --limit N to see more)")
+        return 0
+
+    if sub == "result":
+        job = queue_get_job(db, args.job_id)
+        db.close()
+        if not job:
+            print(f"Job '{args.job_id}' not found.", file=sys.stderr)
+            return 1
+        result_path = job.get("result_path")
+        if result_path and Path(result_path).exists():
+            print(Path(result_path).read_text())
+        else:
+            print(f"No result yet (status: {job['status']})")
+        return 0
+
+    if sub == "cancel":
+        job = queue_get_job(db, args.job_id)
+        if not job:
+            db.close()
+            print(f"Job '{args.job_id}' not found.", file=sys.stderr)
+            return 1
+        if job["status"] in ("done", "failed", "cancelled"):
+            db.close()
+            print(f"Job '{args.job_id}' is already {job['status']}.", file=sys.stderr)
+            return 1
+        pid = job.get("pid")
+        if pid:
+            import signal as _signal
+            try:
+                os.kill(pid, _signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        queue_update_status(db, args.job_id, "cancelled")
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps({"job_id": args.job_id, "status": "cancelled"}))
+        else:
+            print(f"cancelled: {args.job_id}")
+        return 0
+
+    if sub == "clear":
+        count = queue_clear_completed(db)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps({"cleared": count}))
+        else:
+            print(f"cleared {count} completed/failed jobs")
+        return 0
+
+    db.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-004: Kanban swarm topology helper (native, no hermes binary required)
+# ---------------------------------------------------------------------------
+
+import tag.kanban as _kanban
+
+
+def _try_start_gateway(cfg: dict[str, Any], profile_name: str) -> None:
+    """Best-effort: start hermes gateway so it can dispatch tasks we created.
+
+    Management-plane operations (create/monitor tasks) don't need this.
+    Execution-plane (AI agents running tasks) does. Fire-and-forget.
+    """
+    try:
+        hbin = hermes_bin(cfg)
+        if not hbin.exists():
+            return
+        env = profile_exec_env(cfg, profile_name)
+        result = subprocess.run(
+            [str(hbin), "gateway", "status"],
+            env={**os.environ, **env},
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return
+        subprocess.Popen(
+            [str(hbin), "gateway", "start"],
+            env={**os.environ, **env},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(1)
+    except Exception:
+        pass
+
+
+def cmd_swarm(args: argparse.Namespace) -> int:
+    """Create a kanban swarm using TAG's native kanban layer (PRD-004).
+
+    Management plane (task creation + monitoring) is pure SQLite — no hermes
+    binary and no AI API key needed. Execution (agents running tasks) still
+    goes through the hermes gateway, which needs a profile API key. That's
+    expected: you need AI credentials to run AI.
+    """
+    cfg = load_config(config_path(args.config))
+
+    task_type = getattr(args, "task_type", "mixed") or "mixed"
+    board = getattr(args, "board", None) or cfg["defaults"].get("board", "default")
+    profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+    task_text = args.task
+
+    if profile not in cfg.get("profiles", {}):
+        print(f"warning: unknown profile '{profile}' — not found in config", file=sys.stderr)
+
+    try:
+        route = resolve_route(cfg, task_type, profile, [])
+    except SystemExit:
+        route = {}
+
+    workers_cfg = route.get("workers", [])
+    verifier_cfg = route.get("verifier") or {}
+    verifier_name = (
+        verifier_cfg.get("name") if isinstance(verifier_cfg, dict) else str(verifier_cfg)
+    ) or profile
+    synthesizer_name = profile
+
+    # Validate inputs early — before inserting any DB records
+    task_text = task_text.replace("\x00", "").strip()
+    if not task_text:
+        print("error: task/goal text must not be empty.", file=sys.stderr)
+        return 1
+
+    try:
+        kanban_path = _kanban.profile_kanban_db_path(cfg, profile, board)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    worker_specs: list[tuple[str, str]] = [
+        (
+            (w.get("name") if isinstance(w, dict) else str(w)),
+            task_text[:80],
+        )
+        for w in workers_cfg
+    ]
+    if not worker_specs:
+        defaults = [p for p in ["researcher", "coder"] if p in cfg.get("profiles", {})]
+        worker_specs = [(w, task_text[:80]) for w in (defaults or [profile])]
+
+    db = open_db(cfg)
+    run_id = str(uuid.uuid4())[:8]
+    insert_run(
+        db,
+        run_id=run_id,
+        kind="swarm",
+        task_type=task_type,
+        execution="kanban",
+        master_profile=profile,
+        board=board,
+        prompt=task_text,
+        route=route,
+        status="running",
+        metadata={},
+    )
+
+    print(f"Swarm run: {run_id}")
+    print(f"Profile: {profile}  Board: {board}  Task: {task_text[:60]}")
+
+    try:
+        kconn = _kanban.open_db(kanban_path)
+    except Exception as exc:
+        print(f"kanban db error: {exc}", file=sys.stderr)
+        update_run_status(db, run_id=run_id, status="failed")
+        db.close()
+        return 1
+
+    idem_key = hashlib.sha256(f"{board}:{task_text}".encode()).hexdigest()[:16]
+    try:
+        topology = _kanban.create_swarm(
+            kconn,
+            goal=task_text,
+            workers=worker_specs,
+            verifier_assignee=verifier_name,
+            synthesizer_assignee=synthesizer_name,
+            idempotency_key=idem_key,
+        )
+    except Exception as exc:
+        print(f"swarm creation failed: {exc}", file=sys.stderr)
+        update_run_status(db, run_id=run_id, status="failed")
+        kconn.close()
+        db.close()
+        return 1
+
+    # Best-effort: nudge gateway to start picking up the tasks
+    _try_start_gateway(cfg, profile)
+
+    swarm_out = {
+        "run_id": run_id,
+        "status": "running",
+        "swarm": topology,
+        "kanban_db": str(kanban_path),
+    }
+
+    if getattr(args, "no_wait", False):
+        update_run_status(db, run_id=run_id, status="running")
+        kconn.close()
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(swarm_out))
+        else:
+            print(f"Swarm created: root={topology['root_id']}  "
+                  f"workers={topology['worker_ids']}")
+            print(f"Kanban DB: {kanban_path}")
+        return 0
+
+    # Monitor via direct SQLite reads — no hermes binary, no API key
+    poll_interval = cfg.get("swarm", {}).get("poll_interval_seconds", 5)
+    max_wait = cfg.get("swarm", {}).get("max_wait_seconds", 3600)
+    deadline = time.time() + max_wait
+    all_task_ids = (
+        topology["worker_ids"]
+        + [topology["verifier_id"], topology["synthesizer_id"]]
+    )
+
+    try:
+        while time.time() < deadline:
+            if _kanban.tasks_are_terminal(kconn, all_task_ids):
+                break
+            snap = _kanban.swarm_status_summary(kconn, topology)
+            print(f"\r  {snap['done']}/{snap['total']} tasks done", end="", flush=True)
+            time.sleep(poll_interval)
+    except KeyboardInterrupt:
+        print()
+        update_run_status(db, run_id=run_id, status="interrupted")
+        kconn.close()
+        db.close()
+        sys.exit(130)
+
+    print()
+    final = _kanban.swarm_status_summary(kconn, topology)
+    kconn.close()
+
+    status = "completed" if final["complete"] else "timeout"
+    update_run_status(db, run_id=run_id, status=status)
+    db.close()
+
+    if getattr(args, "json", False):
+        print(json.dumps({**swarm_out, "status": status, "final": final}))
+    else:
+        print(f"Swarm {status}: {run_id}  ({final['done']}/{final['total']} tasks done)")
+    return 0 if status == "completed" else 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-007: Desktop Electron app launcher
+# ---------------------------------------------------------------------------
+
+def desktop_build_root(cfg: dict[str, Any]) -> Path:
+    return runtime_home(cfg) / "desktop"
+
+
+def desktop_app_path(cfg: dict[str, Any]) -> Path | None:
+    """Return the built Electron app binary path, or None if not built."""
+    import platform
+    build_root = desktop_build_root(cfg)
+    system = platform.system()
+
+    if system == "Darwin":
+        apps = list((build_root / "build").glob("*.app/Contents/MacOS/*")) if (build_root / "build").exists() else []
+        return apps[0] if apps else None
+    if system == "Linux":
+        build_dir = build_root / "build"
+        if build_dir.exists():
+            appimages = list(build_dir.glob("*.AppImage"))
+            unpacked = list((build_dir / "linux-unpacked").glob("*")) if (build_dir / "linux-unpacked").exists() else []
+            candidates = appimages + [p for p in unpacked if p.is_file() and os.access(p, os.X_OK)]
+            return candidates[0] if candidates else None
+    if system == "Windows":
+        build_dir = build_root / "build" / "win-unpacked"
+        if build_dir.exists():
+            exes = list(build_dir.glob("*.exe"))
+            return exes[0] if exes else None
+    return None
+
+
+def build_desktop_app(cfg: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+    """Build Electron desktop app from the Hermes vendor tarball."""
+    hermes_checkout = hermes_root(cfg)
+    desktop_src = hermes_checkout / "apps" / "desktop"
+
+    if not desktop_src.exists():
+        return {"status": "no_source", "message": "apps/desktop not found in hermes checkout"}
+
+    build_root = desktop_build_root(cfg)
+    build_root.mkdir(parents=True, exist_ok=True)
+
+    if force or not (build_root / "package.json").exists():
+        try:
+            shutil.copytree(
+                desktop_src,
+                build_root,
+                dirs_exist_ok=True,
+                symlinks=True,
+                ignore_dangling_symlinks=True,
+            )
+        except shutil.Error as _copy_err:
+            # Non-fatal: broken symlinks in node_modules/.bin — npm install fixes them
+            pass
+
+    npm_bin = shutil.which("npm")
+    if not npm_bin:
+        return {"status": "error", "message": "npm not found"}
+
+    install = subprocess.run([npm_bin, "install"], cwd=build_root, capture_output=True, text=True)
+    if install.returncode != 0:
+        return {"status": "install_failed", "stderr": install.stderr[-500:]}
+
+    build = subprocess.run(
+        [npm_bin, "run", "build"],
+        cwd=build_root,
+        env={**os.environ, "ELECTRON_BUILDER_COMPRESSION_LEVEL": "1"},
+        capture_output=True,
+        text=True,
+    )
+    if build.returncode != 0:
+        return {"status": "build_failed", "stderr": build.stderr[-500:]}
+
+    app = desktop_app_path(cfg)
+    return {
+        "status": "built" if app else "build_output_missing",
+        "app_path": str(app) if app else None,
+    }
+
+
+def cmd_desktop(args: argparse.Namespace) -> int:
+    """PRD-007: Build and launch the Electron desktop app."""
+    cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    sub = getattr(args, "desktop_subcommand", "open")
+
+    if sub == "build":
+        print("Building Electron desktop app (this may take 2–3 minutes)…")
+        result = build_desktop_app(cfg, force=getattr(args, "force", False))
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2))
+            return 0
+        if result["status"] == "built":
+            print(f"Built: {result['app_path']}")
+            return 0
+        print(f"Build failed ({result['status']}): {result.get('message', result.get('stderr', ''))}", file=sys.stderr)
+        return 1
+
+    # sub == "open"
+    app = desktop_app_path(cfg)
+    if not app:
+        print("Desktop app not built. Run: tag desktop build", file=sys.stderr)
+        return 1
+
+    profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+    env = {**os.environ, **profile_exec_env(cfg, profile), "TAG_DESKTOP_PROFILE": profile}
+    subprocess.Popen([str(app)], env=env)
+    print(f"Launched desktop (profile: {profile})")
+    return 0
 
 
 def cmd_completion(args: argparse.Namespace) -> int:
@@ -2632,43 +3697,291 @@ def cmd_default(args: argparse.Namespace) -> int:
     return cmd_tui(tui_args)
 
 
-def cmd_doctor(args: argparse.Namespace) -> int:
-    cfg = load_config(config_path(args.config))
-    env = hermes_env(cfg)
-    report = {
-        "app_name": APP_NAME,
-        "package_root": str(package_root()),
-        "tag_home": str(tag_home()),
-        "managed_root": str(managed_root()),
-        "hermes_root": str(hermes_root(cfg)),
-        "hermes_bin_exists": hermes_bin(cfg).exists(),
-        "home": env["HOME"],
-        "hermes_home": env["HERMES_HOME"],
-        "codex_home": env["CODEX_HOME"],
-        "config": str(config_path(args.config)),
-        "benchmark_suite": str(benchmark_suite_path(None)),
-        "prerequisites": doctor_prerequisites(cfg),
-    }
-    if hermes_bin(cfg).exists():
+def _doctor_system_checks(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """PRD-009: System-level health checks."""
+    checks: list[dict[str, Any]] = []
+    prereqs = doctor_prerequisites(cfg)
+
+    # Python version
+    ok = prereqs.get("python_runtime_supported", False)
+    checks.append({
+        "name": "python_version",
+        "status": "pass" if ok else "fail",
+        "message": f"Python {sys.version_info[:3]} {'supported' if ok else 'not supported (need 3.11–3.13)'}",
+        "fix_cmd": None if ok else "Install Python 3.11–3.13",
+    })
+
+    # Node.js
+    npm_info = prereqs.get("npm", {})
+    npm_ok = npm_info.get("found", False)
+    checks.append({
+        "name": "npm",
+        "status": "pass" if npm_ok else "warn",
+        "message": f"npm {npm_info.get('version', 'not found')}",
+        "fix_cmd": None if npm_ok else "brew install node  (or equivalent)",
+    })
+
+    # git
+    git_info = prereqs.get("git", {})
+    git_ok = git_info.get("found", False)
+    checks.append({
+        "name": "git",
+        "status": "pass" if git_ok else "warn",
+        "message": f"git {git_info.get('version', 'not found')}",
+        "fix_cmd": None if git_ok else "brew install git  (or equivalent)",
+    })
+
+    # Disk space: warn if < 1 GB free in tag_home parent
+    try:
+        import shutil as _shutil
+        stat = _shutil.disk_usage(tag_home().parent)
+        free_gb = stat.free / (1024 ** 3)
+        disk_ok = free_gb >= 1.0
+        checks.append({
+            "name": "disk_space",
+            "status": "pass" if disk_ok else "warn",
+            "message": f"{free_gb:.1f} GB free in {tag_home().parent}",
+            "fix_cmd": None if disk_ok else "Free up disk space",
+        })
+    except Exception:
+        pass
+
+    return checks
+
+
+def _doctor_hermes_checks(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """PRD-009: Hermes runtime health checks."""
+    checks: list[dict[str, Any]] = []
+    prereqs = doctor_prerequisites(cfg)
+
+    bin_exists = hermes_bin(cfg).exists()
+    checks.append({
+        "name": "hermes_binary",
+        "status": "pass" if bin_exists else "fail",
+        "message": str(hermes_bin(cfg)) if bin_exists else "not provisioned",
+        "fix_cmd": None if bin_exists else "tag setup",
+    })
+
+    if bin_exists:
         try:
-            version = run_hermes(cfg, "--version")
-            report["hermes_version"] = version.stdout.strip()
+            v = run_hermes(cfg, "--version").stdout.strip()
+            checks.append({"name": "hermes_version", "status": "pass", "message": v})
         except subprocess.CalledProcessError as exc:
-            report["hermes_version_error"] = exc.stderr.strip()
-    else:
-        report["hermes_version"] = "not provisioned yet"
+            checks.append({
+                "name": "hermes_version",
+                "status": "fail",
+                "message": exc.stderr.strip() or str(exc),
+                "fix_cmd": "tag setup --refresh",
+            })
 
-    if args.json:
+    tui_ok = prereqs.get("tui_dist_exists", False)
+    checks.append({
+        "name": "tui_built",
+        "status": "pass" if tui_ok else "warn",
+        "message": "TUI built" if tui_ok else "TUI not built",
+        "fix_cmd": None if tui_ok else "tag setup",
+    })
+
+    patch_st = prereqs.get("patch_status", "unknown")
+    _patch_ok = patch_st in ("patched", "applied", "prepatched")
+    checks.append({
+        "name": "patch_applied",
+        "status": "pass" if _patch_ok else "warn",
+        "message": patch_st,
+        "fix_cmd": None if _patch_ok else "tag setup",
+    })
+
+    return checks
+
+
+def _doctor_profile_checks(cfg: dict[str, Any], profile_name: str) -> list[dict[str, Any]]:
+    """PRD-009: Per-profile health checks."""
+    checks: list[dict[str, Any]] = []
+    ph = profile_home(cfg, profile_name)
+
+    home_ok = ph.exists()
+    checks.append({
+        "name": "home",
+        "status": "pass" if home_ok else "fail",
+        "message": str(ph) if home_ok else "missing",
+        "fix_cmd": None if home_ok else f"tag bootstrap",
+    })
+    if not home_ok:
+        return checks
+
+    config_file = ph / "config.yaml"
+    cfg_ok = config_file.exists()
+    checks.append({
+        "name": "config.yaml",
+        "status": "pass" if cfg_ok else "fail",
+        "message": "present" if cfg_ok else "missing",
+        "fix_cmd": None if cfg_ok else f"tag render",
+    })
+
+    env_file = ph / ".env"
+    env_data = read_dotenv(env_file) if env_file.exists() else {}
+
+    profile_cfg = cfg.get("profiles", {}).get(profile_name, {})
+    provider = profile_cfg.get("config", {}).get("model", {}).get("provider", "openrouter")
+    required_keys: dict[str, str] = {
+        "openrouter": "OPENROUTER_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "google": "GEMINI_API_KEY",
+        "openai-codex": "OPENAI_API_KEY",
+    }
+    if req_key := required_keys.get(provider):
+        key_present = bool(env_data.get(req_key))
+        import_cmd = {
+            "openrouter": f"tag import-opencode --profile {profile_name}",
+            "anthropic": f"tag import-claude --profile {profile_name}",
+            "openai": f"tag import-cursor --profile {profile_name}",
+            "google": f"tag import-gemini --profile {profile_name}",
+            "openai-codex": f"tag import-codex --profile {profile_name}",
+        }.get(provider)
+        checks.append({
+            "name": req_key,
+            "status": "pass" if key_present else "warn",
+            "message": "present" if key_present else "missing",
+            "fix_cmd": None if key_present else import_cmd,
+        })
+
+    # Nous Portal gateway check
+    if env_data.get("NOUS_PORTAL_API_KEY"):
+        checks.append({
+            "name": "nous_gateway",
+            "status": "pass",
+            "message": "API key present",
+        })
+
+    # PRD-005: execution backend health check
+    exec_cfg = profile_cfg.get("config", {}).get("execution", {})
+    backend = exec_cfg.get("backend", "local")
+    if backend == "docker":
+        import shutil as _shutil
+        docker_ok = False
+        if _shutil.which("docker"):
+            try:
+                p = subprocess.run(["docker", "info"], capture_output=True, timeout=5)
+                docker_ok = p.returncode == 0
+            except Exception:
+                docker_ok = False
+        checks.append({
+            "name": "docker backend",
+            "status": "pass" if docker_ok else "warn",
+            "message": "daemon running" if docker_ok else "docker daemon not reachable",
+            "fix_cmd": None if docker_ok else "sudo systemctl start docker  # or start Docker Desktop",
+        })
+    elif backend == "ssh":
+        ssh_host = env_data.get("SSH_HOST") or exec_cfg.get("ssh", {}).get("host", "")
+        if ssh_host:
+            ssh_user = env_data.get("SSH_USER") or exec_cfg.get("ssh", {}).get("user", "")
+            target = f"{ssh_user}@{ssh_host}" if ssh_user else ssh_host
+            try:
+                p = subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", target, "exit"],
+                    capture_output=True,
+                    timeout=8,
+                )
+                ssh_ok = p.returncode == 0
+            except Exception:
+                ssh_ok = False
+            checks.append({
+                "name": "ssh backend",
+                "status": "pass" if ssh_ok else "warn",
+                "message": f"reachable ({target})" if ssh_ok else f"cannot reach {target}",
+                "fix_cmd": None if ssh_ok else f"tag import-ssh --profile {profile_name} --host {ssh_host}",
+            })
+        else:
+            checks.append({
+                "name": "ssh backend",
+                "status": "warn",
+                "message": "SSH_HOST not set",
+                "fix_cmd": f"tag import-ssh --profile {profile_name} --host <YOUR_HOST>",
+            })
+    elif backend == "modal":
+        modal_ok = bool(env_data.get("MODAL_TOKEN_ID") and env_data.get("MODAL_TOKEN_SECRET"))
+        checks.append({
+            "name": "modal backend",
+            "status": "pass" if modal_ok else "warn",
+            "message": "credentials present" if modal_ok else "MODAL_TOKEN_ID/SECRET not set",
+            "fix_cmd": None if modal_ok else f"tag import-modal --profile {profile_name} --token-id ID --token-secret SECRET",
+        })
+    elif backend == "daytona":
+        daytona_ok = bool(env_data.get("DAYTONA_WORKSPACE_ID"))
+        checks.append({
+            "name": "daytona backend",
+            "status": "pass" if daytona_ok else "warn",
+            "message": "workspace ID set" if daytona_ok else "DAYTONA_WORKSPACE_ID not set",
+            "fix_cmd": None if daytona_ok else f"tag import-daytona --profile {profile_name} --workspace-id ID",
+        })
+
+    return checks
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """PRD-009: Comprehensive health check with pass/warn/fail per component."""
+    cfg = load_config(config_path(args.config))
+    target_profile = getattr(args, "profile", None)
+
+    if getattr(args, "json", False):
+        # Legacy JSON mode: include full report + new per-profile checks
+        env = hermes_env(cfg)
+        report: dict[str, Any] = {
+            "app_name": APP_NAME,
+            "package_root": str(package_root()),
+            "tag_home": str(tag_home()),
+            "managed_root": str(managed_root()),
+            "hermes_root": str(hermes_root(cfg)),
+            "hermes_bin_exists": hermes_bin(cfg).exists(),
+            "home": env["HOME"],
+            "hermes_home": env["HERMES_HOME"],
+            "codex_home": env["CODEX_HOME"],
+            "config": str(config_path(args.config)),
+            "benchmark_suite": str(benchmark_suite_path(None)),
+            "prerequisites": doctor_prerequisites(cfg),
+        }
+        if hermes_bin(cfg).exists():
+            try:
+                report["hermes_version"] = run_hermes(cfg, "--version").stdout.strip()
+            except subprocess.CalledProcessError as exc:
+                report["hermes_version_error"] = exc.stderr.strip()
+        else:
+            report["hermes_version"] = "not provisioned yet"
+
+        profiles_report: dict[str, Any] = {}
+        profiles_to_check = (
+            [target_profile] if target_profile
+            else list(cfg.get("profiles", {}).keys())
+        )
+        for p in profiles_to_check:
+            profiles_report[p] = _doctor_profile_checks(cfg, p)
+        report["profiles"] = profiles_report
         print(json.dumps(report, indent=2))
-        return 0
+        has_fail = any(
+            c.get("status") == "fail"
+            for checks_list in profiles_report.values()
+            for c in checks_list
+        )
+        return 1 if has_fail else 0
 
-    for key, value in report.items():
-        if key == "prerequisites":
-            print("prerequisites:")
-            for pkey, pdata in value.items():
-                print(f"  {pkey}: {pdata}")
-            continue
-        print(f"{key}: {value}")
+    # Rich / plain-text grouped report
+    groups: dict[str, list[dict[str, Any]]] = {}
+    groups["system"] = _doctor_system_checks(cfg)
+    groups["hermes runtime"] = _doctor_hermes_checks(cfg)
+
+    profiles_to_check = (
+        [target_profile] if target_profile
+        else list(cfg.get("profiles", {}).keys())
+    )
+    for p in profiles_to_check:
+        groups[f"profile: {p}"] = _doctor_profile_checks(cfg, p)
+
+    print_doctor_report(groups)
+
+    all_statuses = [c["status"] for checks in groups.values() for c in checks]
+    if any(s == "fail" for s in all_statuses):
+        return 1
     return 0
 
 
@@ -2954,7 +4267,10 @@ def _cmd_import_generic(
     kwargs: dict[str, Any] = {"profile_name": args.profile}
     if source_path_attr and getattr(args, source_path_attr, None):
         raw = getattr(args, source_path_attr)
-        kwargs[source_path_attr] = Path(raw).expanduser().resolve()
+        try:
+            kwargs[source_path_attr] = Path(raw).expanduser().resolve()
+        except (OSError, RuntimeError) as exc:
+            raise SystemExit(f"Cannot resolve path '{raw}': {exc}") from exc
     if extra_kwargs:
         kwargs.update(extra_kwargs)
     result = import_fn(cfg, **kwargs)
@@ -3050,6 +4366,495 @@ def cmd_import_cursor(args: argparse.Namespace) -> int:
         source_path_attr="cursor_dir",
         display_name="Cursor",
     )
+
+
+# ---------------------------------------------------------------------------
+# PRD-001: Supermemory and Honcho credential import
+# ---------------------------------------------------------------------------
+
+def _detect_supermemory_credentials(
+    source_config_dir: Path | None = None,
+) -> dict[str, str]:
+    """Read Supermemory API key from known config locations."""
+    candidates: list[Path] = []
+    if source_config_dir:
+        candidates.append(source_config_dir / "config.json")
+    candidates += [
+        Path.home() / ".config" / "supermemory" / "config.json",
+        Path.home() / ".supermemory" / "config.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                key = data.get("api_key") or data.get("token")
+                if key:
+                    return {"SUPERMEMORY_API_KEY": str(key)}
+            except (json.JSONDecodeError, OSError):
+                pass
+    if key := os.environ.get("SUPERMEMORY_API_KEY", ""):
+        return {"SUPERMEMORY_API_KEY": key}
+    return {}
+
+
+def import_supermemory_into_profile(
+    cfg: dict[str, Any],
+    profile_name: str,
+    *,
+    api_key: str | None = None,
+    source_config_dir: Path | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    ph = profile_home(cfg, profile_name)
+    if not ph.exists():
+        return {"status": "profile-missing"}
+    creds = {"SUPERMEMORY_API_KEY": api_key} if api_key else _detect_supermemory_credentials(source_config_dir)
+    if not creds:
+        return {"status": "skipped-no-auth"}
+    env_file = ph / ".env"
+    for key, value in creds.items():
+        _upsert_env_line(env_file, key, value)
+    _upsert_env_line(env_file, "SUPERMEMORY_SESSION_INGEST", "1")
+    return {"status": "ok", "profile": profile_name, "providers_imported": ["supermemory"]}
+
+
+def _detect_honcho_credentials(
+    source_config: Path | None = None,
+) -> dict[str, str]:
+    """Read Honcho credentials from known config locations."""
+    candidates: list[Path] = []
+    if source_config:
+        candidates.append(source_config)
+    candidates += [
+        Path.home() / ".honcho" / ".env",
+        Path.home() / ".config" / "honcho" / "config.yaml",
+    ]
+    result: dict[str, str] = {}
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            if path.suffix in (".yaml", ".yml"):
+                data = yaml.safe_load(path.read_text()) or {}
+                if k := data.get("api_key") or data.get("HONCHO_API_KEY"):
+                    result["HONCHO_API_KEY"] = str(k)
+                if u := data.get("base_url") or data.get("HONCHO_BASE_URL"):
+                    result["HONCHO_BASE_URL"] = str(u)
+            else:
+                for line in path.read_text().splitlines():
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        k, _, v = line.partition("=")
+                        if k in ("HONCHO_API_KEY", "HONCHO_BASE_URL"):
+                            result[k] = v.strip()
+        except (OSError, yaml.YAMLError):
+            pass
+    for key in ("HONCHO_API_KEY", "HONCHO_BASE_URL"):
+        if key not in result and (val := os.environ.get(key, "")):
+            result[key] = val
+    return result
+
+
+def import_honcho_into_profile(
+    cfg: dict[str, Any],
+    profile_name: str,
+    *,
+    source_config: Path | None = None,
+    base_url: str | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    ph = profile_home(cfg, profile_name)
+    if not ph.exists():
+        return {"status": "profile-missing"}
+    creds = _detect_honcho_credentials(source_config)
+    if base_url:
+        creds["HONCHO_BASE_URL"] = base_url
+    if not creds:
+        return {"status": "skipped-no-auth"}
+    env_file = ph / ".env"
+    for key, value in creds.items():
+        _upsert_env_line(env_file, key, value)
+    return {"status": "ok", "profile": profile_name, "providers_imported": list(creds.keys())}
+
+
+def cmd_import_supermemory(args: argparse.Namespace) -> int:
+    return _cmd_import_generic(
+        args,
+        import_fn=import_supermemory_into_profile,
+        no_auth_msg=(
+            "No Supermemory API key found. Pass --api-key or set SUPERMEMORY_API_KEY.\n"
+            "Get a key at https://supermemory.ai/"
+        ),
+        source_path_attr="source_config_dir",
+        display_name="Supermemory",
+        extra_kwargs={"api_key": getattr(args, "api_key", None) or None},
+    )
+
+
+def cmd_import_honcho(args: argparse.Namespace) -> int:
+    return _cmd_import_generic(
+        args,
+        import_fn=import_honcho_into_profile,
+        no_auth_msg=(
+            "No Honcho credentials found. Pass --base-url and set HONCHO_API_KEY.\n"
+            "See https://honcho.dev/ for self-hosted setup."
+        ),
+        source_path_attr="source_config",
+        display_name="Honcho",
+        extra_kwargs={"base_url": getattr(args, "base_url", None) or None},
+    )
+
+
+# ---------------------------------------------------------------------------
+# PRD-006: Nous Portal Tool Gateway
+# ---------------------------------------------------------------------------
+
+def _detect_nous_portal_credentials(
+    source_config: Path | None = None,
+) -> dict[str, str]:
+    """Read Nous Portal API key from known config locations."""
+    candidates: list[Path] = []
+    if source_config:
+        candidates.append(source_config)
+    candidates += [
+        Path.home() / ".config" / "nousresearch" / "portal.json",
+        Path.home() / ".nousresearch" / "config.json",
+        Path.home() / ".nousresearch" / "portal.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                key = data.get("api_key") or data.get("token") or data.get("key")
+                if key:
+                    return {"NOUS_PORTAL_API_KEY": str(key)}
+            except (json.JSONDecodeError, OSError):
+                pass
+    if key := os.environ.get("NOUS_PORTAL_API_KEY", ""):
+        return {"NOUS_PORTAL_API_KEY": key}
+    return {}
+
+
+def import_nous_portal_into_profile(
+    cfg: dict[str, Any],
+    profile_name: str,
+    *,
+    api_key: str | None = None,
+    source_config: Path | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Write NOUS_PORTAL_API_KEY to profile .env and enable gateway in config."""
+    ph = profile_home(cfg, profile_name)
+    if not ph.exists():
+        return {"status": "profile-missing", "profile": profile_name}
+
+    creds = {"NOUS_PORTAL_API_KEY": api_key} if api_key else _detect_nous_portal_credentials(source_config)
+    if not creds:
+        return {"status": "skipped-no-auth", "profile": profile_name}
+
+    env_file = ph / ".env"
+    for key, value in creds.items():
+        _upsert_env_line(env_file, key, value)
+
+    # Enable use_gateway in profile's Hermes config.yaml
+    profile_config_file = ph / "config.yaml"
+    if profile_config_file.exists():
+        try:
+            pcfg = yaml.safe_load(profile_config_file.read_text()) or {}
+            pcfg.setdefault("gateway", {})["use_gateway"] = True
+            write_yaml(profile_config_file, pcfg, force=True)
+        except Exception:
+            pass
+
+    return {
+        "status": "ok",
+        "profile": profile_name,
+        "providers_imported": ["nous_portal"],
+        "env_file": str(env_file),
+    }
+
+
+def cmd_import_nous_portal(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    profiles_cfg = cfg.get("profiles", {})
+
+    if getattr(args, "all_profiles", False):
+        profiles_to_update = list(profiles_cfg.keys())
+    else:
+        p = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        if p not in profiles_cfg:
+            available = ", ".join(sorted(profiles_cfg))
+            raise SystemExit(f"Unknown profile '{p}'. Available: {available}")
+        profiles_to_update = [p]
+
+    api_key_arg = getattr(args, "api_key", None) or None
+    if api_key_arg is not None and len(api_key_arg) < 20:
+        raise SystemExit(
+            f"API key too short ({len(api_key_arg)} chars); Nous Portal keys are at least 20 characters"
+        )
+
+    results = []
+    for p in profiles_to_update:
+        ensure_runtime_dirs(cfg)
+        result = import_nous_portal_into_profile(
+            cfg,
+            p,
+            api_key=api_key_arg,
+            force=getattr(args, "force", False),
+        )
+        results.append(result)
+
+    if getattr(args, "json", False):
+        print(json.dumps(results, indent=2))
+        return 0
+
+    any_ok = False
+    for r in results:
+        profile_name = r.get("profile", "?")
+        if r["status"] == "ok":
+            print(f"  ✓ {profile_name}: Nous Portal gateway enabled")
+            any_ok = True
+        elif r["status"] == "skipped-no-auth":
+            print(f"  – {profile_name}: no credentials found")
+        else:
+            print(f"  ✗ {profile_name}: {r['status']}")
+
+    if not any_ok:
+        print(
+            "Hint: pass --api-key YOUR_KEY or set NOUS_PORTAL_API_KEY env var.\n"
+            "Note: Requires an active Nous Portal subscription (https://portal.nousresearch.com/)."
+        )
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-005: Execution backend credential import helpers
+# ---------------------------------------------------------------------------
+
+_VALID_BACKENDS = ("local", "docker", "ssh", "modal", "daytona", "singularity")
+_DOCKER_IMAGE_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_./:@-]*$')
+
+
+def import_docker_into_profile(
+    cfg: dict[str, Any],
+    profile_name: str,
+    *,
+    image: str | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Write Docker backend settings to the profile's .env file."""
+    if image and not _DOCKER_IMAGE_RE.match(image):
+        raise SystemExit(f"Invalid Docker image name: {image!r}")
+    env_file = profile_home(cfg, profile_name) / ".env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+
+    result: dict[str, Any] = {"profile": profile_name, "status": "ok", "keys_written": []}
+    default_image = image or "ubuntu:22.04"
+    _upsert_env_line(env_file, "DOCKER_DEFAULT_IMAGE", default_image)
+    result["keys_written"].append("DOCKER_DEFAULT_IMAGE")
+
+    # Verify Docker is actually available (advisory only — we don't block on this)
+    import shutil as _shutil
+    if _shutil.which("docker"):
+        try:
+            proc = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                timeout=5,
+            )
+            result["docker_available"] = proc.returncode == 0
+        except Exception:
+            result["docker_available"] = False
+    else:
+        result["docker_available"] = False
+        result["warning"] = "docker binary not found — install Docker before using this backend"
+
+    return result
+
+
+_SSH_HOST_RE = re.compile(r'^[a-zA-Z0-9.\-_\[\]:]+$')
+
+
+def import_ssh_into_profile(
+    cfg: dict[str, Any],
+    profile_name: str,
+    *,
+    host: str,
+    user: str | None = None,
+    key_file: str | None = None,
+    port: int = 22,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Write SSH backend credentials to the profile's .env file."""
+    if not host or not host.strip():
+        raise SystemExit("--host is required for SSH backend import")
+    if not _SSH_HOST_RE.match(host.strip()):
+        raise SystemExit(
+            f"Invalid SSH host '{host}': must contain only alphanumerics, dots, hyphens, "
+            "underscores, brackets, and colons (no shell metacharacters)"
+        )
+    if not (1 <= port <= 65535):
+        raise SystemExit(f"Invalid SSH port {port}: must be 1–65535")
+    env_file = profile_home(cfg, profile_name) / ".env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+
+    result: dict[str, Any] = {"profile": profile_name, "status": "ok", "keys_written": []}
+    _upsert_env_line(env_file, "SSH_HOST", host)
+    result["keys_written"].append("SSH_HOST")
+    if user:
+        _upsert_env_line(env_file, "SSH_USER", user)
+        result["keys_written"].append("SSH_USER")
+    if key_file:
+        _upsert_env_line(env_file, "SSH_KEY_FILE", str(Path(key_file).expanduser()))
+        result["keys_written"].append("SSH_KEY_FILE")
+        if not Path(key_file).expanduser().exists():
+            result["warning"] = f"Key file not found: {key_file}"
+    if port != 22:
+        _upsert_env_line(env_file, "SSH_PORT", str(port))
+        result["keys_written"].append("SSH_PORT")
+    return result
+
+
+def import_modal_into_profile(
+    cfg: dict[str, Any],
+    profile_name: str,
+    *,
+    token_id: str,
+    token_secret: str,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Write Modal backend credentials to the profile's .env file."""
+    if not token_id or not token_id.strip() or not token_secret or not token_secret.strip():
+        raise SystemExit("--token-id and --token-secret must not be empty or whitespace-only")
+    env_file = profile_home(cfg, profile_name) / ".env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+
+    _upsert_env_line(env_file, "MODAL_TOKEN_ID", token_id)
+    _upsert_env_line(env_file, "MODAL_TOKEN_SECRET", token_secret)
+    return {"profile": profile_name, "status": "ok", "keys_written": ["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"]}
+
+
+def import_daytona_into_profile(
+    cfg: dict[str, Any],
+    profile_name: str,
+    *,
+    workspace_id: str,
+    api_key: str | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Write Daytona workspace ID to the profile's .env file."""
+    if not workspace_id or not workspace_id.strip():
+        raise SystemExit("--workspace-id must not be empty or whitespace-only")
+    env_file = profile_home(cfg, profile_name) / ".env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+
+    keys: list[str] = []
+    _upsert_env_line(env_file, "DAYTONA_WORKSPACE_ID", workspace_id)
+    keys.append("DAYTONA_WORKSPACE_ID")
+    if api_key:
+        _upsert_env_line(env_file, "DAYTONA_API_KEY", api_key)
+        keys.append("DAYTONA_API_KEY")
+    return {"profile": profile_name, "status": "ok", "keys_written": keys}
+
+
+def cmd_import_docker(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    profile_name = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+    if profile_name not in cfg.get("profiles", {}):
+        available = ", ".join(sorted(cfg.get("profiles", {})))
+        raise SystemExit(f"Unknown profile '{profile_name}'. Available: {available}")
+    ensure_runtime_dirs(cfg)
+    result = import_docker_into_profile(
+        cfg,
+        profile_name,
+        image=getattr(args, "image", None) or None,
+        force=getattr(args, "force", False),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return 0
+    if result["status"] == "ok":
+        print(f"✓ {profile_name}: Docker backend configured")
+        if not result.get("docker_available"):
+            print(f"  ⚠ Warning: {result.get('warning', 'Docker daemon not running')}")
+    else:
+        print(f"✗ {profile_name}: {result['status']}")
+    return 0
+
+
+def cmd_import_ssh(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    profile_name = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+    if profile_name not in cfg.get("profiles", {}):
+        available = ", ".join(sorted(cfg.get("profiles", {})))
+        raise SystemExit(f"Unknown profile '{profile_name}'. Available: {available}")
+    ensure_runtime_dirs(cfg)
+    port_arg = getattr(args, "port", None)
+    result = import_ssh_into_profile(
+        cfg,
+        profile_name,
+        host=args.host,
+        user=getattr(args, "user", None) or None,
+        key_file=getattr(args, "key_file", None) or None,
+        port=port_arg if port_arg is not None else 22,
+        force=getattr(args, "force", False),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return 0
+    if result["status"] == "ok":
+        print(f"✓ {profile_name}: SSH backend configured (host: {args.host})")
+    else:
+        print(f"✗ {profile_name}: {result['status']}")
+    return 0
+
+
+def cmd_import_modal(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    profile_name = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+    if profile_name not in cfg.get("profiles", {}):
+        available = ", ".join(sorted(cfg.get("profiles", {})))
+        raise SystemExit(f"Unknown profile '{profile_name}'. Available: {available}")
+    ensure_runtime_dirs(cfg)
+    result = import_modal_into_profile(
+        cfg,
+        profile_name,
+        token_id=args.token_id,
+        token_secret=args.token_secret,
+        force=getattr(args, "force", False),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return 0
+    print(f"✓ {profile_name}: Modal backend credentials written")
+    return 0
+
+
+def cmd_import_daytona(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(args.config))
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    profile_name = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+    if profile_name not in cfg.get("profiles", {}):
+        available = ", ".join(sorted(cfg.get("profiles", {})))
+        raise SystemExit(f"Unknown profile '{profile_name}'. Available: {available}")
+    ensure_runtime_dirs(cfg)
+    result = import_daytona_into_profile(
+        cfg,
+        profile_name,
+        workspace_id=args.workspace_id,
+        api_key=getattr(args, "api_key", None) or None,
+        force=getattr(args, "force", False),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return 0
+    print(f"✓ {profile_name}: Daytona backend configured (workspace: {args.workspace_id})")
+    return 0
 
 
 def cmd_assignments(args: argparse.Namespace) -> int:
@@ -3525,6 +5330,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="Validate local TAG paths and the managed runtime")
     doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--profile", metavar="NAME", help="Check only this profile")
     doctor.set_defaults(func=cmd_doctor)
 
     bootstrap = sub.add_parser("bootstrap", help="Create profiles and render config")
@@ -3863,6 +5669,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     dashboard = sub.add_parser("dashboard", help="Run dashboard inside a TAG profile")
     dashboard.add_argument("--profile", default="orchestrator", help="TAG profile to use")
+    dashboard.add_argument("--port", type=int, metavar="N", help="Dashboard port (default: 3333)")
+    dashboard.add_argument("--no-browser", action="store_false", dest="open_browser",
+                           help="Print URL only; don't open browser tab")
     dashboard.add_argument("hermes_args", nargs=argparse.REMAINDER)
     dashboard.set_defaults(func=cmd_dashboard)
 
@@ -3891,6 +5700,144 @@ def build_parser() -> argparse.ArgumentParser:
     tui.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     tui.add_argument("hermes_args", nargs=argparse.REMAINDER)
     tui.set_defaults(func=cmd_tui)
+
+    # ---- PRD-002: memory-journal ----
+    mj = sub.add_parser("memory-journal", help="Manage TAG's cross-session memory journal")
+    mj_sub = mj.add_subparsers(dest="mj_subcommand")
+
+    mj_save = mj_sub.add_parser("save", help="Save a key→value fact")
+    mj_save.add_argument("key", help="Fact key (e.g. 'project context')")
+    mj_save.add_argument("value", help="Fact value")
+    mj_save.add_argument("--profile", help="Profile (default: master_profile)")
+    mj_save.add_argument("--ttl-days", type=int, metavar="N", dest="ttl_days")
+    mj_save.add_argument("--json", action="store_true")
+
+    mj_list = mj_sub.add_parser("list", help="List journal entries")
+    mj_list.add_argument("--profile", help="Profile (default: master_profile)")
+    mj_list.add_argument("--json", action="store_true")
+
+    mj_forget = mj_sub.add_parser("forget", help="Delete a journal entry by ID")
+    mj_forget.add_argument("entry_id", metavar="ID")
+    mj_forget.add_argument("--json", action="store_true")
+
+    mj_clear = mj_sub.add_parser("clear", help="Clear all journal entries for a profile")
+    mj_clear.add_argument("--profile", help="Profile (default: master_profile)")
+    mj_clear.add_argument("--confirm", action="store_true")
+    mj_clear.add_argument("--json", action="store_true")
+
+    for mj_p in [mj, mj_save, mj_list, mj_forget, mj_clear]:
+        mj_p.add_argument("--config", help=argparse.SUPPRESS) if "config" not in {a.dest for a in mj_p._actions} else None
+        mj_p.set_defaults(func=cmd_memory_journal)
+
+    # ---- PRD-004: swarm ----
+    swarm = sub.add_parser("swarm", help="Launch a Hermes Kanban swarm using TAG's profile topology")
+    swarm.add_argument("task", help="Task description for the swarm")
+    swarm.add_argument("--profile", help="Orchestrator profile (default: master_profile)")
+    swarm.add_argument("--type", dest="task_type", default="mixed", choices=("research", "implementation", "review", "mixed"))
+    swarm.add_argument("--board", help="Kanban board name (default: from config)")
+    swarm.add_argument("--no-wait", action="store_true", dest="no_wait",
+                       help="Create swarm tasks but don't block waiting for completion")
+    swarm.add_argument("--json", action="store_true")
+    swarm.set_defaults(func=cmd_swarm)
+
+    # ---- PRD-007: desktop ----
+    desktop = sub.add_parser("desktop", help="Build and launch Electron desktop app")
+    desktop_sub = desktop.add_subparsers(dest="desktop_subcommand")
+    desktop_open = desktop_sub.add_parser("open", help="Launch the desktop app")
+    desktop_open.add_argument("--profile", help="Profile to launch with")
+    desktop_build = desktop_sub.add_parser("build", help="Build the desktop app (one-time, ~2-3 min)")
+    desktop_build.add_argument("--force", action="store_true")
+    desktop_build.add_argument("--json", action="store_true")
+    for dp in [desktop, desktop_open, desktop_build]:
+        dp.set_defaults(func=cmd_desktop)
+
+    # ---- PRD-008: queue ----
+    queue = sub.add_parser("queue", help="Background task queue")
+    queue_sub = queue.add_subparsers(dest="queue_subcommand")
+
+    q_add = queue_sub.add_parser("add", help="Queue a task to run in the background")
+    q_add.add_argument("task", help="Task description")
+    q_add.add_argument("--profile", help="Profile to use (default: master_profile)")
+    q_add.add_argument("--type", dest="task_type", default="mixed")
+    q_add.add_argument("--priority", type=int, default=5)
+    q_add.add_argument("--no-notify", action="store_true")
+    q_add.add_argument("--json", action="store_true")
+
+    q_list = queue_sub.add_parser("list", help="List queued/running/done jobs")
+    q_list.add_argument("--status", dest="status_filter", choices=("queued", "running", "done", "failed", "cancelled"))
+    q_list.add_argument("--limit", type=int, default=50, metavar="N", help="Max jobs to show (default: 50)")
+    q_list.add_argument("--json", action="store_true")
+
+    q_result = queue_sub.add_parser("result", help="Show output of a completed job")
+    q_result.add_argument("job_id")
+
+    q_cancel = queue_sub.add_parser("cancel", help="Cancel a running job")
+    q_cancel.add_argument("job_id")
+    q_cancel.add_argument("--json", action="store_true")
+
+    q_clear = queue_sub.add_parser("clear", help="Remove completed/failed jobs from list")
+    q_clear.add_argument("--json", action="store_true")
+
+    for qp in [queue, q_add, q_list, q_result, q_cancel, q_clear]:
+        qp.set_defaults(func=cmd_queue)
+
+    # ---- PRD-001: import-supermemory, import-honcho ----
+    import_sm = sub.add_parser("import-supermemory", help="Import Supermemory API key into a TAG profile")
+    import_sm.add_argument("--profile", required=True)
+    import_sm.add_argument("--api-key", metavar="KEY", dest="api_key")
+    import_sm.add_argument("--source-config-dir", metavar="PATH", dest="source_config_dir")
+    import_sm.add_argument("--json", action="store_true")
+    import_sm.set_defaults(func=cmd_import_supermemory)
+
+    import_honcho = sub.add_parser("import-honcho", help="Import Honcho credentials into a TAG profile")
+    import_honcho.add_argument("--profile", required=True)
+    import_honcho.add_argument("--base-url", metavar="URL", dest="base_url")
+    import_honcho.add_argument("--source-config", metavar="PATH", dest="source_config")
+    import_honcho.add_argument("--json", action="store_true")
+    import_honcho.set_defaults(func=cmd_import_honcho)
+
+    # ---- PRD-006: import-nous-portal ----
+    import_nous = sub.add_parser("import-nous-portal", help="Import Nous Portal API key (enables Tool Gateway)")
+    import_nous.add_argument("--profile", metavar="NAME")
+    import_nous.add_argument("--api-key", metavar="KEY", dest="api_key")
+    import_nous.add_argument("--all-profiles", action="store_true", dest="all_profiles")
+    import_nous.add_argument("--force", action="store_true")
+    import_nous.add_argument("--json", action="store_true")
+    import_nous.set_defaults(func=cmd_import_nous_portal)
+
+    # ---- PRD-005: execution backend imports ----
+    import_docker = sub.add_parser("import-docker", help="Configure Docker execution backend for a profile")
+    import_docker.add_argument("--profile", metavar="NAME")
+    import_docker.add_argument("--image", metavar="IMAGE", help="Docker image (default: ubuntu:22.04)")
+    import_docker.add_argument("--force", action="store_true")
+    import_docker.add_argument("--json", action="store_true")
+    import_docker.set_defaults(func=cmd_import_docker)
+
+    import_ssh_p = sub.add_parser("import-ssh", help="Configure SSH remote execution backend for a profile")
+    import_ssh_p.add_argument("--profile", metavar="NAME")
+    import_ssh_p.add_argument("--host", required=True, metavar="HOST")
+    import_ssh_p.add_argument("--user", metavar="USER")
+    import_ssh_p.add_argument("--key-file", metavar="PATH", dest="key_file")
+    import_ssh_p.add_argument("--port", type=int, default=22)
+    import_ssh_p.add_argument("--force", action="store_true")
+    import_ssh_p.add_argument("--json", action="store_true")
+    import_ssh_p.set_defaults(func=cmd_import_ssh)
+
+    import_modal_p = sub.add_parser("import-modal", help="Configure Modal cloud execution backend for a profile")
+    import_modal_p.add_argument("--profile", metavar="NAME")
+    import_modal_p.add_argument("--token-id", required=True, metavar="ID", dest="token_id")
+    import_modal_p.add_argument("--token-secret", required=True, metavar="SECRET", dest="token_secret")
+    import_modal_p.add_argument("--force", action="store_true")
+    import_modal_p.add_argument("--json", action="store_true")
+    import_modal_p.set_defaults(func=cmd_import_modal)
+
+    import_daytona_p = sub.add_parser("import-daytona", help="Configure Daytona workspace backend for a profile")
+    import_daytona_p.add_argument("--profile", metavar="NAME")
+    import_daytona_p.add_argument("--workspace-id", required=True, metavar="ID", dest="workspace_id")
+    import_daytona_p.add_argument("--api-key", metavar="KEY", dest="api_key")
+    import_daytona_p.add_argument("--force", action="store_true")
+    import_daytona_p.add_argument("--json", action="store_true")
+    import_daytona_p.set_defaults(func=cmd_import_daytona)
 
     return parser
 
