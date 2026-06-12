@@ -1685,3 +1685,1026 @@ class TestAdversarialQARegressions:
         TAG._render_dashboard_plain(snap, "orchestrator")
         out = capsys.readouterr().out
         assert "abc12345" in out
+
+
+# ===========================================================================
+# PRD-011: Plugin System
+# ===========================================================================
+
+class TestPluginSystem:
+
+    def test_load_plugin_registry_returns_dict(self):
+        reg = TAG._load_plugin_registry()
+        assert isinstance(reg, dict)
+
+    def test_plugin_registry_has_known_plugins(self):
+        reg = TAG._load_plugin_registry()
+        plugins = reg.get("plugins", reg).get("registry", {})
+        assert "hermes-local-memory" in plugins
+
+    def test_cmd_plugin_list(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(plugin_subcommand="list", json=False, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_plugin(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "hermes-local-memory" in out
+
+    def test_cmd_plugin_list_json(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(plugin_subcommand="list", json=True, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_plugin(args)
+        assert rc == 0
+        data = json.loads(capsys.readouterr().out)
+        assert isinstance(data, list)
+        names = [r["name"] for r in data]
+        assert "hermes-local-memory" in names
+
+    def test_cmd_plugin_enable_writes_env(self, tmp_path):
+        import argparse
+        args = argparse.Namespace(
+            plugin_subcommand="enable", plugin_name="hermes-web-search",
+            profile="orchestrator", config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_plugin(args)
+        assert rc == 0
+        env_file = tmp_path / "taghome" / "profiles" / "orchestrator" / ".env"
+        assert env_file.exists()
+        assert "TAG_PLUGIN_HERMES_WEB_SEARCH_ENABLED=true" in env_file.read_text()
+
+    def test_cmd_plugin_disable_removes_env_line(self, tmp_path):
+        import argparse
+        env_file = tmp_path / "taghome" / "profiles" / "orchestrator" / ".env"
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_file.write_text("TAG_PLUGIN_HERMES_WEB_SEARCH_ENABLED=true\n")
+        args = argparse.Namespace(
+            plugin_subcommand="disable", plugin_name="hermes-web-search",
+            profile="orchestrator", config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            TAG.cmd_plugin(args)
+        assert "TAG_PLUGIN_HERMES_WEB_SEARCH_ENABLED" not in env_file.read_text()
+
+
+# ===========================================================================
+# PRD-012: Cost Tracking
+# ===========================================================================
+
+class TestCostTracking:
+
+    def test_estimate_cost_known_model(self):
+        cost = TAG._estimate_cost(1000, 500, "openai/gpt-4o")
+        assert cost > 0
+        assert isinstance(cost, float)
+
+    def test_estimate_cost_unknown_model_fallback(self):
+        cost = TAG._estimate_cost(1000, 1000, "unknown/model-x")
+        assert cost > 0
+
+    def test_estimate_cost_zero_tokens(self):
+        cost = TAG._estimate_cost(0, 0, "openai/gpt-4o")
+        assert cost == 0.0
+
+    def test_cmd_costs_no_db(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(profile=None, limit=20, json=False, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_costs(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "No runs" in out or "database" in out.lower()
+
+    def test_cmd_costs_with_db_no_cost_columns(self, tmp_path, capsys):
+        import argparse
+        cfg, db = make_db(tmp_path)
+        db.close()
+        args = argparse.Namespace(profile=None, limit=20, json=False, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_costs(args)
+        # Should gracefully report no cost data yet
+        assert rc == 0
+
+
+# ===========================================================================
+# PRD-013: Distributed Tracing
+# ===========================================================================
+
+class TestTracing:
+
+    def test_open_close_span(self):
+        from tag.tracing import open_span, close_span
+        s = open_span("trace-abc", "run_agent", profile="orchestrator")
+        assert s.finished_at is None
+        close_span(s, status="ok", prompt_tokens=100, completion_tokens=50)
+        assert s.finished_at is not None
+        assert s.duration_ms is not None
+        assert s.duration_ms >= 0
+        assert s.prompt_tokens == 100
+
+    def test_close_span_idempotent(self):
+        from tag.tracing import open_span, close_span
+        s = open_span("trace-abc", "step")
+        close_span(s)
+        finished_first = s.finished_at
+        close_span(s)
+        assert s.finished_at == finished_first
+
+    def test_save_spans_to_db(self, tmp_path):
+        from tag.tracing import open_span, close_span, save_spans_to_db
+        s = open_span("trace-xyz", "fetch_data")
+        close_span(s)
+        db_path = tmp_path / "spans.db"
+        save_spans_to_db(db_path, [s])
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT id, trace_id, name FROM spans WHERE id = ?", (s.id,)).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[1] == "trace-xyz"
+        assert row[2] == "fetch_data"
+
+    def test_render_trace_terminal_no_spans(self):
+        from tag.tracing import render_trace_terminal
+        out = render_trace_terminal([])
+        assert "no spans" in out.lower()
+
+    def test_render_trace_terminal_single_span(self):
+        from tag.tracing import open_span, close_span, render_trace_terminal
+        s = open_span("t1", "root_span")
+        close_span(s, prompt_tokens=200, completion_tokens=100)
+        out = render_trace_terminal([s])
+        assert "root_span" in out
+
+    def test_cmd_trace_list_no_db(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(trace_subcommand="list", limit=20, json=False, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_trace(args)
+        assert rc == 0
+
+    def test_cmd_trace_show_not_found(self, tmp_path, capsys):
+        import argparse
+        cfg, db = make_db(tmp_path)
+        db.close()
+        args = argparse.Namespace(trace_subcommand="show", trace_id="nonexistent", json=False, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_trace(args)
+        assert rc == 1
+
+
+# ===========================================================================
+# PRD-014: MCP Server Registry
+# ===========================================================================
+
+class TestMcpRegistry:
+
+    def test_load_mcp_registry(self):
+        reg = TAG._load_mcp_registry()
+        assert isinstance(reg, dict)
+        servers = reg.get("servers", {})
+        assert "mcp-filesystem" in servers
+        assert "mcp-github" in servers
+
+    def test_mcp_registry_server_has_required_fields(self):
+        reg = TAG._load_mcp_registry()
+        fs = reg["servers"]["mcp-filesystem"]
+        assert "description" in fs
+        assert "category" in fs
+        assert "install" in fs
+        assert "config" in fs
+
+    def test_cmd_mcp_registry_list(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(mcp_reg_subcommand="list", category=None, json=False, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_mcp_registry(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "mcp-filesystem" in out
+
+    def test_cmd_mcp_registry_list_json(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(mcp_reg_subcommand="list", category=None, json=True, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_mcp_registry(args)
+        assert rc == 0
+        data = json.loads(capsys.readouterr().out)
+        names = [r["name"] for r in data]
+        assert "mcp-filesystem" in names
+
+    def test_cmd_mcp_registry_list_category_filter(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(mcp_reg_subcommand="list", category="web", json=False, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            TAG.cmd_mcp_registry(args)
+        out = capsys.readouterr().out
+        assert "mcp-brave-search" in out
+        assert "mcp-filesystem" not in out
+
+    def test_cmd_mcp_registry_unknown_server(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(
+            mcp_reg_subcommand="enable", server_name="no-such-server", profile="orchestrator", config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_mcp_registry(args)
+        assert rc == 1
+
+    def test_cmd_mcp_registry_enable_writes_config(self, tmp_path):
+        import argparse
+        args = argparse.Namespace(
+            mcp_reg_subcommand="enable", server_name="mcp-filesystem", profile="orchestrator", config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_mcp_registry(args)
+        assert rc == 0
+        cfg_path = tmp_path / "taghome" / "profiles" / "orchestrator" / "lab-config.yaml"
+        assert cfg_path.exists()
+        import yaml
+        data = yaml.safe_load(cfg_path.read_text())
+        names = [e["name"] for e in data.get("mcp_servers", [])]
+        assert "mcp-filesystem" in names
+
+
+# ===========================================================================
+# PRD-015: Profile Templates
+# ===========================================================================
+
+class TestProfileTemplates:
+
+    def test_redact_env_redacts_keys(self):
+        assert TAG._redact_env("OPENAI_API_KEY", "sk-abc123") == "<OPENAI_API_KEY>"
+        assert TAG._redact_env("DATABASE_URL", "postgres://...") == "<DATABASE_URL>"
+
+    def test_redact_env_passes_safe_keys(self):
+        val = TAG._redact_env("MODEL_ID", "gpt-4o")
+        assert val == "gpt-4o"
+
+    def test_cmd_template_export(self, tmp_path, capsys):
+        import argparse
+        out_file = tmp_path / "template.yaml"
+        args = argparse.Namespace(
+            template_subcommand="export", profile="orchestrator",
+            output=str(out_file), config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_template(args)
+        assert rc == 0
+        assert out_file.exists()
+        import yaml
+        tmpl = yaml.safe_load(out_file.read_text())
+        assert tmpl["name"] == "orchestrator"
+        assert "env" in tmpl
+        assert "config" in tmpl
+
+    def test_cmd_template_export_stdout(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(
+            template_subcommand="export", profile="orchestrator",
+            output=None, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_template(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "orchestrator" in out
+
+    def test_cmd_template_import(self, tmp_path):
+        import argparse, yaml
+        tmpl = {"name": "test-imported", "version": "1", "env": {"MODEL_ID": "gpt-4o"}, "config": {}}
+        tmpl_file = tmp_path / "tmpl.yaml"
+        tmpl_file.write_text(yaml.dump(tmpl))
+        args = argparse.Namespace(
+            template_subcommand="import", template_file=str(tmpl_file),
+            profile=None, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_template(args)
+        assert rc == 0
+        env_file = tmp_path / "taghome" / "profiles" / "test-imported" / ".env"
+        assert env_file.exists()
+        assert "MODEL_ID=gpt-4o" in env_file.read_text()
+
+    def test_cmd_template_import_redacted_values_commented(self, tmp_path):
+        import argparse, yaml
+        tmpl = {
+            "name": "secure-profile", "version": "1",
+            "env": {"OPENAI_API_KEY": "<OPENAI_API_KEY>", "MODEL_ID": "gpt-4o"},
+            "config": {},
+        }
+        tmpl_file = tmp_path / "secure.yaml"
+        tmpl_file.write_text(yaml.dump(tmpl))
+        args = argparse.Namespace(
+            template_subcommand="import", template_file=str(tmpl_file),
+            profile=None, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            TAG.cmd_template(args)
+        env_file = tmp_path / "taghome" / "profiles" / "secure-profile" / ".env"
+        content = env_file.read_text()
+        assert "# OPENAI_API_KEY=<fill in>" in content
+        assert "MODEL_ID=gpt-4o" in content
+
+
+# ===========================================================================
+# PRD-016: Webhook Event Hooks
+# ===========================================================================
+
+class TestEventHooks:
+
+    def test_interpolate_replaces_placeholders(self):
+        result = TAG._interpolate("echo {{run_id}} {{status}}", {"run_id": "abc123", "status": "ok"})
+        assert result == "echo abc123 ok"
+
+    def test_interpolate_ignores_missing_keys(self):
+        result = TAG._interpolate("echo {{missing}}", {"run_id": "x"})
+        assert "{{missing}}" in result
+
+    def test_execute_hook_shell(self, tmp_path):
+        out_file = tmp_path / "hook_out.txt"
+        hook = {"type": "shell", "command": f"touch {out_file}"}
+        ok = TAG._execute_hook(hook, {})
+        assert ok is True
+        assert out_file.exists()
+
+    def test_execute_hook_bad_command(self):
+        hook = {"type": "shell", "command": "false"}
+        ok = TAG._execute_hook(hook, {})
+        assert ok is False
+
+    def test_fire_hooks_no_hooks_configured(self, tmp_path):
+        cfg = TAG.load_config(ROOT / "src" / "tag" / "config" / "default.yaml")
+        fired = TAG._fire_hooks(cfg, "run.completed", {"run_id": "x"})
+        assert fired == 0
+
+    def test_fire_hooks_shell_hook(self, tmp_path):
+        out_file = tmp_path / "hook_triggered.txt"
+        cfg = TAG.load_config(ROOT / "src" / "tag" / "config" / "default.yaml")
+        cfg = dict(cfg)
+        cfg["hooks"] = {"run.completed": [{"name": "test", "type": "shell", "command": f"touch {out_file}"}]}
+        fired = TAG._fire_hooks(cfg, "run.completed", {"run_id": "abc"})
+        assert fired == 1
+        assert out_file.exists()
+
+    def test_cmd_hooks_list_no_hooks(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(hooks_subcommand="list", json=False, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_hooks(args)
+        assert rc == 0
+        assert "No hooks" in capsys.readouterr().out
+
+    def test_cmd_hooks_log_no_db(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(hooks_subcommand="log", limit=50, json=False, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_hooks(args)
+        assert rc == 0
+
+
+# ===========================================================================
+# PRD-017: Multi-Model Comparison
+# ===========================================================================
+
+class TestCompare:
+
+    def test_cmd_compare_list_no_db(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(compare_subcommand="list", limit=20, json=False, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_compare(args)
+        assert rc == 0
+
+    def test_cmd_compare_show_not_found(self, tmp_path, capsys):
+        import argparse
+        cfg, db = make_db(tmp_path)
+        db.close()
+        args = argparse.Namespace(
+            compare_subcommand="show", comparison_id="nonexistent", json=False, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_compare(args)
+        assert rc == 1
+
+    def test_cmd_compare_list_json_empty(self, tmp_path, capsys):
+        import argparse
+        cfg, db = make_db(tmp_path)
+        db.close()
+        args = argparse.Namespace(compare_subcommand="list", limit=20, json=True, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_compare(args)
+        assert rc == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data == []
+
+
+# ===========================================================================
+# PRD-018: Context Window Management
+# ===========================================================================
+
+class TestContextManagement:
+
+    def test_cmd_context_compress_no_session_id(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(
+            context_subcommand="compress", profile="orchestrator", session_id=None, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_context(args)
+        assert rc == 1
+
+    def test_cmd_context_trim_no_session_id(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(
+            context_subcommand="trim", profile="orchestrator", session_id=None, keep_last=10, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_context(args)
+        assert rc == 1
+
+
+# ===========================================================================
+# PRD-019: Natural Language Shell
+# ===========================================================================
+
+class TestShellMode:
+
+    def test_shell_mode_imports(self):
+        from tag.shell_mode import ShellSession, run_shell, classify_input, SHELL_COMMANDS
+        assert "/help" in SHELL_COMMANDS
+        assert "/exit" in SHELL_COMMANDS
+
+    def test_shell_session_add_turn(self):
+        from tag.shell_mode import ShellSession
+        cfg = {}
+        sess = ShellSession(cfg, "orchestrator")
+        sess.add_turn("user", "hello")
+        sess.add_turn("assistant", "hi there")
+        assert len(sess.history) == 2
+        assert sess.history[0]["role"] == "user"
+
+    def test_shell_session_get_history_text_empty(self):
+        from tag.shell_mode import ShellSession
+        sess = ShellSession({}, "orchestrator")
+        assert "(no history)" in sess.get_history_text()
+
+    def test_shell_session_clear(self):
+        from tag.shell_mode import ShellSession
+        sess = ShellSession({}, "orchestrator")
+        sess.add_turn("user", "test")
+        sess.history.clear()
+        assert len(sess.history) == 0
+
+    def test_cmd_shell_missing_profile(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(profile="nonexistent-profile-xyz", config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            with patch("tag.shell_mode.run_shell", return_value=1) as mock_run:
+                rc = TAG.cmd_shell(args)
+        assert rc == 1
+
+
+# ===========================================================================
+# PRD-020: CI/CD Integration
+# ===========================================================================
+
+class TestCiCdIntegration:
+
+    def test_ci_module_imports(self):
+        from tag.ci import (
+            fetch_pr_diff, fetch_pr_metadata, post_pr_comment,
+            build_review_prompt, build_diagnose_prompt,
+            read_ci_log, detect_git_host, get_staged_diff,
+        )
+
+    def test_read_ci_log_small_file(self, tmp_path):
+        from tag.ci import read_ci_log
+        log_file = tmp_path / "ci.log"
+        log_file.write_text("line1\nline2\nline3\n")
+        content = read_ci_log(log_file)
+        assert "line1" in content
+        assert "line3" in content
+
+    def test_read_ci_log_large_file_truncated(self, tmp_path):
+        from tag.ci import read_ci_log
+        log_file = tmp_path / "big.log"
+        log_file.write_text("\n".join(f"line{i}" for i in range(300)))
+        content = read_ci_log(log_file)
+        assert "omitted" in content
+        assert "line299" in content
+
+    def test_read_ci_log_missing_file(self, tmp_path):
+        from tag.ci import read_ci_log
+        with pytest.raises(FileNotFoundError):
+            read_ci_log(tmp_path / "nonexistent.log")
+
+    def test_build_review_prompt_structure(self):
+        from tag.ci import build_review_prompt
+        diff = "--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new"
+        meta = {"title": "Fix bug", "body": "Fixes #42", "author": {"login": "alice"},
+                 "baseRefName": "main", "headRefName": "fix/bug", "labels": []}
+        prompt = build_review_prompt(diff, meta)
+        assert "Fix bug" in prompt
+        assert "alice" in prompt
+        assert "diff" in prompt.lower() or "---" in prompt
+
+    def test_build_review_prompt_truncates_long_diff(self):
+        from tag.ci import build_review_prompt
+        diff = "x" * 20000
+        meta = {"title": "Big PR", "body": "", "author": {}, "baseRefName": "main",
+                 "headRefName": "feat/x", "labels": []}
+        prompt = build_review_prompt(diff, meta, max_diff_chars=1000)
+        assert "truncated" in prompt
+
+    def test_build_diagnose_prompt_contains_log(self):
+        from tag.ci import build_diagnose_prompt
+        prompt = build_diagnose_prompt("ERROR: build failed at step 3")
+        assert "build failed" in prompt
+
+    def test_detect_git_host_returns_string(self):
+        from tag.ci import detect_git_host
+        host = detect_git_host()
+        assert host in ("github", "gitlab", "local")
+
+    def test_cmd_review_pr_missing_args(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(repo=None, pr=None, profile=None, post_comments=False, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_review_pr(args)
+        assert rc == 1
+
+    def test_cmd_ci_diagnose_missing_log(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(
+            ci_subcommand="diagnose", log_file=str(tmp_path / "no.log"),
+            profile=None, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_ci(args)
+        assert rc == 1
+
+    def test_cmd_ci_diagnose_no_log_file_arg(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(
+            ci_subcommand="diagnose", log_file=None,
+            profile=None, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_ci(args)
+        assert rc == 1
+
+    def test_cmd_ci_status(self, tmp_path, capsys):
+        import argparse
+        args = argparse.Namespace(ci_subcommand="status", profile=None, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_ci(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Git host:" in out
+
+
+# ===========================================================================
+# Parser: all 10 new commands registered
+# ===========================================================================
+
+class TestParserRegistration:
+
+    def test_all_new_commands_in_parser(self):
+        p = TAG.build_parser()
+        sub_actions = [a for a in p._actions if hasattr(a, "_name_parser_map")]
+        assert sub_actions, "No subcommand actions found"
+        registered = list(sub_actions[0]._name_parser_map.keys())
+        for cmd in ["plugin", "costs", "trace", "mcp-registry", "template",
+                    "hooks", "compare", "context", "shell", "review-pr", "ci"]:
+            assert cmd in registered, f"Command '{cmd}' not in parser"
+
+
+# ===========================================================================
+# Adversarial QA Regressions — PRD-011 through PRD-020
+# ===========================================================================
+
+class TestPRD011ThroughPRD020Regressions:
+    """Regression tests for bugs found by adversarial QA testing of PRD-011..020."""
+
+    # -----------------------------------------------------------------------
+    # BUG-1: _execute_hook does not catch subprocess.TimeoutExpired
+    # -----------------------------------------------------------------------
+
+    def test_execute_hook_timeout_returns_false(self):
+        """_execute_hook must return False (not raise) when the shell command times out."""
+        # We cannot run an actual 30-second sleep, so patch subprocess.run to raise.
+        import subprocess as _sp
+        with patch("subprocess.run", side_effect=_sp.TimeoutExpired("sleep 35", 30)):
+            ok = TAG._execute_hook({"type": "shell", "command": "sleep 35"}, {})
+        assert ok is False
+
+    def test_fire_hooks_with_timeout_returns_zero(self, tmp_path, monkeypatch):
+        """_fire_hooks must handle TimeoutExpired without raising and return 0 fired."""
+        import subprocess as _sp
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+        cfg = TAG.load_config(ROOT / "src" / "tag" / "config" / "default.yaml")
+        cfg = dict(cfg)
+        cfg["hooks"] = {"run.completed": [{"name": "slow", "type": "shell", "command": "sleep 35"}]}
+        with patch("subprocess.run", side_effect=_sp.TimeoutExpired("sleep 35", 30)):
+            fired = TAG._fire_hooks(cfg, "run.completed", {"run_id": "x"})
+        assert fired == 0
+
+    def test_fire_hooks_no_double_log_on_exception(self, tmp_path, monkeypatch):
+        """Exceptions in _execute_hook must not result in duplicate hook_log rows."""
+        import subprocess as _sp
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+        cfg, db = make_db(tmp_path)
+        db_path = TAG.runtime_db_path(cfg)
+        cfg = dict(cfg)
+        cfg["hooks"] = {"run.completed": [{"name": "failing", "type": "shell", "command": "false"}]}
+        TAG._fire_hooks(cfg, "run.completed", {"run_id": "x"}, db_path=db_path)
+        rows = db.execute("SELECT COUNT(*) FROM hook_log").fetchone()[0]
+        assert rows == 1, f"Expected 1 log row, got {rows} (double-logging bug)"
+        db.close()
+
+    # -----------------------------------------------------------------------
+    # BUG-2: cmd_template import crashes when YAML file is null
+    # -----------------------------------------------------------------------
+
+    def test_cmd_template_import_null_yaml_returns_1(self, tmp_path, capsys):
+        """template import must return rc=1 cleanly when the YAML file is 'null'."""
+        import argparse
+        null_yaml = tmp_path / "null.yaml"
+        null_yaml.write_text("null\n")
+        args = argparse.Namespace(
+            template_subcommand="import", template_file=str(null_yaml),
+            profile=None, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_template(args)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "valid YAML" in err or "mapping" in err or "null" in err.lower()
+
+    def test_cmd_template_import_non_dict_yaml_returns_1(self, tmp_path):
+        """template import must return rc=1 for YAML that is a list, not a dict."""
+        import argparse, yaml
+        list_yaml = tmp_path / "list.yaml"
+        list_yaml.write_text(yaml.dump(["a", "b", "c"]))
+        args = argparse.Namespace(
+            template_subcommand="import", template_file=str(list_yaml),
+            profile=None, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_template(args)
+        assert rc == 1
+
+    # -----------------------------------------------------------------------
+    # BUG-3: Plugin enable with spaces in name writes invalid env var key
+    # -----------------------------------------------------------------------
+
+    def test_plugin_enable_spaces_in_name_creates_valid_env_key(self, tmp_path):
+        """Plugin names with spaces must produce valid (no-space) env var keys."""
+        import argparse
+        args = argparse.Namespace(
+            plugin_subcommand="enable", plugin_name="has spaces",
+            profile="orchestrator", config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_plugin(args)
+        assert rc == 0
+        env_file = tmp_path / "taghome" / "profiles" / "orchestrator" / ".env"
+        content = env_file.read_text()
+        # Verify the key part (before '=') has no space
+        for line in content.splitlines():
+            if "=" in line and not line.startswith("#"):
+                key = line.split("=", 1)[0]
+                assert " " not in key, f"Env var key contains space: {key!r}"
+
+    def test_plugin_enable_special_chars_normalised(self, tmp_path):
+        """Plugin names with special chars produce only alphanumeric+underscore env keys."""
+        import argparse
+        args = argparse.Namespace(
+            plugin_subcommand="enable", plugin_name="my.plugin!name",
+            profile="orchestrator", config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_plugin(args)
+        assert rc == 0
+        env_file = tmp_path / "taghome" / "profiles" / "orchestrator" / ".env"
+        content = env_file.read_text()
+        for line in content.splitlines():
+            if "=" in line and not line.startswith("#"):
+                key = line.split("=", 1)[0]
+                import re
+                assert re.match(r"^[A-Za-z0-9_]+$", key), f"Non-identifier env key: {key!r}"
+
+    # -----------------------------------------------------------------------
+    # BUG-4: Path traversal via profile name in cmd_plugin and cmd_mcp_registry
+    # -----------------------------------------------------------------------
+
+    def test_plugin_enable_path_traversal_blocked(self, tmp_path):
+        """cmd_plugin enable must raise SystemExit for path-traversal profile names."""
+        import argparse
+        args = argparse.Namespace(
+            plugin_subcommand="enable", plugin_name="hermes-web-search",
+            profile="../../../etc", config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            with pytest.raises(SystemExit, match="path traversal"):
+                TAG.cmd_plugin(args)
+
+    def test_plugin_disable_path_traversal_blocked(self, tmp_path):
+        """cmd_plugin disable must raise SystemExit for path-traversal profile names."""
+        import argparse
+        args = argparse.Namespace(
+            plugin_subcommand="disable", plugin_name="hermes-web-search",
+            profile="../../secret", config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            with pytest.raises(SystemExit, match="path traversal"):
+                TAG.cmd_plugin(args)
+
+    def test_mcp_registry_enable_path_traversal_blocked(self, tmp_path):
+        """cmd_mcp_registry enable must raise SystemExit for path-traversal profile names."""
+        import argparse
+        args = argparse.Namespace(
+            mcp_reg_subcommand="enable", server_name="mcp-filesystem",
+            profile="../../../tmp", config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            with pytest.raises(SystemExit, match="path traversal"):
+                TAG.cmd_mcp_registry(args)
+
+    def test_mcp_registry_disable_path_traversal_blocked(self, tmp_path):
+        """cmd_mcp_registry disable must raise SystemExit for path-traversal profile names."""
+        import argparse
+        args = argparse.Namespace(
+            mcp_reg_subcommand="disable", server_name="mcp-filesystem",
+            profile="../../../tmp", config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            with pytest.raises(SystemExit, match="path traversal"):
+                TAG.cmd_mcp_registry(args)
+
+    def test_safe_profile_path_valid_name(self, tmp_path):
+        """_safe_profile_path must succeed for normal profile names."""
+        base = tmp_path / "profiles"
+        base.mkdir()
+        result = TAG._safe_profile_path(base, "orchestrator")
+        assert result == base / "orchestrator"
+
+    def test_safe_profile_path_deep_traversal_blocked(self, tmp_path):
+        """_safe_profile_path must block deeply nested traversals."""
+        base = tmp_path / "profiles"
+        base.mkdir()
+        with pytest.raises(SystemExit, match="path traversal"):
+            TAG._safe_profile_path(base, "../../../etc/passwd")
+
+    # -----------------------------------------------------------------------
+    # Additional adversarial scenarios for PRD-011..020
+    # -----------------------------------------------------------------------
+
+    def test_redact_env_model_id_not_redacted(self):
+        """MODEL_ID must NOT be redacted by _redact_env."""
+        val = TAG._redact_env("MODEL_ID", "gpt-4o")
+        assert val == "gpt-4o"
+
+    def test_redact_env_hermes_model_not_redacted(self):
+        """HERMES_MODEL must NOT be redacted by _redact_env."""
+        val = TAG._redact_env("HERMES_MODEL", "anthropic/claude-opus-4-8")
+        assert val == "anthropic/claude-opus-4-8"
+
+    def test_redact_env_openrouter_api_key_redacted(self):
+        """OPENROUTER_API_KEY must be redacted."""
+        val = TAG._redact_env("OPENROUTER_API_KEY", "sk-or-abc")
+        assert val == "<OPENROUTER_API_KEY>"
+
+    def test_redact_env_webhook_url_redacted(self):
+        """WEBHOOK_URL must be redacted (contains 'url')."""
+        val = TAG._redact_env("WEBHOOK_URL", "https://hooks.example.com/abc")
+        assert val == "<WEBHOOK_URL>"
+
+    def test_redact_env_database_url_redacted(self):
+        """DATABASE_URL must be redacted (contains 'url')."""
+        val = TAG._redact_env("DATABASE_URL", "postgres://user:pass@host/db")
+        assert val == "<DATABASE_URL>"
+
+    def test_redact_env_my_secret_token_redacted(self):
+        """MY_SECRET_TOKEN must be redacted (contains 'token')."""
+        val = TAG._redact_env("MY_SECRET_TOKEN", "tok-xyz")
+        assert val == "<MY_SECRET_TOKEN>"
+
+    def test_interpolate_shell_metacharacters_not_executed(self):
+        """_interpolate with shell metacharacters must only do string substitution."""
+        payload = {"run_id": "$(rm -rf /tmp/test)", "status": "ok"}
+        result = TAG._interpolate("run_id={{run_id}}", payload)
+        # The dangerous string is present but was never executed (just substituted)
+        assert "$(rm -rf /tmp/test)" in result
+
+    def test_cmd_costs_limit_zero(self, tmp_path, monkeypatch):
+        """cmd_costs --limit 0 must not crash."""
+        import argparse
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+        cfg, db = make_db(tmp_path)
+        db.close()
+        args = argparse.Namespace(profile=None, limit=0, json=False, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_costs(args)
+        assert rc == 0
+
+    def test_cmd_costs_limit_zero_with_profile_filter(self, tmp_path, monkeypatch, capsys):
+        """cmd_costs --limit 0 --profile nonexistent --json must not crash."""
+        import argparse
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+        cfg, db = make_db(tmp_path)
+        db.close()
+        args = argparse.Namespace(profile="foo", limit=0, json=True, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_costs(args)
+        assert rc == 0
+        data = json.loads(capsys.readouterr().out)
+        assert "runs" in data
+        assert "totals" in data
+
+    def test_trace_show_null_duration_ms(self, tmp_path, monkeypatch):
+        """cmd_trace show must handle spans with NULL finished_at/duration_ms gracefully."""
+        import argparse
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+        cfg, db = make_db(tmp_path)
+        db.execute("""CREATE TABLE IF NOT EXISTS spans (
+            id TEXT PRIMARY KEY, trace_id TEXT, parent_id TEXT, name TEXT, profile TEXT,
+            model_id TEXT, started_at TEXT, finished_at TEXT, duration_ms INTEGER,
+            status TEXT, prompt_tokens INTEGER, completion_tokens INTEGER,
+            attributes TEXT, error_msg TEXT
+        )""")
+        db.execute("""INSERT INTO spans VALUES (
+            'span-001', 'trace-001', NULL, 'test_op', 'orchestrator', 'gpt-4o',
+            '2026-01-01T00:00:00', NULL, NULL, 'ok', 100, 50, '{}', NULL
+        )""")
+        db.commit()
+        db.close()
+        args = argparse.Namespace(
+            trace_subcommand="show", trace_id="trace-001", json=False, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_trace(args)
+        assert rc == 0
+
+    def test_trace_show_null_duration_json(self, tmp_path, monkeypatch, capsys):
+        """cmd_trace show --json must handle NULL duration_ms (JSON serialisable)."""
+        import argparse
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "taghome"))
+        cfg, db = make_db(tmp_path)
+        db.execute("""CREATE TABLE IF NOT EXISTS spans (
+            id TEXT PRIMARY KEY, trace_id TEXT, parent_id TEXT, name TEXT, profile TEXT,
+            model_id TEXT, started_at TEXT, finished_at TEXT, duration_ms INTEGER,
+            status TEXT, prompt_tokens INTEGER, completion_tokens INTEGER,
+            attributes TEXT, error_msg TEXT
+        )""")
+        db.execute("""INSERT INTO spans VALUES (
+            'span-002', 'trace-002', NULL, 'fetch', NULL, NULL,
+            '2026-01-01T00:00:00', NULL, NULL, 'ok', 0, 0, '{}', NULL
+        )""")
+        db.commit()
+        db.close()
+        args = argparse.Namespace(
+            trace_subcommand="show", trace_id="trace-002", json=True, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_trace(args)
+        assert rc == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data[0]["duration_ms"] is None
+
+    def test_mcp_registry_enable_twice_no_duplicate(self, tmp_path):
+        """cmd_mcp_registry enable must be idempotent (no duplicate entries)."""
+        import argparse, yaml
+        for _ in range(2):
+            args = argparse.Namespace(
+                mcp_reg_subcommand="enable", server_name="mcp-filesystem",
+                profile="orchestrator", config=None,
+            )
+            with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+                TAG.cmd_mcp_registry(args)
+        cfg_path = tmp_path / "taghome" / "profiles" / "orchestrator" / "lab-config.yaml"
+        data = yaml.safe_load(cfg_path.read_text())
+        count = sum(1 for e in data.get("mcp_servers", []) if e.get("name") == "mcp-filesystem")
+        assert count == 1, f"Expected 1 entry, got {count} (duplicate bug)"
+
+    def test_cmd_template_import_config_null_ok(self, tmp_path):
+        """template import with config: null must not crash (treat as empty config)."""
+        import argparse, yaml
+        tmpl = {"name": "null-cfg-profile", "version": "1", "env": {}, "config": None}
+        tmpl_file = tmp_path / "tmpl.yaml"
+        tmpl_file.write_text(yaml.dump(tmpl))
+        args = argparse.Namespace(
+            template_subcommand="import", template_file=str(tmpl_file),
+            profile=None, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_template(args)
+        assert rc == 0
+
+    def test_cmd_template_import_no_name_key(self, tmp_path):
+        """template import with no 'name' key must fall back to 'imported' profile name."""
+        import argparse, yaml
+        tmpl = {"version": "1", "env": {"MODEL_ID": "gpt-4o"}, "config": {}}
+        tmpl_file = tmp_path / "noname.yaml"
+        tmpl_file.write_text(yaml.dump(tmpl))
+        args = argparse.Namespace(
+            template_subcommand="import", template_file=str(tmpl_file),
+            profile=None, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_template(args)
+        assert rc == 0
+        # Falls back to 'imported' as profile name
+        assert (tmp_path / "taghome" / "profiles" / "imported" / ".env").exists()
+
+    def test_hooks_test_no_hooks_configured_fires_zero(self, tmp_path, capsys):
+        """hooks test with an event that has no hooks must print 'Fired 0 hooks' cleanly."""
+        import argparse
+        args = argparse.Namespace(
+            hooks_subcommand="test", event_type="event.with.no.hooks", config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_hooks(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "0" in out
+
+    def test_cmd_compare_run_no_model_ref_exits_1(self, tmp_path, capsys):
+        """compare run without --model-ref must return 1."""
+        import argparse
+        args = argparse.Namespace(
+            compare_subcommand="run", profile=None, model_ref=[],
+            suite="/nonexistent.yaml", config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_compare(args)
+        assert rc == 1
+
+    def test_cmd_compare_run_no_suite_exits_1(self, tmp_path, capsys):
+        """compare run without --suite must return 1."""
+        import argparse
+        args = argparse.Namespace(
+            compare_subcommand="run", profile=None, model_ref=["gpt-4o"],
+            suite=None, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_compare(args)
+        assert rc == 1
+
+    def test_cmd_context_trim_keep_last_zero(self, tmp_path):
+        """context trim --keep-last 0 must not crash (edge case boundary)."""
+        import argparse
+        args = argparse.Namespace(
+            context_subcommand="trim", profile="orchestrator",
+            session_id="sess-001", keep_last=0, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
+                rc = TAG.cmd_context(args)
+        assert rc == 0
+
+    def test_cmd_shell_nonexistent_profile_returns_1(self, tmp_path, capsys):
+        """cmd_shell with a nonexistent profile must return 1 with a clear error."""
+        import argparse
+        args = argparse.Namespace(profile="nonexistent-xyz-profile", config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            with patch("tag.shell_mode.run_shell", return_value=1):
+                rc = TAG.cmd_shell(args)
+        assert rc == 1
+
+    def test_cmd_ci_diagnose_empty_log_file(self, tmp_path, capsys):
+        """ci diagnose with an empty log file (/dev/null equivalent) must not crash."""
+        import argparse
+        empty_log = tmp_path / "empty.log"
+        empty_log.write_text("")
+        args = argparse.Namespace(
+            ci_subcommand="diagnose", log_file=str(empty_log),
+            profile=None, config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="No issues", stderr="")):
+                rc = TAG.cmd_ci(args)
+        assert rc == 0
+
+    def test_cmd_ci_commit_lint_no_staged_changes(self, tmp_path, capsys):
+        """ci commit-lint with no staged changes must return 1 and print a helpful message."""
+        import argparse
+        args = argparse.Namespace(ci_subcommand="commit-lint", profile=None, config=None)
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            with patch("tag.ci.get_staged_diff", return_value=""):
+                rc = TAG.cmd_ci(args)
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "staged" in out.lower() or "git add" in out.lower()
+
+    def test_execute_hook_returns_false_for_bad_command(self):
+        """_execute_hook shell type must return False when command exits non-zero."""
+        ok = TAG._execute_hook({"type": "shell", "command": "false"}, {})
+        assert ok is False
+
+    def test_execute_hook_unknown_type_returns_false(self):
+        """_execute_hook with an unknown hook type must return False, not raise."""
+        ok = TAG._execute_hook({"type": "unknown_type", "command": "echo hi"}, {})
+        assert ok is False
