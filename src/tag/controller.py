@@ -433,9 +433,107 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
           notify      INTEGER NOT NULL DEFAULT 1
         );
         CREATE INDEX IF NOT EXISTS idx_qj_status ON queue_jobs(status, priority, created_at);
+
+        CREATE TABLE IF NOT EXISTS spans (
+          id                TEXT PRIMARY KEY,
+          trace_id          TEXT NOT NULL,
+          parent_id         TEXT,
+          name              TEXT NOT NULL,
+          profile           TEXT,
+          model_id          TEXT,
+          started_at        TEXT NOT NULL,
+          finished_at       TEXT,
+          duration_ms       INTEGER,
+          status            TEXT NOT NULL DEFAULT 'ok',
+          prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+          completion_tokens INTEGER NOT NULL DEFAULT 0,
+          attributes        TEXT NOT NULL DEFAULT '{}',
+          error_msg         TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_spans_trace ON spans(trace_id, started_at);
+
+        CREATE TABLE IF NOT EXISTS events (
+          id          TEXT PRIMARY KEY,
+          event_type  TEXT NOT NULL,
+          profile     TEXT,
+          run_id      TEXT,
+          payload     TEXT NOT NULL DEFAULT '{}',
+          created_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type, created_at);
+
+        CREATE TABLE IF NOT EXISTS hook_log (
+          id          TEXT PRIMARY KEY,
+          hook_name   TEXT NOT NULL,
+          event_id    TEXT NOT NULL,
+          status      TEXT NOT NULL DEFAULT 'ok',
+          response    TEXT,
+          fired_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_hook_log_name ON hook_log(hook_name, fired_at);
+
+        CREATE TABLE IF NOT EXISTS benchmark_comparisons (
+          id          TEXT PRIMARY KEY,
+          suite_path  TEXT NOT NULL,
+          models      TEXT NOT NULL DEFAULT '[]',
+          judge_model TEXT,
+          created_at  TEXT NOT NULL,
+          status      TEXT NOT NULL DEFAULT 'running'
+        );
+
+        CREATE TABLE IF NOT EXISTS benchmark_results (
+          id                TEXT PRIMARY KEY,
+          comparison_id     TEXT NOT NULL,
+          model_id          TEXT NOT NULL,
+          case_id           TEXT NOT NULL,
+          output            TEXT,
+          passed            INTEGER,
+          quality_score     REAL,
+          latency_ms        INTEGER,
+          prompt_tokens     INTEGER,
+          completion_tokens INTEGER,
+          cost_usd          REAL,
+          error             TEXT,
+          created_at        TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_br_comparison ON benchmark_results(comparison_id, model_id);
         """
     )
+    _migrate_runs_cost_columns(conn)
+    _prune_old_spans(conn)
     return conn
+
+
+def _migrate_runs_cost_columns(conn: sqlite3.Connection) -> None:
+    """Add cost/token columns to runs table if they don't exist yet."""
+    cursor = conn.execute("PRAGMA table_info(runs)")
+    existing = {row[1] for row in cursor.fetchall()}
+    migrations = [
+        ("prompt_tokens",     "INTEGER DEFAULT 0"),
+        ("completion_tokens", "INTEGER DEFAULT 0"),
+        ("total_tokens",      "INTEGER DEFAULT 0"),
+        ("estimated_cost_usd","REAL"),
+        ("model_id",          "TEXT"),
+        ("provider",          "TEXT"),
+    ]
+    for col, typedef in migrations:
+        if col not in existing:
+            try:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass
+    conn.commit()
+
+
+def _prune_old_spans(conn: sqlite3.Connection, days: int = 30) -> None:
+    """Remove spans older than `days` days to keep the DB size bounded."""
+    import datetime as _dt
+    cutoff = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days)).isoformat()
+    try:
+        conn.execute("DELETE FROM spans WHERE started_at < ?", (cutoff,))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -5315,6 +5413,980 @@ def cmd_openrouter_models(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# PRD-011: Plugin System
+# ---------------------------------------------------------------------------
+
+def _safe_profile_path(base: Path, profile: str) -> Path:
+    """Return ``base / profile`` only when the resolved path stays within *base*.
+
+    Raises ``SystemExit`` if *profile* contains path-traversal components such
+    as ``../`` that would escape the base directory.
+    """
+    resolved = (base / profile).resolve()
+    base_resolved = base.resolve()
+    try:
+        resolved.relative_to(base_resolved)
+    except ValueError:
+        raise SystemExit(f"Invalid profile name (path traversal detected): {profile!r}")
+    return base / profile
+
+
+def _plugin_registry_path() -> Path:
+    return Path(__file__).parent / "config" / "plugin-registry.yaml"
+
+
+def _load_plugin_registry() -> dict[str, Any]:
+    p = _plugin_registry_path()
+    if not p.exists():
+        return {}
+    with p.open() as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def _hermes_venv_pip(cfg: dict[str, Any], profile: str, *pip_args: str) -> subprocess.CompletedProcess:
+    venv_pip = tag_home() / "venvs" / profile / "bin" / "pip"
+    if not venv_pip.exists():
+        venv_pip = hermes_bin(cfg).parent / "pip"
+    return subprocess.run([str(venv_pip), *pip_args], capture_output=True, text=True)
+
+
+def cmd_plugin(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    registry = _load_plugin_registry()
+    plugins_map: dict[str, Any] = registry.get("plugins", registry).get("registry", {})
+    sub = getattr(args, "plugin_subcommand", None)
+
+    if sub == "list" or sub is None:
+        if not plugins_map:
+            print("No plugins in registry.")
+            return 0
+        rows = []
+        for name, info in plugins_map.items():
+            rows.append({"name": name, "description": info.get("description", ""), "pypi": info.get("pypi", "")})
+        if getattr(args, "json", False):
+            print(json.dumps(rows, indent=2))
+        else:
+            for r in rows:
+                print(f"  {r['name']:<35} {r['description']}")
+        return 0
+
+    if sub == "install":
+        name = args.plugin_name
+        info = plugins_map.get(name)
+        if not info:
+            print_error(f"Unknown plugin: {name}")
+            return 1
+        pypi = info.get("pypi", name)
+        profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+        result = _hermes_venv_pip(cfg, profile, "install", pypi)
+        if result.returncode != 0:
+            print_error(f"pip install failed: {result.stderr.strip()}")
+            return result.returncode
+        print_success(f"Installed {name} ({pypi}) into profile '{profile}'")
+        return 0
+
+    if sub == "enable":
+        name = args.plugin_name
+        profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+        profile_dir = _safe_profile_path(tag_home() / "profiles", profile)
+        env_file = profile_dir / ".env"
+        # Normalise the plugin name to a valid env var identifier (replace any
+        # non-alphanumeric characters with underscores, not just hyphens).
+        env_key_suffix = re.sub(r"[^A-Z0-9]", "_", name.upper())
+        line = f"TAG_PLUGIN_{env_key_suffix}_ENABLED=true\n"
+        if env_file.exists():
+            existing = env_file.read_text()
+            if f"TAG_PLUGIN_{env_key_suffix}" in existing:
+                env_file.write_text(re.sub(
+                    rf"TAG_PLUGIN_{re.escape(env_key_suffix)}_ENABLED=.*\n",
+                    line, existing,
+                ))
+            else:
+                with env_file.open("a") as fh:
+                    fh.write(line)
+        else:
+            env_file.parent.mkdir(parents=True, exist_ok=True)
+            env_file.write_text(line)
+        print_success(f"Enabled plugin '{name}' for profile '{profile}'")
+        return 0
+
+    if sub == "disable":
+        name = args.plugin_name
+        profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+        profile_dir = _safe_profile_path(tag_home() / "profiles", profile)
+        env_file = profile_dir / ".env"
+        if env_file.exists():
+            env_key_suffix = re.sub(r"[^A-Z0-9]", "_", name.upper())
+            key = f"TAG_PLUGIN_{env_key_suffix}_ENABLED"
+            lines = [l for l in env_file.read_text().splitlines(keepends=True)
+                     if not l.startswith(key)]
+            env_file.write_text("".join(lines))
+        print_success(f"Disabled plugin '{name}' for profile '{profile}'")
+        return 0
+
+    print_error(f"Unknown subcommand: {sub}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-012: Cost Tracking
+# ---------------------------------------------------------------------------
+
+_COST_TABLE: dict[str, dict[str, float]] = {
+    "openai/gpt-4o": {"prompt": 0.005, "completion": 0.015},
+    "openai/gpt-4o-mini": {"prompt": 0.00015, "completion": 0.0006},
+    "openai/gpt-4-turbo": {"prompt": 0.01, "completion": 0.03},
+    "openai/gpt-3.5-turbo": {"prompt": 0.0005, "completion": 0.0015},
+    "anthropic/claude-sonnet-4-6": {"prompt": 0.003, "completion": 0.015},
+    "anthropic/claude-opus-4-8": {"prompt": 0.015, "completion": 0.075},
+    "anthropic/claude-haiku-4-5": {"prompt": 0.00025, "completion": 0.00125},
+    "google/gemini-2.5-pro": {"prompt": 0.00125, "completion": 0.005},
+    "google/gemini-2.5-flash": {"prompt": 0.000075, "completion": 0.0003},
+    "meta-llama/llama-3.3-70b-instruct": {"prompt": 0.00059, "completion": 0.00079},
+}
+
+
+def _estimate_cost(prompt_tokens: int, completion_tokens: int, model_id: str) -> float:
+    entry = _COST_TABLE.get(model_id, {"prompt": 0.001, "completion": 0.002})
+    return (prompt_tokens / 1000 * entry["prompt"]) + (completion_tokens / 1000 * entry["completion"])
+
+
+def cmd_costs(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db_path = runtime_db_path(cfg)
+    if not db_path.exists():
+        print("No runs database found.")
+        return 0
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+        if "total_tokens" not in cols:
+            print("No cost data recorded yet (run some tasks first).")
+            conn.close()
+            return 0
+        limit = getattr(args, "limit", 20)
+        profile_filter = getattr(args, "profile", None)
+        where = "WHERE master_profile = ?" if profile_filter else ""
+        params = (profile_filter,) if profile_filter else ()
+        rows = conn.execute(
+            f"SELECT id, master_profile, model_id, prompt_tokens, completion_tokens, total_tokens, "
+            f"estimated_cost_usd, created_at FROM runs {where} ORDER BY created_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        agg = conn.execute(
+            f"SELECT SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens), "
+            f"SUM(estimated_cost_usd) FROM runs {where}",
+            params,
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if getattr(args, "json", False):
+        out = {
+            "runs": [
+                {"id": r[0], "profile": r[1], "model_id": r[2], "prompt_tokens": r[3],
+                 "completion_tokens": r[4], "total_tokens": r[5],
+                 "estimated_cost_usd": r[6], "created_at": r[7]}
+                for r in rows
+            ],
+            "totals": {
+                "prompt_tokens": agg[0] or 0,
+                "completion_tokens": agg[1] or 0,
+                "total_tokens": agg[2] or 0,
+                "estimated_cost_usd": agg[3] or 0.0,
+            },
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    print(f"{'Run ID':<24} {'Profile':<20} {'Model':<40} {'Tokens':>8} {'Cost':>10}")
+    print("-" * 110)
+    for r in rows:
+        cost = f"${r[6]:.4f}" if r[6] is not None else "n/a"
+        print(f"{r[0]:<24} {(r[1] or ''):<20} {(r[2] or ''):<40} {(r[5] or 0):>8} {cost:>10}")
+    print("-" * 110)
+    total_cost = f"${agg[3]:.4f}" if agg[3] is not None else "n/a"
+    print(f"{'TOTAL':<85} {(agg[2] or 0):>8} {total_cost:>10}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-013: Distributed Tracing
+# ---------------------------------------------------------------------------
+
+def cmd_trace(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db_path = runtime_db_path(cfg)
+    if not db_path.exists():
+        print("No spans database found.")
+        return 0
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        sub = getattr(args, "trace_subcommand", None)
+
+        if sub == "list" or sub is None:
+            rows = conn.execute(
+                "SELECT DISTINCT trace_id, MIN(started_at) as t, COUNT(*) as n FROM spans "
+                "GROUP BY trace_id ORDER BY t DESC LIMIT ?",
+                (getattr(args, "limit", 20),),
+            ).fetchall()
+            if getattr(args, "json", False):
+                print(json.dumps([{"trace_id": r[0], "started_at": r[1], "span_count": r[2]} for r in rows], indent=2))
+            else:
+                print(f"{'Trace ID':<36} {'Started':<28} {'Spans':>6}")
+                print("-" * 74)
+                for r in rows:
+                    print(f"{r[0]:<36} {r[1]:<28} {r[2]:>6}")
+            return 0
+
+        if sub == "show":
+            trace_id = args.trace_id
+            rows = conn.execute(
+                "SELECT id, trace_id, parent_id, name, profile, model_id, started_at, "
+                "finished_at, duration_ms, status, prompt_tokens, completion_tokens, "
+                "attributes, error_msg FROM spans WHERE trace_id = ? ORDER BY started_at",
+                (trace_id,),
+            ).fetchall()
+            if not rows:
+                print(f"No spans found for trace {trace_id}")
+                return 1
+            if getattr(args, "json", False):
+                col = ["id","trace_id","parent_id","name","profile","model_id","started_at",
+                       "finished_at","duration_ms","status","prompt_tokens","completion_tokens",
+                       "attributes","error_msg"]
+                print(json.dumps([dict(zip(col, r)) for r in rows], indent=2))
+                return 0
+            try:
+                from tag.tracing import Span, render_trace_terminal
+                spans = []
+                for r in rows:
+                    s = Span(
+                        id=r[0], trace_id=r[1], parent_id=r[2], name=r[3],
+                        profile=r[4], model_id=r[5], started_at=r[6],
+                        finished_at=r[7], duration_ms=r[8], status=r[9],
+                        prompt_tokens=r[10], completion_tokens=r[11],
+                        attributes=json.loads(r[12] or "{}"), error_msg=r[13],
+                    )
+                    spans.append(s)
+                print(render_trace_terminal(spans))
+            except ImportError:
+                for r in rows:
+                    print(f"  {r[3]:<40} {r[9]:<8} {r[8] or 0}ms")
+            return 0
+
+        if sub == "export":
+            endpoint = args.endpoint
+            profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+            trace_id = getattr(args, "trace_id", None)
+            where = "WHERE trace_id = ?" if trace_id else ""
+            params = (trace_id,) if trace_id else ()
+            rows = conn.execute(
+                f"SELECT id, trace_id, parent_id, name, profile, model_id, started_at, "
+                f"finished_at, duration_ms, status, prompt_tokens, completion_tokens, "
+                f"attributes, error_msg FROM spans {where} ORDER BY started_at",
+                params,
+            ).fetchall()
+            try:
+                from tag.tracing import export_spans_otlp
+                ok = export_spans_otlp(rows, endpoint)
+                if ok:
+                    print_success(f"Exported {len(rows)} spans to {endpoint}")
+                else:
+                    print_error(f"OTLP export failed — check endpoint: {endpoint}")
+                    return 1
+            except ImportError:
+                print_error("tag.tracing not available")
+                return 1
+            return 0
+
+    finally:
+        conn.close()
+
+    print_error(f"Unknown subcommand: {sub}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-014: MCP Server Registry
+# ---------------------------------------------------------------------------
+
+def _load_mcp_registry() -> dict[str, Any]:
+    p = Path(__file__).parent / "config" / "mcp-registry.yaml"
+    if not p.exists():
+        return {}
+    with p.open() as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def cmd_mcp_registry(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    reg = _load_mcp_registry()
+    servers: dict[str, Any] = reg.get("servers", {})
+    sub = getattr(args, "mcp_reg_subcommand", None)
+
+    if sub == "list" or sub is None:
+        category_filter = getattr(args, "category", None)
+        rows = []
+        for name, info in servers.items():
+            if category_filter and info.get("category") != category_filter:
+                continue
+            rows.append({
+                "name": name,
+                "description": info.get("description", ""),
+                "category": info.get("category", ""),
+                "requires_env": info.get("requires_env", []),
+            })
+        if getattr(args, "json", False):
+            print(json.dumps(rows, indent=2))
+        else:
+            print(f"{'Name':<30} {'Category':<14} {'Description'}")
+            print("-" * 80)
+            for r in rows:
+                env_note = f" [needs: {', '.join(r['requires_env'])}]" if r["requires_env"] else ""
+                print(f"  {r['name']:<28} {r['category']:<14} {r['description']}{env_note}")
+        return 0
+
+    if sub == "install":
+        name = args.server_name
+        info = servers.get(name)
+        if not info:
+            print_error(f"Unknown MCP server: {name}")
+            return 1
+        install = info.get("install", {})
+        pkg = install.get("package", name)
+        itype = install.get("type", "npm")
+        if itype == "npm":
+            result = subprocess.run(["npm", "install", "-g", pkg], capture_output=True, text=True)
+        elif itype == "pip":
+            result = subprocess.run([sys.executable, "-m", "pip", "install", pkg], capture_output=True, text=True)
+        else:
+            print_error(f"Unknown install type: {itype}")
+            return 1
+        if result.returncode != 0:
+            print_error(f"Install failed: {result.stderr.strip()}")
+            return result.returncode
+        print_success(f"Installed MCP server '{name}' ({pkg})")
+        return 0
+
+    if sub == "enable":
+        name = args.server_name
+        info = servers.get(name)
+        if not info:
+            print_error(f"Unknown MCP server: {name}")
+            return 1
+        profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+        cfg_block = info.get("config", {})
+        profile_dir = _safe_profile_path(tag_home() / "profiles", profile)
+        profile_cfg_path = profile_dir / "lab-config.yaml"
+        if profile_cfg_path.exists():
+            with profile_cfg_path.open() as fh:
+                pcfg = yaml.safe_load(fh) or {}
+        else:
+            pcfg = {}
+        mcp_list: list = pcfg.setdefault("mcp_servers", [])
+        existing_names = [e.get("name") for e in mcp_list]
+        if name not in existing_names:
+            mcp_list.append({"name": name, **cfg_block})
+            profile_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            write_yaml(profile_cfg_path, pcfg, force=True)
+            print_success(f"Enabled MCP server '{name}' for profile '{profile}'")
+        else:
+            print(f"MCP server '{name}' is already enabled for profile '{profile}'")
+        return 0
+
+    if sub == "disable":
+        name = args.server_name
+        profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+        profile_dir = _safe_profile_path(tag_home() / "profiles", profile)
+        profile_cfg_path = profile_dir / "lab-config.yaml"
+        if profile_cfg_path.exists():
+            with profile_cfg_path.open() as fh:
+                pcfg = yaml.safe_load(fh) or {}
+            mcp_list = pcfg.get("mcp_servers", [])
+            pcfg["mcp_servers"] = [e for e in mcp_list if e.get("name") != name]
+            write_yaml(profile_cfg_path, pcfg, force=True)
+            print_success(f"Disabled MCP server '{name}' for profile '{profile}'")
+        else:
+            print(f"No profile config found for '{profile}'")
+        return 0
+
+    print_error(f"Unknown subcommand: {sub}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-015: Profile Templates
+# ---------------------------------------------------------------------------
+
+_REDACT_PATTERNS = re.compile(
+    r"(api[_-]?key|secret|token|password|credential|auth|url)",
+    re.IGNORECASE,
+)
+
+
+def _redact_env(key: str, val: str) -> str:
+    if _REDACT_PATTERNS.search(key):
+        return f"<{key.upper()}>"
+    return val
+
+
+def cmd_template(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    sub = getattr(args, "template_subcommand", None)
+
+    if sub == "export" or sub is None:
+        profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+        profile_dir = tag_home() / "profiles" / profile
+        env_file = profile_dir / ".env"
+        cfg_file = profile_dir / "lab-config.yaml"
+
+        template: dict[str, Any] = {
+            "name": profile,
+            "version": "1",
+            "description": f"TAG profile template for '{profile}'",
+            "env": {},
+            "config": {},
+        }
+
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                template["env"][k.strip()] = _redact_env(k.strip(), v.strip())
+
+        if cfg_file.exists():
+            with cfg_file.open() as fh:
+                template["config"] = yaml.safe_load(fh) or {}
+
+        out_path = getattr(args, "output", None)
+        yaml_text = yaml.dump(template, default_flow_style=False, sort_keys=False)
+        if out_path:
+            Path(out_path).write_text(yaml_text)
+            print_success(f"Template exported to {out_path}")
+        else:
+            print(yaml_text)
+        return 0
+
+    if sub == "import":
+        tmpl_path = args.template_file
+        with open(tmpl_path) as fh:
+            tmpl = yaml.safe_load(fh)
+        if not isinstance(tmpl, dict):
+            print_error(f"Template file '{tmpl_path}' does not contain a valid YAML mapping")
+            return 1
+        profile = getattr(args, "profile", None) or tmpl.get("name", "imported")
+        profile_dir = tag_home() / "profiles" / profile
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        env_data = tmpl.get("env", {})
+        if env_data:
+            env_file = profile_dir / ".env"
+            lines = []
+            for k, v in env_data.items():
+                if str(v).startswith("<") and str(v).endswith(">"):
+                    lines.append(f"# {k}=<fill in>")
+                else:
+                    lines.append(f"{k}={v}")
+            env_file.write_text("\n".join(lines) + "\n")
+
+        cfg_data = tmpl.get("config", {})
+        if cfg_data:
+            write_yaml(profile_dir / "lab-config.yaml", cfg_data, force=True)
+
+        print_success(f"Template imported as profile '{profile}'")
+        return 0
+
+    if sub == "fetch":
+        url = args.url
+        try:
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                tmpl_text = resp.read().decode()
+        except urllib.error.URLError as exc:
+            print_error(f"Failed to fetch template: {exc}")
+            return 1
+        print(tmpl_text)
+        return 0
+
+    print_error(f"Unknown subcommand: {sub}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-016: Webhook Event Hooks
+# ---------------------------------------------------------------------------
+
+def _interpolate(template: str, payload: dict[str, Any]) -> str:
+    for k, v in payload.items():
+        template = template.replace(f"{{{{{k}}}}}", str(v))
+    return template
+
+
+def _execute_hook(hook: dict[str, Any], payload: dict[str, Any]) -> bool:
+    hook_type = hook.get("type", "shell")
+    if hook_type == "shell":
+        cmd_str = _interpolate(hook.get("command", ""), payload)
+        try:
+            result = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, timeout=30)
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+    if hook_type == "webhook":
+        url = hook.get("url", "")
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10):
+                return True
+        except urllib.error.URLError:
+            return False
+    return False
+
+
+def _fire_hooks(cfg: dict[str, Any], event_type: str, payload: dict[str, Any], db_path: Path | None = None) -> int:
+    hooks: list[dict[str, Any]] = cfg.get("hooks", {}).get(event_type, [])
+    if not hooks:
+        return 0
+    fired = 0
+    for hook in hooks:
+        exc_msg: str | None = None
+        try:
+            ok = _execute_hook(hook, payload)
+        except Exception as exc:
+            ok = False
+            exc_msg = str(exc)
+        if ok:
+            fired += 1
+        if db_path:
+            try:
+                conn = sqlite3.connect(str(db_path))
+                conn.execute(
+                    "INSERT INTO hook_log (id, hook_name, event_id, status, response, fired_at) "
+                    "VALUES (?,?,?,?,?,datetime('now'))",
+                    (uuid.uuid4().hex[:12], hook.get("name", ""), event_type,
+                     "ok" if ok else "error", exc_msg),
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+    return fired
+
+
+def cmd_hooks(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    sub = getattr(args, "hooks_subcommand", None)
+
+    if sub == "list" or sub is None:
+        hooks_cfg: dict[str, Any] = cfg.get("hooks", {})
+        if not hooks_cfg:
+            print("No hooks configured.")
+            return 0
+        if getattr(args, "json", False):
+            print(json.dumps(hooks_cfg, indent=2))
+            return 0
+        for event_type, hook_list in hooks_cfg.items():
+            print(f"\n  {event_type}:")
+            for h in hook_list:
+                print(f"    - {h.get('name', '(unnamed)')}: {h.get('type', 'shell')}")
+        return 0
+
+    if sub == "log":
+        db_path = runtime_db_path(cfg)
+        if not db_path.exists():
+            print("No hook log found.")
+            return 0
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT id, hook_name, event_id, status, response, fired_at "
+            "FROM hook_log ORDER BY fired_at DESC LIMIT ?",
+            (getattr(args, "limit", 50),),
+        ).fetchall()
+        conn.close()
+        if getattr(args, "json", False):
+            print(json.dumps([
+                {"id": r[0], "hook_name": r[1], "event_type": r[2],
+                 "status": r[3], "response": r[4], "fired_at": r[5]}
+                for r in rows
+            ], indent=2))
+            return 0
+        print(f"{'ID':<14} {'Event':<20} {'Hook':<25} {'Status':<8} {'Time'}")
+        print("-" * 90)
+        for r in rows:
+            print(f"  {r[0]:<12} {r[1]:<20} {r[2]:<25} {r[3]:<8} {r[5]}")
+        return 0
+
+    if sub == "test":
+        event_type = args.event_type
+        payload = {"event_type": event_type, "test": "true", "timestamp": str(dt.datetime.utcnow())}
+        fired = _fire_hooks(cfg, event_type, payload)
+        print_success(f"Fired {fired} hook(s) for event '{event_type}'")
+        return 0
+
+    print_error(f"Unknown subcommand: {sub}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-017: Multi-Model Comparison
+# ---------------------------------------------------------------------------
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db_path = runtime_db_path(cfg)
+    sub = getattr(args, "compare_subcommand", None)
+
+    if sub == "list" or sub is None:
+        if not db_path.exists():
+            print("No benchmark database found.")
+            return 0
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT id, suite_path, created_at, status, models FROM benchmark_comparisons "
+            "ORDER BY created_at DESC LIMIT ?",
+            (getattr(args, "limit", 20),),
+        ).fetchall()
+        conn.close()
+        if getattr(args, "json", False):
+            print(json.dumps([
+                {"id": r[0], "suite_path": r[1], "created_at": r[2], "status": r[3], "models": r[4]}
+                for r in rows
+            ], indent=2))
+            return 0
+        print(f"{'ID':<14} {'Suite':<40} {'Status':<12} {'Created'}")
+        print("-" * 90)
+        for r in rows:
+            print(f"  {r[0]:<12} {r[1]:<40} {r[3]:<12} {r[2]}")
+        return 0
+
+    if sub == "show":
+        comparison_id = args.comparison_id
+        if not db_path.exists():
+            print("No benchmark database found.")
+            return 0
+        conn = sqlite3.connect(str(db_path))
+        meta = conn.execute(
+            "SELECT id, suite_path, created_at, status, models FROM benchmark_comparisons WHERE id = ?",
+            (comparison_id,),
+        ).fetchone()
+        if not meta:
+            print_error(f"Comparison '{comparison_id}' not found")
+            conn.close()
+            return 1
+        results = conn.execute(
+            "SELECT model_id, case_id, quality_score, latency_ms, prompt_tokens, completion_tokens, output "
+            "FROM benchmark_results WHERE comparison_id = ? ORDER BY case_id, quality_score DESC",
+            (comparison_id,),
+        ).fetchall()
+        conn.close()
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "id": meta[0], "suite_path": meta[1], "created_at": meta[2],
+                "status": meta[3], "models": meta[4],
+                "results": [
+                    {"model_id": r[0], "case_id": r[1], "quality_score": r[2],
+                     "latency_ms": r[3], "prompt_tokens": r[4], "completion_tokens": r[5]}
+                    for r in results
+                ],
+            }, indent=2))
+            return 0
+        print(f"Comparison: {meta[1]} (id={meta[0]})")
+        print(f"Status:     {meta[3]}  |  Created: {meta[2]}")
+        print(f"Models:     {meta[4]}")
+        print(f"\n{'Model':<40} {'Case':<25} {'Score':>6} {'Latency':>10}")
+        print("-" * 90)
+        for r in results:
+            print(f"  {r[0]:<38} {r[1]:<25} {r[2] or '-':>6} {(str(r[3]) + 'ms') if r[3] else 'n/a':>10}")
+        return 0
+
+    if sub == "run":
+        profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+        model_refs = getattr(args, "model_ref", [])
+        suite_path = getattr(args, "suite", None)
+        if not model_refs:
+            print_error("Provide at least one --model-ref")
+            return 1
+        if not suite_path:
+            print_error("Provide --suite <path>")
+            return 1
+        with open(suite_path) as fh:
+            suite = yaml.safe_load(fh) or {}
+        cases = suite.get("cases", [])
+        if not cases:
+            print_error("Suite has no cases")
+            return 1
+
+        comparison_id = uuid.uuid4().hex[:12]
+        comparison_name = suite.get("name", Path(suite_path).stem)
+        conn = open_db(cfg)
+        conn.execute(
+            "INSERT INTO benchmark_comparisons (id, suite_path, created_at, status, models) "
+            "VALUES (?,?,datetime('now'),?,?)",
+            (comparison_id, str(suite_path), "running", json.dumps(model_refs)),
+        )
+        conn.commit()
+
+        for case in cases:
+            case_name = case.get("name", "unnamed")
+            prompt_text = case.get("prompt", "")
+            for model_ref in model_refs:
+                print(f"  Running case '{case_name}' with model '{model_ref}'...")
+                env = profile_exec_env(cfg, profile)
+                env["HERMES_MODEL"] = model_ref
+                start = time.monotonic()
+                try:
+                    result = subprocess.run(
+                        [str(hermes_bin(cfg)), "chat", "-q", prompt_text, "-Q"],
+                        env=env, capture_output=True, text=True, timeout=120,
+                    )
+                    latency = int((time.monotonic() - start) * 1000)
+                    output = result.stdout.strip()
+                    score = None
+                except subprocess.TimeoutExpired:
+                    latency = 120000
+                    output = "(timeout)"
+                    score = 0
+                result_id = uuid.uuid4().hex[:12]
+                conn.execute(
+                    "INSERT INTO benchmark_results (id, comparison_id, model_id, case_id, quality_score, "
+                    "latency_ms, prompt_tokens, completion_tokens, output) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (result_id, comparison_id, model_ref, case_name, score, latency, 0, 0, output),
+                )
+                conn.commit()
+
+        conn.close()
+        print_success(f"Comparison '{comparison_name}' saved (id={comparison_id})")
+        return 0
+
+    print_error(f"Unknown subcommand: {sub}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-018: Context Window Management
+# ---------------------------------------------------------------------------
+
+def cmd_context(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+    sub = getattr(args, "context_subcommand", None)
+
+    if sub == "show" or sub is None:
+        result = subprocess.run(
+            [str(hermes_bin(cfg)), "sessions", "list", "--json"],
+            env=profile_exec_env(cfg, profile),
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print_error(f"Failed to list sessions: {result.stderr.strip()}")
+            return 1
+        try:
+            sessions = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            print(result.stdout)
+            return 0
+        if getattr(args, "json", False):
+            print(json.dumps(sessions, indent=2))
+            return 0
+        if not sessions:
+            print(f"No active sessions for profile '{profile}'")
+            return 0
+        print(f"Sessions for profile '{profile}':")
+        for sess in sessions[:20]:
+            sid = sess.get("id", sess.get("session_id", "?"))
+            tokens = sess.get("token_count", sess.get("tokens", "?"))
+            model = sess.get("model_id", sess.get("model", "?"))
+            print(f"  {sid:<40} tokens={tokens:<10} model={model}")
+        return 0
+
+    if sub == "compress":
+        session_id = getattr(args, "session_id", None)
+        if not session_id:
+            print_error("Provide --session-id")
+            return 1
+        cmd_args = [str(hermes_bin(cfg)), "sessions", "compress", session_id]
+        result = subprocess.run(
+            cmd_args, env=profile_exec_env(cfg, profile),
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print_error(f"Context compression failed: {result.stderr.strip()}")
+            return 1
+        print_success(f"Context compressed for session '{session_id}'")
+        return 0
+
+    if sub == "trim":
+        session_id = getattr(args, "session_id", None)
+        keep_last = getattr(args, "keep_last", 10)
+        if not session_id:
+            print_error("Provide --session-id")
+            return 1
+        result = subprocess.run(
+            [str(hermes_bin(cfg)), "sessions", "trim", session_id, "--keep-last", str(keep_last)],
+            env=profile_exec_env(cfg, profile),
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print_error(f"Context trim failed: {result.stderr.strip()}")
+            return 1
+        print_success(f"Trimmed session '{session_id}' to last {keep_last} turns")
+        return 0
+
+    print_error(f"Unknown subcommand: {sub}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-019: Natural Language Shell
+# ---------------------------------------------------------------------------
+
+def cmd_shell(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+    try:
+        from tag.shell_mode import run_shell
+        return run_shell(cfg, profile)
+    except ImportError as exc:
+        print_error(f"Shell mode not available: {exc}")
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-020: CI/CD Integration
+# ---------------------------------------------------------------------------
+
+def cmd_review_pr(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    repo = getattr(args, "repo", None)
+    pr_number = getattr(args, "pr", None)
+    profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+    post_comments = getattr(args, "post_comments", False)
+
+    try:
+        from tag.ci import (
+            fetch_pr_diff,
+            fetch_pr_metadata,
+            post_pr_comment,
+            build_review_prompt,
+        )
+    except ImportError as exc:
+        print_error(f"tag.ci not available: {exc}")
+        return 1
+
+    if not repo or not pr_number:
+        print_error("Provide --repo owner/name and --pr NUMBER")
+        return 1
+
+    print(f"Fetching PR #{pr_number} from {repo}...")
+    try:
+        diff = fetch_pr_diff(repo, pr_number)
+        metadata = fetch_pr_metadata(repo, pr_number)
+    except (RuntimeError, ValueError) as exc:
+        print_error(str(exc))
+        return 1
+
+    prompt_text = build_review_prompt(diff, metadata)
+
+    print(f"Running code review with profile '{profile}'...")
+    result = subprocess.run(
+        [str(hermes_bin(cfg)), "chat", "-q", prompt_text, "-Q"],
+        env=profile_exec_env(cfg, profile),
+        capture_output=True, text=True,
+    )
+    review_text = result.stdout.strip()
+
+    if not review_text:
+        print_error("No review output received from agent")
+        return 1
+
+    if post_comments:
+        body = f"## TAG Automated Code Review\n\n{review_text}\n\n---\n*Generated by tag-agent*"
+        ok = post_pr_comment(repo, pr_number, body)
+        if ok:
+            print_success(f"Posted review comment to {repo}#{pr_number}")
+        else:
+            print_warning("Failed to post comment — printing review instead:")
+            print(review_text)
+    else:
+        print(review_text)
+
+    return 0
+
+
+def cmd_ci(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    sub = getattr(args, "ci_subcommand", None)
+    profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+
+    try:
+        from tag.ci import (
+            build_diagnose_prompt,
+            read_ci_log,
+            detect_git_host,
+            get_staged_diff,
+        )
+    except ImportError as exc:
+        print_error(f"tag.ci not available: {exc}")
+        return 1
+
+    if sub == "diagnose":
+        log_path = getattr(args, "log_file", None)
+        if not log_path:
+            print_error("Provide --log-file PATH")
+            return 1
+        try:
+            log_content = read_ci_log(Path(log_path))
+        except FileNotFoundError:
+            print_error(f"Log file not found: {log_path}")
+            return 1
+        prompt_text = build_diagnose_prompt(log_content)
+        result = subprocess.run(
+            [str(hermes_bin(cfg)), "chat", "-q", prompt_text, "-Q"],
+            env=profile_exec_env(cfg, profile),
+            capture_output=True, text=True,
+        )
+        print(result.stdout.strip() or "(no output)")
+        return result.returncode
+
+    if sub == "commit-lint":
+        diff = get_staged_diff()
+        if not diff.strip():
+            print("No staged changes. Stage your changes with `git add` first.")
+            return 1
+        prompt_text = textwrap.dedent(f"""\
+            Review the following staged git diff and suggest a concise conventional commit message.
+            Format: <type>(<scope>): <subject>
+            Types: feat, fix, docs, style, refactor, perf, test, chore
+            Keep subject under 72 characters.
+
+            Diff:
+            {diff[:4000]}
+        """)
+        result = subprocess.run(
+            [str(hermes_bin(cfg)), "chat", "-q", prompt_text, "-Q"],
+            env=profile_exec_env(cfg, profile),
+            capture_output=True, text=True,
+        )
+        print(result.stdout.strip() or "(no output)")
+        return result.returncode
+
+    if sub == "status":
+        host = detect_git_host()
+        print(f"Git host: {host}")
+        result = subprocess.run(["git", "status", "--short"], capture_output=True, text=True)
+        print(result.stdout or "(clean)")
+        return 0
+
+    print_error(f"Unknown subcommand: {sub}")
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="TAG orchestration CLI")
     parser.add_argument("--config", help="Path to lab config YAML")
@@ -5838,6 +6910,150 @@ def build_parser() -> argparse.ArgumentParser:
     import_daytona_p.add_argument("--force", action="store_true")
     import_daytona_p.add_argument("--json", action="store_true")
     import_daytona_p.set_defaults(func=cmd_import_daytona)
+
+    # ---- PRD-011: plugin ----
+    plugin = sub.add_parser("plugin", help="Manage TAG plugins")
+    plugin_sub = plugin.add_subparsers(dest="plugin_subcommand")
+    plugin_list = plugin_sub.add_parser("list", help="List available plugins")
+    plugin_list.add_argument("--json", action="store_true")
+    plugin_install = plugin_sub.add_parser("install", help="Install a plugin into a profile venv")
+    plugin_install.add_argument("plugin_name", metavar="NAME")
+    plugin_install.add_argument("--profile")
+    plugin_install.add_argument("--json", action="store_true")
+    plugin_enable = plugin_sub.add_parser("enable", help="Enable a plugin for a profile")
+    plugin_enable.add_argument("plugin_name", metavar="NAME")
+    plugin_enable.add_argument("--profile")
+    plugin_disable = plugin_sub.add_parser("disable", help="Disable a plugin for a profile")
+    plugin_disable.add_argument("plugin_name", metavar="NAME")
+    plugin_disable.add_argument("--profile")
+    for pp in [plugin, plugin_list, plugin_install, plugin_enable, plugin_disable]:
+        pp.set_defaults(func=cmd_plugin)
+
+    # ---- PRD-012: costs ----
+    costs = sub.add_parser("costs", help="Show token usage and cost estimates for recent runs")
+    costs.add_argument("--profile", help="Filter by profile")
+    costs.add_argument("--limit", type=positive_int, default=20)
+    costs.add_argument("--json", action="store_true")
+    costs.set_defaults(func=cmd_costs)
+
+    # ---- PRD-013: trace ----
+    trace = sub.add_parser("trace", help="View and export distributed trace spans")
+    trace_sub = trace.add_subparsers(dest="trace_subcommand")
+    trace_list = trace_sub.add_parser("list", help="List recent traces")
+    trace_list.add_argument("--limit", type=positive_int, default=20)
+    trace_list.add_argument("--json", action="store_true")
+    trace_show = trace_sub.add_parser("show", help="Show flamechart for a trace")
+    trace_show.add_argument("trace_id", metavar="TRACE_ID")
+    trace_show.add_argument("--json", action="store_true")
+    trace_export = trace_sub.add_parser("export", help="Export spans to OTLP endpoint")
+    trace_export.add_argument("endpoint", metavar="ENDPOINT")
+    trace_export.add_argument("--trace-id", metavar="ID", dest="trace_id")
+    trace_export.add_argument("--profile")
+    for tp in [trace, trace_list, trace_show, trace_export]:
+        tp.set_defaults(func=cmd_trace)
+
+    # ---- PRD-014: mcp-registry ----
+    mcp_reg = sub.add_parser("mcp-registry", help="Browse and install curated MCP servers")
+    mcp_reg_sub = mcp_reg.add_subparsers(dest="mcp_reg_subcommand")
+    mcp_list = mcp_reg_sub.add_parser("list", help="List available MCP servers")
+    mcp_list.add_argument("--category", help="Filter by category")
+    mcp_list.add_argument("--json", action="store_true")
+    mcp_install = mcp_reg_sub.add_parser("install", help="Install an MCP server globally")
+    mcp_install.add_argument("server_name", metavar="NAME")
+    mcp_enable = mcp_reg_sub.add_parser("enable", help="Enable an MCP server for a profile")
+    mcp_enable.add_argument("server_name", metavar="NAME")
+    mcp_enable.add_argument("--profile")
+    mcp_disable = mcp_reg_sub.add_parser("disable", help="Disable an MCP server for a profile")
+    mcp_disable.add_argument("server_name", metavar="NAME")
+    mcp_disable.add_argument("--profile")
+    for mp in [mcp_reg, mcp_list, mcp_install, mcp_enable, mcp_disable]:
+        mp.set_defaults(func=cmd_mcp_registry)
+
+    # ---- PRD-015: template ----
+    tmpl = sub.add_parser("template", help="Export/import/fetch profile config templates")
+    tmpl_sub = tmpl.add_subparsers(dest="template_subcommand")
+    tmpl_export = tmpl_sub.add_parser("export", help="Export a profile as a YAML template")
+    tmpl_export.add_argument("--profile")
+    tmpl_export.add_argument("--output", "-o", metavar="FILE", help="Write to file instead of stdout")
+    tmpl_import = tmpl_sub.add_parser("import", help="Import a YAML template as a new profile")
+    tmpl_import.add_argument("template_file", metavar="FILE")
+    tmpl_import.add_argument("--profile", help="Override profile name from template")
+    tmpl_fetch = tmpl_sub.add_parser("fetch", help="Fetch a template from a URL")
+    tmpl_fetch.add_argument("url", metavar="URL")
+    for tp in [tmpl, tmpl_export, tmpl_import, tmpl_fetch]:
+        tp.set_defaults(func=cmd_template)
+
+    # ---- PRD-016: hooks ----
+    hooks_cmd = sub.add_parser("hooks", help="Manage and test TAG lifecycle event hooks")
+    hooks_sub = hooks_cmd.add_subparsers(dest="hooks_subcommand")
+    hooks_list = hooks_sub.add_parser("list", help="List configured hooks")
+    hooks_list.add_argument("--json", action="store_true")
+    hooks_log = hooks_sub.add_parser("log", help="Show recent hook execution log")
+    hooks_log.add_argument("--limit", type=positive_int, default=50)
+    hooks_log.add_argument("--json", action="store_true")
+    hooks_test = hooks_sub.add_parser("test", help="Test-fire hooks for an event type")
+    hooks_test.add_argument("event_type", metavar="EVENT")
+    for hp in [hooks_cmd, hooks_list, hooks_log, hooks_test]:
+        hp.set_defaults(func=cmd_hooks)
+
+    # ---- PRD-017: compare ----
+    compare = sub.add_parser("compare", help="Multi-model benchmark comparisons")
+    compare_sub = compare.add_subparsers(dest="compare_subcommand")
+    compare_list = compare_sub.add_parser("list", help="List saved comparisons")
+    compare_list.add_argument("--limit", type=positive_int, default=20)
+    compare_list.add_argument("--json", action="store_true")
+    compare_show = compare_sub.add_parser("show", help="Show comparison results")
+    compare_show.add_argument("comparison_id", metavar="ID")
+    compare_show.add_argument("--json", action="store_true")
+    compare_run = compare_sub.add_parser("run", help="Run a new multi-model comparison")
+    compare_run.add_argument("--profile")
+    compare_run.add_argument("--suite", required=True, help="Path to benchmark suite YAML")
+    compare_run.add_argument("--model-ref", action="append", default=[], metavar="REF",
+                             help="Model reference (provider/model-id); repeat for multiple")
+    compare_run.add_argument("--json", action="store_true")
+    for cp in [compare, compare_list, compare_show, compare_run]:
+        cp.set_defaults(func=cmd_compare)
+
+    # ---- PRD-018: context ----
+    context_cmd = sub.add_parser("context", help="Manage agent context window size")
+    context_sub = context_cmd.add_subparsers(dest="context_subcommand")
+    ctx_show = context_sub.add_parser("show", help="List active sessions and their token counts")
+    ctx_show.add_argument("--profile")
+    ctx_show.add_argument("--json", action="store_true")
+    ctx_compress = context_sub.add_parser("compress", help="Summarize and compress a session context")
+    ctx_compress.add_argument("--profile")
+    ctx_compress.add_argument("--session-id", required=True, dest="session_id")
+    ctx_trim = context_sub.add_parser("trim", help="Trim a session to the last N turns")
+    ctx_trim.add_argument("--profile")
+    ctx_trim.add_argument("--session-id", required=True, dest="session_id")
+    ctx_trim.add_argument("--keep-last", type=positive_int, default=10, dest="keep_last")
+    for ctx_p in [context_cmd, ctx_show, ctx_compress, ctx_trim]:
+        ctx_p.set_defaults(func=cmd_context)
+
+    # ---- PRD-019: shell ----
+    shell_cmd = sub.add_parser("shell", help="Open interactive natural-language TAG shell")
+    shell_cmd.add_argument("--profile", help="Profile to use (default: master_profile)")
+    shell_cmd.set_defaults(func=cmd_shell)
+
+    # ---- PRD-020: review-pr / ci ----
+    review_pr_cmd = sub.add_parser("review-pr", help="AI code review for a GitHub pull request")
+    review_pr_cmd.add_argument("--repo", required=True, help="GitHub repository (owner/name)")
+    review_pr_cmd.add_argument("--pr", required=True, type=int, metavar="NUMBER")
+    review_pr_cmd.add_argument("--profile", help="Profile to run review with")
+    review_pr_cmd.add_argument("--post-comments", action="store_true", dest="post_comments",
+                               help="Post review as a PR comment via gh CLI")
+    review_pr_cmd.set_defaults(func=cmd_review_pr)
+
+    ci_cmd = sub.add_parser("ci", help="CI/CD integration utilities")
+    ci_sub = ci_cmd.add_subparsers(dest="ci_subcommand")
+    ci_diagnose = ci_sub.add_parser("diagnose", help="Diagnose a CI failure from a log file")
+    ci_diagnose.add_argument("--log-file", required=True, dest="log_file", metavar="PATH")
+    ci_diagnose.add_argument("--profile")
+    ci_lint = ci_sub.add_parser("commit-lint", help="Suggest a conventional commit message for staged changes")
+    ci_lint.add_argument("--profile")
+    ci_status = ci_sub.add_parser("status", help="Show git host and working tree status")
+    for cp in [ci_cmd, ci_diagnose, ci_lint, ci_status]:
+        cp.set_defaults(func=cmd_ci)
 
     return parser
 
