@@ -68,6 +68,7 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
+          skip_existing: true
 
   publish-npm:
     needs: build
@@ -88,6 +89,13 @@ jobs:
           path: dist
 
       - name: Publish to npm
-        run: npm publish ./dist/*.tgz --access public
+        run: |
+          TARBALL=$(ls ./dist/*.tgz | head -1)
+          npm publish "$TARBALL" --access public 2>&1 | tee /tmp/npm-out.txt; STATUS=${PIPESTATUS[0]}
+          if [ $STATUS -ne 0 ] && grep -qi "previously published\|already exists\|cannot publish over" /tmp/npm-out.txt; then
+            echo "Version already published on npm — skipping."
+          else
+            exit $STATUS
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
