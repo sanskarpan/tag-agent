@@ -31,7 +31,7 @@ jobs:
         run: python -m pip install -e .[dev]
 
       - name: Run TAG tests
-        run: pytest -q tests/test_controller.py
+        run: PYTHONPATH=src pytest -q tests/test_controller.py
 
       - name: Build Python distributions
         run: python -m build
