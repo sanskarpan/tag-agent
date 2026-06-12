@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" width="160" height="160">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e"/>
+      <stop offset="100%" style="stop-color:#16213e"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4f8ef7"/>
+      <stop offset="100%" style="stop-color:#7c3aed"/>
+    </linearGradient>
+  </defs>
+  <!-- Outer rounded square -->
+  <rect width="160" height="160" rx="28" fill="url(#bg)"/>
+  <!-- Terminal window bar -->
+  <rect x="18" y="22" width="124" height="10" rx="3" fill="url(#accent)" opacity="0.7"/>
+  <!-- Window dots -->
+  <circle cx="30" cy="27" r="3" fill="#ff5f57" opacity="0.9"/>
+  <circle cx="42" cy="27" r="3" fill="#febc2e" opacity="0.9"/>
+  <circle cx="54" cy="27" r="3" fill="#28c840" opacity="0.9"/>
+  <!-- TAG lettering -->
+  <text x="80" y="108" font-family="'SF Mono', 'Fira Code', monospace" font-size="56" font-weight="700" fill="white" text-anchor="middle" letter-spacing="-2">TAG</text>
+  <!-- Prompt cursor -->
+  <text x="18" y="146" font-family="'SF Mono', 'Fira Code', monospace" font-size="14" fill="#4f8ef7" opacity="0.8">&#x25B6; agent</text>
+</svg>

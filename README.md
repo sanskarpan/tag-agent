@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/sanskarpan/tag-agent/main/docs/logo.png" alt="TAG" width="160" />
+  <img src="https://raw.githubusercontent.com/sanskarpan/tag-agent/main/docs/logo.svg" alt="TAG" width="140" />
 </p>
 
 <h1 align="center">TAG</h1>
@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  Multi-provider routing &bull; Profile-based orchestration &bull; Zero-dependency bootstrap &bull; Full TUI
+  Multi-provider routing &bull; Native kanban layer &bull; Background job queue &bull; Live dashboard &bull; Swarm topology
 </p>
 
 <p align="center">
@@ -26,11 +26,20 @@
     <img src="https://img.shields.io/pypi/pyversions/tag-agent?style=flat-square" alt="Python 3.11+" />
   </a>
   <a href="https://github.com/sanskarpan/tag-agent/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/sanskarpan/tag-agent?style=flat-square" alt="MIT License" />
+    <img src="https://img.shields.io/github/license/sanskarpan/tag-agent?style=flat-square&label=license&color=blue" alt="MIT License" />
   </a>
 </p>
 
 ---
+
+## What's new in v0.4.0
+
+- **Native kanban layer** — pure SQLite management plane; create and monitor tasks without an API key
+- **Swarm topology** — fan out one goal to multiple workers with idempotent deduplication (`tag swarm`)
+- **Background job queue** — detached queue with priority scheduling; survives terminal close (`tag queue`)
+- **Memory journal** — persistent agent reflection log with search and expiry (`tag memory-journal`)
+- **Enhanced `tag doctor`** — JSON output mode, accurate patch-state detection, non-zero exit on failures
+- **Enhanced `tag dashboard`** — native live view powered by Rich; no external dependencies
 
 ## Features
 
@@ -38,6 +47,11 @@
 - **Profile-based orchestration** — four built-in roles (orchestrator, researcher, coder, reviewer) each with independent model, credential, and routing config
 - **Zero-dependency bootstrap** — bundles Hermes v0.16.0; provisions a managed runtime on first run, no manual steps required
 - **Broad credential import** — one command to pull keys from 10+ local AI tools: Claude Code, Gemini CLI, Codex, Continue.dev, Mistral Vibe, opencode, Zed, Cursor, GitHub Copilot, Aider, AWS Bedrock
+- **Native kanban layer** — SQLite-backed task management plane; no hermes binary required to create or monitor tasks
+- **Swarm topology** — fan out a single goal to a configurable worker pool; SHA-256 idempotency key prevents duplicate task creation on retries
+- **Background queue** — priority-ordered job queue (1–10) with status tracking, graceful cancellation, and truncation warnings
+- **Memory journal** — append, search, and expire reflection entries without touching the hermes runtime
+- **Live dashboard** — Rich-powered terminal dashboard showing active runs, queue depth, and profile health
 - **Full TUI** — patched Hermes terminal UI with TAG skin; also works fully headless for CI and scripting
 - **Benchmark suite** — built-in task runner with persistent history via `tag benchmark` / `tag runs`
 - **Escape hatch** — `tag hermes -- ...` passes any command through to the underlying runtime
@@ -101,6 +115,11 @@ No keys are sent anywhere — they are written to the target profile's `.env` fi
 | `tag import-aider` | `~/.aider.conf.yml`, `~/.env`, `~/.aider.env` |
 | `tag import-aws` | `~/.aws/credentials` (Amazon Bedrock / Q Developer) |
 | `tag import-cursor` | Cursor's local SQLite store (BYOK API keys) |
+| `tag import-ssh` | SSH key + host → profile env (remote agent execution) |
+| `tag import-docker` | Docker image name → profile env (containerised agents) |
+| `tag import-modal` | Modal token-id + token-secret → profile env |
+| `tag import-daytona` | Daytona workspace-id → profile env |
+| `tag import-nous-portal` | Nous Portal API key → profile env |
 
 Each command accepts `--profile <name>` and `--json` for machine-readable output.
 
@@ -111,15 +130,36 @@ Each command accepts `--profile <name>` and `--json` for machine-readable output
 | Command | Description |
 |---|---|
 | `tag setup` | Full first-run bootstrap — runtime, profiles, credentials |
-| `tag doctor` | Check runtime health and configuration |
+| `tag doctor` | Check runtime health and configuration; `--json` for machine-readable output |
+| `tag dashboard` | Live Rich dashboard — active runs, queue depth, profile health |
 | `tag tui` | Launch the orchestrator TUI |
 | `tag tui --profile coder` | Launch TUI inside a specific profile |
-| `tag submit` | Submit a task for direct or Kanban execution |
+| `tag submit` | Submit a task for direct or kanban execution |
 | `tag benchmark` | Run the benchmark suite against a profile/model |
 | `tag runs` | Show benchmark run history |
 | `tag bootstrap` | Re-bootstrap profiles without full setup |
 | `tag update` | Update the managed Hermes runtime |
 | `tag status` | Show current profile and model status |
+
+**Swarm & queue (v0.4.0):**
+
+| Command | Description |
+|---|---|
+| `tag swarm --goal "..." --workers 4` | Fan out a goal to N parallel workers |
+| `tag swarm --board research --goal "..."` | Target a named kanban board |
+| `tag queue add --prompt "..." --priority 8` | Add a job to the background queue (priority 1–10) |
+| `tag queue list` | Show pending and active jobs; `--limit N` to page |
+| `tag queue cancel --job-id <id>` | Cancel a pending job |
+| `tag queue status --job-id <id>` | Show job status and result |
+
+**Memory journal (v0.4.0):**
+
+| Command | Description |
+|---|---|
+| `tag memory-journal add "..."` | Append an entry to the journal |
+| `tag memory-journal list` | List recent entries |
+| `tag memory-journal search "..."` | Full-text search across entries |
+| `tag memory-journal forget <id>` | Remove a specific entry |
 
 **Model management:**
 
@@ -202,8 +242,24 @@ export TAG_HOME=/custom/path   # override root
 ## Requirements
 
 - Python **3.11 – 3.13**
-- `npm` — required for the full TUI build on first run; not needed for `submit` / `benchmark` / model commands
+- `npm` — required for the full TUI build on first run; not needed for `submit` / `benchmark` / `queue` / `swarm` / `doctor` / `dashboard`
 - `git` — recommended for `tag update` on git-backed checkouts
+
+## Architecture
+
+```
+tag CLI
+├── Management plane  (SQLite — no API key needed)
+│   ├── kanban.py     native task create / monitor
+│   ├── queue_worker  priority background jobs
+│   └── dashboard     Rich live view
+└── Execution plane   (Hermes gateway — API key required)
+    ├── swarm         fan-out topology
+    ├── submit        direct / kanban dispatch
+    └── tui           full terminal UI
+```
+
+The split means `tag queue`, `tag swarm`, `tag dashboard`, `tag doctor`, and credential-import commands work offline and without an active API key.
 
 ## Notes
 
