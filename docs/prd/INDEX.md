@@ -29,6 +29,14 @@
 | [018](PRD-018-context-window-management.md) | Context Window & Long-Context Management (`tag context`) | P1 | M | Proposed |
 | [019](PRD-019-natural-language-shell.md) | Natural Language Shell Mode (`tag shell`) | P2 | M | Proposed |
 | [020](PRD-020-cicd-integration.md) | CI/CD Integration & Automated Code Review (`tag review-pr`) | P2 | L | Proposed |
+| [022](PRD-022-ide-bridge-lsp.md) | IDE Bridge — LSP Server & VS Code Extension (`tag lsp`) | P2 | XL | Proposed |
+| [021](PRD-021-streaming-tui-dashboard.md) | Streaming TUI Dashboard (`tag serve` / `tag dashboard`) | P1 | L | Proposed |
+| [022](PRD-021-semantic-memory-confidence-decay.md) | Semantic Memory with Confidence Decay (`tag memory`) | P1 | L | Proposed |
+| [026](PRD-026-vector-based-tool-retrieval.md) | Vector-Based Tool Retrieval (`tag mcp-registry index`) | P1 | M | Proposed |
+| [035](PRD-035-profile-marketplace.md) | Profile Marketplace — pull/push with SHA pinning & secret scan (`tag profile pull/push`) | P1 | M | Proposed — BLOCKED on PRD-034 |
+| [sandbox](PRD-021-sandbox-code-execution.md) | Sandbox Code Execution (`tag sandbox`) — Docker/E2B/Modal/restricted isolation | P0 Critical | L | Proposed |
+| [037](PRD-037-otel-genai-span-cost-attribution.md) | OTel GenAI Span Cost Attribution (semconv attribute alignment + histogram) | P1 | S | Proposed |
+| [037-notify](PRD-037-notification-hooks.md) | Notification Hooks — Slack, email, desktop, webhook (`tag hooks notify`) | P1 | M | Proposed |
 
 ---
 
@@ -63,11 +71,13 @@ Build after Wave 2 is stable.
 
 ### Wave 4 — Differentiating Features (P2, high impact)
 
-16. **PRD-017** — Multi-Model Benchmarking (extends existing benchmark system)
-17. **PRD-019** — Natural Language Shell (new REPL module)
-18. **PRD-020** — CI/CD Integration (gh CLI + GitHub Actions template)
-19. **PRD-007** — Desktop App (Electron build from vendor tarball)
-20. **PRD-010** — Dashboard Upgrade (minimal changes, big discoverability win)
+16. **PRD-021** — Streaming TUI Dashboard / `tag serve` (builds on PRD-003 Rich TUI, PRD-008 queue, PRD-013 tracing)
+17. **PRD-017** — Multi-Model Benchmarking (extends existing benchmark system)
+18. **PRD-019** — Natural Language Shell (new REPL module)
+19. **PRD-020** — CI/CD Integration (gh CLI + GitHub Actions template)
+20. **PRD-007** — Desktop App (Electron build from vendor tarball)
+21. **PRD-010** — Dashboard Upgrade (minimal changes, big discoverability win)
+22. **PRD-022** — IDE Bridge (LSP server + VS Code extension — editor-native TAG code actions)
 
 ---
 
@@ -93,6 +103,12 @@ Build after Wave 2 is stable.
 | `src/tag/shell_mode.py` | 019 |
 | `src/tag/ci.py` | 020 |
 | `src/tag/queue_worker.py` | 008 |
+| `src/tag/dashboard.py` | 021 |
+| `src/tag/api.py` | 021 |
+| `src/tag/lsp_server.py` | 022 |
+| `vscode/` (extension package) | 022 |
+| `src/tag/tool_retrieval.py` | 026 |
+| `src/tag/vector_store.py` | 022 (semantic memory), 026 (shared ChromaDB client) |
 
 ---
 
@@ -101,6 +117,7 @@ Build after Wave 2 is stable.
 ### Memory
 - PRD-001: Hermes memory backend selection (Supermemory, Honcho, local)
 - PRD-002: TAG-native cross-session facts journal
+- PRD-022: Semantic memory with confidence decay (ChromaDB + sentence-transformers, local embeddings)
 - PRD-018: Context window management and auto-summarization
 
 ### Developer Experience (TUI / UX)
@@ -119,13 +136,18 @@ Build after Wave 2 is stable.
 - PRD-006: Nous Portal Tool Gateway
 - PRD-011: Plugin management
 - PRD-014: MCP server registry
+- PRD-026: Vector-based tool retrieval (ChromaDB index over MCP tools, top-K selection at query time)
 
 ### Observability & Operations
 - PRD-012: Cost tracking and budgets
 - PRD-013: Distributed tracing
 - PRD-009: Doctor diagnostics
 
+### Observability & Live Dashboards
+- PRD-021: Streaming TUI Dashboard — live token stream, cost ticker, tool call inspector, queue status, web bridge
+
 ### Collaboration & Ecosystem
 - PRD-015: Profile templates and sharing
 - PRD-017: Multi-model benchmarking
 - PRD-020: CI/CD integration and automated code review
+- PRD-035: Profile Marketplace — GitHub-based profile distribution with SHA pinning, secret scanning, and Gist push (BLOCKED on PRD-034)
