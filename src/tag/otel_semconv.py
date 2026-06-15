@@ -23,9 +23,14 @@ from typing import Any
 SEMCONV_VERSION = "1.28.0"
 
 # Instrumentation scope sent in OTLP payloads
+try:
+    from tag import __version__ as _tag_version
+except Exception:
+    _tag_version = "0.0.0"
+
 INSTRUMENTATION_SCOPE = {
     "name": "tag-agent",
-    "version": "0.5.0",
+    "version": _tag_version,
     "attributes": [
         {"key": "otel.semconv.version", "value": {"stringValue": SEMCONV_VERSION}},
         {"key": "otel.semconv.stability", "value": {"stringValue": "Development"}},
