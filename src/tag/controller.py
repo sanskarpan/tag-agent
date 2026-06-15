@@ -8086,7 +8086,10 @@ def cmd_queue_extended(args: argparse.Namespace) -> int:
             db.close()
             return 1
         db.close()
-        print(f"Queue job added: {job_id}")
+        if getattr(args, "json", False):
+            print(json.dumps({"job_id": job_id, "status": "added", "depends_on": depends_on}))
+        else:
+            print(f"Queue job added: {job_id}")
         return 0
 
     if sub == "promote":
@@ -8400,13 +8403,18 @@ def cmd_diff_inject(args: argparse.Namespace) -> int:
         print(f"Skipped {len(result['files_skipped'])} file(s): {', '.join(result['files_skipped'][:5])}", file=sys.stderr)
 
     if not result["content"].strip():
-        print("No diff content to inject (no changed files in scope).")
+        if getattr(args, "json", False):
+            print(json.dumps({"files": [], "content": "", "estimated_tokens": 0, "warn": False, "files_included": [], "files_skipped": []}))
+        else:
+            print("No diff content to inject (no changed files in scope).")
         return 0
 
-    print(f"Diff context: {len(result['files_included'])} file(s), ~{result['estimated_tokens']:,} tokens")
+    _json = getattr(args, "json", False)
+    print(f"Diff context: {len(result['files_included'])} file(s), ~{result['estimated_tokens']:,} tokens",
+          file=sys.stderr if _json else sys.stdout)
 
-    if output_only or getattr(args, "json", False):
-        if getattr(args, "json", False):
+    if output_only or _json:
+        if _json:
             print(json.dumps(result, indent=2))
         else:
             print(result["content"])
@@ -9860,6 +9868,7 @@ def build_parser() -> argparse.ArgumentParser:
     qadd.add_argument("--depends-on", dest="depends_on", action="append", metavar="JOB_ID",
                       help="Prerequisite job ID (can be repeated)")
     qadd.add_argument("--profile")
+    qadd.add_argument("--json", action="store_true")
     qpromote = qext_sub.add_parser("promote", help="Promote ready pending jobs")
     for qp in [qext_cmd, qadd, qpromote]:
         qp.set_defaults(func=cmd_queue_extended)
