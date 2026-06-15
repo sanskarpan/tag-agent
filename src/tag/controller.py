@@ -7615,8 +7615,9 @@ def cmd_cache(args: argparse.Namespace) -> int:
     """PRD-030: Prompt cache analytics — hit rate and cost savings per profile."""
     cfg = load_config(config_path(getattr(args, "config", None)))
     db_path = runtime_db_path(cfg)
+    _json = getattr(args, "json", False)
     if not db_path.exists():
-        print("No runs database found.")
+        print(json.dumps([]) if _json else "No runs database found.")
         return 0
 
     conn = sqlite3.connect(str(db_path))
@@ -7625,7 +7626,7 @@ def cmd_cache(args: argparse.Namespace) -> int:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
         has_cache = "cache_read_tokens" in cols and "cache_creation_tokens" in cols
         if not has_cache:
-            print("No cache data recorded yet (cache columns not present).")
+            print(json.dumps([]) if _json else "No cache data recorded yet (cache columns not present).")
             return 0
 
         profile_filter = getattr(args, "profile", None)
@@ -7651,10 +7652,10 @@ def cmd_cache(args: argparse.Namespace) -> int:
         conn.close()
 
     if not rows:
-        print("No run data found.")
+        print(json.dumps([]) if _json else "No run data found.")
         return 0
 
-    if getattr(args, "json", False):
+    if _json:
         out = []
         for r in rows:
             total_input = (r[2] or 0)
