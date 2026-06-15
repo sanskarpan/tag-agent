@@ -442,6 +442,7 @@ class TestErrorMessageQuality:
         import subprocess
         env = os.environ.copy()
         env["TAG_HOME"] = str(tmp_path / "taghome")
+        env["PYTHONPATH"] = str(ROOT / "src")
         result = subprocess.run(
             [sys.executable, "-m", "tag", *args_list],
             capture_output=True, text=True, env=env,
@@ -494,6 +495,7 @@ class TestErrorMessageQuality:
         import subprocess
         env = os.environ.copy()
         env["TAG_HOME"] = str(tmp_path / "taghome")
+        env["PYTHONPATH"] = str(ROOT / "src")
         result = subprocess.run(
             [sys.executable, "-m", "tag", "lsp"],
             capture_output=True, text=True, env=env, cwd=str(ROOT),
