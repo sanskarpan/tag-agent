@@ -8037,6 +8037,9 @@ def cmd_dag(args: argparse.Namespace) -> int:
     if sub == "list":
         dags = list_dags(db)
         db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(dags, indent=2))
+            return 0
         if not dags:
             print("No saved DAGs.")
             return 0
@@ -8141,6 +8144,11 @@ def cmd_security(args: argparse.Namespace) -> int:
             "ORDER BY created_at DESC LIMIT 20"
         ).fetchall()
         db.close()
+        if getattr(args, "json", False):
+            data = [{"id": r[0], "path": r[1], "findings": r[2],
+                     "status": r[3], "created_at": r[4]} for r in rows]
+            print(json.dumps(data, indent=2))
+            return 0
         if not rows:
             print("No security scans recorded.")
             return 0
@@ -8166,7 +8174,7 @@ def cmd_lsp(args: argparse.Namespace) -> int:
     lsp_ensure(db)
     sub = getattr(args, "lsp_subcommand", None)
 
-    if sub == "status":
+    if sub == "status" or sub is None:
         sessions = get_lsp_status(db)
         db.close()
         if not sessions:
@@ -8174,27 +8182,28 @@ def cmd_lsp(args: argparse.Namespace) -> int:
             return 0
         for s in sessions:
             tp = s["transport"]
-            port = f":{s['port']}" if s.get("port") else ""
-            print(f"{s['id'][:8]}  {tp}{port}  pid={s['pid']}  {s['created_at'][:19]}")
+            port_suffix = f":{s['port']}" if s.get("port") else ""
+            print(f"{s['id'][:8]}  {tp}{port_suffix}  pid={s['pid']}  {s['created_at'][:19]}")
         return 0
 
-    # Collect profile names
-    profiles_dir = tag_home() / "profiles"
-    profiles: list[str] = []
-    if profiles_dir.exists():
-        profiles = [p.name for p in profiles_dir.iterdir() if p.is_dir()]
-    if not profiles:
-        profiles = ["orchestrator", "coder", "reviewer"]
+    if sub == "start":
+        # Collect profile names
+        profiles_dir = tag_home() / "profiles"
+        profiles: list[str] = []
+        if profiles_dir.exists():
+            profiles = [p.name for p in profiles_dir.iterdir() if p.is_dir()]
+        if not profiles:
+            profiles = ["orchestrator", "coder", "reviewer"]
 
-    port = getattr(args, "port", 7878)
-    use_stdio = getattr(args, "stdio", False)
-    server = TagLspServer(profiles=profiles, conn=db)
+        server_port = getattr(args, "port", 7878)
+        use_stdio = getattr(args, "stdio", False)
+        server = TagLspServer(profiles=profiles, conn=db)
 
-    if use_stdio or port == 0:
-        print("TAG LSP server starting on stdio ...", file=sys.stderr)
-        server.run_stdio()
-    else:
-        server.run_tcp(host="127.0.0.1", port=port)
+        if use_stdio or server_port == 0:
+            print("TAG LSP server starting on stdio ...", file=sys.stderr)
+            server.run_stdio()
+        else:
+            server.run_tcp(host="127.0.0.1", port=server_port)
 
     db.close()
     return 0
@@ -8245,12 +8254,13 @@ def cmd_persona(args: argparse.Namespace) -> int:
     if sub == "list" or sub is None:
         personas = list_personas(db)
         db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(personas, indent=2))
+            return 0
         if not personas:
             print("No personas available.")
             return 0
         for p in personas:
-            active_mark = ""
-            tags = ", ".join(p.get("tags", []))
             print(f"{'[builtin]' if p['source'] == 'builtin' else '[user]   ':10} {p['name']:<30}  {p['description'][:50]}")
         return 0
 
@@ -8445,6 +8455,9 @@ def cmd_budget(args: argparse.Namespace) -> int:
     if sub == "list":
         budgets = list_budgets(db)
         db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(budgets, indent=2))
+            return 0
         if not budgets:
             print("No token budgets configured.")
             return 0
@@ -8489,6 +8502,9 @@ def cmd_budget(args: argparse.Namespace) -> int:
     # Default: list
     budgets = list_budgets(db)
     db.close()
+    if getattr(args, "json", False):
+        print(json.dumps(budgets, indent=2))
+        return 0
     if not budgets:
         print("No token budgets configured. Use 'tag budget set' to add one.")
         return 0
@@ -8539,6 +8555,9 @@ def cmd_notify(args: argparse.Namespace) -> int:
         profile = getattr(args, "profile", None)
         hooks = list_hooks(db, profile=profile)
         db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(hooks, indent=2))
+            return 0
         if not hooks:
             print("No notification hooks configured.")
             return 0
@@ -8692,6 +8711,9 @@ def cmd_split(args: argparse.Namespace) -> int:
     if sub == "list" or sub is None:
         runs = list_split_runs(db)
         db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(runs, indent=2))
+            return 0
         if not runs:
             print("No architect/editor split runs.")
             return 0
@@ -8888,6 +8910,9 @@ def cmd_agentops(args: argparse.Namespace) -> int:
         limit = getattr(args, "limit", 20) or 20
         sessions = list_sessions(db, limit=limit)
         db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(sessions, indent=2))
+            return 0
         if not sessions:
             print("No AgentOps sessions recorded.")
             return 0
