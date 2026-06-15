@@ -500,8 +500,176 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
         """
     )
     _migrate_runs_cost_columns(conn)
+    _migrate_prd_021_032_tables(conn)
     _prune_old_spans(conn)
     return conn
+
+
+def _migrate_prd_021_032_tables(conn: sqlite3.Connection) -> None:
+    """Create tables for PRD-021 through PRD-032 features (idempotent)."""
+    try:
+        conn.executescript("""
+            -- PRD-021: Agent Loop
+            CREATE TABLE IF NOT EXISTS loop_runs (
+              id           TEXT PRIMARY KEY,
+              profile      TEXT NOT NULL,
+              goal         TEXT NOT NULL,
+              max_iters    INTEGER NOT NULL DEFAULT 10,
+              current_iter INTEGER NOT NULL DEFAULT 0,
+              status       TEXT NOT NULL DEFAULT 'running',
+              approval     TEXT NOT NULL DEFAULT 'auto',
+              created_at   TEXT NOT NULL,
+              updated_at   TEXT NOT NULL,
+              completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_lr_status ON loop_runs(status, created_at);
+
+            CREATE TABLE IF NOT EXISTS loop_iterations (
+              id         TEXT PRIMARY KEY,
+              loop_id    TEXT NOT NULL,
+              iteration  INTEGER NOT NULL,
+              input      TEXT NOT NULL,
+              output     TEXT NOT NULL DEFAULT '',
+              decision   TEXT NOT NULL DEFAULT 'continue',
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(loop_id) REFERENCES loop_runs(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_li_loop ON loop_iterations(loop_id, iteration);
+
+            -- PRD-022: Cron
+            CREATE TABLE IF NOT EXISTS cron_jobs (
+              id          TEXT PRIMARY KEY,
+              name        TEXT NOT NULL,
+              schedule    TEXT NOT NULL,
+              profile     TEXT NOT NULL,
+              task        TEXT NOT NULL,
+              enabled     INTEGER NOT NULL DEFAULT 1,
+              last_run_at TEXT,
+              run_count   INTEGER NOT NULL DEFAULT 0,
+              created_at  TEXT NOT NULL,
+              updated_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cj_enabled ON cron_jobs(enabled, name);
+
+            -- PRD-024: Workspace
+            CREATE TABLE IF NOT EXISTS workspace_files (
+              path         TEXT PRIMARY KEY,
+              content_hash TEXT NOT NULL,
+              byte_size    INTEGER NOT NULL DEFAULT 0,
+              token_count  INTEGER NOT NULL DEFAULT 0,
+              rank         REAL NOT NULL DEFAULT 0.0,
+              indexed_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_wf_rank ON workspace_files(rank DESC);
+
+            -- PRD-025: Semantic Memory
+            CREATE TABLE IF NOT EXISTS semantic_memories (
+              id           TEXT PRIMARY KEY,
+              profile      TEXT NOT NULL,
+              content      TEXT NOT NULL,
+              memory_type  TEXT NOT NULL DEFAULT 'fact',
+              confidence   REAL NOT NULL DEFAULT 1.0,
+              created_at   TEXT NOT NULL,
+              accessed_at  TEXT NOT NULL,
+              access_count INTEGER NOT NULL DEFAULT 0,
+              source       TEXT NOT NULL DEFAULT 'manual'
+            );
+            CREATE INDEX IF NOT EXISTS idx_sm_profile ON semantic_memories(profile, memory_type);
+
+            -- PRD-026: Profile Marketplace
+            CREATE TABLE IF NOT EXISTS profile_cache (
+              id           TEXT PRIMARY KEY,
+              name         TEXT NOT NULL,
+              source_url   TEXT NOT NULL,
+              sha256       TEXT NOT NULL,
+              local_path   TEXT NOT NULL,
+              downloaded_at TEXT NOT NULL,
+              UNIQUE(name)
+            );
+
+            -- PRD-027: Eval Framework
+            CREATE TABLE IF NOT EXISTS eval_runs (
+              id           TEXT PRIMARY KEY,
+              suite_path   TEXT NOT NULL,
+              profile      TEXT NOT NULL,
+              suite_name   TEXT NOT NULL DEFAULT '',
+              status       TEXT NOT NULL DEFAULT 'running',
+              pass_count   INTEGER NOT NULL DEFAULT 0,
+              fail_count   INTEGER NOT NULL DEFAULT 0,
+              total_count  INTEGER NOT NULL DEFAULT 0,
+              created_at   TEXT NOT NULL,
+              completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_er_created ON eval_runs(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS eval_cases (
+              id             TEXT PRIMARY KEY,
+              eval_run_id    TEXT NOT NULL,
+              case_id        TEXT NOT NULL,
+              input          TEXT NOT NULL,
+              output         TEXT NOT NULL DEFAULT '',
+              passed         INTEGER NOT NULL DEFAULT 0,
+              score          REAL NOT NULL DEFAULT 0.0,
+              failure_reason TEXT,
+              created_at     TEXT NOT NULL,
+              FOREIGN KEY(eval_run_id) REFERENCES eval_runs(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ec_run ON eval_cases(eval_run_id);
+
+            -- PRD-028: Sandbox
+            CREATE TABLE IF NOT EXISTS sandbox_runs (
+              id           TEXT PRIMARY KEY,
+              command      TEXT NOT NULL,
+              backend      TEXT NOT NULL DEFAULT 'restricted',
+              image        TEXT,
+              status       TEXT NOT NULL DEFAULT 'running',
+              exit_code    INTEGER,
+              output       TEXT NOT NULL DEFAULT '',
+              error        TEXT,
+              created_at   TEXT NOT NULL,
+              completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_sr_created ON sandbox_runs(created_at DESC);
+
+            -- PRD-031: Route Fallback Chains
+            CREATE TABLE IF NOT EXISTS route_fallbacks (
+              id             TEXT PRIMARY KEY,
+              profile        TEXT NOT NULL,
+              primary_model  TEXT NOT NULL,
+              fallback_model TEXT NOT NULL,
+              condition      TEXT NOT NULL DEFAULT 'context_overflow',
+              priority       INTEGER NOT NULL DEFAULT 1,
+              enabled        INTEGER NOT NULL DEFAULT 1,
+              created_at     TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_rf_profile ON route_fallbacks(profile, enabled);
+
+            -- PRD-032: Trace Snapshots
+            CREATE TABLE IF NOT EXISTS trace_snapshots (
+              id           TEXT PRIMARY KEY,
+              trace_id     TEXT NOT NULL,
+              step_index   INTEGER NOT NULL DEFAULT 0,
+              snapshot_json TEXT NOT NULL DEFAULT '{}',
+              created_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ts_trace ON trace_snapshots(trace_id, step_index);
+        """)
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migrate: add cache token columns to runs table (PRD-030)
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    for col, typedef in [
+        ("cache_read_tokens", "INTEGER DEFAULT 0"),
+        ("cache_creation_tokens", "INTEGER DEFAULT 0"),
+    ]:
+        if col not in existing_cols:
+            try:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass
+    conn.commit()
 
 
 def _migrate_runs_cost_columns(conn: sqlite3.Connection) -> None:
@@ -5704,6 +5872,10 @@ def cmd_trace(args: argparse.Namespace) -> int:
     finally:
         conn.close()
 
+    # PRD-032 extension: replay, diff, checkpoint, snapshot
+    if sub in ("replay", "diff", "checkpoint", "snapshot"):
+        return cmd_trace_extended(args)
+
     print_error(f"Unknown subcommand: {sub}")
     return 1
 
@@ -6387,6 +6559,1262 @@ def cmd_ci(args: argparse.Namespace) -> int:
     return 1
 
 
+# ---------------------------------------------------------------------------
+# PRD-021: Agent Loop / Autonomous Mode
+# ---------------------------------------------------------------------------
+
+def _launch_loop_worker(cfg: dict[str, Any], loop_id: str) -> int:
+    """Spawn loop_agent as a detached background process. Returns PID."""
+    db_path = runtime_db_path(cfg)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "tag.loop_agent",
+         "--loop-id", loop_id,
+         "--config", str(config_path(None)),
+         "--db", str(db_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return proc.pid
+
+
+def cmd_loop(args: argparse.Namespace) -> int:
+    """PRD-021: Autonomous agent loop with iteration cap and goal detection."""
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    ensure_runtime_dirs(cfg)
+    db = open_db(cfg)
+    sub = getattr(args, "loop_subcommand", "list")
+
+    if sub == "start":
+        goal = (getattr(args, "goal", "") or "").strip()
+        if not goal:
+            db.close()
+            print_error("--goal TEXT is required")
+            return 1
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        max_iters = getattr(args, "max_iters", 10) or 10
+        approval = getattr(args, "approval", "auto") or "auto"
+        if approval not in ("auto", "human"):
+            db.close()
+            print_error("--approval must be 'auto' or 'human'")
+            return 1
+
+        loop_id = uuid.uuid4().hex[:12]
+        now = utc_now()
+        db.execute(
+            """INSERT INTO loop_runs(id, profile, goal, max_iters, current_iter,
+               status, approval, created_at, updated_at)
+               VALUES(?,?,?,?,0,'running',?,?,?)""",
+            (loop_id, profile, goal, max_iters, approval, now, now),
+        )
+        db.commit()
+
+        pid = _launch_loop_worker(cfg, loop_id)
+        db.close()
+
+        if getattr(args, "json", False):
+            print(json.dumps({"loop_id": loop_id, "pid": pid, "status": "running"}))
+        else:
+            print(f"loop started: {loop_id}  (worker pid {pid})")
+            print(f"goal: {goal[:80]}")
+            print(f"max iterations: {max_iters}  approval: {approval}")
+        return 0
+
+    if sub == "list":
+        rows = db.execute(
+            "SELECT id, profile, status, current_iter, max_iters, created_at, goal "
+            "FROM loop_runs ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps([dict(r) for r in rows], indent=2))
+            return 0
+        if not rows:
+            print("No loop runs.")
+            return 0
+        print(f"  {'ID':<14} {'PROFILE':<16} {'STATUS':<12} {'ITERS':<8} {'GOAL'}")
+        print("  " + "─" * 76)
+        for r in rows:
+            goal_short = (r["goal"] or "")[:40]
+            iters = f"{r['current_iter']}/{r['max_iters']}"
+            print(f"  {r['id']:<14} {r['profile']:<16} {r['status']:<12} {iters:<8} {goal_short}")
+        return 0
+
+    if sub == "status":
+        loop_id = getattr(args, "loop_id", None)
+        if not loop_id:
+            db.close()
+            print_error("LOOP_ID required")
+            return 1
+        run = db.execute("SELECT * FROM loop_runs WHERE id=?", (loop_id,)).fetchone()
+        if not run:
+            db.close()
+            print_error(f"Loop '{loop_id}' not found")
+            return 1
+        iters = db.execute(
+            "SELECT iteration, decision, output FROM loop_iterations WHERE loop_id=? ORDER BY iteration",
+            (loop_id,),
+        ).fetchall()
+        db.close()
+        run_d = dict(run)
+        if getattr(args, "json", False):
+            run_d["iterations"] = [dict(i) for i in iters]
+            print(json.dumps(run_d, indent=2))
+            return 0
+        print(f"Loop: {loop_id}")
+        print(f"  Profile: {run_d['profile']}  Status: {run_d['status']}")
+        print(f"  Goal: {run_d['goal'][:80]}")
+        print(f"  Iterations: {run_d['current_iter']}/{run_d['max_iters']}")
+        for it in iters:
+            print(f"  [{it['iteration']}] {it['decision']}: {(it['output'] or '')[:80]}")
+        return 0
+
+    if sub == "abort":
+        loop_id = getattr(args, "loop_id", None)
+        if not loop_id:
+            db.close()
+            print_error("LOOP_ID required")
+            return 1
+        db.execute(
+            "UPDATE loop_runs SET status='aborted', updated_at=? WHERE id=? AND status='running'",
+            (utc_now(), loop_id),
+        )
+        db.commit()
+        db.close()
+        print(f"abort requested: {loop_id}")
+        return 0
+
+    db.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-022: Cron / Scheduled Agents
+# ---------------------------------------------------------------------------
+
+def cmd_cron(args: argparse.Namespace) -> int:
+    """PRD-022: Cron-style scheduled agent runs."""
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    ensure_runtime_dirs(cfg)
+    db = open_db(cfg)
+    sub = getattr(args, "cron_subcommand", "list")
+
+    if sub == "add":
+        from tag.cron_scheduler import validate_cron_expression
+        name = (getattr(args, "name", "") or "").strip()
+        schedule = (getattr(args, "schedule", "") or "").strip()
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        task = (getattr(args, "task", "") or "").strip()
+        if not name or not schedule or not task:
+            db.close()
+            print_error("--name, --schedule and TASK are required")
+            return 1
+        try:
+            validate_cron_expression(schedule)
+        except ValueError as exc:
+            db.close()
+            print_error(str(exc))
+            return 1
+        job_id = uuid.uuid4().hex[:8]
+        now = utc_now()
+        db.execute(
+            """INSERT INTO cron_jobs(id, name, schedule, profile, task, enabled,
+               run_count, created_at, updated_at)
+               VALUES(?,?,?,?,?,1,0,?,?)""",
+            (job_id, name, schedule, profile, task, now, now),
+        )
+        db.commit()
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps({"id": job_id, "name": name, "schedule": schedule}))
+        else:
+            print(f"cron job added: {job_id}  '{name}'  [{schedule}]")
+        return 0
+
+    if sub == "list":
+        rows = db.execute(
+            "SELECT id, name, schedule, profile, enabled, last_run_at, run_count FROM cron_jobs ORDER BY name"
+        ).fetchall()
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps([dict(r) for r in rows], indent=2))
+            return 0
+        if not rows:
+            print("No cron jobs.")
+            return 0
+        print(f"  {'ID':<10} {'NAME':<20} {'SCHEDULE':<16} {'PROFILE':<14} {'EN':<4} {'RUNS':>5} {'LAST RUN'}")
+        print("  " + "─" * 80)
+        for r in rows:
+            en = "✓" if r["enabled"] else "✗"
+            last = (r["last_run_at"] or "never")[:19]
+            print(f"  {r['id']:<10} {r['name']:<20} {r['schedule']:<16} {r['profile']:<14} {en:<4} {r['run_count']:>5} {last}")
+        return 0
+
+    if sub == "remove":
+        job_id = getattr(args, "job_id", None)
+        if not job_id:
+            db.close()
+            print_error("JOB_ID required")
+            return 1
+        cur = db.execute("DELETE FROM cron_jobs WHERE id=?", (job_id,))
+        db.commit()
+        db.close()
+        if cur.rowcount == 0:
+            print_error(f"Job '{job_id}' not found")
+            return 1
+        print(f"removed: {job_id}")
+        return 0
+
+    if sub in ("enable", "disable"):
+        job_id = getattr(args, "job_id", None)
+        if not job_id:
+            db.close()
+            print_error("JOB_ID required")
+            return 1
+        enabled = 1 if sub == "enable" else 0
+        cur = db.execute(
+            "UPDATE cron_jobs SET enabled=?, updated_at=? WHERE id=?",
+            (enabled, utc_now(), job_id),
+        )
+        db.commit()
+        db.close()
+        if cur.rowcount == 0:
+            print_error(f"Job '{job_id}' not found")
+            return 1
+        print(f"{sub}d: {job_id}")
+        return 0
+
+    if sub == "run":
+        # Trigger a cron job immediately (one-shot, ignores schedule)
+        job_id = getattr(args, "job_id", None)
+        if not job_id:
+            db.close()
+            print_error("JOB_ID required")
+            return 1
+        job = db.execute("SELECT * FROM cron_jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            db.close()
+            print_error(f"Job '{job_id}' not found")
+            return 1
+        q_id = uuid.uuid4().hex[:8]
+        now = utc_now()
+        db.execute(
+            """INSERT INTO queue_jobs(id, profile, task, task_type, status, priority, created_at, notify)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (q_id, job["profile"], job["task"], "mixed", "queued", 5, now, 1),
+        )
+        db.execute(
+            "UPDATE cron_jobs SET last_run_at=?, run_count=run_count+1, updated_at=? WHERE id=?",
+            (now, now, job_id),
+        )
+        db.commit()
+        pid = launch_queue_worker(cfg, q_id)
+        queue_update_pid(db, q_id, pid)
+        db.commit()
+        db.close()
+        print(f"triggered: cron job {job_id} → queue job {q_id} (pid {pid})")
+        return 0
+
+    if sub == "daemon":
+        # Run the cron daemon in-process (blocking)
+        db.close()
+        from tag.cron_scheduler import run_daemon
+        db_path = str(runtime_db_path(cfg))
+        cfg_path = str(config_path(getattr(args, "config", None)) or "")
+        print(f"TAG cron daemon starting (polling every 30s) — Ctrl+C to stop")
+        try:
+            run_daemon(db_path, cfg_path)
+        except KeyboardInterrupt:
+            print("\ncron daemon stopped.")
+        return 0
+
+    db.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-024: Repo-Map / Workspace Context
+# ---------------------------------------------------------------------------
+
+def cmd_workspace(args: argparse.Namespace) -> int:
+    """PRD-024: Workspace file indexing and token-efficient repo-map generation."""
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    ensure_runtime_dirs(cfg)
+    db = open_db(cfg)
+    sub = getattr(args, "workspace_subcommand", "status")
+
+    try:
+        from tag.workspace import index_workspace, build_workspace_map, workspace_status
+    except ImportError as exc:
+        db.close()
+        print_error(f"tag.workspace not available: {exc}")
+        return 1
+
+    root = Path(getattr(args, "path", None) or ".").resolve()
+
+    if sub == "index":
+        max_files = getattr(args, "max_files", 500) or 500
+        result = index_workspace(db, root, max_files=max_files)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(result))
+        else:
+            print(f"Indexed {result['files_indexed']} files ({result['total_tokens']} tokens)")
+            if result["max_rank_file"]:
+                print(f"Top-ranked file: {result['max_rank_file']}")
+        return 0
+
+    if sub == "map":
+        budget = getattr(args, "budget", 4000) or 4000
+        ws_map = build_workspace_map(db, root, budget_tokens=budget)
+        db.close()
+        print(ws_map)
+        return 0
+
+    if sub == "status":
+        stats = workspace_status(db)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(stats))
+        else:
+            if stats["file_count"] == 0:
+                print("Workspace not indexed. Run `tag workspace index` first.")
+            else:
+                print(f"Indexed: {stats['file_count']} files  {stats['total_tokens']} tokens")
+                print(f"Last indexed: {stats['last_indexed'] or 'never'}")
+        return 0
+
+    if sub == "clear":
+        db.execute("DELETE FROM workspace_files")
+        db.commit()
+        db.close()
+        print("Workspace index cleared.")
+        return 0
+
+    db.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-025: Semantic Memory with Confidence Decay
+# ---------------------------------------------------------------------------
+
+def cmd_memory_semantic(args: argparse.Namespace) -> int:
+    """PRD-025: Semantic memory with confidence decay and FTS search."""
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    ensure_runtime_dirs(cfg)
+    db = open_db(cfg)
+    profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+    sub = getattr(args, "mem_subcommand", "list")
+
+    try:
+        from tag.semantic_memory import (
+            add_memory, search_memories, list_memories,
+            forget_memory, memory_stats, ensure_schema,
+        )
+    except ImportError as exc:
+        db.close()
+        print_error(f"tag.semantic_memory not available: {exc}")
+        return 1
+
+    ensure_schema(db)
+
+    if sub == "add":
+        content = (getattr(args, "content", "") or "").strip()
+        if not content:
+            db.close()
+            print_error("Memory content required (positional argument or --content)")
+            return 1
+        mtype = getattr(args, "memory_type", "fact") or "fact"
+        confidence = getattr(args, "confidence", 1.0) or 1.0
+        try:
+            mem_id = add_memory(db, profile, content, memory_type=mtype, confidence=confidence)
+        except ValueError as exc:
+            db.close()
+            print_error(str(exc))
+            return 1
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps({"id": mem_id, "profile": profile}))
+        else:
+            print(f"Memory saved: {mem_id}")
+        return 0
+
+    if sub == "search":
+        query = (getattr(args, "query", "") or "").strip()
+        if not query:
+            db.close()
+            print_error("QUERY required")
+            return 1
+        limit = getattr(args, "limit", 10) or 10
+        mtype = getattr(args, "memory_type", None)
+        results = search_memories(db, profile, query, limit=limit, memory_type=mtype)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(results, indent=2))
+            return 0
+        if not results:
+            print(f"No memories found for: {query!r}")
+            return 0
+        for r in results:
+            conf = r["confidence"]
+            print(f"[{r['id'][:8]}] ({r['memory_type']} conf={conf:.2f}) {r['content'][:80]}")
+        return 0
+
+    if sub == "list":
+        limit = getattr(args, "limit", 20) or 20
+        mtype = getattr(args, "memory_type", None)
+        mems = list_memories(db, profile, memory_type=mtype, limit=limit)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(mems, indent=2))
+            return 0
+        if not mems:
+            print(f"No memories for profile '{profile}'.")
+            return 0
+        for m in mems:
+            print(f"[{m['id'][:8]}] ({m['memory_type']} conf={m['confidence']:.2f}) {m['content'][:80]}")
+        return 0
+
+    if sub == "forget":
+        mem_id = getattr(args, "mem_id", None)
+        if not mem_id:
+            db.close()
+            print_error("MEMORY_ID required")
+            return 1
+        deleted = forget_memory(db, mem_id, profile)
+        db.close()
+        if not deleted:
+            print_error(f"Memory '{mem_id}' not found for profile '{profile}'")
+            return 1
+        print(f"forgotten: {mem_id}")
+        return 0
+
+    if sub == "stats":
+        stats = memory_stats(db, profile)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(stats, indent=2))
+            return 0
+        print(f"Profile: {profile}  Total memories: {stats['total']}")
+        for mtype, info in sorted(stats["by_type"].items()):
+            print(f"  {mtype:<12}  count={info['count']}  avg_conf_base={info['avg_confidence_base']:.3f}")
+        return 0
+
+    db.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-026: Profile Marketplace (pull/push)
+# ---------------------------------------------------------------------------
+
+def _profile_sha256(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def cmd_profile_marketplace(args: argparse.Namespace) -> int:
+    """PRD-026: Pull/push profiles from/to GitHub Gist or URL."""
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    ensure_runtime_dirs(cfg)
+    db = open_db(cfg)
+    sub = getattr(args, "marketplace_subcommand", None)
+
+    if sub == "pull":
+        url = getattr(args, "url", "")
+        if not url:
+            db.close()
+            print_error("URL required (e.g. https://raw.githubusercontent.com/user/repo/main/profile.yaml)")
+            return 1
+        name = getattr(args, "name", None) or Path(url).stem
+
+        try:
+            response = urllib.request.urlopen(url, timeout=15)  # noqa: S310
+            content = response.read()
+        except urllib.error.URLError as exc:
+            db.close()
+            print_error(f"Failed to fetch profile: {exc}")
+            return 1
+
+        # Basic YAML validation
+        try:
+            profile_data = yaml.safe_load(content)
+            if not isinstance(profile_data, dict):
+                raise ValueError("Profile must be a YAML mapping")
+        except Exception as exc:
+            db.close()
+            print_error(f"Invalid profile YAML: {exc}")
+            return 1
+
+        sha = hashlib.sha256(content).hexdigest()
+        profiles_dir = runtime_home(cfg) / "profiles"
+        profiles_dir.mkdir(parents=True, exist_ok=True)
+        local_path = profiles_dir / f"{name}.yaml"
+        local_path.write_bytes(content)
+
+        now = utc_now()
+        db.execute(
+            """INSERT INTO profile_cache(id, name, source_url, sha256, local_path, downloaded_at)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(name) DO UPDATE SET
+                 source_url=excluded.source_url, sha256=excluded.sha256,
+                 local_path=excluded.local_path, downloaded_at=excluded.downloaded_at""",
+            (uuid.uuid4().hex[:12], name, url, sha, str(local_path), now),
+        )
+        db.commit()
+        db.close()
+
+        if getattr(args, "json", False):
+            print(json.dumps({"name": name, "sha256": sha, "local_path": str(local_path)}))
+        else:
+            print(f"Pulled profile: {name}")
+            print(f"  SHA256: {sha[:16]}...")
+            print(f"  Saved to: {local_path}")
+        return 0
+
+    if sub == "push":
+        profile_name = getattr(args, "profile_name", None)
+        if not profile_name:
+            db.close()
+            print_error("profile name required")
+            return 1
+        # Find the profile file
+        profiles_dir = runtime_home(cfg) / "profiles"
+        candidates = list(profiles_dir.glob(f"{profile_name}.yaml"))
+        if not candidates:
+            db.close()
+            print_error(f"Profile file not found: {profiles_dir}/{profile_name}.yaml")
+            return 1
+        pfile = candidates[0]
+        sha = _profile_sha256(pfile)
+        db.close()
+        # For now, print info — actual GitHub Gist push requires auth token
+        print(f"Profile: {profile_name}")
+        print(f"  File: {pfile}")
+        print(f"  SHA256: {sha}")
+        print("  To push: gh gist create --public --filename profile.yaml " + str(pfile))
+        return 0
+
+    if sub == "list":
+        rows = db.execute(
+            "SELECT name, source_url, sha256, downloaded_at FROM profile_cache ORDER BY name"
+        ).fetchall()
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps([{"name": r[0], "source_url": r[1], "sha256": r[2][:12], "downloaded_at": r[3]} for r in rows], indent=2))
+            return 0
+        if not rows:
+            print("No cached profiles. Use `tag marketplace pull <url>` to add one.")
+            return 0
+        for r in rows:
+            print(f"  {r[0]:<24} {r[3][:10]}  {r[1][:60]}")
+        return 0
+
+    db.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-027: Eval Framework
+# ---------------------------------------------------------------------------
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    """PRD-027: Run eval suites against TAG profiles."""
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    ensure_runtime_dirs(cfg)
+    db = open_db(cfg)
+    sub = getattr(args, "eval_subcommand", "list")
+
+    try:
+        from tag.eval_framework import (
+            load_suite, score_case, create_eval_run,
+            record_case_result, finalize_eval_run,
+            list_eval_runs, get_eval_run_detail,
+        )
+    except ImportError as exc:
+        db.close()
+        print_error(f"tag.eval_framework not available: {exc}")
+        return 1
+
+    if sub == "run":
+        suite_path_str = getattr(args, "suite", None)
+        if not suite_path_str:
+            db.close()
+            print_error("--suite SUITE_PATH required")
+            return 1
+        suite_path = Path(suite_path_str)
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        dry_run = getattr(args, "dry_run", False)
+
+        try:
+            suite = load_suite(suite_path)
+        except (FileNotFoundError, ValueError) as exc:
+            db.close()
+            print_error(str(exc))
+            return 1
+
+        suite_name = suite.get("name", suite_path.stem)
+        run_id = create_eval_run(db, str(suite_path), profile, suite_name)
+        cases = suite.get("cases", [])
+
+        if not dry_run:
+            print(f"Eval run: {run_id}  suite: {suite_name}  profile: {profile}")
+            print(f"Running {len(cases)} cases...")
+
+        passed = 0
+        failed = 0
+        for case in cases:
+            case_id = case.get("id", f"case_{cases.index(case)+1}")
+            input_text = case.get("input", "")
+
+            if dry_run:
+                output = "(dry-run — no agent invocation)"
+                ok, score, reason = True, 1.0, None
+            else:
+                # Run the case via hermes
+                result = subprocess.run(
+                    [sys.executable, "-m", "tag", "--config",
+                     str(config_path(getattr(args, "config", None)) or ""),
+                     "submit", "--task-type", "mixed", "--prompt", input_text,
+                     "--master-profile", profile, "--source", "eval"],
+                    capture_output=True, text=True, timeout=300,
+                )
+                output = result.stdout
+                ok, score, reason = score_case(case, output)
+
+            record_case_result(
+                db, run_id, case_id, input_text, output,
+                passed=ok, score=score, failure_reason=reason,
+            )
+            if ok:
+                passed += 1
+            else:
+                failed += 1
+            status_char = "✓" if ok else "✗"
+            if not dry_run:
+                print(f"  [{status_char}] {case_id}  score={score:.2f}" +
+                      (f"  {reason}" if reason else ""))
+
+        summary = finalize_eval_run(db, run_id)
+        db.close()
+
+        if getattr(args, "json", False):
+            print(json.dumps(summary, indent=2))
+        else:
+            print(f"\nResults: {passed}/{len(cases)} passed")
+        return 0 if failed == 0 else 1
+
+    if sub == "list":
+        runs = list_eval_runs(db)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(runs, indent=2))
+            return 0
+        if not runs:
+            print("No eval runs yet.")
+            return 0
+        print(f"  {'ID':<18} {'SUITE':<24} {'PROFILE':<14} {'STATUS':<10} {'PASS':<6} {'FAIL':<6}")
+        print("  " + "─" * 80)
+        for r in runs:
+            print(f"  {r['id']:<18} {r['suite_name'][:24]:<24} {r['profile']:<14} "
+                  f"{r['status']:<10} {r['pass_count']:<6} {r['fail_count']:<6}")
+        return 0
+
+    if sub == "show":
+        run_id = getattr(args, "run_id", None)
+        if not run_id:
+            db.close()
+            print_error("RUN_ID required")
+            return 1
+        detail = get_eval_run_detail(db, run_id)
+        db.close()
+        if not detail:
+            print_error(f"Eval run '{run_id}' not found")
+            return 1
+        if getattr(args, "json", False):
+            print(json.dumps(detail, indent=2))
+            return 0
+        print(f"Eval run: {detail['id']}")
+        print(f"  Suite: {detail['suite_name']}  Profile: {detail['profile']}")
+        print(f"  Status: {detail['status']}  {detail['pass_count']}/{detail['total_count']} passed")
+        for c in detail.get("cases", []):
+            icon = "✓" if c["passed"] else "✗"
+            reason = f"  — {c['failure_reason']}" if c.get("failure_reason") else ""
+            print(f"  [{icon}] {c['case_id']}  score={c['score']:.2f}{reason}")
+        return 0
+
+    db.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-028: Sandbox Code Execution
+# ---------------------------------------------------------------------------
+
+def cmd_sandbox(args: argparse.Namespace) -> int:
+    """PRD-028: Isolated code execution via restricted subprocess or Docker."""
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    ensure_runtime_dirs(cfg)
+    db = open_db(cfg)
+    sub = getattr(args, "sandbox_subcommand", "list")
+
+    try:
+        from tag.sandbox import run_in_sandbox, list_sandbox_runs, get_sandbox_run
+    except ImportError as exc:
+        db.close()
+        print_error(f"tag.sandbox not available: {exc}")
+        return 1
+
+    if sub == "run":
+        command = getattr(args, "command", "")
+        if not command:
+            db.close()
+            print_error("COMMAND required")
+            return 1
+        backend = getattr(args, "backend", "restricted") or "restricted"
+        image = getattr(args, "image", "python:3.12-slim") or "python:3.12-slim"
+        timeout = getattr(args, "timeout", 60) or 60
+
+        result = run_in_sandbox(db, command, backend=backend, image=image, timeout=timeout)
+        db.close()
+
+        if getattr(args, "json", False):
+            out = {k: v for k, v in result.items() if k != "output"}
+            out["output_preview"] = (result.get("output") or "")[:200]
+            print(json.dumps(out, indent=2))
+        else:
+            print(f"Sandbox run: {result['id']}  exit={result['exit_code']}")
+            if result.get("output"):
+                print("--- output ---")
+                print(result["output"][:2000])
+        return 0 if result.get("exit_code") == 0 else 1
+
+    if sub == "list":
+        runs = list_sandbox_runs(db, limit=20)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(runs, indent=2))
+            return 0
+        if not runs:
+            print("No sandbox runs.")
+            return 0
+        print(f"  {'ID':<14} {'BACKEND':<12} {'STATUS':<10} {'EXIT':<5} {'COMMAND'}")
+        print("  " + "─" * 70)
+        for r in runs:
+            ec = str(r["exit_code"]) if r["exit_code"] is not None else "?"
+            print(f"  {r['id']:<14} {r['backend']:<12} {r['status']:<10} {ec:<5} {r['command']}")
+        return 0
+
+    if sub == "result":
+        run_id = getattr(args, "run_id", None)
+        if not run_id:
+            db.close()
+            print_error("RUN_ID required")
+            return 1
+        run = get_sandbox_run(db, run_id)
+        db.close()
+        if not run:
+            print_error(f"Sandbox run '{run_id}' not found")
+            return 1
+        if getattr(args, "json", False):
+            print(json.dumps(run, indent=2))
+        else:
+            print(f"Sandbox run: {run['id']}  backend: {run['backend']}  exit: {run['exit_code']}")
+            print(run.get("output") or "(no output)")
+        return 0
+
+    db.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-029: Streaming TUI Dashboard (tag serve enhancement)
+# ---------------------------------------------------------------------------
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """PRD-029: Start a local HTTP server serving the TAG dashboard as SSE stream."""
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    ensure_runtime_dirs(cfg)
+    port = getattr(args, "port", 7880) or 7880
+    profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+
+    try:
+        import http.server
+        import threading
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *a):
+                pass  # Silence default access log
+
+            def do_GET(self):
+                if self.path == "/events":
+                    self._serve_sse()
+                elif self.path == "/" or self.path == "/index.html":
+                    self._serve_html()
+                else:
+                    self.send_error(404)
+
+            def _serve_html(self):
+                html = _dashboard_html(profile)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html.encode())))
+                self.end_headers()
+                self.wfile.write(html.encode())
+
+            def _serve_sse(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                try:
+                    while True:
+                        snap = _dashboard_snapshot(cfg)
+                        data = json.dumps(snap)
+                        msg = f"data: {data}\n\n"
+                        self.wfile.write(msg.encode())
+                        self.wfile.flush()
+                        time.sleep(3)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        server = http.server.HTTPServer(("127.0.0.1", port), _Handler)
+        url = f"http://127.0.0.1:{port}"
+        print(f"TAG dashboard server: {url}  (Ctrl+C to stop)")
+
+        # Try to open browser
+        try:
+            import webbrowser
+            threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        except Exception:
+            pass
+
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+    return 0
+
+
+def _dashboard_html(profile: str) -> str:
+    """Minimal HTML page that connects to the SSE stream and renders a live table."""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>TAG Dashboard — {profile}</title>
+<style>
+body{{font-family:monospace;background:#111;color:#eee;padding:16px}}
+h1{{color:#7ec8e3}}table{{border-collapse:collapse;width:100%;margin:8px 0}}
+th{{background:#222;color:#7ec8e3;padding:6px 10px;text-align:left}}
+td{{padding:4px 10px;border-bottom:1px solid #333}}
+.ok{{color:#5fbb5f}}.fail{{color:#e05252}}.run{{color:#e0c000}}
+#ts{{float:right;color:#888;font-size:0.8em}}
+</style></head>
+<body>
+<h1>TAG Dashboard <span id=ts></span></h1>
+<h2>Recent Runs</h2><table id=runs><tr><th>ID</th><th>Profile</th><th>Status</th><th>When</th></tr></table>
+<h2>Queue</h2><table id=queue><tr><th>Job</th><th>Status</th><th>Task</th></tr></table>
+<script>
+const es=new EventSource('/events');
+es.onmessage=e=>{{
+  const d=JSON.parse(e.data);
+  document.getElementById('ts').textContent=new Date().toLocaleTimeString();
+  const runs=document.getElementById('runs');
+  runs.innerHTML='<tr><th>ID</th><th>Profile</th><th>Status</th><th>When</th></tr>';
+  (d.runs||[]).slice(0,10).forEach(r=>{{
+    const cls=r.status==='completed'?'ok':r.status==='failed'?'fail':'run';
+    const when=(r.created_at||'').substring(11,16);
+    runs.innerHTML+=`<tr><td>${{r.run_id}}</td><td>${{r.master_profile}}</td><td class="${{cls}}">${{r.status}}</td><td>${{when}}</td></tr>`;
+  }});
+  const q=document.getElementById('queue');
+  q.innerHTML='<tr><th>Job</th><th>Status</th><th>Task</th></tr>';
+  (d.queue||[]).slice(0,8).forEach(j=>{{
+    const cls=j.status==='done'?'ok':j.status==='failed'?'fail':'run';
+    q.innerHTML+=`<tr><td>${{j.id}}</td><td class="${{cls}}">${{j.status}}</td><td>${{(j.task||'').substring(0,60)}}</td></tr>`;
+  }});
+}};
+</script></body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# PRD-030: Prompt Cache Analytics
+# ---------------------------------------------------------------------------
+
+def cmd_cache(args: argparse.Namespace) -> int:
+    """PRD-030: Prompt cache analytics — hit rate and cost savings per profile."""
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db_path = runtime_db_path(cfg)
+    if not db_path.exists():
+        print("No runs database found.")
+        return 0
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # Check columns exist
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+        has_cache = "cache_read_tokens" in cols and "cache_creation_tokens" in cols
+        if not has_cache:
+            print("No cache data recorded yet (cache columns not present).")
+            return 0
+
+        profile_filter = getattr(args, "profile", None)
+        where = "WHERE master_profile=?" if profile_filter else ""
+        params = (profile_filter,) if profile_filter else ()
+
+        rows = conn.execute(
+            f"""SELECT master_profile, model_id,
+                   SUM(prompt_tokens) as pt,
+                   SUM(completion_tokens) as ct,
+                   SUM(total_tokens) as tt,
+                   SUM(COALESCE(cache_read_tokens, 0)) as crt,
+                   SUM(COALESCE(cache_creation_tokens, 0)) as cct,
+                   SUM(COALESCE(estimated_cost_usd, 0)) as cost,
+                   COUNT(*) as runs
+                FROM runs {where}
+                GROUP BY master_profile, model_id
+                ORDER BY tt DESC
+                LIMIT 20""",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        print("No run data found.")
+        return 0
+
+    if getattr(args, "json", False):
+        out = []
+        for r in rows:
+            total_input = (r[2] or 0)
+            cache_read = (r[5] or 0)
+            hit_rate = cache_read / total_input if total_input > 0 else 0.0
+            # Cache reads cost 0.1x; savings vs full price
+            savings_tokens = cache_read * 0.9  # 90% discount on reads
+            out.append({
+                "profile": r[0], "model": r[1],
+                "prompt_tokens": r[2], "completion_tokens": r[3],
+                "cache_read_tokens": r[5], "cache_creation_tokens": r[6],
+                "cache_hit_rate": round(hit_rate, 4),
+                "estimated_savings_tokens": int(savings_tokens),
+                "total_cost_usd": r[7],
+                "runs": r[8],
+            })
+        print(json.dumps(out, indent=2))
+        return 0
+
+    print(f"{'Profile':<20} {'Model':<36} {'Prompt':>8} {'CacheRead':>10} {'HitRate':>8} {'Savings':>10}")
+    print("-" * 100)
+    for r in rows:
+        profile, model, pt, ct, tt, crt, cct, cost, runs = r
+        hit_rate = (crt / pt * 100) if pt else 0.0
+        savings_tokens = (crt or 0) * 0.9
+        print(f"{(profile or ''):<20} {(model or ''):<36} {(pt or 0):>8} "
+              f"{(crt or 0):>10} {hit_rate:>7.1f}% {int(savings_tokens):>10}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-031: Model Fallback Chains
+# ---------------------------------------------------------------------------
+
+def cmd_route_fallback(args: argparse.Namespace) -> int:
+    """PRD-031: Manage model fallback chains for automatic provider switching."""
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    ensure_runtime_dirs(cfg)
+    db = open_db(cfg)
+    sub = getattr(args, "fallback_subcommand", "list")
+    profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+
+    if sub == "add":
+        primary = (getattr(args, "primary", "") or "").strip()
+        fallback = (getattr(args, "fallback", "") or "").strip()
+        if not primary or not fallback:
+            db.close()
+            print_error("--primary and --fallback model IDs required")
+            return 1
+        condition = getattr(args, "condition", "context_overflow") or "context_overflow"
+        valid_conditions = {"context_overflow", "error", "timeout", "cost_limit", "any"}
+        if condition not in valid_conditions:
+            db.close()
+            print_error(f"--condition must be one of: {', '.join(sorted(valid_conditions))}")
+            return 1
+        priority = getattr(args, "priority", 1) or 1
+        fb_id = uuid.uuid4().hex[:8]
+        db.execute(
+            """INSERT INTO route_fallbacks(id, profile, primary_model, fallback_model,
+               condition, priority, enabled, created_at)
+               VALUES(?,?,?,?,?,?,1,?)""",
+            (fb_id, profile, primary, fallback, condition, priority, utc_now()),
+        )
+        db.commit()
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps({"id": fb_id, "profile": profile, "primary": primary, "fallback": fallback}))
+        else:
+            print(f"Fallback added: {fb_id}")
+            print(f"  {primary} → {fallback}  on: {condition}  priority: {priority}")
+        return 0
+
+    if sub == "list":
+        rows = db.execute(
+            """SELECT id, primary_model, fallback_model, condition, priority, enabled
+               FROM route_fallbacks WHERE profile=? ORDER BY priority, created_at""",
+            (profile,),
+        ).fetchall()
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps([{
+                "id": r[0], "primary": r[1], "fallback": r[2],
+                "condition": r[3], "priority": r[4], "enabled": bool(r[5]),
+            } for r in rows], indent=2))
+            return 0
+        if not rows:
+            print(f"No fallback chains for profile '{profile}'.")
+            return 0
+        print(f"  {'ID':<10} {'PRIMARY':<36} {'FALLBACK':<36} {'CONDITION':<16} {'PRI':>4} {'EN':>4}")
+        print("  " + "─" * 110)
+        for r in rows:
+            en = "✓" if r[5] else "✗"
+            print(f"  {r[0]:<10} {r[1]:<36} {r[2]:<36} {r[3]:<16} {r[4]:>4} {en:>4}")
+        return 0
+
+    if sub == "remove":
+        fb_id = getattr(args, "fb_id", None)
+        if not fb_id:
+            db.close()
+            print_error("FALLBACK_ID required")
+            return 1
+        cur = db.execute("DELETE FROM route_fallbacks WHERE id=? AND profile=?", (fb_id, profile))
+        db.commit()
+        db.close()
+        if cur.rowcount == 0:
+            print_error(f"Fallback '{fb_id}' not found for profile '{profile}'")
+            return 1
+        print(f"removed: {fb_id}")
+        return 0
+
+    if sub == "resolve":
+        primary = (getattr(args, "primary", "") or "").strip()
+        condition = getattr(args, "condition", "context_overflow") or "context_overflow"
+        if not primary:
+            db.close()
+            print_error("--primary required")
+            return 1
+        row = db.execute(
+            """SELECT fallback_model FROM route_fallbacks
+               WHERE profile=? AND primary_model=? AND condition=? AND enabled=1
+               ORDER BY priority LIMIT 1""",
+            (profile, primary, condition),
+        ).fetchone()
+        db.close()
+        if not row:
+            print(f"No fallback configured for {primary!r} on condition={condition!r}")
+            return 1
+        if getattr(args, "json", False):
+            print(json.dumps({"primary": primary, "fallback": row[0], "condition": condition}))
+        else:
+            print(f"Fallback: {primary} → {row[0]}  (condition: {condition})")
+        return 0
+
+    db.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-032: Agent Replay / Time-Travel Debugging (extends tag trace)
+# ---------------------------------------------------------------------------
+
+def _snapshot_trace(conn: sqlite3.Connection, trace_id: str) -> None:
+    """Capture a full snapshot of the trace into trace_snapshots."""
+    rows = conn.execute(
+        """SELECT id, name, profile, model_id, started_at, finished_at,
+               prompt_tokens, completion_tokens, status, attributes, error_msg
+           FROM spans WHERE trace_id=? ORDER BY started_at""",
+        (trace_id,),
+    ).fetchall()
+    if not rows:
+        return
+
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    snap_id = uuid.uuid4().hex[:16]
+    snapshot = {
+        "trace_id": trace_id,
+        "captured_at": now,
+        "spans": [
+            {
+                "id": r[0], "name": r[1], "profile": r[2], "model_id": r[3],
+                "started_at": r[4], "finished_at": r[5],
+                "prompt_tokens": r[6], "completion_tokens": r[7],
+                "status": r[8],
+                "attributes": json.loads(r[9] or "{}"),
+                "error_msg": r[10],
+            }
+            for r in rows
+        ],
+    }
+    conn.execute(
+        """INSERT OR REPLACE INTO trace_snapshots(id, trace_id, step_index, snapshot_json, created_at)
+           VALUES(?,?,0,?,?)""",
+        (snap_id, trace_id, json.dumps(snapshot), now),
+    )
+    conn.commit()
+
+
+def cmd_trace_extended(args: argparse.Namespace) -> int:
+    """PRD-032: Extended trace commands including replay, diff, and snapshot."""
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db_path = runtime_db_path(cfg)
+    if not db_path.exists():
+        print("No spans database found.")
+        return 0
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        sub = getattr(args, "trace_subcommand", None)
+
+        if sub == "snapshot":
+            trace_id = getattr(args, "trace_id", None)
+            if not trace_id:
+                print_error("TRACE_ID required")
+                return 1
+            _snapshot_trace(conn, trace_id)
+            print(f"Snapshot captured for trace: {trace_id}")
+            return 0
+
+        if sub == "replay":
+            trace_id = getattr(args, "trace_id", None)
+            if not trace_id:
+                print_error("TRACE_ID required")
+                return 1
+            row = conn.execute(
+                "SELECT snapshot_json FROM trace_snapshots WHERE trace_id=? ORDER BY created_at DESC LIMIT 1",
+                (trace_id,),
+            ).fetchone()
+            if not row:
+                # Try to build snapshot from live spans
+                _snapshot_trace(conn, trace_id)
+                row = conn.execute(
+                    "SELECT snapshot_json FROM trace_snapshots WHERE trace_id=? ORDER BY created_at DESC LIMIT 1",
+                    (trace_id,),
+                ).fetchone()
+            if not row:
+                print_error(f"No snapshot found for trace {trace_id}")
+                return 1
+
+            snap = json.loads(row[0])
+            spans = snap.get("spans", [])
+            if getattr(args, "json", False):
+                print(json.dumps(snap, indent=2))
+                return 0
+
+            print(f"Trace replay: {trace_id}")
+            print(f"Captured: {snap.get('captured_at', '?')}")
+            print(f"Spans: {len(spans)}")
+            print()
+            for i, s in enumerate(spans, 1):
+                status = s.get("status", "?")
+                dur = ""
+                if s.get("started_at") and s.get("finished_at"):
+                    try:
+                        from datetime import datetime as _dt
+                        start = _dt.fromisoformat(s["started_at"])
+                        end = _dt.fromisoformat(s["finished_at"])
+                        ms = int((end - start).total_seconds() * 1000)
+                        dur = f"  {ms}ms"
+                    except Exception:
+                        pass
+                pt = s.get("prompt_tokens", 0) or 0
+                ct = s.get("completion_tokens", 0) or 0
+                print(f"  [{i:02d}] {s['name']:<40} {status:<8} {pt+ct:>8} tokens{dur}")
+                if s.get("error_msg"):
+                    print(f"       error: {s['error_msg'][:80]}")
+            return 0
+
+        if sub == "diff":
+            trace_a = getattr(args, "trace_a", None)
+            trace_b = getattr(args, "trace_b", None)
+            if not trace_a or not trace_b:
+                print_error("Two trace IDs required: TRACE_A TRACE_B")
+                return 1
+
+            def _load_snap(tid):
+                r = conn.execute(
+                    "SELECT snapshot_json FROM trace_snapshots WHERE trace_id=? ORDER BY created_at DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if not r:
+                    _snapshot_trace(conn, tid)
+                    r = conn.execute(
+                        "SELECT snapshot_json FROM trace_snapshots WHERE trace_id=? ORDER BY created_at DESC LIMIT 1",
+                        (tid,),
+                    ).fetchone()
+                return json.loads(r[0]) if r else None
+
+            snap_a = _load_snap(trace_a)
+            snap_b = _load_snap(trace_b)
+            if not snap_a:
+                print_error(f"No snapshot for trace {trace_a}")
+                return 1
+            if not snap_b:
+                print_error(f"No snapshot for trace {trace_b}")
+                return 1
+
+            spans_a = {s["name"]: s for s in snap_a.get("spans", [])}
+            spans_b = {s["name"]: s for s in snap_b.get("spans", [])}
+            all_names = sorted(set(spans_a) | set(spans_b))
+
+            if getattr(args, "json", False):
+                diff = []
+                for name in all_names:
+                    sa = spans_a.get(name)
+                    sb = spans_b.get(name)
+                    diff.append({"name": name, "a": sa, "b": sb})
+                print(json.dumps(diff, indent=2))
+                return 0
+
+            print(f"Trace diff: {trace_a[:12]}  vs  {trace_b[:12]}")
+            print(f"{'Span':<40} {'A tokens':>10} {'B tokens':>10} {'Δ tokens':>10} {'A status':<10} {'B status'}")
+            print("-" * 100)
+            for name in all_names:
+                sa = spans_a.get(name)
+                sb = spans_b.get(name)
+                ta = ((sa or {}).get("prompt_tokens", 0) or 0) + ((sa or {}).get("completion_tokens", 0) or 0)
+                tb = ((sb or {}).get("prompt_tokens", 0) or 0) + ((sb or {}).get("completion_tokens", 0) or 0)
+                delta = tb - ta
+                delta_str = f"+{delta}" if delta > 0 else str(delta)
+                sta = (sa or {}).get("status", "—")
+                stb = (sb or {}).get("status", "—")
+                prefix = "+" if sa is None else ("-" if sb is None else " ")
+                print(f"{prefix} {name:<38} {ta:>10} {tb:>10} {delta_str:>10} {sta:<10} {stb}")
+            return 0
+
+        if sub == "checkpoint":
+            # snapshot sub-alias
+            trace_id = getattr(args, "trace_id", None)
+            if not trace_id:
+                print_error("TRACE_ID required")
+                return 1
+            _snapshot_trace(conn, trace_id)
+            snaps = conn.execute(
+                "SELECT id, created_at FROM trace_snapshots WHERE trace_id=? ORDER BY created_at DESC",
+                (trace_id,),
+            ).fetchall()
+            if getattr(args, "json", False):
+                print(json.dumps([{"id": r[0], "created_at": r[1]} for r in snaps], indent=2))
+            else:
+                print(f"Checkpoints for trace {trace_id}:")
+                for i, r in enumerate(snaps):
+                    print(f"  [{i}] {r[0]}  {r[1]}")
+            return 0
+
+    finally:
+        conn.close()
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="TAG orchestration CLI")
     parser.add_argument("--config", help="Path to lab config YAML")
@@ -6949,7 +8377,21 @@ def build_parser() -> argparse.ArgumentParser:
     trace_export.add_argument("endpoint", metavar="ENDPOINT")
     trace_export.add_argument("--trace-id", metavar="ID", dest="trace_id")
     trace_export.add_argument("--profile")
-    for tp in [trace, trace_list, trace_show, trace_export]:
+    # PRD-032: replay, diff, checkpoint, snapshot
+    trace_replay = trace_sub.add_parser("replay", help="Replay a captured trace snapshot (PRD-032)")
+    trace_replay.add_argument("trace_id", metavar="TRACE_ID")
+    trace_replay.add_argument("--json", action="store_true")
+    trace_diff = trace_sub.add_parser("diff", help="Diff two traces span-by-span (PRD-032)")
+    trace_diff.add_argument("trace_a", metavar="TRACE_A")
+    trace_diff.add_argument("trace_b", metavar="TRACE_B")
+    trace_diff.add_argument("--json", action="store_true")
+    trace_checkpoint = trace_sub.add_parser("checkpoint", help="List snapshots for a trace (PRD-032)")
+    trace_checkpoint.add_argument("trace_id", metavar="TRACE_ID")
+    trace_checkpoint.add_argument("--json", action="store_true")
+    trace_snapshot = trace_sub.add_parser("snapshot", help="Capture a trace snapshot (PRD-032)")
+    trace_snapshot.add_argument("trace_id", metavar="TRACE_ID")
+    for tp in [trace, trace_list, trace_show, trace_export,
+               trace_replay, trace_diff, trace_checkpoint, trace_snapshot]:
         tp.set_defaults(func=cmd_trace)
 
     # ---- PRD-014: mcp-registry ----
@@ -7054,6 +8496,190 @@ def build_parser() -> argparse.ArgumentParser:
     ci_status = ci_sub.add_parser("status", help="Show git host and working tree status")
     for cp in [ci_cmd, ci_diagnose, ci_lint, ci_status]:
         cp.set_defaults(func=cmd_ci)
+
+    # ---- PRD-021: loop ----
+    loop_cmd = sub.add_parser("loop", help="Autonomous agent loop with goal detection and iteration cap")
+    loop_sub = loop_cmd.add_subparsers(dest="loop_subcommand")
+    loop_start = loop_sub.add_parser("start", help="Start an autonomous loop")
+    loop_start.add_argument("--goal", required=True, help="Goal text the loop works toward")
+    loop_start.add_argument("--profile", help="Profile to run (default: master_profile)")
+    loop_start.add_argument("--max-iters", type=int, default=10, dest="max_iters",
+                            help="Maximum number of iterations (default: 10)")
+    loop_start.add_argument("--approval", choices=["auto", "human"], default="auto",
+                            help="Gate mode: auto continues automatically, human pauses for approval")
+    loop_start.add_argument("--json", action="store_true")
+    loop_list = loop_sub.add_parser("list", help="List all loop runs")
+    loop_list.add_argument("--json", action="store_true")
+    loop_status_p = loop_sub.add_parser("status", help="Show status and iterations of a loop")
+    loop_status_p.add_argument("loop_id", metavar="LOOP_ID")
+    loop_status_p.add_argument("--json", action="store_true")
+    loop_abort = loop_sub.add_parser("abort", help="Abort a running loop")
+    loop_abort.add_argument("loop_id", metavar="LOOP_ID")
+    for lp in [loop_cmd, loop_start, loop_list, loop_status_p, loop_abort]:
+        lp.set_defaults(func=cmd_loop)
+
+    # ---- PRD-022: cron ----
+    cron_cmd = sub.add_parser("cron", help="Cron-style scheduled agent runs")
+    cron_sub = cron_cmd.add_subparsers(dest="cron_subcommand")
+    cron_add = cron_sub.add_parser("add", help="Add a cron job")
+    cron_add.add_argument("--name", required=True, help="Unique job name")
+    cron_add.add_argument("--schedule", required=True, help="5-field cron expression (e.g. '0 9 * * 1-5')")
+    cron_add.add_argument("--profile", help="Profile to run task with")
+    cron_add.add_argument("task", metavar="TASK", help="Task text to submit")
+    cron_add.add_argument("--json", action="store_true")
+    cron_list = cron_sub.add_parser("list", help="List all cron jobs")
+    cron_list.add_argument("--json", action="store_true")
+    cron_remove = cron_sub.add_parser("remove", help="Remove a cron job")
+    cron_remove.add_argument("job_id", metavar="JOB_ID")
+    cron_enable = cron_sub.add_parser("enable", help="Enable a cron job")
+    cron_enable.add_argument("job_id", metavar="JOB_ID")
+    cron_disable = cron_sub.add_parser("disable", help="Disable a cron job")
+    cron_disable.add_argument("job_id", metavar="JOB_ID")
+    cron_run = cron_sub.add_parser("run", help="Trigger a cron job immediately (ignore schedule)")
+    cron_run.add_argument("job_id", metavar="JOB_ID")
+    cron_daemon = cron_sub.add_parser("daemon", help="Run the cron daemon in-process (blocking)")
+    for cp in [cron_cmd, cron_add, cron_list, cron_remove, cron_enable, cron_disable, cron_run, cron_daemon]:
+        cp.set_defaults(func=cmd_cron)
+
+    # ---- PRD-024: workspace ----
+    ws_cmd = sub.add_parser("workspace", help="Repo-map and workspace context indexing")
+    ws_sub = ws_cmd.add_subparsers(dest="workspace_subcommand")
+    ws_index = ws_sub.add_parser("index", help="Index workspace files")
+    ws_index.add_argument("--path", default=".", help="Root path to index (default: .)")
+    ws_index.add_argument("--max-files", type=int, default=500, dest="max_files")
+    ws_index.add_argument("--json", action="store_true")
+    ws_map = ws_sub.add_parser("map", help="Print token-efficient workspace map")
+    ws_map.add_argument("--path", default=".", help="Root path")
+    ws_map.add_argument("--budget", type=int, default=4000, help="Token budget (default: 4000)")
+    ws_status = ws_sub.add_parser("status", help="Show workspace index statistics")
+    ws_status.add_argument("--json", action="store_true")
+    ws_clear = ws_sub.add_parser("clear", help="Clear workspace index")
+    for wp in [ws_cmd, ws_index, ws_map, ws_status, ws_clear]:
+        wp.set_defaults(func=cmd_workspace)
+
+    # ---- PRD-025: memory (semantic) ----
+    mem_cmd = sub.add_parser("mem", help="Semantic memory with confidence decay (tag mem)")
+    mem_sub = mem_cmd.add_subparsers(dest="mem_subcommand")
+    mem_add = mem_sub.add_parser("add", help="Add a memory")
+    mem_add.add_argument("content", metavar="CONTENT", help="Memory text")
+    mem_add.add_argument("--type", dest="memory_type", default="fact",
+                         choices=["fact", "convention", "decision", "gotcha", "other"])
+    mem_add.add_argument("--confidence", type=float, default=1.0)
+    mem_add.add_argument("--profile")
+    mem_add.add_argument("--json", action="store_true")
+    mem_search = mem_sub.add_parser("search", help="Full-text search over memories")
+    mem_search.add_argument("query", metavar="QUERY")
+    mem_search.add_argument("--type", dest="memory_type")
+    mem_search.add_argument("--limit", type=int, default=10)
+    mem_search.add_argument("--profile")
+    mem_search.add_argument("--json", action="store_true")
+    mem_list = mem_sub.add_parser("list", help="List memories sorted by effective confidence")
+    mem_list.add_argument("--type", dest="memory_type")
+    mem_list.add_argument("--limit", type=int, default=20)
+    mem_list.add_argument("--profile")
+    mem_list.add_argument("--json", action="store_true")
+    mem_forget = mem_sub.add_parser("forget", help="Delete a memory by ID")
+    mem_forget.add_argument("mem_id", metavar="MEMORY_ID")
+    mem_forget.add_argument("--profile")
+    mem_stats = mem_sub.add_parser("stats", help="Show memory store statistics")
+    mem_stats.add_argument("--profile")
+    mem_stats.add_argument("--json", action="store_true")
+    for mp in [mem_cmd, mem_add, mem_search, mem_list, mem_forget, mem_stats]:
+        mp.set_defaults(func=cmd_memory_semantic)
+
+    # ---- PRD-026: marketplace ----
+    mkt_cmd = sub.add_parser("marketplace", help="Profile marketplace: pull/push profiles")
+    mkt_sub = mkt_cmd.add_subparsers(dest="marketplace_subcommand")
+    mkt_pull = mkt_sub.add_parser("pull", help="Download a profile from a URL")
+    mkt_pull.add_argument("url", metavar="URL")
+    mkt_pull.add_argument("--name", help="Local name for the profile (default: filename)")
+    mkt_pull.add_argument("--json", action="store_true")
+    mkt_push = mkt_sub.add_parser("push", help="Show how to push a profile to GitHub Gist")
+    mkt_push.add_argument("profile_name", metavar="PROFILE_NAME")
+    mkt_list = mkt_sub.add_parser("list", help="List cached profiles")
+    mkt_list.add_argument("--json", action="store_true")
+    for mp in [mkt_cmd, mkt_pull, mkt_push, mkt_list]:
+        mp.set_defaults(func=cmd_profile_marketplace)
+
+    # ---- PRD-027: eval ----
+    eval_cmd = sub.add_parser("eval", help="Run eval suites against TAG profiles")
+    eval_sub = eval_cmd.add_subparsers(dest="eval_subcommand")
+    eval_run = eval_sub.add_parser("run", help="Run an eval suite")
+    eval_run.add_argument("--suite", required=True, metavar="SUITE_PATH", help="Path to YAML eval suite")
+    eval_run.add_argument("--profile", help="Profile to evaluate")
+    eval_run.add_argument("--dry-run", action="store_true", dest="dry_run",
+                          help="Validate suite without running agent")
+    eval_run.add_argument("--json", action="store_true")
+    eval_list = eval_sub.add_parser("list", help="List eval runs")
+    eval_list.add_argument("--json", action="store_true")
+    eval_show = eval_sub.add_parser("show", help="Show eval run detail")
+    eval_show.add_argument("run_id", metavar="RUN_ID")
+    eval_show.add_argument("--json", action="store_true")
+    for ep in [eval_cmd, eval_run, eval_list, eval_show]:
+        ep.set_defaults(func=cmd_eval)
+
+    # ---- PRD-028: sandbox ----
+    sb_cmd = sub.add_parser("sandbox", help="Isolated code execution (restricted subprocess or Docker)")
+    sb_sub = sb_cmd.add_subparsers(dest="sandbox_subcommand")
+    sb_run = sb_sub.add_parser("run", help="Run a command in the sandbox")
+    sb_run.add_argument("command", metavar="COMMAND", help="Shell command to run")
+    sb_run.add_argument("--backend", choices=["restricted", "docker"], default="restricted")
+    sb_run.add_argument("--image", default="python:3.12-slim", help="Docker image (for --backend docker)")
+    sb_run.add_argument("--timeout", type=int, default=60, metavar="SECONDS")
+    sb_run.add_argument("--json", action="store_true")
+    sb_list = sb_sub.add_parser("list", help="List recent sandbox runs")
+    sb_list.add_argument("--json", action="store_true")
+    sb_result = sb_sub.add_parser("result", help="Show sandbox run output")
+    sb_result.add_argument("run_id", metavar="RUN_ID")
+    sb_result.add_argument("--json", action="store_true")
+    for sp in [sb_cmd, sb_run, sb_list, sb_result]:
+        sp.set_defaults(func=cmd_sandbox)
+
+    # ---- PRD-029: serve ----
+    serve_cmd = sub.add_parser("serve", help="Start local HTTP dashboard server with SSE streaming")
+    serve_cmd.add_argument("--port", type=int, default=7880, help="Port to listen on (default: 7880)")
+    serve_cmd.add_argument("--profile", help="Default profile for dashboard view")
+    serve_cmd.set_defaults(func=cmd_serve)
+
+    # ---- PRD-030: cache ----
+    cache_cmd = sub.add_parser("cache", help="Prompt cache analytics")
+    cache_sub = cache_cmd.add_subparsers(dest="cache_subcommand")
+    cache_stats = cache_sub.add_parser("stats", help="Show cache hit rates and savings per profile")
+    cache_stats.add_argument("--profile", help="Filter to a specific profile")
+    cache_stats.add_argument("--json", action="store_true")
+    for cp in [cache_cmd, cache_stats]:
+        cp.set_defaults(func=cmd_cache)
+
+    # ---- PRD-031: route fallback ----
+    # Extend the existing 'route' command with a 'fallback' subgroup
+    route_fallback_cmd = sub.add_parser("route-fallback", help="Manage model fallback chains (PRD-031)")
+    rf_sub = route_fallback_cmd.add_subparsers(dest="fallback_subcommand")
+    rf_add = rf_sub.add_parser("add", help="Add a fallback chain")
+    rf_add.add_argument("--primary", required=True, help="Primary model ID")
+    rf_add.add_argument("--fallback", required=True, help="Fallback model ID")
+    rf_add.add_argument("--condition", default="context_overflow",
+                        choices=["context_overflow", "error", "timeout", "cost_limit", "any"])
+    rf_add.add_argument("--priority", type=int, default=1)
+    rf_add.add_argument("--profile")
+    rf_add.add_argument("--json", action="store_true")
+    rf_list = rf_sub.add_parser("list", help="List fallback chains")
+    rf_list.add_argument("--profile")
+    rf_list.add_argument("--json", action="store_true")
+    rf_remove = rf_sub.add_parser("remove", help="Remove a fallback chain")
+    rf_remove.add_argument("fb_id", metavar="FALLBACK_ID")
+    rf_remove.add_argument("--profile")
+    rf_resolve = rf_sub.add_parser("resolve", help="Show which fallback would be used")
+    rf_resolve.add_argument("--primary", required=True)
+    rf_resolve.add_argument("--condition", default="context_overflow")
+    rf_resolve.add_argument("--profile")
+    rf_resolve.add_argument("--json", action="store_true")
+    for rfp in [route_fallback_cmd, rf_add, rf_list, rf_remove, rf_resolve]:
+        rfp.set_defaults(func=cmd_route_fallback)
+
+    # ---- PRD-032: extend trace with replay/diff/checkpoint/snapshot ----
+    # The existing 'trace' command now supports replay, diff, checkpoint, snapshot
+    # Parser entries are added here as aliases on the existing trace_sub
+    # (already registered above — we just need to add the new subcommands)
 
     return parser
 
