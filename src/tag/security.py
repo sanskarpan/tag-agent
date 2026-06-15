@@ -16,13 +16,13 @@ from typing import Iterator
 # Pattern library — name → compiled regex (no capturing groups on value)
 # ---------------------------------------------------------------------------
 _PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("anthropic_api_key",      re.compile(r'sk-ant-api0[0-9]-[A-Za-z0-9_\-]{80,}')),
-    ("openai_api_key",         re.compile(r'sk-[A-Za-z0-9]{48}')),
-    ("openai_org",             re.compile(r'org-[A-Za-z0-9]{24}')),
+    ("anthropic_api_key",      re.compile(r'sk-ant-[A-Za-z0-9_\-]{20,}')),
+    ("openai_api_key",         re.compile(r'sk-(?:proj-)?[A-Za-z0-9_\-]{20,}')),
+    ("openai_org",             re.compile(r'org-[A-Za-z0-9]{20,}')),
     ("aws_access_key",         re.compile(r'AKIA[0-9A-Z]{16}')),
-    ("aws_secret_key",         re.compile(r'(?i)aws.{0,20}secret.{0,20}["\']?([A-Za-z0-9/+]{40})')),
+    ("aws_secret_key",         re.compile(r'(?i)aws.{0,20}(?:secret|key).{0,20}["\']?([A-Za-z0-9/+]{20,})')),
     ("github_pat_classic",     re.compile(r'ghp_[A-Za-z0-9]{36}')),
-    ("github_pat_fine",        re.compile(r'github_pat_[A-Za-z0-9_]{82}')),
+    ("github_pat_fine",        re.compile(r'github_pat_[A-Za-z0-9_]{59,}')),
     ("github_oauth",           re.compile(r'gho_[A-Za-z0-9]{36}')),
     ("npm_access_token",       re.compile(r'npm_[A-Za-z0-9]{36}')),
     ("stripe_secret",          re.compile(r'sk_live_[A-Za-z0-9]{24,}')),
