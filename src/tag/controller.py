@@ -501,6 +501,7 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
     )
     _migrate_runs_cost_columns(conn)
     _migrate_prd_021_032_tables(conn)
+    _migrate_prd_033_044_tables(conn)
     _prune_old_spans(conn)
     return conn
 
@@ -670,6 +671,173 @@ def _migrate_prd_021_032_tables(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError:
                 pass
     conn.commit()
+
+
+def _migrate_prd_033_044_tables(conn: sqlite3.Connection) -> None:
+    """Create tables for PRD-033 through PRD-044 features (idempotent)."""
+    try:
+        conn.executescript("""
+            -- PRD-033: DAG / dependency-aware queue
+            CREATE TABLE IF NOT EXISTS queue_dags (
+              id          TEXT PRIMARY KEY,
+              name        TEXT NOT NULL UNIQUE,
+              spec_json   TEXT NOT NULL,
+              created_at  TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS _dag_init_sentinel (id INTEGER PRIMARY KEY);
+
+            -- PRD-034: Secret Scanning
+            CREATE TABLE IF NOT EXISTS security_scans (
+              id          TEXT PRIMARY KEY,
+              scanned_path TEXT NOT NULL,
+              finding_count INTEGER NOT NULL DEFAULT 0,
+              status      TEXT NOT NULL DEFAULT 'ok',
+              created_at  TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS security_findings (
+              id          TEXT PRIMARY KEY,
+              scan_id     TEXT NOT NULL,
+              file_path   TEXT NOT NULL,
+              line_no     INTEGER NOT NULL,
+              pattern_name TEXT NOT NULL,
+              is_entropy  INTEGER NOT NULL DEFAULT 0,
+              created_at  TEXT NOT NULL,
+              FOREIGN KEY(scan_id) REFERENCES security_scans(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sf_scan ON security_findings(scan_id);
+
+            -- PRD-035: LSP sessions
+            CREATE TABLE IF NOT EXISTS lsp_sessions (
+              id          TEXT PRIMARY KEY,
+              transport   TEXT NOT NULL DEFAULT 'stdio',
+              port        INTEGER,
+              pid         INTEGER,
+              status      TEXT NOT NULL DEFAULT 'running',
+              created_at  TEXT NOT NULL,
+              stopped_at  TEXT
+            );
+
+            -- PRD-037: Personas
+            CREATE TABLE IF NOT EXISTS personas (
+              id           TEXT PRIMARY KEY,
+              name         TEXT NOT NULL UNIQUE,
+              description  TEXT NOT NULL DEFAULT '',
+              style_prompt TEXT NOT NULL,
+              inject       TEXT NOT NULL DEFAULT 'prepend',
+              tags_json    TEXT NOT NULL DEFAULT '[]',
+              source       TEXT NOT NULL DEFAULT 'builtin',
+              created_at   TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS active_personas (
+              profile      TEXT NOT NULL,
+              persona_name TEXT NOT NULL,
+              position     INTEGER NOT NULL DEFAULT 0,
+              session_id   TEXT,
+              created_at   TEXT NOT NULL,
+              PRIMARY KEY(profile, persona_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ap_profile ON active_personas(profile);
+
+            -- PRD-039: Token Budgets
+            CREATE TABLE IF NOT EXISTS token_budgets (
+              id          TEXT PRIMARY KEY,
+              profile     TEXT NOT NULL UNIQUE,
+              period      TEXT NOT NULL DEFAULT 'daily',
+              max_tokens  INTEGER NOT NULL,
+              warn_pct    REAL NOT NULL DEFAULT 0.8,
+              enabled     INTEGER NOT NULL DEFAULT 1,
+              created_at  TEXT NOT NULL,
+              updated_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tb_profile ON token_budgets(profile);
+
+            -- PRD-040: Notification Hooks
+            CREATE TABLE IF NOT EXISTS notification_hooks (
+              id           TEXT PRIMARY KEY,
+              profile      TEXT,
+              event        TEXT NOT NULL,
+              channel      TEXT NOT NULL,
+              config_json  TEXT NOT NULL DEFAULT '{}',
+              template     TEXT NOT NULL DEFAULT '',
+              enabled      INTEGER NOT NULL DEFAULT 1,
+              created_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_nh_event ON notification_hooks(event, enabled);
+            CREATE TABLE IF NOT EXISTS notification_log (
+              id           TEXT PRIMARY KEY,
+              hook_id      TEXT NOT NULL,
+              event        TEXT NOT NULL,
+              channel      TEXT NOT NULL,
+              outcome      TEXT NOT NULL,
+              http_status  INTEGER,
+              attempt      INTEGER NOT NULL DEFAULT 1,
+              created_at   TEXT NOT NULL,
+              FOREIGN KEY(hook_id) REFERENCES notification_hooks(id)
+            );
+
+            -- PRD-042: Architect/Editor Split
+            CREATE TABLE IF NOT EXISTS split_runs (
+              id               TEXT PRIMARY KEY,
+              task             TEXT NOT NULL,
+              architect_model  TEXT NOT NULL,
+              editor_model     TEXT NOT NULL,
+              profile          TEXT NOT NULL,
+              spec_json        TEXT,
+              status           TEXT NOT NULL DEFAULT 'pending',
+              items_total      INTEGER NOT NULL DEFAULT 0,
+              items_done       INTEGER NOT NULL DEFAULT 0,
+              items_rejected   INTEGER NOT NULL DEFAULT 0,
+              created_at       TEXT NOT NULL,
+              updated_at       TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS split_items (
+              id          TEXT PRIMARY KEY,
+              run_id      TEXT NOT NULL,
+              item_id     TEXT NOT NULL,
+              file        TEXT NOT NULL,
+              description TEXT NOT NULL,
+              action      TEXT NOT NULL DEFAULT 'modify',
+              status      TEXT NOT NULL DEFAULT 'pending',
+              diff        TEXT,
+              verdict     TEXT,
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              created_at  TEXT NOT NULL,
+              FOREIGN KEY(run_id) REFERENCES split_runs(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_si_run ON split_items(run_id, status);
+
+            -- PRD-043: Tool index metadata
+            CREATE TABLE IF NOT EXISTS tool_index_meta (
+              id          TEXT PRIMARY KEY DEFAULT 'singleton',
+              registry_mtime REAL,
+              tool_count  INTEGER NOT NULL DEFAULT 0,
+              built_at    TEXT NOT NULL
+            );
+
+            -- PRD-044: AgentOps sessions
+            CREATE TABLE IF NOT EXISTS agentops_sessions (
+              id             TEXT PRIMARY KEY,
+              run_id         TEXT NOT NULL UNIQUE,
+              session_id     TEXT,
+              dashboard_url  TEXT,
+              status         TEXT NOT NULL DEFAULT 'pending',
+              created_at     TEXT NOT NULL,
+              closed_at      TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_ao_run ON agentops_sessions(run_id);
+        """)
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Add deps_json to queue_jobs if not present (PRD-033)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(queue_jobs)").fetchall()}
+    if "deps_json" not in cols:
+        try:
+            conn.execute("ALTER TABLE queue_jobs ADD COLUMN deps_json TEXT DEFAULT '[]'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
 
 def _migrate_runs_cost_columns(conn: sqlite3.Connection) -> None:
@@ -7815,6 +7983,939 @@ def cmd_trace_extended(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# PRD-033: Dependency-Aware Task Queue
+# ---------------------------------------------------------------------------
+
+def cmd_dag(args: argparse.Namespace) -> int:
+    """PRD-033: tag queue dag show/save/run/list."""
+    from tag.dag import (
+        ensure_schema as dag_ensure, show_dag, save_dag, run_dag,
+        list_dags, DagSpec,
+    )
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db = open_db(cfg)
+    dag_ensure(db)
+    sub = getattr(args, "dag_subcommand", None)
+
+    if sub == "show" or sub is None:
+        job_ids = getattr(args, "job_ids", None) or []
+        print(show_dag(db, job_ids if job_ids else None))
+        db.close()
+        return 0
+
+    if sub == "save":
+        name = getattr(args, "name", "")
+        steps_json = getattr(args, "steps", "[]")
+        try:
+            steps = json.loads(steps_json)
+        except json.JSONDecodeError as exc:
+            print_error(f"Invalid steps JSON: {exc}")
+            db.close()
+            return 1
+        spec = DagSpec(name=name, steps=steps)
+        dag_id = save_dag(db, spec)
+        db.close()
+        print(f"DAG saved: {name} ({dag_id})")
+        return 0
+
+    if sub == "run":
+        name = getattr(args, "name", "")
+        board = getattr(args, "board", "default")
+        try:
+            job_ids = run_dag(db, name, board=board)
+        except ValueError as exc:
+            print_error(str(exc))
+            db.close()
+            return 1
+        db.close()
+        print(f"DAG '{name}' submitted: {len(job_ids)} jobs")
+        for jid in job_ids:
+            print(f"  {jid}")
+        return 0
+
+    if sub == "list":
+        dags = list_dags(db)
+        db.close()
+        if not dags:
+            print("No saved DAGs.")
+            return 0
+        for d in dags:
+            print(f"{d['id'][:8]}  {d['name']:<30}  {d['step_count']} steps  {d['created_at'][:19]}")
+        return 0
+
+    db.close()
+    print_error(f"Unknown dag subcommand: {sub!r}")
+    return 1
+
+
+def cmd_queue_extended(args: argparse.Namespace) -> int:
+    """PRD-033: extended queue subcommands (depends-on support)."""
+    from tag.dag import ensure_schema as dag_ensure, add_job, promote_ready_jobs
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db = open_db(cfg)
+    dag_ensure(db)
+
+    sub = getattr(args, "queue_ext_subcommand", None)
+
+    if sub == "add":
+        task = getattr(args, "task", "")
+        profile = getattr(args, "profile", None)
+        depends_on = getattr(args, "depends_on", []) or []
+        if not task.strip():
+            print_error("Task must not be empty.")
+            db.close()
+            return 1
+        try:
+            job_id = add_job(db, task, profile=profile, depends_on=depends_on)
+        except ValueError as exc:
+            print_error(str(exc))
+            db.close()
+            return 1
+        db.close()
+        print(f"Queue job added: {job_id}")
+        return 0
+
+    if sub == "promote":
+        promoted = promote_ready_jobs(db)
+        db.close()
+        if promoted:
+            print(f"Promoted {len(promoted)} jobs to ready: {', '.join(promoted)}")
+        else:
+            print("No jobs promoted.")
+        return 0
+
+    db.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-034: Secret Scanning
+# ---------------------------------------------------------------------------
+
+def cmd_security(args: argparse.Namespace) -> int:
+    """PRD-034: tag security scan/list."""
+    from tag.security import scan_directory, scan_file, record_scan, ensure_schema as sec_ensure
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db = open_db(cfg)
+    sec_ensure(db)
+    sub = getattr(args, "security_subcommand", None)
+
+    if sub == "scan" or sub is None:
+        path_str = getattr(args, "path", ".") or "."
+        scan_path = Path(path_str).resolve()
+        max_files = getattr(args, "max_files", 2000) or 2000
+
+        if scan_path.is_file():
+            from tag.security import scan_file as sf
+            findings = sf(scan_path)
+        else:
+            from tag.security import scan_directory as sd
+            findings = list(sd(scan_path, max_files=max_files))
+
+        record_scan(db, str(scan_path), findings)
+        db.close()
+
+        if getattr(args, "json", False):
+            print(json.dumps([
+                {"file": str(f.file), "line_no": f.line_no, "pattern": f.pattern_name,
+                 "entropy": f.is_entropy}
+                for f in findings
+            ], indent=2))
+            return 1 if findings else 0
+
+        if not findings:
+            print(f"✓ No secrets found in {scan_path}")
+            return 0
+
+        print(f"⚠ Found {len(findings)} potential secret(s) in {scan_path}:\n")
+        for f in findings:
+            tag = "[entropy]" if f.is_entropy else f"[{f.pattern_name}]"
+            print(f"  {f.file}:{f.line_no}  {tag}")
+        print("\nNOTE: Matched values are NOT displayed for security.")
+        return 1
+
+    if sub == "list":
+        rows = db.execute(
+            "SELECT id, scanned_path, finding_count, status, created_at FROM security_scans "
+            "ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+        db.close()
+        if not rows:
+            print("No security scans recorded.")
+            return 0
+        for r in rows:
+            status_icon = "✓" if r[3] == "clean" else "⚠"
+            print(f"{status_icon} {r[0][:8]}  {r[1][:60]:<60}  {r[2]} findings  {r[4][:19]}")
+        return 0
+
+    db.close()
+    print_error(f"Unknown security subcommand: {sub!r}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-035: IDE Bridge (LSP)
+# ---------------------------------------------------------------------------
+
+def cmd_lsp(args: argparse.Namespace) -> int:
+    """PRD-035: tag lsp [--port PORT] [--stdio] [status]."""
+    from tag.lsp_server import TagLspServer, get_lsp_status, ensure_schema as lsp_ensure
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db = open_db(cfg)
+    lsp_ensure(db)
+    sub = getattr(args, "lsp_subcommand", None)
+
+    if sub == "status":
+        sessions = get_lsp_status(db)
+        db.close()
+        if not sessions:
+            print("No active LSP sessions.")
+            return 0
+        for s in sessions:
+            tp = s["transport"]
+            port = f":{s['port']}" if s.get("port") else ""
+            print(f"{s['id'][:8]}  {tp}{port}  pid={s['pid']}  {s['created_at'][:19]}")
+        return 0
+
+    # Collect profile names
+    profiles_dir = tag_home() / "profiles"
+    profiles: list[str] = []
+    if profiles_dir.exists():
+        profiles = [p.name for p in profiles_dir.iterdir() if p.is_dir()]
+    if not profiles:
+        profiles = ["orchestrator", "coder", "reviewer"]
+
+    port = getattr(args, "port", 7878)
+    use_stdio = getattr(args, "stdio", False)
+    server = TagLspServer(profiles=profiles, conn=db)
+
+    if use_stdio or port == 0:
+        print("TAG LSP server starting on stdio ...", file=sys.stderr)
+        server.run_stdio()
+    else:
+        server.run_tcp(host="127.0.0.1", port=port)
+
+    db.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-036: Web Dashboard
+# ---------------------------------------------------------------------------
+
+def cmd_web(args: argparse.Namespace) -> int:
+    """PRD-036: tag web [--port 8787] [--host 127.0.0.1] [--no-browser]."""
+    from tag.api import DashboardServer
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db_path = runtime_db_path(cfg)
+    if not db_path.exists():
+        # Ensure DB exists with base schema
+        db = open_db(cfg)
+        db.close()
+
+    host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
+    port = getattr(args, "port", 8787) or 8787
+    no_browser = getattr(args, "no_browser", False)
+
+    if host != "127.0.0.1":
+        print(f"⚠ WARNING: Binding to {host} — dashboard will be accessible on your network.", file=sys.stderr)
+
+    server = DashboardServer(db_path=db_path, host=host, port=port)
+    server.start(open_browser=not no_browser)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-037: Agent Personas
+# ---------------------------------------------------------------------------
+
+def cmd_persona(args: argparse.Namespace) -> int:
+    """PRD-037: tag persona list/show/apply/remove/stack."""
+    from tag.persona import (
+        list_personas, get_persona, apply_persona, remove_active_persona,
+        get_active_personas, remove_persona, install_persona, load_persona_file,
+        ensure_schema as persona_ensure, build_merged_prompt,
+    )
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db = open_db(cfg)
+    persona_ensure(db)
+    sub = getattr(args, "persona_subcommand", None)
+
+    if sub == "list" or sub is None:
+        personas = list_personas(db)
+        db.close()
+        if not personas:
+            print("No personas available.")
+            return 0
+        for p in personas:
+            active_mark = ""
+            tags = ", ".join(p.get("tags", []))
+            print(f"{'[builtin]' if p['source'] == 'builtin' else '[user]   ':10} {p['name']:<30}  {p['description'][:50]}")
+        return 0
+
+    if sub == "show":
+        name = getattr(args, "name", "")
+        p = get_persona(db, name)
+        db.close()
+        if not p:
+            print_error(f"Persona not found: {name!r}")
+            return 1
+        print(f"Name:        {p['name']}")
+        print(f"Description: {p['description']}")
+        print(f"Inject:      {p['inject']}")
+        print(f"Tags:        {', '.join(p.get('tags', []))}")
+        print(f"Source:      {p['source']}")
+        print(f"\nStyle Prompt:\n{p['style_prompt']}")
+        return 0
+
+    if sub == "apply":
+        name = getattr(args, "name", "")
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        session_id = getattr(args, "session_id", None)
+        try:
+            apply_persona(db, profile, name, session_id=session_id)
+        except ValueError as exc:
+            print_error(str(exc))
+            db.close()
+            return 1
+        db.close()
+        print(f"Persona '{name}' applied to profile '{profile}'.")
+        return 0
+
+    if sub == "remove":
+        name = getattr(args, "name", "")
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        removed = remove_active_persona(db, profile, name)
+        db.close()
+        if removed:
+            print(f"Persona '{name}' removed from profile '{profile}'.")
+        else:
+            print(f"Persona '{name}' was not active on profile '{profile}'.")
+        return 0
+
+    if sub == "stack":
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        personas = get_active_personas(db, profile)
+        db.close()
+        if not personas:
+            print(f"No active personas for profile '{profile}'.")
+            return 0
+        print(f"Active personas for '{profile}':")
+        for p in personas:
+            print(f"  [{p.get('position', 0)}] {p['name']} ({p['inject']})")
+        return 0
+
+    if sub == "install":
+        path_str = getattr(args, "file", "")
+        try:
+            persona_data = load_persona_file(Path(path_str))
+            pid = install_persona(db, persona_data, source="user")
+        except (FileNotFoundError, ValueError) as exc:
+            print_error(str(exc))
+            db.close()
+            return 1
+        db.close()
+        print(f"Persona '{persona_data['name']}' installed ({pid[:8]}).")
+        return 0
+
+    if sub == "preview":
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        base_prompt = getattr(args, "base_prompt", "You are a helpful agent.")
+        personas = get_active_personas(db, profile)
+        db.close()
+        merged = build_merged_prompt(base_prompt, personas)
+        print(merged)
+        return 0
+
+    db.close()
+    print_error(f"Unknown persona subcommand: {sub!r}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-038: Diff-Aware Context Injection
+# ---------------------------------------------------------------------------
+
+def cmd_diff_inject(args: argparse.Namespace) -> int:
+    """PRD-038: tag context inject --git-diff / --pr / --staged."""
+    from tag.diff_context import build_diff_context, pr_diff_context
+    cfg = load_config(config_path(getattr(args, "config", None)))
+
+    pr_num = getattr(args, "pr", None)
+    ref = getattr(args, "ref", "HEAD") or "HEAD"
+    staged = getattr(args, "staged", False)
+    context_lines = getattr(args, "context_lines", 3) or 3
+    max_files = getattr(args, "max_files", 10) or 10
+    blocked = getattr(args, "blocked", []) or []
+    output_only = getattr(args, "output_only", False)
+
+    try:
+        if pr_num:
+            repo = getattr(args, "repo", None)
+            result = pr_diff_context(
+                pr_num, repo, context_lines=context_lines,
+                max_files=max_files, blocked_patterns=blocked,
+            )
+        else:
+            workdir = Path(getattr(args, "workdir", ".") or ".").resolve()
+            result = build_diff_context(
+                ref, staged=staged, context_lines=context_lines,
+                max_files=max_files, blocked_patterns=blocked, workdir=workdir,
+            )
+    except RuntimeError as exc:
+        print_error(str(exc))
+        return 1
+
+    if result["warn"]:
+        print(f"⚠ Warning: diff context is large ({result['estimated_tokens']:,} estimated tokens).", file=sys.stderr)
+
+    if result["files_skipped"]:
+        print(f"Skipped {len(result['files_skipped'])} file(s): {', '.join(result['files_skipped'][:5])}", file=sys.stderr)
+
+    if not result["content"].strip():
+        print("No diff content to inject (no changed files in scope).")
+        return 0
+
+    print(f"Diff context: {len(result['files_included'])} file(s), ~{result['estimated_tokens']:,} tokens")
+
+    if output_only or getattr(args, "json", False):
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2))
+        else:
+            print(result["content"])
+        return 0
+
+    # Store in context (writes to a context file that tag submit picks up)
+    context_dir = runtime_db_path(cfg).parent / "context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    ctx_file = context_dir / "diff_context.md"
+    ctx_file.write_text(result["content"])
+    print(f"Diff context saved to {ctx_file}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-039: Token Budget Enforcement
+# ---------------------------------------------------------------------------
+
+def cmd_budget(args: argparse.Namespace) -> int:
+    """PRD-039: tag budget set/get/list/remove/check."""
+    from tag.budget import (
+        set_budget, get_budget, list_budgets, remove_budget, check_budget,
+        BudgetExceeded, ensure_schema as budget_ensure,
+    )
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db = open_db(cfg)
+    budget_ensure(db)
+    sub = getattr(args, "budget_subcommand", None)
+
+    if sub == "set":
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        max_tokens = getattr(args, "max_tokens", 0)
+        period = getattr(args, "period", "daily") or "daily"
+        warn_pct = getattr(args, "warn_pct", 0.8)
+        try:
+            bid = set_budget(db, profile, max_tokens, period=period, warn_pct=warn_pct)
+        except ValueError as exc:
+            print_error(str(exc))
+            db.close()
+            return 1
+        db.close()
+        print(f"Budget set for '{profile}': {max_tokens:,} tokens/{period} (warn at {int(warn_pct*100)}%)")
+        return 0
+
+    if sub == "get":
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        budget = get_budget(db, profile)
+        db.close()
+        if not budget:
+            print(f"No budget set for profile '{profile}'.")
+            return 0
+        if getattr(args, "json", False):
+            print(json.dumps(budget, indent=2))
+        else:
+            print(f"Profile:    {profile}")
+            print(f"Period:     {budget['period']}")
+            print(f"Max tokens: {budget['max_tokens']:,}")
+            print(f"Warn at:    {int(budget['warn_pct']*100)}%")
+            print(f"Enabled:    {budget['enabled']}")
+        return 0
+
+    if sub == "list":
+        budgets = list_budgets(db)
+        db.close()
+        if not budgets:
+            print("No token budgets configured.")
+            return 0
+        for b in budgets:
+            status = "✓" if b["enabled"] else "✗"
+            print(f"{status} {b['profile']:<30}  {b['max_tokens']:>10,} tokens/{b['period']}")
+        return 0
+
+    if sub == "remove":
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        removed = remove_budget(db, profile)
+        db.close()
+        if removed:
+            print(f"Budget removed for '{profile}'.")
+        else:
+            print(f"No budget found for '{profile}'.")
+        return 0
+
+    if sub == "check":
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        try:
+            result = check_budget(db, profile)
+        except BudgetExceeded as exc:
+            db.close()
+            print_error(str(exc))
+            return 1
+        db.close()
+        if result.get("budget") is None:
+            print(f"No budget configured for '{profile}' — unlimited.")
+            return 0
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2))
+        else:
+            used = result.get("used", 0)
+            limit = result.get("limit", 0)
+            pct = result.get("pct", 0.0)
+            warn = result.get("warn", False)
+            warn_icon = "⚠" if warn else "✓"
+            print(f"{warn_icon} {profile}: {used:,}/{limit:,} tokens ({pct}%) [{result.get('period')}]")
+        return 0
+
+    # Default: list
+    budgets = list_budgets(db)
+    db.close()
+    if not budgets:
+        print("No token budgets configured. Use 'tag budget set' to add one.")
+        return 0
+    for b in budgets:
+        status = "✓" if b["enabled"] else "✗"
+        print(f"{status} {b['profile']:<30}  {b['max_tokens']:>10,} tokens/{b['period']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-040: Notification Hooks
+# ---------------------------------------------------------------------------
+
+def cmd_notify(args: argparse.Namespace) -> int:
+    """PRD-040: tag notify add/list/test/remove/enable/disable."""
+    from tag.notifications import (
+        add_hook, list_hooks, remove_hook, set_hook_enabled, deliver,
+        ensure_schema as notif_ensure, VALID_CHANNELS, VALID_EVENTS,
+    )
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db = open_db(cfg)
+    notif_ensure(db)
+    sub = getattr(args, "notify_subcommand", None)
+
+    if sub == "add":
+        event = getattr(args, "event", "run.completed") or "run.completed"
+        channel = getattr(args, "channel", "desktop") or "desktop"
+        profile = getattr(args, "profile", None)
+        config_str = getattr(args, "config_json", "{}") or "{}"
+        template = getattr(args, "template", "") or ""
+        try:
+            config_data = json.loads(config_str)
+        except json.JSONDecodeError as exc:
+            print_error(f"Invalid config JSON: {exc}")
+            db.close()
+            return 1
+        try:
+            hook_id = add_hook(db, event, channel, config_data, profile=profile, template=template)
+        except ValueError as exc:
+            print_error(str(exc))
+            db.close()
+            return 1
+        db.close()
+        print(f"Notification hook added: {hook_id}  ({channel} on {event})")
+        return 0
+
+    if sub == "list":
+        profile = getattr(args, "profile", None)
+        hooks = list_hooks(db, profile=profile)
+        db.close()
+        if not hooks:
+            print("No notification hooks configured.")
+            return 0
+        for h in hooks:
+            status = "✓" if h["enabled"] else "✗"
+            print(f"{status} {h['id'][:8]}  {h['channel']:<10} {h['event']:<20} profile={h['profile'] or '*'}")
+        return 0
+
+    if sub == "test":
+        hook_id = getattr(args, "hook_id", "")
+        hooks = list_hooks(db)
+        hook = next((h for h in hooks if h["id"].startswith(hook_id)), None)
+        db.close()
+        if not hook:
+            print_error(f"Hook not found: {hook_id!r}")
+            return 1
+        ctx = {
+            "run_id": "test-run-001", "profile": "test", "duration": "0s",
+            "tokens_used": "0", "cost_usd": "0.00", "status": "completed",
+            "error_message": "", "task": "Test notification", "event": "test",
+        }
+        ok, err = deliver(hook, "test", ctx)
+        if ok:
+            print(f"✓ Test notification sent via {hook['channel']}.")
+        else:
+            print_error(f"Delivery failed: {err}")
+        return 0 if ok else 1
+
+    if sub == "remove":
+        hook_id = getattr(args, "hook_id", "")
+        removed = remove_hook(db, hook_id)
+        db.close()
+        if removed:
+            print(f"Hook {hook_id} removed.")
+        else:
+            print_error(f"Hook not found: {hook_id}")
+            return 1
+        return 0
+
+    if sub == "enable":
+        hook_id = getattr(args, "hook_id", "")
+        set_hook_enabled(db, hook_id, True)
+        db.close()
+        print(f"Hook {hook_id} enabled.")
+        return 0
+
+    if sub == "disable":
+        hook_id = getattr(args, "hook_id", "")
+        set_hook_enabled(db, hook_id, False)
+        db.close()
+        print(f"Hook {hook_id} disabled.")
+        return 0
+
+    db.close()
+    print_error(f"Unknown notify subcommand: {sub!r}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-041: OTel GenAI Span Cost Attribution
+# ---------------------------------------------------------------------------
+
+def cmd_otel_export(args: argparse.Namespace) -> int:
+    """PRD-041: tag trace export --otlp-endpoint ... --semconv."""
+    from tag.otel_semconv import spans_to_otlp_json, SEMCONV_VERSION
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db = open_db(cfg)
+    trace_id = getattr(args, "trace_id", None)
+    endpoint = getattr(args, "endpoint", "") or ""
+    include_metrics = not getattr(args, "no_metrics", False)
+    semconv = getattr(args, "semconv", SEMCONV_VERSION) or SEMCONV_VERSION
+
+    # Fetch spans
+    if trace_id:
+        rows = db.execute(
+            "SELECT id, trace_id, parent_id, name, profile, model_id, started_at, "
+            "finished_at, duration_ms, status, prompt_tokens, completion_tokens, attributes "
+            "FROM spans WHERE trace_id=? ORDER BY started_at",
+            (trace_id,),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id, trace_id, parent_id, name, profile, model_id, started_at, "
+            "finished_at, duration_ms, status, prompt_tokens, completion_tokens, attributes "
+            "FROM spans ORDER BY started_at DESC LIMIT 100",
+        ).fetchall()
+
+    db.close()
+
+    span_dicts = [
+        {
+            "id": r[0], "trace_id": r[1], "parent_id": r[2], "name": r[3],
+            "profile": r[4], "model_id": r[5], "started_at": r[6],
+            "finished_at": r[7], "duration_ms": r[8], "status": r[9],
+            "prompt_tokens": r[10], "completion_tokens": r[11],
+        }
+        for r in rows
+    ]
+
+    payload = spans_to_otlp_json(span_dicts, include_metrics=include_metrics)
+
+    if not endpoint:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    # POST to OTLP endpoint
+    import urllib.request, urllib.error
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        endpoint.rstrip("/") + "/v1/traces",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            print(f"✓ Exported {len(span_dicts)} spans to {endpoint} (HTTP {resp.status})")
+            print(f"  OTel GenAI semconv version: {semconv}")
+        if include_metrics and any(s.get("prompt_tokens") for s in span_dicts):
+            metrics_body = json.dumps({"resourceMetrics": payload.get("resourceMetrics", [])}).encode()
+            metrics_req = urllib.request.Request(
+                endpoint.rstrip("/") + "/v1/metrics",
+                data=metrics_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(metrics_req, timeout=30) as resp:
+                print(f"✓ Exported token usage metrics (HTTP {resp.status})")
+    except urllib.error.URLError as exc:
+        print_error(f"OTLP export failed: {exc}")
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# PRD-042: Architect/Editor Agent Split
+# ---------------------------------------------------------------------------
+
+def cmd_split(args: argparse.Namespace) -> int:
+    """PRD-042: tag split list/show/plan."""
+    from tag.split_agent import (
+        create_split_run, get_split_run, list_split_runs,
+        save_spec, ChangeSpec, ARCHITECT_SYSTEM, EDITOR_SYSTEM,
+        ensure_schema as split_ensure,
+    )
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db = open_db(cfg)
+    split_ensure(db)
+    sub = getattr(args, "split_subcommand", None)
+
+    if sub == "list" or sub is None:
+        runs = list_split_runs(db)
+        db.close()
+        if not runs:
+            print("No architect/editor split runs.")
+            return 0
+        for r in runs:
+            print(f"{r['id'][:12]}  {r['status']:<12}  {r['architect_model'][:20]} → {r['editor_model'][:20]}  {r['task'][:50]}")
+        return 0
+
+    if sub == "show":
+        run_id = getattr(args, "run_id", "")
+        run = get_split_run(db, run_id)
+        db.close()
+        if not run:
+            print_error(f"Split run not found: {run_id!r}")
+            return 1
+        if getattr(args, "json", False):
+            print(json.dumps(run, indent=2))
+        else:
+            print(f"Run:         {run['id']}")
+            print(f"Task:        {run['task']}")
+            print(f"Architect:   {run['architect_model']}")
+            print(f"Editor:      {run['editor_model']}")
+            print(f"Status:      {run['status']}")
+            print(f"Items:       {run['items_done']}/{run['items_total']} done, {run['items_rejected']} rejected")
+            if run.get("items"):
+                print("\nItems:")
+                for item in run["items"]:
+                    icon = {"accepted": "✓", "rejected": "✗", "pending": "○"}.get(item["status"], "?")
+                    print(f"  {icon} [{item['action']:8}] {item['file']:40}  {item['description'][:50]}")
+        return 0
+
+    if sub == "plan":
+        task = getattr(args, "task", "")
+        architect = getattr(args, "architect", "claude-opus-4") or "claude-opus-4"
+        editor = getattr(args, "editor", "claude-haiku-4-5") or "claude-haiku-4-5"
+        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        spec_json_str = getattr(args, "spec_json", None)
+
+        run_id = create_split_run(db, task, architect, editor, profile)
+
+        if spec_json_str:
+            try:
+                spec = ChangeSpec.from_json(spec_json_str)
+                save_spec(db, run_id, spec)
+                db.close()
+                print(f"Split run created: {run_id}  ({len(spec.items)} items from spec)")
+            except (json.JSONDecodeError, KeyError) as exc:
+                print_error(f"Invalid spec JSON: {exc}")
+                db.close()
+                return 1
+        else:
+            db.close()
+            print(f"Split run created: {run_id}")
+            print(f"Architect: {architect}  Editor: {editor}")
+            print(f"\nArchitect system prompt:\n{ARCHITECT_SYSTEM}")
+        return 0
+
+    db.close()
+    print_error(f"Unknown split subcommand: {sub!r}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-043: Vector-Based Tool Retrieval
+# ---------------------------------------------------------------------------
+
+def cmd_tool_retrieval(args: argparse.Namespace) -> int:
+    """PRD-043: tag mcp-registry index/search."""
+    from tag.tool_retrieval import (
+        build_index, search_tools, is_available, keyword_search_tools,
+        get_index_stats, ensure_schema as tr_ensure,
+    )
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db = open_db(cfg)
+    tr_ensure(db)
+    sub = getattr(args, "tr_subcommand", None)
+
+    persist_dir = runtime_db_path(cfg).parent / "tool_index"
+    cache_dir = tag_home() / ".cache" / "embeddings"
+
+    if sub == "index" or sub is None:
+        # Load tools from MCP registry YAML
+        mcp_registry_path = tag_home() / "mcp-registry.yaml"
+        tools: list[dict] = []
+        if mcp_registry_path.exists():
+            import yaml
+            try:
+                reg = yaml.safe_load(mcp_registry_path.read_text())
+                for server_name, server_cfg in (reg or {}).items():
+                    for tool in (server_cfg or {}).get("tools", []):
+                        tools.append({
+                            "name": tool.get("name", ""),
+                            "description": tool.get("description", ""),
+                            "server": server_name,
+                        })
+            except Exception as exc:
+                print(f"Warning: could not parse MCP registry: {exc}", file=sys.stderr)
+
+        if not is_available():
+            print("⚠ chromadb and sentence-transformers not installed.", file=sys.stderr)
+            print("  Install with: pip install chromadb sentence-transformers")
+            print(f"  Found {len(tools)} tool(s) in MCP registry — index not built.")
+            db.close()
+            return 0
+
+        count = build_index(tools, persist_dir, cache_dir, conn=db)
+        db.close()
+        print(f"✓ Tool index built: {count} tools indexed")
+        return 0
+
+    if sub == "search":
+        query = getattr(args, "query", "")
+        top_k = getattr(args, "top_k", 8) or 8
+        if not query.strip():
+            print_error("Query must not be empty.")
+            db.close()
+            return 1
+
+        if is_available():
+            results = search_tools(query, persist_dir, cache_dir, top_k=top_k)
+        else:
+            # Fallback: load from registry and do keyword search
+            mcp_registry_path = tag_home() / "mcp-registry.yaml"
+            all_tools: list[dict] = []
+            if mcp_registry_path.exists():
+                import yaml
+                try:
+                    reg = yaml.safe_load(mcp_registry_path.read_text())
+                    for sname, scfg in (reg or {}).items():
+                        for t in (scfg or {}).get("tools", []):
+                            all_tools.append({"name": t.get("name",""), "description": t.get("description",""), "server": sname})
+                except Exception:
+                    pass
+            results = keyword_search_tools(query, all_tools, top_k=top_k)
+
+        db.close()
+
+        stats = get_index_stats(db) if False else {}  # already closed
+        if not results:
+            print(f"No tools found for query: {query!r}")
+            return 0
+
+        if getattr(args, "json", False):
+            print(json.dumps(results, indent=2))
+        else:
+            print(f"Top {len(results)} tools for: {query!r}\n")
+            for i, t in enumerate(results, 1):
+                print(f"  {i:2}. [{t.get('server','?'):20}] {t.get('name',''):<30}  {t.get('description','')[:60]}")
+        return 0
+
+    if sub == "status":
+        stats = get_index_stats(db)
+        db.close()
+        if not stats.get("built"):
+            print("Tool index not built. Run: tag tool-index index")
+            return 0
+        print(f"Index status:  {stats['tool_count']} tools")
+        print(f"Built at:      {stats.get('built_at', 'unknown')}")
+        print(f"Backend:       {'chromadb + sentence-transformers' if stats.get('available') else 'keyword fallback'}")
+        return 0
+
+    db.close()
+    print_error(f"Unknown tool-index subcommand: {sub!r}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# PRD-044: AgentOps Session Observability
+# ---------------------------------------------------------------------------
+
+def cmd_agentops(args: argparse.Namespace) -> int:
+    """PRD-044: tag agentops sessions/show."""
+    from tag.integrations.agentops_bridge import (
+        is_available, is_configured, list_sessions, get_session_for_run,
+        mask_key, ensure_schema as ao_ensure,
+    )
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db = open_db(cfg)
+    ao_ensure(db)
+    sub = getattr(args, "agentops_subcommand", None)
+
+    if sub == "status":
+        db.close()
+        sdk_ok = is_available()
+        cfg_ok = is_configured(cfg)
+        print(f"AgentOps SDK installed: {'✓' if sdk_ok else '✗'}")
+        print(f"API key configured:     {'✓' if cfg_ok else '✗ (run: tag config set agentops.api_key <key>)'}")
+        if cfg_ok:
+            import os
+            key = cfg.get("agentops", {}).get("api_key", "") or os.environ.get("AGENTOPS_API_KEY", "")
+            print(f"API key:               {mask_key(key)}")
+        return 0
+
+    if sub == "sessions" or sub is None:
+        limit = getattr(args, "limit", 20) or 20
+        sessions = list_sessions(db, limit=limit)
+        db.close()
+        if not sessions:
+            print("No AgentOps sessions recorded.")
+            return 0
+        for s in sessions:
+            print(f"{s['run_id'][:12]}  {s['status']:<12}  {s['session_id'] or '(no session)'}  {s['created_at'][:19]}")
+        return 0
+
+    if sub == "show":
+        run_id = getattr(args, "run_id", "")
+        session = get_session_for_run(db, run_id)
+        db.close()
+        if not session:
+            print_error(f"No AgentOps session for run: {run_id}")
+            return 1
+        if getattr(args, "json", False):
+            print(json.dumps(session, indent=2))
+        else:
+            print(f"Session ID:    {session['session_id']}")
+            print(f"Dashboard URL: {session['dashboard_url']}")
+            print(f"Status:        {session['status']}")
+            print(f"Created at:    {session['created_at']}")
+        return 0
+
+    db.close()
+    print_error(f"Unknown agentops subcommand: {sub!r}")
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="TAG orchestration CLI")
     parser.add_argument("--config", help="Path to lab config YAML")
@@ -8680,6 +9781,190 @@ def build_parser() -> argparse.ArgumentParser:
     # The existing 'trace' command now supports replay, diff, checkpoint, snapshot
     # Parser entries are added here as aliases on the existing trace_sub
     # (already registered above — we just need to add the new subcommands)
+
+    # ---- PRD-033: dependency-aware task queue / DAG ----
+    dag_cmd = sub.add_parser("dag", help="DAG workflow engine for queue jobs (PRD-033)")
+    dag_sub = dag_cmd.add_subparsers(dest="dag_subcommand")
+    dag_show = dag_sub.add_parser("show", help="Show job dependency graph")
+    dag_show.add_argument("job_ids", nargs="*", metavar="JOB_ID", help="Job IDs to show (default: all)")
+    dag_save = dag_sub.add_parser("save", help="Save a named DAG spec")
+    dag_save.add_argument("name", metavar="NAME")
+    dag_save.add_argument("--steps", default="[]", help="JSON array of step objects")
+    dag_run = dag_sub.add_parser("run", help="Submit a named DAG")
+    dag_run.add_argument("name", metavar="NAME")
+    dag_run.add_argument("--board", default="default")
+    dag_list = dag_sub.add_parser("list", help="List saved DAGs")
+    for dp in [dag_cmd, dag_show, dag_save, dag_run, dag_list]:
+        dp.set_defaults(func=cmd_dag)
+
+    qext_cmd = sub.add_parser("queue-dep", help="Add queue job with dependencies (PRD-033)")
+    qext_sub = qext_cmd.add_subparsers(dest="queue_ext_subcommand")
+    qadd = qext_sub.add_parser("add", help="Add a queue job with --depends-on")
+    qadd.add_argument("task", metavar="TASK")
+    qadd.add_argument("--depends-on", dest="depends_on", action="append", metavar="JOB_ID",
+                      help="Prerequisite job ID (can be repeated)")
+    qadd.add_argument("--profile")
+    qpromote = qext_sub.add_parser("promote", help="Promote ready pending jobs")
+    for qp in [qext_cmd, qadd, qpromote]:
+        qp.set_defaults(func=cmd_queue_extended)
+
+    # ---- PRD-034: secret scanning ----
+    sec_cmd = sub.add_parser("security", help="Secret scanning and security auditing (PRD-034)")
+    sec_sub = sec_cmd.add_subparsers(dest="security_subcommand")
+    sec_scan = sec_sub.add_parser("scan", help="Scan files for secrets")
+    sec_scan.add_argument("path", nargs="?", default=".", metavar="PATH")
+    sec_scan.add_argument("--max-files", type=int, default=2000)
+    sec_scan.add_argument("--json", action="store_true")
+    sec_list = sec_sub.add_parser("list", help="List past scan results")
+    sec_list.add_argument("--json", action="store_true")
+    for sp in [sec_cmd, sec_scan, sec_list]:
+        sp.set_defaults(func=cmd_security)
+
+    # ---- PRD-035: IDE Bridge / LSP ----
+    lsp_cmd = sub.add_parser("lsp", help="TAG IDE Bridge / LSP server (PRD-035)")
+    lsp_sub = lsp_cmd.add_subparsers(dest="lsp_subcommand")
+    lsp_start = lsp_sub.add_parser("start", help="Start LSP server")
+    lsp_start.add_argument("--port", type=int, default=7878, help="TCP port (0=stdio)")
+    lsp_start.add_argument("--stdio", action="store_true", help="Use stdio transport")
+    lsp_status = lsp_sub.add_parser("status", help="Show running LSP sessions")
+    for lp in [lsp_cmd, lsp_start, lsp_status]:
+        lp.set_defaults(func=cmd_lsp)
+
+    # ---- PRD-036: Web Dashboard ----
+    web_cmd = sub.add_parser("web", help="Local web dashboard (FastAPI+React) (PRD-036)")
+    web_cmd.add_argument("--port", type=int, default=8787)
+    web_cmd.add_argument("--host", default="127.0.0.1")
+    web_cmd.add_argument("--no-browser", action="store_true")
+    web_cmd.set_defaults(func=cmd_web)
+
+    # ---- PRD-037: Agent Personas ----
+    persona_cmd = sub.add_parser("persona", help="Agent persona management (PRD-037)")
+    persona_sub = persona_cmd.add_subparsers(dest="persona_subcommand")
+    pa_list = persona_sub.add_parser("list", help="List available personas")
+    pa_show = persona_sub.add_parser("show", help="Show persona details")
+    pa_show.add_argument("name", metavar="NAME")
+    pa_apply = persona_sub.add_parser("apply", help="Apply a persona to a profile")
+    pa_apply.add_argument("name", metavar="NAME")
+    pa_apply.add_argument("--profile")
+    pa_apply.add_argument("--session-id")
+    pa_remove = persona_sub.add_parser("remove", help="Remove an active persona from a profile")
+    pa_remove.add_argument("name", metavar="NAME")
+    pa_remove.add_argument("--profile")
+    pa_stack = persona_sub.add_parser("stack", help="Show active persona stack for a profile")
+    pa_stack.add_argument("--profile")
+    pa_install = persona_sub.add_parser("install", help="Install a persona from a YAML file")
+    pa_install.add_argument("file", metavar="FILE")
+    pa_preview = persona_sub.add_parser("preview", help="Preview merged system prompt with active personas")
+    pa_preview.add_argument("--profile")
+    pa_preview.add_argument("--base-prompt", default="You are a helpful agent.")
+    for pp in [persona_cmd, pa_list, pa_show, pa_apply, pa_remove, pa_stack, pa_install, pa_preview]:
+        pp.set_defaults(func=cmd_persona)
+
+    # ---- PRD-038: Diff-Aware Context Injection ----
+    diff_cmd = sub.add_parser("diff-context", help="Inject git diff context for agent runs (PRD-038)")
+    diff_cmd.add_argument("--ref", default="HEAD", help="Git ref to diff against")
+    diff_cmd.add_argument("--staged", action="store_true", help="Diff staged changes only")
+    diff_cmd.add_argument("--pr", type=int, metavar="PR_NUMBER", help="GitHub PR number")
+    diff_cmd.add_argument("--repo", help="GitHub repo (owner/repo) for --pr")
+    diff_cmd.add_argument("--context-lines", type=int, default=3, dest="context_lines")
+    diff_cmd.add_argument("--max-files", type=int, default=10)
+    diff_cmd.add_argument("--blocked", action="append", metavar="PATTERN", help="Extra blocked patterns")
+    diff_cmd.add_argument("--output-only", action="store_true", help="Print diff content without saving")
+    diff_cmd.add_argument("--workdir", default=".")
+    diff_cmd.add_argument("--json", action="store_true")
+    diff_cmd.set_defaults(func=cmd_diff_inject)
+
+    # ---- PRD-039: Token Budget Enforcement ----
+    budget_cmd = sub.add_parser("budget", help="Per-profile token budget enforcement (PRD-039)")
+    budget_sub = budget_cmd.add_subparsers(dest="budget_subcommand")
+    b_set = budget_sub.add_parser("set", help="Set token budget")
+    b_set.add_argument("--profile")
+    b_set.add_argument("--max-tokens", type=int, required=True, dest="max_tokens")
+    b_set.add_argument("--period", choices=["daily", "weekly", "monthly"], default="daily")
+    b_set.add_argument("--warn-pct", type=float, default=0.8, dest="warn_pct")
+    b_get = budget_sub.add_parser("get", help="Get token budget for a profile")
+    b_get.add_argument("--profile")
+    b_get.add_argument("--json", action="store_true")
+    b_list = budget_sub.add_parser("list", help="List all token budgets")
+    b_list.add_argument("--json", action="store_true")
+    b_remove = budget_sub.add_parser("remove", help="Remove token budget")
+    b_remove.add_argument("--profile")
+    b_check = budget_sub.add_parser("check", help="Check current usage against budget")
+    b_check.add_argument("--profile")
+    b_check.add_argument("--json", action="store_true")
+    for bp in [budget_cmd, b_set, b_get, b_list, b_remove, b_check]:
+        bp.set_defaults(func=cmd_budget)
+
+    # ---- PRD-040: Notification Hooks ----
+    notify_cmd = sub.add_parser("notify", help="Notification hooks (Slack, email, desktop) (PRD-040)")
+    notify_sub = notify_cmd.add_subparsers(dest="notify_subcommand")
+    n_add = notify_sub.add_parser("add", help="Add a notification hook")
+    n_add.add_argument("--event", default="run.completed")
+    n_add.add_argument("--channel", choices=["slack", "email", "desktop", "webhook"], default="desktop")
+    n_add.add_argument("--profile")
+    n_add.add_argument("--config-json", default="{}", dest="config_json")
+    n_add.add_argument("--template", default="")
+    n_list = notify_sub.add_parser("list", help="List notification hooks")
+    n_list.add_argument("--profile")
+    n_test = notify_sub.add_parser("test", help="Send test notification")
+    n_test.add_argument("hook_id", metavar="HOOK_ID")
+    n_remove = notify_sub.add_parser("remove", help="Remove a notification hook")
+    n_remove.add_argument("hook_id", metavar="HOOK_ID")
+    n_enable = notify_sub.add_parser("enable", help="Enable a hook")
+    n_enable.add_argument("hook_id", metavar="HOOK_ID")
+    n_disable = notify_sub.add_parser("disable", help="Disable a hook")
+    n_disable.add_argument("hook_id", metavar="HOOK_ID")
+    for np in [notify_cmd, n_add, n_list, n_test, n_remove, n_enable, n_disable]:
+        np.set_defaults(func=cmd_notify)
+
+    # ---- PRD-041: OTel GenAI Span Cost Attribution ----
+    otel_cmd = sub.add_parser("otel-export", help="Export spans with OTel GenAI semconv attributes (PRD-041)")
+    otel_cmd.add_argument("--trace-id", dest="trace_id", metavar="TRACE_ID")
+    otel_cmd.add_argument("--endpoint", help="OTLP HTTP endpoint (e.g. http://localhost:4318)")
+    otel_cmd.add_argument("--semconv", default="1.28.0", help="Override OTel GenAI semconv version")
+    otel_cmd.add_argument("--no-metrics", action="store_true", dest="no_metrics")
+    otel_cmd.add_argument("--json", action="store_true")
+    otel_cmd.set_defaults(func=cmd_otel_export)
+
+    # ---- PRD-042: Architect/Editor Agent Split ----
+    split_cmd = sub.add_parser("split", help="Architect/Editor agent split execution (PRD-042)")
+    split_sub = split_cmd.add_subparsers(dest="split_subcommand")
+    sp_list = split_sub.add_parser("list", help="List split runs")
+    sp_show = split_sub.add_parser("show", help="Show split run details")
+    sp_show.add_argument("run_id", metavar="RUN_ID")
+    sp_show.add_argument("--json", action="store_true")
+    sp_plan = split_sub.add_parser("plan", help="Create a split run plan")
+    sp_plan.add_argument("task", metavar="TASK")
+    sp_plan.add_argument("--architect", default="claude-opus-4")
+    sp_plan.add_argument("--editor", default="claude-haiku-4-5")
+    sp_plan.add_argument("--profile")
+    sp_plan.add_argument("--spec-json", dest="spec_json", help="Optional pre-built spec JSON")
+    for ssp in [split_cmd, sp_list, sp_show, sp_plan]:
+        ssp.set_defaults(func=cmd_split)
+
+    # ---- PRD-043: Vector-Based Tool Retrieval ----
+    tr_cmd = sub.add_parser("tool-index", help="Vector tool retrieval for MCP registry (PRD-043)")
+    tr_sub = tr_cmd.add_subparsers(dest="tr_subcommand")
+    tr_index = tr_sub.add_parser("index", help="Build tool embedding index")
+    tr_search = tr_sub.add_parser("search", help="Search tools by query")
+    tr_search.add_argument("query", metavar="QUERY")
+    tr_search.add_argument("--top-k", type=int, default=8, dest="top_k")
+    tr_search.add_argument("--json", action="store_true")
+    tr_status = tr_sub.add_parser("status", help="Show tool index status")
+    for tp in [tr_cmd, tr_index, tr_search, tr_status]:
+        tp.set_defaults(func=cmd_tool_retrieval)
+
+    # ---- PRD-044: AgentOps Session Observability ----
+    ao_cmd = sub.add_parser("agentops", help="AgentOps session observability (PRD-044)")
+    ao_sub = ao_cmd.add_subparsers(dest="agentops_subcommand")
+    ao_status = ao_sub.add_parser("status", help="Show AgentOps integration status")
+    ao_sessions = ao_sub.add_parser("sessions", help="List AgentOps sessions")
+    ao_sessions.add_argument("--limit", type=int, default=20)
+    ao_show = ao_sub.add_parser("show", help="Show AgentOps session for a run")
+    ao_show.add_argument("run_id", metavar="RUN_ID")
+    ao_show.add_argument("--json", action="store_true")
+    for ap in [ao_cmd, ao_status, ao_sessions, ao_show]:
+        ap.set_defaults(func=cmd_agentops)
 
     return parser
 
