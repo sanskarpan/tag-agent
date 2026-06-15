@@ -157,6 +157,28 @@ def add_job(
 # DAG visualization
 # ---------------------------------------------------------------------------
 
+def list_jobs_raw(conn: sqlite3.Connection, job_ids: list[str] | None = None) -> list[dict]:
+    """Return job records as dicts for JSON output."""
+    ensure_schema(conn)
+    if job_ids:
+        rows = conn.execute(
+            f"SELECT id, task, task_type, profile, status, deps_json, created_at FROM queue_jobs"
+            f" WHERE id IN ({','.join('?'*len(job_ids))})",
+            job_ids,
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, task, task_type, profile, status, deps_json, created_at FROM queue_jobs ORDER BY created_at LIMIT 50"
+        ).fetchall()
+    return [
+        {
+            "id": r[0], "task": r[1], "task_type": r[2], "profile": r[3],
+            "status": r[4], "deps": json.loads(r[5] or "[]"), "created_at": r[6],
+        }
+        for r in rows
+    ]
+
+
 def show_dag(conn: sqlite3.Connection, job_ids: list[str] | None = None) -> str:
     """Return an ASCII representation of the job dependency graph."""
     ensure_schema(conn)
