@@ -1,0 +1,166 @@
+"""PRD-022: Cron / Scheduled Agents.
+
+Provides cron-style scheduling for TAG agent runs. Jobs are stored in SQLite;
+a lightweight daemon process polls the table and launches queue_worker jobs
+when a schedule fires.
+
+Schedule format: standard 5-field cron ``MIN HOUR DOM MON DOW``
+e.g. ``"0 9 * * 1-5"`` fires at 09:00 on weekdays.
+"""
+from __future__ import annotations
+
+import re
+import time
+from datetime import datetime, timezone
+
+
+# ---------------------------------------------------------------------------
+# Minimal cron expression parser (no external deps)
+# ---------------------------------------------------------------------------
+
+def _field_matches(field: str, value: int, lo: int, hi: int) -> bool:
+    """Return True if *value* matches a single cron field token."""
+    if field == "*":
+        return True
+    # Step: */N or lo-hi/N
+    if "/" in field:
+        base, step_str = field.rsplit("/", 1)
+        step = int(step_str)
+        if base == "*":
+            return (value - lo) % step == 0
+        if "-" in base:
+            start, end = (int(x) for x in base.split("-", 1))
+            return start <= value <= end and (value - start) % step == 0
+        return value == int(base)
+    # Range: lo-hi
+    if "-" in field:
+        start, end = (int(x) for x in field.split("-", 1))
+        return start <= value <= end
+    # List: a,b,c
+    if "," in field:
+        return value in {int(x) for x in field.split(",")}
+    # Literal
+    return value == int(field)
+
+
+def cron_matches(expr: str, dt: datetime) -> bool:
+    """Return True if *dt* matches the 5-field cron expression *expr*."""
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        raise ValueError(f"Invalid cron expression (need 5 fields): {expr!r}")
+    minute, hour, dom, month, dow = parts
+    return (
+        _field_matches(minute, dt.minute, 0, 59)
+        and _field_matches(hour, dt.hour, 0, 23)
+        and _field_matches(dom, dt.day, 1, 31)
+        and _field_matches(month, dt.month, 1, 12)
+        and _field_matches(dow, dt.weekday(), 0, 6)  # 0=Mon in Python, 0=Sun in cron → shift
+    )
+
+
+def validate_cron_expression(expr: str) -> None:
+    """Raise ValueError if *expr* is not a valid 5-field cron expression."""
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        raise ValueError(f"Cron expression must have exactly 5 fields, got: {expr!r}")
+    ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
+    for field, (lo, hi) in zip(parts, ranges):
+        # Basic format check — strip step/range/list markers
+        cleaned = re.sub(r"[0-9,\-/\*]", "", field)
+        if cleaned:
+            raise ValueError(f"Invalid cron field {field!r} in expression {expr!r}")
+
+
+# ---------------------------------------------------------------------------
+# Cron daemon
+# ---------------------------------------------------------------------------
+
+def run_daemon(db_path: str, config_path: str) -> None:
+    """Poll cron_jobs every 30 seconds and fire due jobs via queue_worker."""
+    import sqlite3
+    import subprocess
+    import sys
+    import uuid
+
+    def _open(path: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
+        return conn
+
+    def _utc_now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    conn = _open(db_path)
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS cron_jobs (
+              id          TEXT PRIMARY KEY,
+              name        TEXT NOT NULL,
+              schedule    TEXT NOT NULL,
+              profile     TEXT NOT NULL,
+              task        TEXT NOT NULL,
+              enabled     INTEGER NOT NULL DEFAULT 1,
+              last_run_at TEXT,
+              run_count   INTEGER NOT NULL DEFAULT 0,
+              created_at  TEXT NOT NULL,
+              updated_at  TEXT NOT NULL
+            );
+        """)
+        conn.commit()
+    except Exception:
+        pass
+
+    while True:
+        now = datetime.now(timezone.utc)
+        try:
+            jobs = conn.execute(
+                "SELECT * FROM cron_jobs WHERE enabled=1"
+            ).fetchall()
+        except Exception:
+            time.sleep(30)
+            continue
+
+        for job in jobs:
+            try:
+                if not cron_matches(job["schedule"], now):
+                    continue
+                last = job["last_run_at"]
+                if last:
+                    last_dt = datetime.fromisoformat(last)
+                    # Prevent firing twice in the same minute
+                    if (now - last_dt).total_seconds() < 55:
+                        continue
+            except Exception:
+                continue
+
+            # Queue a job
+            job_id = uuid.uuid4().hex[:8]
+            try:
+                conn.execute(
+                    """INSERT INTO queue_jobs(id, profile, task, task_type, status, priority,
+                       created_at, notify) VALUES(?,?,?,?,?,?,?,?)""",
+                    (job_id, job["profile"], job["task"], "mixed", "queued", 5,
+                     _utc_now(), 1),
+                )
+                conn.execute(
+                    "UPDATE cron_jobs SET last_run_at=?, run_count=run_count+1, updated_at=? WHERE id=?",
+                    (_utc_now(), _utc_now(), job["id"]),
+                )
+                conn.commit()
+
+                # Launch worker
+                subprocess.Popen(
+                    [sys.executable, "-m", "tag.queue_worker",
+                     "--job-id", job_id,
+                     "--config", config_path,
+                     "--db", db_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception:
+                pass
+
+        time.sleep(30)
