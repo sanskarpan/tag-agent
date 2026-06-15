@@ -7036,7 +7036,10 @@ def cmd_workspace(args: argparse.Namespace) -> int:
         budget = getattr(args, "budget", 4000) or 4000
         ws_map = build_workspace_map(db, root, budget_tokens=budget)
         db.close()
-        print(ws_map)
+        if getattr(args, "json", False):
+            print(json.dumps({"map": ws_map}))
+        else:
+            print(ws_map)
         return 0
 
     if sub == "status":
@@ -8000,6 +8003,12 @@ def cmd_dag(args: argparse.Namespace) -> int:
 
     if sub == "show" or sub is None:
         job_ids = getattr(args, "job_ids", None) or []
+        from tag.dag import list_jobs_raw
+        if getattr(args, "json", False):
+            rows = list_jobs_raw(db, job_ids if job_ids else None)
+            db.close()
+            print(json.dumps(rows, indent=2))
+            return 0
         print(show_dag(db, job_ids if job_ids else None))
         db.close()
         return 0
@@ -8177,6 +8186,9 @@ def cmd_lsp(args: argparse.Namespace) -> int:
     if sub == "status" or sub is None:
         sessions = get_lsp_status(db)
         db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(sessions, indent=2))
+            return 0
         if not sessions:
             print("No active LSP sessions.")
             return 0
@@ -8271,6 +8283,9 @@ def cmd_persona(args: argparse.Namespace) -> int:
         if not p:
             print_error(f"Persona not found: {name!r}")
             return 1
+        if getattr(args, "json", False):
+            print(json.dumps(p, indent=2))
+            return 0
         print(f"Name:        {p['name']}")
         print(f"Description: {p['description']}")
         print(f"Inject:      {p['inject']}")
@@ -8866,6 +8881,9 @@ def cmd_tool_retrieval(args: argparse.Namespace) -> int:
     if sub == "status":
         stats = get_index_stats(db)
         db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(stats, indent=2))
+            return 0
         if not stats.get("built"):
             print("Tool index not built. Run: tag tool-index index")
             return 0
@@ -8895,9 +8913,18 @@ def cmd_agentops(args: argparse.Namespace) -> int:
     sub = getattr(args, "agentops_subcommand", None)
 
     if sub == "status":
-        db.close()
         sdk_ok = is_available()
         cfg_ok = is_configured(cfg)
+        db.close()
+        if getattr(args, "json", False):
+            import os
+            key = cfg.get("agentops", {}).get("api_key", "") or os.environ.get("AGENTOPS_API_KEY", "")
+            print(json.dumps({
+                "sdk_installed": sdk_ok,
+                "api_key_configured": cfg_ok,
+                "api_key_masked": mask_key(key) if cfg_ok else None,
+            }, indent=2))
+            return 0
         print(f"AgentOps SDK installed: {'✓' if sdk_ok else '✗'}")
         print(f"API key configured:     {'✓' if cfg_ok else '✗ (run: tag config set agentops.api_key <key>)'}")
         if cfg_ok:
@@ -9677,6 +9704,7 @@ def build_parser() -> argparse.ArgumentParser:
     ws_map = ws_sub.add_parser("map", help="Print token-efficient workspace map")
     ws_map.add_argument("--path", default=".", help="Root path")
     ws_map.add_argument("--budget", type=int, default=4000, help="Token budget (default: 4000)")
+    ws_map.add_argument("--json", action="store_true")
     ws_status = ws_sub.add_parser("status", help="Show workspace index statistics")
     ws_status.add_argument("--json", action="store_true")
     ws_clear = ws_sub.add_parser("clear", help="Clear workspace index")
@@ -9812,6 +9840,7 @@ def build_parser() -> argparse.ArgumentParser:
     dag_sub = dag_cmd.add_subparsers(dest="dag_subcommand")
     dag_show = dag_sub.add_parser("show", help="Show job dependency graph")
     dag_show.add_argument("job_ids", nargs="*", metavar="JOB_ID", help="Job IDs to show (default: all)")
+    dag_show.add_argument("--json", action="store_true")
     dag_save = dag_sub.add_parser("save", help="Save a named DAG spec")
     dag_save.add_argument("name", metavar="NAME")
     dag_save.add_argument("--steps", default="[]", help="JSON array of step objects")
@@ -9819,6 +9848,7 @@ def build_parser() -> argparse.ArgumentParser:
     dag_run.add_argument("name", metavar="NAME")
     dag_run.add_argument("--board", default="default")
     dag_list = dag_sub.add_parser("list", help="List saved DAGs")
+    dag_list.add_argument("--json", action="store_true")
     for dp in [dag_cmd, dag_show, dag_save, dag_run, dag_list]:
         dp.set_defaults(func=cmd_dag)
 
@@ -9852,6 +9882,7 @@ def build_parser() -> argparse.ArgumentParser:
     lsp_start.add_argument("--port", type=int, default=7878, help="TCP port (0=stdio)")
     lsp_start.add_argument("--stdio", action="store_true", help="Use stdio transport")
     lsp_status = lsp_sub.add_parser("status", help="Show running LSP sessions")
+    lsp_status.add_argument("--json", action="store_true")
     for lp in [lsp_cmd, lsp_start, lsp_status]:
         lp.set_defaults(func=cmd_lsp)
 
@@ -9866,8 +9897,10 @@ def build_parser() -> argparse.ArgumentParser:
     persona_cmd = sub.add_parser("persona", help="Agent persona management (PRD-037)")
     persona_sub = persona_cmd.add_subparsers(dest="persona_subcommand")
     pa_list = persona_sub.add_parser("list", help="List available personas")
+    pa_list.add_argument("--json", action="store_true")
     pa_show = persona_sub.add_parser("show", help="Show persona details")
     pa_show.add_argument("name", metavar="NAME")
+    pa_show.add_argument("--json", action="store_true")
     pa_apply = persona_sub.add_parser("apply", help="Apply a persona to a profile")
     pa_apply.add_argument("name", metavar="NAME")
     pa_apply.add_argument("--profile")
@@ -9931,6 +9964,7 @@ def build_parser() -> argparse.ArgumentParser:
     n_add.add_argument("--template", default="")
     n_list = notify_sub.add_parser("list", help="List notification hooks")
     n_list.add_argument("--profile")
+    n_list.add_argument("--json", action="store_true")
     n_test = notify_sub.add_parser("test", help="Send test notification")
     n_test.add_argument("hook_id", metavar="HOOK_ID")
     n_remove = notify_sub.add_parser("remove", help="Remove a notification hook")
@@ -9955,6 +9989,7 @@ def build_parser() -> argparse.ArgumentParser:
     split_cmd = sub.add_parser("split", help="Architect/Editor agent split execution (PRD-042)")
     split_sub = split_cmd.add_subparsers(dest="split_subcommand")
     sp_list = split_sub.add_parser("list", help="List split runs")
+    sp_list.add_argument("--json", action="store_true")
     sp_show = split_sub.add_parser("show", help="Show split run details")
     sp_show.add_argument("run_id", metavar="RUN_ID")
     sp_show.add_argument("--json", action="store_true")
@@ -9976,6 +10011,7 @@ def build_parser() -> argparse.ArgumentParser:
     tr_search.add_argument("--top-k", type=int, default=8, dest="top_k")
     tr_search.add_argument("--json", action="store_true")
     tr_status = tr_sub.add_parser("status", help="Show tool index status")
+    tr_status.add_argument("--json", action="store_true")
     for tp in [tr_cmd, tr_index, tr_search, tr_status]:
         tp.set_defaults(func=cmd_tool_retrieval)
 
@@ -9983,8 +10019,10 @@ def build_parser() -> argparse.ArgumentParser:
     ao_cmd = sub.add_parser("agentops", help="AgentOps session observability (PRD-044)")
     ao_sub = ao_cmd.add_subparsers(dest="agentops_subcommand")
     ao_status = ao_sub.add_parser("status", help="Show AgentOps integration status")
+    ao_status.add_argument("--json", action="store_true")
     ao_sessions = ao_sub.add_parser("sessions", help="List AgentOps sessions")
     ao_sessions.add_argument("--limit", type=int, default=20)
+    ao_sessions.add_argument("--json", action="store_true")
     ao_show = ao_sub.add_parser("show", help="Show AgentOps session for a run")
     ao_show.add_argument("run_id", metavar="RUN_ID")
     ao_show.add_argument("--json", action="store_true")
