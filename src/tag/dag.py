@@ -105,11 +105,13 @@ def promote_ready_jobs(conn: sqlite3.Connection) -> list[str]:
             )
             continue
         if all_deps_satisfied(conn, job_id):
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE queue_jobs SET status='ready' WHERE id=? AND status='pending'",
                 (job_id,),
             )
-            promoted.append(job_id)
+            # Only count jobs actually updated (rowcount=0 means another thread beat us)
+            if cursor.rowcount > 0:
+                promoted.append(job_id)
     conn.commit()
     return promoted
 
