@@ -1,0 +1,274 @@
+"""PRD-033: Dependency-Aware Task Queue (tag queue dag).
+
+Adds a topological ordering / DAG layer on top of the existing queue_jobs
+table. Jobs declare --depends-on parent job IDs; the dispatcher promotes a
+job from 'pending' to 'ready' only when all parents have reached 'done'.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import uuid
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Schema migration — adds deps_json column and queue_dags table
+# ---------------------------------------------------------------------------
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        -- deps_json column: JSON array of prerequisite job IDs
+        -- Adds column only if it does not already exist (SQLite-safe pattern)
+        CREATE TABLE IF NOT EXISTS _dag_init_sentinel (id INTEGER PRIMARY KEY);
+    """)
+
+    # Add deps_json to queue_jobs if not present
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(queue_jobs)").fetchall()}
+    if "deps_json" not in cols:
+        conn.execute("ALTER TABLE queue_jobs ADD COLUMN deps_json TEXT DEFAULT '[]'")
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS queue_dags (
+          id          TEXT PRIMARY KEY,
+          name        TEXT NOT NULL UNIQUE,
+          spec_json   TEXT NOT NULL,
+          created_at  TEXT NOT NULL
+        );
+    """)
+    conn.commit()
+
+
+def _utc_now() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Dependency resolution
+# ---------------------------------------------------------------------------
+
+def _get_job_status(conn: sqlite3.Connection, job_id: str) -> str | None:
+    row = conn.execute("SELECT status FROM queue_jobs WHERE id=?", (job_id,)).fetchone()
+    return row[0] if row else None
+
+
+def all_deps_satisfied(conn: sqlite3.Connection, job_id: str) -> bool:
+    """Return True if all declared dependencies of *job_id* have status='done'."""
+    row = conn.execute("SELECT deps_json FROM queue_jobs WHERE id=?", (job_id,)).fetchone()
+    if not row or not row[0]:
+        return True
+    deps: list[str] = json.loads(row[0] or "[]")
+    for dep_id in deps:
+        status = _get_job_status(conn, dep_id)
+        if status != "done":
+            return False
+    return True
+
+
+def has_failed_dep(conn: sqlite3.Connection, job_id: str) -> str | None:
+    """Return the first failed dependency ID, or None if none have failed."""
+    row = conn.execute("SELECT deps_json FROM queue_jobs WHERE id=?", (job_id,)).fetchone()
+    if not row or not row[0]:
+        return None
+    deps: list[str] = json.loads(row[0] or "[]")
+    for dep_id in deps:
+        status = _get_job_status(conn, dep_id)
+        if status == "failed":
+            return dep_id
+    return None
+
+
+def promote_ready_jobs(conn: sqlite3.Connection) -> list[str]:
+    """Promote pending jobs whose dependencies are all satisfied.
+
+    Returns list of job IDs that were promoted from 'pending' to 'ready'.
+    """
+    # Ensure queue_jobs has deps_json column
+    try:
+        ensure_schema(conn)
+    except Exception:
+        pass
+
+    pending_rows = conn.execute(
+        "SELECT id FROM queue_jobs WHERE status='pending'"
+    ).fetchall()
+    promoted: list[str] = []
+    for row in pending_rows:
+        job_id = row[0]
+        # Check for failed deps — if any dep failed, cascade-fail this job
+        failed_dep = has_failed_dep(conn, job_id)
+        if failed_dep:
+            conn.execute(
+                "UPDATE queue_jobs SET status='failed', error=? WHERE id=?",
+                (f"dependency {failed_dep} failed", job_id),
+            )
+            continue
+        if all_deps_satisfied(conn, job_id):
+            conn.execute(
+                "UPDATE queue_jobs SET status='ready' WHERE id=? AND status='pending'",
+                (job_id,),
+            )
+            promoted.append(job_id)
+    conn.commit()
+    return promoted
+
+
+# ---------------------------------------------------------------------------
+# Job submission with dependency declaration
+# ---------------------------------------------------------------------------
+
+def add_job(
+    conn: sqlite3.Connection,
+    task: str,
+    profile: str | None = None,
+    *,
+    depends_on: list[str] | None = None,
+    task_type: str = "mixed",
+    board: str = "default",
+) -> str:
+    """Insert a new job with optional dependency list. Returns the new job ID."""
+    ensure_schema(conn)
+    job_id = uuid.uuid4().hex[:16]
+    now = _utc_now()
+    deps = depends_on or []
+    # Validate that dependencies exist
+    for dep_id in deps:
+        row = conn.execute("SELECT id FROM queue_jobs WHERE id=?", (dep_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Dependency job not found: {dep_id!r}")
+
+    # If no deps, start ready; otherwise pending until promoted
+    status = "ready" if not deps else "pending"
+
+    # Use only columns guaranteed to exist in queue_jobs (see controller.py schema)
+    conn.execute(
+        """INSERT INTO queue_jobs(id, profile, task, task_type, status, deps_json, created_at)
+           VALUES(?,?,?,?,?,?,?)""",
+        (job_id, profile or "default", task, task_type, status, json.dumps(deps), now),
+    )
+    conn.commit()
+    return job_id
+
+
+# ---------------------------------------------------------------------------
+# DAG visualization
+# ---------------------------------------------------------------------------
+
+def show_dag(conn: sqlite3.Connection, job_ids: list[str] | None = None) -> str:
+    """Return an ASCII representation of the job dependency graph."""
+    ensure_schema(conn)
+
+    if job_ids:
+        rows = conn.execute(
+            f"SELECT id, task, status, deps_json FROM queue_jobs WHERE id IN ({','.join('?'*len(job_ids))})",
+            job_ids,
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, task, status, deps_json FROM queue_jobs ORDER BY created_at LIMIT 50"
+        ).fetchall()
+
+    if not rows:
+        return "No jobs found."
+
+    _STATUS_ICON = {
+        "ready": "⏳", "running": "▶", "done": "✓", "failed": "✗",
+        "pending": "○", "cancelled": "⊘",
+    }
+
+    lines = ["Job Dependency Graph", "=" * 40]
+    for row in rows:
+        job_id, task, status, deps_json = row
+        icon = _STATUS_ICON.get(status, "?")
+        task_short = (task or "")[:50]
+        deps = json.loads(deps_json or "[]")
+        dep_str = f" ← [{', '.join(d[:8] for d in deps)}]" if deps else ""
+        lines.append(f"{icon} {job_id[:12]} [{status:8}] {task_short}{dep_str}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Named DAG storage
+# ---------------------------------------------------------------------------
+
+class DagSpec:
+    """A named DAG: ordered list of steps with dependency declarations."""
+
+    def __init__(self, name: str, steps: list[dict]):
+        """
+        steps: list of {task, profile, depends_on (optional step indices)}
+        Example:
+          steps = [
+              {"task": "Generate tests", "profile": "coder"},
+              {"task": "Run tests", "profile": "tester", "depends_on": [0]},
+              {"task": "Review output", "profile": "reviewer", "depends_on": [1]},
+          ]
+        """
+        self.name = name
+        self.steps = steps
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "steps": self.steps}
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DagSpec":
+        return cls(name=d["name"], steps=d.get("steps", []))
+
+    @classmethod
+    def from_json(cls, s: str) -> "DagSpec":
+        return cls.from_dict(json.loads(s))
+
+
+def save_dag(conn: sqlite3.Connection, spec: DagSpec) -> str:
+    ensure_schema(conn)
+    dag_id = uuid.uuid4().hex[:12]
+    conn.execute(
+        """INSERT INTO queue_dags(id, name, spec_json, created_at) VALUES(?,?,?,?)
+           ON CONFLICT(name) DO UPDATE SET spec_json=excluded.spec_json""",
+        (dag_id, spec.name, spec.to_json(), _utc_now()),
+    )
+    conn.commit()
+    row = conn.execute("SELECT id FROM queue_dags WHERE name=?", (spec.name,)).fetchone()
+    return row[0]
+
+
+def run_dag(conn: sqlite3.Connection, dag_name: str, board: str = "default") -> list[str]:
+    """Submit all steps of a named DAG in topological order. Returns job IDs."""
+    row = conn.execute("SELECT spec_json FROM queue_dags WHERE name=?", (dag_name,)).fetchone()
+    if not row:
+        raise ValueError(f"DAG not found: {dag_name!r}")
+    spec = DagSpec.from_json(row[0])
+    submitted: list[str] = []  # index → job_id
+
+    for i, step in enumerate(spec.steps):
+        dep_indices = step.get("depends_on", [])
+        dep_job_ids = [submitted[idx] for idx in dep_indices if idx < len(submitted)]
+        job_id = add_job(
+            conn, step["task"],
+            profile=step.get("profile"),
+            depends_on=dep_job_ids,
+            board=board,
+        )
+        submitted.append(job_id)
+
+    return submitted
+
+
+def list_dags(conn: sqlite3.Connection) -> list[dict]:
+    ensure_schema(conn)
+    rows = conn.execute(
+        "SELECT id, name, spec_json, created_at FROM queue_dags ORDER BY name"
+    ).fetchall()
+    return [
+        {
+            "id": r[0], "name": r[1],
+            "step_count": len(json.loads(r[2] or "{}").get("steps", [])),
+            "created_at": r[3],
+        }
+        for r in rows
+    ]
