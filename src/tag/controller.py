@@ -6766,7 +6766,13 @@ def cmd_loop(args: argparse.Namespace) -> int:
             print_error("--goal TEXT is required")
             return 1
         profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
-        max_iters = getattr(args, "max_iters", 10) or 10
+        max_iters = getattr(args, "max_iters", 10)
+        if max_iters is None:
+            max_iters = 10
+        if max_iters < 1:
+            db.close()
+            print_error("--max-iters must be >= 1")
+            return 1
         approval = getattr(args, "approval", "auto") or "auto"
         if approval not in ("auto", "human"):
             db.close()
