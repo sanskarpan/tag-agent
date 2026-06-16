@@ -6895,6 +6895,11 @@ def cmd_cron(args: argparse.Namespace) -> int:
             db.close()
             print_error(str(exc))
             return 1
+        existing = db.execute("SELECT id FROM cron_jobs WHERE name=?", (name,)).fetchone()
+        if existing:
+            db.close()
+            print_error(f"A cron job named '{name}' already exists (names must be unique)")
+            return 1
         job_id = uuid.uuid4().hex[:8]
         now = utc_now()
         db.execute(
