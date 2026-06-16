@@ -354,10 +354,15 @@ def ensure_runtime_dirs(cfg: dict[str, Any]) -> None:
 
 def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
     ensure_runtime_dirs(cfg)
-    conn = sqlite3.connect(runtime_db_path(cfg), timeout=5)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA foreign_keys = ON")
+    db_path = runtime_db_path(cfg)
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA foreign_keys = ON")
+    except sqlite3.DatabaseError as exc:
+        print_error(f"Database error: {exc}. Try deleting {db_path} and re-running.")
+        raise SystemExit(1)
     last_error: sqlite3.OperationalError | None = None
     for _ in range(20):
         try:
@@ -365,10 +370,11 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
             conn.execute("PRAGMA synchronous = NORMAL")
             last_error = None
             break
-        except sqlite3.OperationalError as exc:
+        except sqlite3.DatabaseError as exc:
             if "locked" not in str(exc).lower():
-                raise
-            last_error = exc
+                print_error(f"Database corrupt or unreadable ({exc}). Try deleting {db_path}.")
+                raise SystemExit(1)
+            last_error = sqlite3.OperationalError(str(exc))
             time.sleep(0.1)
     if last_error is not None:
         raise last_error
