@@ -58,17 +58,41 @@ def cron_matches(expr: str, dt: datetime) -> bool:
     )
 
 
+_CRON_ALIASES = frozenset({
+    "@reboot", "@yearly", "@annually", "@monthly",
+    "@weekly", "@daily", "@midnight", "@hourly",
+})
+
+
 def validate_cron_expression(expr: str) -> None:
-    """Raise ValueError if *expr* is not a valid 5-field cron expression."""
-    parts = expr.strip().split()
+    """Raise ValueError if *expr* is not a valid 5-field cron expression or known alias."""
+    stripped = expr.strip()
+    if stripped.lower() in _CRON_ALIASES:
+        return
+    parts = stripped.split()
     if len(parts) != 5:
         raise ValueError(f"Cron expression must have exactly 5 fields, got: {expr!r}")
-    ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
-    for field, (lo, hi) in zip(parts, ranges):
-        # Basic format check — strip step/range/list markers
+    field_names = ["minute", "hour", "day-of-month", "month", "day-of-week"]
+    ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)]
+    for field, name, (lo, hi) in zip(parts, field_names, ranges):
+        if field == "*":
+            continue
+        # Strip step/range/list markers and validate each numeric token
         cleaned = re.sub(r"[0-9,\-/\*]", "", field)
         if cleaned:
-            raise ValueError(f"Invalid cron field {field!r} in expression {expr!r}")
+            raise ValueError(f"Invalid cron field {field!r} ({name}) in expression {expr!r}")
+        # Validate all literal numbers are in range
+        for token in re.split(r"[,\-/]", field):
+            if token == "*" or not token:
+                continue
+            try:
+                val = int(token)
+            except ValueError:
+                continue
+            if not (lo <= val <= hi):
+                raise ValueError(
+                    f"Cron {name} value {val} out of range [{lo}-{hi}] in {expr!r}"
+                )
 
 
 # ---------------------------------------------------------------------------
