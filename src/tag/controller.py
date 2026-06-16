@@ -8589,7 +8589,10 @@ def cmd_notify(args: argparse.Namespace) -> int:
             db.close()
             return 1
         db.close()
-        print(f"Notification hook added: {hook_id}  ({channel} on {event})")
+        if getattr(args, "json", False):
+            print(json.dumps({"id": hook_id, "channel": channel, "event": event}))
+        else:
+            print(f"Notification hook added: {hook_id}  ({channel} on {event})")
         return 0
 
     if sub == "list":
@@ -9989,6 +9992,7 @@ def build_parser() -> argparse.ArgumentParser:
     n_add.add_argument("--profile")
     n_add.add_argument("--config-json", default="{}", dest="config_json")
     n_add.add_argument("--template", default="")
+    n_add.add_argument("--json", action="store_true")
     n_list = notify_sub.add_parser("list", help="List notification hooks")
     n_list.add_argument("--profile")
     n_list.add_argument("--json", action="store_true")
