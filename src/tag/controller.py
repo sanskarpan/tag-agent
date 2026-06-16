@@ -10079,7 +10079,17 @@ def main() -> int:
     args = parser.parse_args()
     if not getattr(args, "command", None):
         return int(cmd_default(args))
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except sqlite3.OperationalError as exc:
+        msg = str(exc)
+        if "readonly" in msg.lower():
+            print_error(f"Database is read-only — check file permissions: {msg}")
+        elif "locked" in msg.lower():
+            print_error(f"Database is locked by another process: {msg}")
+        else:
+            print_error(f"Database error: {msg}")
+        return 1
 
 
 if __name__ == "__main__":
