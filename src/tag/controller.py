@@ -7722,6 +7722,10 @@ def cmd_route_fallback(args: argparse.Namespace) -> int:
             db.close()
             print_error("--primary and --fallback model IDs required")
             return 1
+        if primary == fallback:
+            db.close()
+            print_error("--primary and --fallback must be different models")
+            return 1
         condition = getattr(args, "condition", "context_overflow") or "context_overflow"
         valid_conditions = {"context_overflow", "error", "timeout", "cost_limit", "any"}
         if condition not in valid_conditions:
