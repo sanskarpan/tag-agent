@@ -8414,7 +8414,10 @@ def cmd_diff_inject(args: argparse.Namespace) -> int:
                 max_files=max_files, blocked_patterns=blocked, workdir=workdir,
             )
     except RuntimeError as exc:
-        print_error(str(exc))
+        if getattr(args, "json", False):
+            print(json.dumps({"error": str(exc), "files": [], "content": "", "estimated_tokens": 0}))
+        else:
+            print_error(str(exc))
         return 1
 
     if result["warn"]:
