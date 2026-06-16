@@ -8796,7 +8796,11 @@ def cmd_split(args: argparse.Namespace) -> int:
         return 0
 
     if sub == "plan":
-        task = getattr(args, "task", "")
+        task = (getattr(args, "task", "") or "").strip()
+        if not task:
+            db.close()
+            print_error("task must not be empty")
+            return 1
         architect = getattr(args, "architect", "claude-opus-4") or "claude-opus-4"
         editor = getattr(args, "editor", "claude-haiku-4-5") or "claude-haiku-4-5"
         profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
