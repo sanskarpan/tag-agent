@@ -8116,10 +8116,28 @@ def cmd_queue_extended(args: argparse.Namespace) -> int:
     if sub == "promote":
         promoted = promote_ready_jobs(db)
         db.close()
-        if promoted:
+        if getattr(args, "json", False):
+            print(json.dumps({"promoted": promoted}))
+        elif promoted:
             print(f"Promoted {len(promoted)} jobs to ready: {', '.join(promoted)}")
         else:
             print("No jobs promoted.")
+        return 0
+
+    if sub == "list":
+        from tag.dag import list_jobs_raw
+        jobs = list_jobs_raw(db)
+        db.close()
+        if getattr(args, "json", False):
+            print(json.dumps(jobs, indent=2))
+        else:
+            if not jobs:
+                print("No DAG jobs.")
+            else:
+                print(f"  {'ID':<14} {'STATUS':<12} {'TASK':<40}")
+                print("  " + "─" * 70)
+                for j in jobs:
+                    print(f"  {j['id']:<14} {j['status']:<12} {str(j.get('task',''))[:40]}")
         return 0
 
     db.close()
@@ -8534,7 +8552,10 @@ def cmd_budget(args: argparse.Namespace) -> int:
             return 1
         db.close()
         if result.get("budget") is None:
-            print(f"No budget configured for '{profile}' — unlimited.")
+            if getattr(args, "json", False):
+                print(json.dumps({"profile": profile, "budget": None, "unlimited": True}))
+            else:
+                print(f"No budget configured for '{profile}' — unlimited.")
             return 0
         if getattr(args, "json", False):
             print(json.dumps(result, indent=2))
@@ -9901,11 +9922,15 @@ def build_parser() -> argparse.ArgumentParser:
     qadd.add_argument("--profile")
     qadd.add_argument("--json", action="store_true")
     qpromote = qext_sub.add_parser("promote", help="Promote ready pending jobs")
-    for qp in [qext_cmd, qadd, qpromote]:
+    qpromote.add_argument("--json", action="store_true")
+    qlist = qext_sub.add_parser("list", help="List DAG jobs and their status")
+    qlist.add_argument("--json", action="store_true")
+    for qp in [qext_cmd, qadd, qpromote, qlist]:
         qp.set_defaults(func=cmd_queue_extended)
 
     # ---- PRD-034: secret scanning ----
     sec_cmd = sub.add_parser("security", help="Secret scanning and security auditing (PRD-034)")
+    sec_cmd.add_argument("--json", action="store_true")
     sec_sub = sec_cmd.add_subparsers(dest="security_subcommand")
     sec_scan = sec_sub.add_parser("scan", help="Scan files for secrets")
     sec_scan.add_argument("path", nargs="?", default=".", metavar="PATH")
