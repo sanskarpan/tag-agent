@@ -908,3 +908,4 @@ def test_render_performance():
 
 - The GitHub Actions JSON Schema is large (~1 MB) and may have validation false positives for valid YAML patterns that the schema does not fully capture. If schema validation proves too strict, the fallback is to use `actionlint` (called as a subprocess if installed) instead of, or in addition to, `jsonschema`. This decision should be made during Phase 3 based on actual validation results.
 - The `issue-solve` template's `tag loop --create-pr` flag assumes PRD-021 implements that flag. If it does not, the template will need to emit a manual `gh pr create` step instead.
+
