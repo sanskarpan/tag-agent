@@ -255,3 +255,4 @@ def send_desktop_notification(title: str, message: str) -> None:
         # Windows: silently skipped for now
     except (OSError, subprocess.TimeoutExpired):
         pass
+

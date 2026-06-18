@@ -206,3 +206,4 @@ def get_sandbox_run(conn: sqlite3.Connection, run_id: str) -> dict | None:
     cols = ["id", "command", "backend", "image", "status", "exit_code",
             "output", "error", "created_at", "completed_at"]
     return dict(zip(cols, row))
+

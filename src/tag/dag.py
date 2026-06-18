@@ -296,3 +296,4 @@ def list_dags(conn: sqlite3.Connection) -> list[dict]:
         }
         for r in rows
     ]
+

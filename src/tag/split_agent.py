@@ -285,3 +285,4 @@ def build_editor_prompt(item: ChangeItem, file_content: str) -> str:
         f"CURRENT FILE CONTENT:\n```\n{file_content}\n```\n\n"
         f"Produce the complete updated file content."
     )
+

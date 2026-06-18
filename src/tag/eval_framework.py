@@ -262,3 +262,4 @@ def get_eval_run_detail(conn: sqlite3.Connection, run_id: str) -> dict | None:
             for c in cases
         ],
     }
+

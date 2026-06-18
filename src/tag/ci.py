@@ -399,3 +399,4 @@ def get_staged_diff() -> str:
     if result.returncode != 0:
         return ""
     return result.stdout
+

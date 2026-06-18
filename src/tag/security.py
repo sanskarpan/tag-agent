@@ -194,3 +194,4 @@ def record_scan(conn: sqlite3.Connection, scanned_path: str, findings: list[Find
         )
     conn.commit()
     return scan_id
+

@@ -642,3 +642,4 @@ def swarm_status_summary(conn: sqlite3.Connection, topology: dict[str, Any]) -> 
         "done": done_count,
         "complete": done_count == len(all_ids),
     }
+

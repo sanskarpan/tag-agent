@@ -319,3 +319,4 @@ def fire_event_notifications(
              "ok" if ok else "failed", None, 1, now),
         )
     conn.commit()
+

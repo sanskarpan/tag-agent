@@ -188,3 +188,4 @@ def workspace_status(conn: sqlite3.Connection) -> dict:
         "total_tokens": row[1] or 0,
         "last_indexed": row[2],
     }
+

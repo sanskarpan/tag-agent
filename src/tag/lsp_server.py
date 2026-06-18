@@ -266,3 +266,4 @@ def get_lsp_status(conn: sqlite3.Connection) -> list[dict]:
          "status": r[4], "created_at": r[5]}
         for r in rows
     ]
+
