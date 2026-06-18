@@ -341,3 +341,4 @@ class CompiledGraph:
 | 3 | SQLite session/step tracking, `describe` command | 2 |
 | 4 | CLI (`graph run`, `graph list`, `graph show`) | 2 |
 | 5 | Integration tests, documentation | 2 |
+
