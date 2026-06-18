@@ -274,3 +274,4 @@ def capture_vnc_screenshot(host: str, port: int, width: int, height: int) -> byt
 | 4 | Action dispatch via VNC, PRD-119 integration | 2 |
 | 5 | Snapshot/restore, noVNC web viewer, security hardening | 2 |
 | 6 | Integration tests, documentation | 2 |
+
