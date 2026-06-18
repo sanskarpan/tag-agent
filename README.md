@@ -805,3 +805,4 @@ MIT — see [LICENSE](https://github.com/sanskarpan/tag-agent/blob/main/LICENSE)
 <p align="center">
   Made with care. Built for the terminal.
 </p>
+
