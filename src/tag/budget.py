@@ -185,3 +185,4 @@ def check_budget(conn: sqlite3.Connection, profile: str) -> dict:
         result["warn"] = True
 
     return result
+
