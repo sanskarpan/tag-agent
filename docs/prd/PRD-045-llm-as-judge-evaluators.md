@@ -1117,3 +1117,4 @@ tag eval run \
 | Online mode thread not completing before process exit | Medium | Document limitation in Phase 3; defer SQLite work-queue solution to OQ-04 follow-up. |
 | Anthropic rate limits slow down `--parallel` runs | Low | Default `--parallel 1`; document retry-with-backoff behavior (Anthropic SDK's built-in retry handles 429). |
 | `security.scan_for_secrets` not yet exposed as a public function | Low | Inline the regex patterns from `security.py` into `eval_judge.py` as a fallback until `security.py` exports a public API. |
+
