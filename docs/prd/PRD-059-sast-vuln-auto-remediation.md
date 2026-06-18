@@ -1055,3 +1055,4 @@ Require: Python, bandit, semgrep (skipped with `pytest.mark.skipif` if not insta
 
 *GitHub Issue:* [#344](https://github.com/org/repo/issues/344)
 *Document version:* 1.0 — 2026-06-17
+
