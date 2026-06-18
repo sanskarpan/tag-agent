@@ -347,3 +347,4 @@ def _utc_now() -> str:
 | 2 | Tripwire counters, post-hook `output-secret-scan`, integration tests | 2 |
 | 3 | TOOL span boundary integration (PRD-013), CLI commands | 2 |
 | 4 | Documentation, security tests | 1 |
+
