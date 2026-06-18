@@ -350,3 +350,4 @@ class AgentCardVerifier:
 | 2 | `AgentCardVerifier` with tamper detection, security tests | 2 |
 | 3 | Key rotation, CLI commands, SQLite key registry | 2 |
 | 4 | PRD-082 team integration, documentation | 2 |
+
