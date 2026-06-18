@@ -311,3 +311,4 @@ def _utc_now() -> str:
 | 2 | `PlaywrightSession` start/close/health-check | 2 |
 | 3 | Screenshot capture + span attachment | 1 |
 | 4 | CLI commands, sandbox mode, integration tests | 2 |
+
