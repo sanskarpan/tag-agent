@@ -245,3 +245,4 @@ Respond with JSON: {"action": "assign"|"replan"|"complete"|"abort",
 | 3 | Stall detection, loop detection, context compression | 2 |
 | 4 | CLI integration, `ledger show/history` commands | 2 |
 | 5 | Integration tests, benchmark, documentation | 2 |
+

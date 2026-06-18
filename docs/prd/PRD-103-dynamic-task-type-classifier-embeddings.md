@@ -1171,3 +1171,4 @@ Location: `tests/test_routing_perf.py`
 *GitHub Issue: #349*
 *Cluster: G — Advanced Reasoning & Planning*
 *Related PRDs: PRD-043 (tool retrieval), PRD-101 (self-consistency), PRD-102 (multi-agent debate)*
+
