@@ -475,3 +475,4 @@ def export_spans_otlp(
             return True
     except urllib.error.URLError:
         return False
+
