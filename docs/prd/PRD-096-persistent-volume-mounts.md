@@ -5,7 +5,7 @@
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Sandbox & Execution Environment
 **Affects:** `sandbox.py + sandbox_volumes SQLite`
-**Depends on:** PRD-028 (sandbox-code-execution), PRD-013 (agent-tracing-observability), PRD-034 (security), PRD-012 (cost-tracking-budget), PRD-020 (cicd-integration)
+**Depends on:** PRD-028 (Sandbox Code Execution), PRD-034 (Secret Scanning / security.py), PRD-013 (Agent Tracing/Observability), PRD-005 (Execution Backend Selection), PRD-094 (Per-Sandbox Egress Firewall), PRD-097 (Sandbox Secrets Vault), PRD-012 (Cost Tracking / Budget), PRD-020 (CI/CD Integration)
 **Inspired by:** Modal volumes, E2B filesystem, Daytona persistent workspace
 **GitHub Issue:** #348
 
