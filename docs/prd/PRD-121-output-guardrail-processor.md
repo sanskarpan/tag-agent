@@ -305,3 +305,4 @@ class OutputGuardrailPipeline:
 | 2 | `JSONSchemaGuardrail`, `OutputGuardrailPipeline`, audit log | 2 |
 | 3 | CLI commands, rewrite action, `cmd_run` integration | 2 |
 | 4 | Integration tests, documentation | 1 |
+
