@@ -1207,3 +1207,4 @@ All integration tests use an in-memory SQLite database via a `tmp_path`-based `c
 - Performance tests (1,000 entities, parallel loads).
 - Update `pyproject.toml` with optional extras `[vault]` and `[aws]`.
 - **Deliverable:** Full feature complete, all acceptance criteria passing, backend abstraction documented.
+
