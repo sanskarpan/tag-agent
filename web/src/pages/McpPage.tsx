@@ -755,3 +755,4 @@ export default function McpPage() {
     </div>
   );
 }
+
