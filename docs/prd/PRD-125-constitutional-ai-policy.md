@@ -370,3 +370,4 @@ def _utc_now() -> str:
 | 2 | `CritiqueRevisionLoop` core (critique prompt, revision prompt, compliance detection) | 2 |
 | 3 | SQLite audit log, PRD-121 integration, CLI commands | 2 |
 | 4 | Evaluation tests (20-case set), documentation | 2 |
+
