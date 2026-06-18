@@ -1260,3 +1260,4 @@ p_list.add_argument("--json", action="store_true")
 - TAG PRD-040 (Notification Hooks): `docs/prd/PRD-040-notification-hooks.md`
 - TAG PRD-041 (OTel GenAI Cost Attribution): `docs/prd/PRD-041-otel-genai-span-cost-attribution.md`
 - TAG PRD-078 (HITL Tool Approval Audit Trail): `docs/prd/PRD-078-hitl-tool-approval-audit-trail.md`
+
