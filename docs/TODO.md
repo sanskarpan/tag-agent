@@ -46,3 +46,4 @@ described as a polished standalone product instead of a strong prototype.
 - [x] Shipped `tag-control` skin
 - [x] Hermes TUI patch integration
 - [x] Profile bootstrap and rendered config installation
+

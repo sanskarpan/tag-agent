@@ -497,3 +497,4 @@ TAG's codebase has more built than appears from the feature list. Before impleme
 - **`api.py`** — HTTP server base for A2A card endpoint; one new route
 - **`sandbox.py`** — BACKENDS set with docker/modal stubs; complete the streaming stdout first
 - **`budget.py`** — total spend tracked; per-span USD just needs pricing table + attribution call
+

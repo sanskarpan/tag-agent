@@ -274,3 +274,4 @@ Build after Wave 2 is stable.
 - PRD-017: Multi-model benchmarking
 - PRD-020: CI/CD integration and automated code review
 - PRD-035: Profile Marketplace — GitHub-based profile distribution with SHA pinning, secret scanning, and Gist push (BLOCKED on PRD-034)
+

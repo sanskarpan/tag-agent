@@ -150,3 +150,4 @@ PRD-021, PRD-024, PRD-025, PRD-027, PRD-028, PRD-029, PRD-030, PRD-031, PRD-032,
 
 - [docs/prd/INDEX.md](INDEX.md) — PRD-001 through PRD-020 (prior backlog cohort)
 - [docs/](../) — architecture diagrams, logo assets
+
