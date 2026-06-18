@@ -315,3 +315,4 @@ ACTION_HANDLERS: dict = {}  # Populated by platform-specific backends
 | 2 | Claude API integration (beta headers, tool definition, response parsing) | 2 |
 | 3 | Allow-list, error recovery, cost tracking | 1 |
 | 4 | Integration tests, documentation | 2 |
+
