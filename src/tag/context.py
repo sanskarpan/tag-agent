@@ -120,3 +120,4 @@ def export_context(hermes_bin_path: Path, profile_home: Path) -> str:
         return ""
     except Exception:
         return ""
+
