@@ -225,3 +225,4 @@ def list_sessions(conn: sqlite3.Connection, *, limit: int = 20) -> list[dict]:
         }
         for r in rows
     ]
+
