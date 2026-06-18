@@ -128,3 +128,4 @@ servers:
     requires_env: []
     profiles:
       recommended: [researcher]
+
