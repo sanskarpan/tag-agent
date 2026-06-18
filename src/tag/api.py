@@ -305,3 +305,4 @@ class DashboardServer:
     def stop(self) -> None:
         if self._server:
             self._server.shutdown()
+
