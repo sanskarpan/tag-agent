@@ -297,3 +297,4 @@ def build_merged_prompt(
         parts.append("\n\n".join(append_parts))
 
     return "\n\n".join(parts)
+
