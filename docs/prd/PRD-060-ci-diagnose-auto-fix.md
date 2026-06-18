@@ -1159,3 +1159,4 @@ The suite is runnable via `tag eval run --suite evals/ci_diagnose.yaml` (PRD-027
 *GitHub Issue: #344*
 *PRD authors: TAG core team*
 *Last updated: 2026-06-17*
+
