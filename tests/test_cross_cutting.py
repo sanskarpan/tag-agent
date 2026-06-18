@@ -896,3 +896,4 @@ class TestOutputFormat:
         assert "gen_ai.usage.input_tokens" in attrs
         assert "gen_ai.request.model" in attrs
         assert attrs["gen_ai.request.model"]["value"]["stringValue"] == "claude-opus-4"
+
