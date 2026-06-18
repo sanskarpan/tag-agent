@@ -273,3 +273,4 @@ class Scratchpad:
 | 1 | SQLite DDL, `Scratchpad` class, unit tests | 1 |
 | 2 | CLI commands, export/promote | 1 |
 | 3 | Auto-injection integration, integration tests | 1 |
+
