@@ -226,3 +226,4 @@ def keyword_search_tools(
             scored.append((score, tool))
     scored.sort(key=lambda x: -x[0])
     return [t for _, t in scored[:top_k]]
+
