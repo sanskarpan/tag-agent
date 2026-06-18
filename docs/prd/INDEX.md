@@ -5,7 +5,28 @@
 
 ---
 
-## Priority Matrix
+## Cluster A–J PRD Summary (PRD-045 to PRD-125)
+
+These 81 PRDs were added in the v0.6.x planning cycle after competitive research across 10 domains.
+See [FEATURES_ROADMAP.md](../FEATURES_ROADMAP.md) for the full cluster map.
+
+| Cluster | Domain | PRDs | Count |
+|---------|--------|------|-------|
+| A | Evaluation & Observability | PRD-045 to PRD-054 | 10 |
+| B | CI/CD & Agentic Dev Workflows | PRD-055 to PRD-064 | 10 |
+| C | Memory & Knowledge | PRD-065 to PRD-072 | 8 |
+| D | MCP Ecosystem & Tool Connectivity | PRD-073 to PRD-080 | 8 |
+| E | Multi-Agent Interoperability | PRD-081 to PRD-088 | 8 |
+| F | Sandbox & Execution Environment | PRD-089 to PRD-100 | 12 |
+| G | Advanced Reasoning & Planning | PRD-101 to PRD-108 | 8 |
+| H | Agentic Workflow State & Graph | PRD-109 to PRD-116 | 8 |
+| I | Computer Use & Browser Automation | PRD-117 to PRD-120 | 4 |
+| J | Security & Guardrails | PRD-121 to PRD-125 | 5 |
+| **Total** | | | **81** |
+
+---
+
+## Priority Matrix (PRD-001 to PRD-044)
 
 | PRD | Feature | Priority | Effort | Status |
 |-----|---------|----------|--------|--------|
@@ -119,17 +140,119 @@ Build after Wave 2 is stable.
 - PRD-002: TAG-native cross-session facts journal
 - PRD-022: Semantic memory with confidence decay (ChromaDB + sentence-transformers, local embeddings)
 - PRD-018: Context window management and auto-summarization
+- PRD-065: Automatic post-run memory extraction
+- PRD-066: Hybrid memory search (BM25 + vector RRF fusion)
+- PRD-067: Hierarchical memory tiers (core/recall/archival)
+- PRD-068: Background sleep-time memory consolidation
+- PRD-069: Temporal fact versioning
+- PRD-070: Entity-relationship graph and community detection
+- PRD-071: Episodic memory session episodes
+- PRD-072: Cross-session vector store (LanceDB embedded)
+- PRD-116: MemEx persistent scratchpad
 
 ### Developer Experience (TUI / UX)
 - PRD-003: Rich streaming output, spinners, progress bars
 - PRD-007: Electron desktop app
 - PRD-009: Enhanced diagnostics
 - PRD-019: Natural language shell REPL
+- PRD-054: Local browser DevUI
+
+### Evaluation & Observability
+- PRD-045: LLM-as-judge evaluators
+- PRD-046: Per-span USD cost attribution
+- PRD-047: Eval CI gate PR comment
+- PRD-048: Structured tool call child spans
+- PRD-049: Versioned eval dataset management
+- PRD-050: Alert rules on metric thresholds
+- PRD-051: Human annotation and labeling queue
+- PRD-052: Prompt versioning hub
+- PRD-053: TraceProcessor lifecycle hooks
+- PRD-041: OTel GenAI span cost attribution
+- PRD-044: AgentOps session observability
+
+### CI/CD & Dev Workflows
+- PRD-055: Issue-to-PR autonomous loop
+- PRD-056: Inbound webhook trigger server
+- PRD-057: Automated test generation
+- PRD-058: GitHub Actions workflow scaffold
+- PRD-059: SAST vulnerability auto-remediation
+- PRD-060: CI diagnose auto-fix
+- PRD-061: Configurable PR review signal classes
+- PRD-062: GitLab CI pipeline autogen
+- PRD-063: Self-healing flaky test detection
+- PRD-064: SWE-agent bash/editor harness
 
 ### Multi-Agent Orchestration
 - PRD-004: Kanban swarm helpers
 - PRD-008: Background task queue
 - PRD-016: Webhook event triggers
+- PRD-082: Multi-agent team primitives
+- PRD-108: MagenticOne dual-ledger orchestrator
+- PRD-114: Five team orchestration primitives (sequential/hierarchical/supervisor/debate/swarm)
+
+### Agentic Workflow State
+- PRD-109: HITL interrupt()+Command(resume=)
+- PRD-110: Loop state serialization (SqliteCheckpointer)
+- PRD-111: Dynamic fan-out/map-reduce (Send API)
+- PRD-112: Graph-based workflow engine (WorkflowGraph)
+- PRD-113: Time-travel debugging
+- PRD-115: Stateful process framework (@process decorator)
+
+### MCP Ecosystem & Tool Connectivity
+- PRD-073: Live MCP registry sync
+- PRD-074: MCP OAuth PKCE device flow
+- PRD-075: Per-user entity-scoped multi-tenant tool auth
+- PRD-076: High-value MCP server bundle
+- PRD-077: Scope-based tool filtering
+- PRD-078: HITL tool approval audit trail
+- PRD-079: Cloud-hosted tool execution
+- PRD-080: Enterprise IDP SSO MCP servers
+
+### Multi-Agent Interoperability
+- PRD-081: A2A agent card publication
+- PRD-083: Agent-as-tool pattern
+- PRD-084: A2A signed agent cards (Ed25519 JWS)
+- PRD-085: Formal handoff message primitive
+- PRD-086: ANP identity layer (W3C DID)
+- PRD-087: ACP lightweight REST adapter
+- PRD-088: Distributed agent runtime (gRPC)
+
+### Sandbox & Execution
+- PRD-028: Sandbox code execution
+- PRD-089: Sandbox streaming stdout/stderr
+- PRD-090: Sandbox template snapshot system
+- PRD-091: Configurable sandbox TTL and session refresh
+- PRD-092: Desktop GUI sandbox VNC
+- PRD-093: GPU sandbox (Modal backend)
+- PRD-094: Per-sandbox egress firewall
+- PRD-095: Sandbox pause/resume
+- PRD-096: Persistent volume mounts
+- PRD-097: Sandbox secrets vault
+- PRD-098: Sandbox stdin signal delivery
+- PRD-099: Per-second cost attribution (sandbox)
+- PRD-100: Sandbox lifecycle policies
+
+### Advanced Reasoning
+- PRD-101: Self-consistency ensemble
+- PRD-102: Multi-agent debate
+- PRD-103: Dynamic task type classifier (embeddings)
+- PRD-104: Node-level cache TTL
+- PRD-105: TDAG dependency-first task decomposition
+- PRD-106: Speculative action execution
+- PRD-107: Confidence-aware model routing
+
+### Computer Use & Browser Automation
+- PRD-117: Playwright MCP integration
+- PRD-118: Computer use CLI (`tag computer-use`)
+- PRD-119: Claude computer use screenshot loop
+- PRD-120: Desktop GUI sandbox VNC
+
+### Security & Guardrails
+- PRD-121: Output guardrail processor
+- PRD-122: Input guardrail validator
+- PRD-123: Runtime guardrail hooks/tripwire
+- PRD-124: GuardrailResult dataclass
+- PRD-125: Constitutional AI policy (critique-revision loop)
 
 ### Provider & Tool Integrations
 - PRD-005: Execution backends (Docker, SSH, Modal, Daytona)
