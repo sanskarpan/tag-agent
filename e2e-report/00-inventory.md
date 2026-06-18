@@ -237,3 +237,4 @@ Nested:
 5. Stateful runtime E2E: `submit`, `benchmark`, SQLite persistence, concurrency, Codex import paths.
 6. Wrapper and TUI E2E: `hermes`, Hermes wrappers, TTY/non-TTY TUI paths, patched Hermes TUI build and tests.
 7. Negative paths: malformed config, missing tools, invalid refs, invalid limits, invalid prompts, missing API keys.
+
