@@ -1158,3 +1158,4 @@ Install with: `pip install tag[runtime]`
 *GitHub Issue: [#347](https://github.com/tag-agent/tag/issues/347)*
 *Cluster: E — Multi-Agent Interoperability Protocols*
 *PRD Author: Generated 2026-06-17*
+

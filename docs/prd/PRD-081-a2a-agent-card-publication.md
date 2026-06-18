@@ -1164,3 +1164,4 @@ Run the official A2A conformance test suite from `a2a-sdk` against the TAG A2A s
 **3–5 days** for a single engineer, with a target of approximately 600 lines of new Python (across `a2a_card.py`, additions to `api.py` and `controller.py`) and 35 test cases. The implementation is classified **Difficulty 2/5** because it builds on existing infrastructure (`api.py` HTTP server, `open_db()`, `tracing.py`, `controller.py` dispatch pattern) and introduces no new architectural patterns: the A2A endpoint is a new route on an existing server, the task router calls existing `cmd_run` infrastructure, and the discovery client uses stdlib `urllib.request`.
 
 The **Impact 4/5** rating reflects that this single feature makes TAG visible to the entire A2A ecosystem (150+ platforms) with no required changes to existing profiles, enabling a new class of multi-agent workflows that TAG could not participate in before.
+
