@@ -923,3 +923,4 @@ class TestToolsConfigEndpoints:
             r = fn(path, **kwargs)
             assert r.status_code == 401, f"{method} {path} not gated"
 
+
