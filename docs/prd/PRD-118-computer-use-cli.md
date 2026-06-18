@@ -260,3 +260,4 @@ def check_allow_list(action_type: str, allow_list: Optional[set]) -> bool:
 | 2 | Screenshot capture, action dispatch, OTel attachment | 2 |
 | 3 | CLI commands, replay, sandbox integration | 2 |
 | 4 | Integration tests, security tests | 1 |
+
