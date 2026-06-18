@@ -699,3 +699,4 @@ Start by creating `e2e-report/` and a `e2e-report/00-inventory.md`
 that lists every command, every flag, every env var, and
 every config key you plan to exercise. Then execute
 section by section.
+
