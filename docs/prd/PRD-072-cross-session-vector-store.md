@@ -389,3 +389,4 @@ class VectorStore:
 | 5 | Migration framework, performance benchmarks | 2 |
 | 6 | Integration with PRD-065 memory extraction pipeline | 1 |
 | 7 | Documentation, final integration tests | 2 |
+

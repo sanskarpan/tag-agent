@@ -976,3 +976,4 @@ def cmd_memory_gc(args: argparse.Namespace) -> int:
 - Fix any acceptance criterion gaps found during review.
 
 **Total estimated effort: 12–14 days (M — fits within 2-week sprint)**
+

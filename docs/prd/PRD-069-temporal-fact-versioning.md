@@ -1055,3 +1055,4 @@ def test_default_search_overhead(tmp_path):
 | Recursive CTE for history traversal exceeds SQLite depth limit on very long chains | Low | Visited-set guard in backward walk; depth limit documented in security section. |
 | FTS5 sync overhead exceeds NFR-09 threshold (10%) | Low | FTS rows for invalidated memories are not updated (only the main table is); FTS remains in sync for searchability. |
 | `compute_confidence` decay interacting unexpectedly with back-dated `valid_at` vs `created_at` | Medium | OQ-2 is flagged; unit test AC-14 specifically verifies decay is driven by `created_at`, not `valid_at`. |
+
