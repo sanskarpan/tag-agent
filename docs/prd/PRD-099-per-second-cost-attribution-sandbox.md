@@ -1097,3 +1097,4 @@ def test_query_costs_10k_rows(tmp_sqlite):
 - Documentation: `--help` text for all new flags, docstrings on all public functions
 - Update `docs/prd/INDEX.md` to add PRD-099
 - Code review and merge
+
