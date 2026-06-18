@@ -1266,3 +1266,4 @@ p_update.add_argument("--json", action="store_true",
 - Documentation update in `README` (one paragraph on registry sync).
 
 **Exit criteria:** All 18 acceptance criteria pass; `tag doctor` shows green `mcp_registry` check after a successful sync.
+
