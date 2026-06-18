@@ -311,3 +311,4 @@ class SqliteCheckpointer:
 | 2 | Pruning, list/show/restore CLI commands | 1 |
 | 3 | Integration with workflow engine (PRD-112), resume logic | 2 |
 | 4 | Integration tests, concurrency tests, documentation | 1 |
+
