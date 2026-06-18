@@ -188,3 +188,4 @@ def run_daemon(db_path: str, config_path: str) -> None:
                 pass
 
         time.sleep(30)
+
