@@ -1174,3 +1174,4 @@ def test_backward_compat_ephemeral_run():
 | CLI surface wired + all new subcommands functional | Day 3 EOD |
 | Integration tests passing + Docker backend validated | Day 4 EOD |
 | PR open, review feedback incorporated | Day 5 EOD |
+
