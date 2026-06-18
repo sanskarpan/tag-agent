@@ -20,3 +20,4 @@ set -e
 
 printf '%s\n' "$rc" >"$test_dir/exitcode.txt"
 exit "$rc"
+
