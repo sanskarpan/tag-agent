@@ -1123,3 +1123,4 @@ Each test requires a sandbox IdP tenant (Okta dev tenant, Azure AD app registrat
 **Total: ~4.5 weeks core implementation + 0.5 weeks buffer = 5 weeks**
 
 The XL estimate (4-8 weeks) accounts for: IdP sandbox provisioning delays (typically 1-2 days per IdP for approval), potential firewall/keychain issues in CI environments (OQ-06, OQ-07), and the possibility that Azure AD Conditional Access (OQ-03) requires a Phase 2 step-up authentication implementation.
+

@@ -1084,3 +1084,4 @@ tests/test_mcp_host_perf.py::test_audit_log_write_throughput
 ---
 
 *PRD-079 authored for TAG CLI — GitHub issue #346*
+

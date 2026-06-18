@@ -1318,3 +1318,4 @@ approval:
 | 20  | Final integration test pass; coverage assertion (> 90%); PR review |
 
 **Total estimate:** 20 engineering days (4 weeks for a single developer, ~2 weeks with two developers working Phase 1/2 in parallel with Phase 3/4).
+

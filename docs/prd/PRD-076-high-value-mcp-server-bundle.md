@@ -1280,3 +1280,4 @@ curated_bundle:
 - `tag mcp registry add-curated --dry-run` output reviewed and approved by a second team member.
 - Security review of Section 11 items OQ7 and the Playwright/Docker warnings completed.
 - Issue #346 closed with a reference to the merged PR.
+
