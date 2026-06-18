@@ -1049,3 +1049,4 @@ class SandboxStreamPanel:
 | High-throughput SQLite writes causing WAL file growth | Low | Low | WAL mode + batch writes minimize contention; add checkpoint hint after run completion |
 | Orphaned child processes on Windows (process group kill not available) | Medium | Low | Windows fallback uses `proc.kill()` which kills the process but not descendants; document limitation |
 | Breaking change if existing code calls `run_in_sandbox()` and expects the old return dict format | Low | High | Streaming path is a new function `run_in_sandbox_streaming()`; existing `run_in_sandbox()` is untouched |
+

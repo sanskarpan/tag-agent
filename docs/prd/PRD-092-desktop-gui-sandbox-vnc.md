@@ -936,3 +936,4 @@ These tests require Docker to be running and are skipped via `pytest.mark.skipif
 ---
 
 **Total estimated duration:** 40 working days (8 weeks) for a single engineer. Can be compressed to 4–5 weeks with a second engineer parallelizing Phase 3 (agent loop) with Phase 2 (capture/injection).
+

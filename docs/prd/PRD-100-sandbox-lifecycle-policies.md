@@ -981,3 +981,4 @@ The `controller.py` cron dispatcher recognises the sentinel command `__internal_
 - Final review and cleanup
 
 **Exit criterion:** All acceptance criteria verified; benchmark under 200 ms; no regressions in existing sandbox tests.
+
