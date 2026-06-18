@@ -770,3 +770,4 @@ function TelegramOnboardingPanel({
     </div>
   );
 }
+
