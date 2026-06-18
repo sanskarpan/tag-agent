@@ -403,3 +403,4 @@ def _utc_now() -> str:
 | 2 | Review TUI (render, keyboard handling, progress persistence) | 2 |
 | 3 | Export/import pipeline, `stats` command, IAA computation | 2 |
 | 4 | CLI wiring, integration tests, TUI polish | 2 |
+

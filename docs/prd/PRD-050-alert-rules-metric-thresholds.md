@@ -471,3 +471,4 @@ class AlertDaemon:
 | 3 | Notification dispatchers (Slack, email, desktop) | 1 |
 | 4 | CLI commands (`create`, `list`, `show`, `delete`, `test`, `history`, `daemon`) | 2 |
 | 5 | LLM-judge mode, integration tests | 1 |
+
