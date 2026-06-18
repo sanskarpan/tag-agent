@@ -254,3 +254,4 @@ def memory_stats(conn: sqlite3.Connection, profile: str) -> dict:
         "SELECT COUNT(*) FROM semantic_memories WHERE profile=?", (profile,)
     ).fetchone()[0]
     return {"profile": profile, "total": total, "by_type": by_type}
+
