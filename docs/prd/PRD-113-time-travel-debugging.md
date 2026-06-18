@@ -254,3 +254,4 @@ class TimeTravel:
 | 2 | TUI inspector (navigation, state render, keyboard shortcuts) | 2 |
 | 3 | CLI commands, `--patch` validation, `--diff` rendering | 2 |
 | 4 | Integration tests, documentation | 1 |
+

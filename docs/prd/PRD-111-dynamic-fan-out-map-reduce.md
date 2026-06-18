@@ -280,3 +280,4 @@ def fan_out_execute(
 | 2 | SQLite branch tracking, integration with PRD-112 | 2 |
 | 3 | CLI (`fan-out show --live`, `retry`), error handling | 2 |
 | 4 | Integration tests, stress test, documentation | 1 |
+

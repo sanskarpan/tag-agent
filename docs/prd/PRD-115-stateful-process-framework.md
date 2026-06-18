@@ -305,3 +305,4 @@ def process(name: str):
 | 2 | `@process` decorator, `tag process start/list/show/stop` CLI | 2 |
 | 3 | Crash recovery, escalate integration, cron scheduling | 2 |
 | 4 | Integration tests, documentation | 1 |
+

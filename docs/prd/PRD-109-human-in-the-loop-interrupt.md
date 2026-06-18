@@ -271,3 +271,4 @@ def _utc_now() -> str:
 | 2 | Checkpoint integration (PRD-110), resume logic | 2 |
 | 3 | CLI commands, `--auto-approve`, timeout handling | 2 |
 | 4 | Integration tests, documentation | 1 |
+
