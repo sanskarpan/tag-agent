@@ -1343,3 +1343,4 @@ All unit tests use an in-memory SQLite database created by calling `open_db()` w
 - Agent interoperability protocol comparison: https://arxiv.org/html/2505.02279v1
 - RFC 8615 (Well-Known URIs): https://datatracker.ietf.org/doc/html/rfc8615
 - TAG GitHub Issue #347: https://github.com/tag-project/tag/issues/347
+
