@@ -1093,3 +1093,4 @@ Location: `tests/test_sandbox_perf.py`
 - Update `docs/prd/INDEX.md` with PRD-098 entry.
 - Manual end-to-end walkthrough: Python REPL, sqlite3 CLI, bash in Docker.
 - Address any CI failures from the Docker matrix job.
+
