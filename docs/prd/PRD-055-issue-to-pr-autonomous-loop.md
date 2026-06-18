@@ -1080,3 +1080,4 @@ These tests use a real git repository in a temp directory, a mocked Hermes (no l
 ---
 
 *PRD-055 written 2026-06-17. Review against PRD-021 (loop), PRD-028 (sandbox), PRD-034 (security) before implementation kickoff.*
+
