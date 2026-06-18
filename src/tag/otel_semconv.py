@@ -216,3 +216,4 @@ def _iso_to_ns(iso: str) -> int:
         return int(dt.timestamp() * 1_000_000_000)
     except Exception:
         return 0
+
