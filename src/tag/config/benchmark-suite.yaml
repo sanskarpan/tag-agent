@@ -12,3 +12,4 @@ cases:
   - id: bullet-format
     prompt: "Reply with exactly these two lines and nothing else: - alpha\n- beta"
     expected_regex: '(^|\n)- alpha\n- beta\s*$'
+
