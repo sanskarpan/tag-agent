@@ -328,3 +328,4 @@ def run_shell(cfg: dict[str, Any], profile_name: str) -> int:
         session.add_turn("assistant", f"(dispatched to profile: {target_profile})")
 
     return 0
+
