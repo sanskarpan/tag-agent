@@ -1312,3 +1312,4 @@ class TestPerformance:
 - Confirm all 18 acceptance criteria pass.
 
 **Deliverable:** PRD-062 ready for merge; all AC pass; security checklist signed off.
+

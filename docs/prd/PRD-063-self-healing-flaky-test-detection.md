@@ -1021,3 +1021,4 @@ The benchmark tests are tagged with `@pytest.mark.flaky` for ground-truth labeli
 - `defusedxml` adding a new optional dependency may require pyproject.toml updates and CI matrix changes.
 - `--sandbox docker` mode depends on PRD-028 API stability; if PRD-028 is mid-refactor, defer sandbox support to Phase 6.
 - Statistical minimum sample size debate (OQ-04) should be resolved before Phase 1 ships to avoid schema migration for a minimum-runs constraint.
+

@@ -1271,3 +1271,4 @@ tag hooks test --platform github --event pull_request.opened --port 18080 --dry-
 ---
 
 *PRD-056 authored 2026-06-17 for TAG CLI v0.4.x milestone. Review required from: Engineering Lead, Security, Product.*
+

@@ -904,3 +904,4 @@ def open_test_pr(
 ### Rollout
 
 After Phase 4: internal dogfooding on the TAG repository itself (`tag ci test-gen --pr <next-pr>`). Collect coverage_pct distribution across 10 real PRs. Adjust default `--min-coverage` based on observed baselines before public release.
+
