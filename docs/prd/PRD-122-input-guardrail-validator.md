@@ -300,3 +300,4 @@ class InputGuardrailPipeline:
 | 2 | `InputGuardrailPipeline`, sanitize action, audit log | 2 |
 | 3 | CLI commands, `cmd_run` integration, topic filter guardrail | 2 |
 | 4 | Evaluation tests, documentation | 1 |
+
