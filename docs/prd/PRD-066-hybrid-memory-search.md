@@ -393,3 +393,4 @@ class HybridMemorySearch:
 | 3 | Entity boost, recency decay, result rendering | 1 |
 | 4 | CLI integration (`--mode`, `--alpha`, `--entity`, `--recency-weight`) | 1 |
 | 5 | Performance benchmarks, integration tests | 1 |
+
