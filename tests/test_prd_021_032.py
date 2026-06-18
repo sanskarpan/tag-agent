@@ -1158,3 +1158,4 @@ class TestTraceReplay:
         assert isinstance(data, list)
         assert len(data) > 0
         assert "name" in data[0]
+

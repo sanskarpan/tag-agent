@@ -2708,3 +2708,4 @@ class TestPRD011ThroughPRD020Regressions:
         """_execute_hook with an unknown hook type must return False, not raise."""
         ok = TAG._execute_hook({"type": "unknown_type", "command": "echo hi"}, {})
         assert ok is False
+

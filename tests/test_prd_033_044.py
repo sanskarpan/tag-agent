@@ -1337,3 +1337,4 @@ class TestAgentOps:
             TAG.cmd_agentops(args)
         out = capsys.readouterr().out
         assert "No AgentOps sessions" in out
+

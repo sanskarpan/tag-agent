@@ -1428,3 +1428,4 @@ def test_import_cursor_writes_env_file(tmp_path, monkeypatch):
     assert result["status"] == "imported"
     env = TAG.read_dotenv(TAG.profile_home(cfg, "coder") / ".env")
     assert env["OPENAI_API_KEY"] == "sk-cursor-import-test"
+

@@ -30,3 +30,4 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     if hasattr(hermes_constants, "HERMES_HOME"):
         monkeypatch.setattr(hermes_constants, "HERMES_HOME", hermes_home)
     yield hermes_home
+
