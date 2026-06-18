@@ -298,3 +298,4 @@ class TeamOrchestrator:
 | 2 | Hierarchical + supervisor processes | 3 |
 | 3 | Debate process, agreement scoring | 2 |
 | 4 | CLI integration, checkpoint wiring, tests | 3 |
+
