@@ -44,3 +44,4 @@ jobs:
 
       - name: Smoke-test npm launcher version
         run: node bin/tag.js --version
+
