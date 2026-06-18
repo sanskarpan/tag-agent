@@ -1307,3 +1307,4 @@ The `passthrough` profile echoes input to output without making a model API call
 | `gh pr comment` authentication fails in CI (missing `GITHUB_TOKEN`) | Medium | Low | `post_pr_comment` already returns `False` on failure; gate decision is independent. |
 | Large `runs` table (100K+ rows) makes `create_dataset_from_runs` slow | Low | Medium | The SQL query uses `created_at >= ?` which benefits from the existing `idx_er_status` index on `eval_runs`; add a dedicated index on `runs.created_at` if needed. |
 | Deduplication O(n²) cost for large candidate sets | Low | Low | At 200 candidates (10× the typical `--limit`), O(n²) Jaccard is 40,000 comparisons; negligible on modern hardware. If this becomes a bottleneck, switch to MinHash LSH. |
+
