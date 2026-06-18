@@ -1015,3 +1015,4 @@ The frontend is tested with a Vitest + Playwright setup in `web/devui/`:
 ---
 
 *Filed as GitHub issue #343. Questions and design feedback welcome before Phase 1 kickoff.*
+
