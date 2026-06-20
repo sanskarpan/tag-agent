@@ -1222,13 +1222,47 @@ def rewrite_cli_hints(text: str) -> str:
     )
     rewritten = re.sub(r"\bHermes/tag\b", "TAG", rewritten, flags=re.IGNORECASE)
     rewritten = re.sub(r"\btag/tag\b", "tag", rewritten, flags=re.IGNORECASE)
+    # BUG-004/BUG-005: version strings from the runtime binary
     rewritten = re.sub(r"\bHermes Agent\b", "TAG", rewritten, flags=re.IGNORECASE)
     rewritten = re.sub(r"\bhermes-agent\b", "tag-agent", rewritten, flags=re.IGNORECASE)
     rewritten = re.sub(r"\bthis Hermes profile\b", "this TAG profile", rewritten, flags=re.IGNORECASE)
     rewritten = re.sub(r"\bActive Hermes profile\b", "Active TAG profile", rewritten, flags=re.IGNORECASE)
     rewritten = re.sub(r"\bHermes profile\b", "TAG profile", rewritten, flags=re.IGNORECASE)
     rewritten = rewritten.replace("~/.hermes/.env", "the active TAG profile env file")
+    # BUG-007/008/009: rewrite runtime internal paths to clean display form
+    rewritten = re.sub(
+        r'(?:/[^/\s]+)+/\.tag/runtime/home/\.hermes/profiles/',
+        '~/.tag/runtime/profiles/',
+        rewritten,
+    )
+    # BUG-010: bare ~/.hermes path shown in `tag profile`
+    rewritten = rewritten.replace("~/.hermes", "~/.tag/profiles")
+    # BUG-001: title box strings like "⚕ Hermes Configuration" and "Hermes Status"
+    rewritten = re.sub(r"\bHermes Configuration\b", "TAG Configuration", rewritten)
+    rewritten = re.sub(r"\bHermes Status\b", "TAG Status", rewritten)
+    rewritten = re.sub(r"\bHermes Runtime\b", "TAG Runtime", rewritten, flags=re.IGNORECASE)
+    # BUG-011: re-centre box titles after brand substitution shortened them
+    rewritten = _fix_box_title_alignment(rewritten)
+    # Catch any remaining standalone Hermes brand references that aren't filesystem paths
+    rewritten = re.sub(r"(?<![/.])\bHermes\b(?![-/.])", "TAG", rewritten)
     return rewritten
+
+
+_BOX_TITLE_RE = re.compile(r"┌(─+)┐\n│([^\n]*)│\n└(─+)┘", re.MULTILINE)
+
+
+def _fix_box_title_alignment(text: str) -> str:
+    """BUG-011: Re-centre box titles that were shortened by brand substitution."""
+    def recentre(m: re.Match) -> str:
+        top_dashes, content, bot_dashes = m.group(1), m.group(2), m.group(3)
+        if "⚕" not in content:
+            return m.group(0)
+        inner_width = len(top_dashes)
+        icon_pos = content.index("⚕")
+        title_part = content[icon_pos:].rstrip()
+        centred = title_part.center(inner_width)
+        return f"┌{top_dashes}┐\n│{centred}│\n└{bot_dashes}┘"
+    return _BOX_TITLE_RE.sub(recentre, text)
 
 
 def infrastructure_failure_reason(output: str) -> str | None:
@@ -4190,25 +4224,25 @@ def _doctor_system_checks(cfg: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _doctor_hermes_checks(cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    """PRD-009: Hermes runtime health checks."""
+    """PRD-009: TAG runtime health checks."""
     checks: list[dict[str, Any]] = []
     prereqs = doctor_prerequisites(cfg)
 
     bin_exists = hermes_bin(cfg).exists()
     checks.append({
-        "name": "hermes_binary",
+        "name": "tag_binary",
         "status": "pass" if bin_exists else "fail",
-        "message": str(hermes_bin(cfg)) if bin_exists else "not provisioned",
+        "message": rewrite_cli_hints(str(hermes_bin(cfg))) if bin_exists else "not provisioned",
         "fix_cmd": None if bin_exists else "tag setup",
     })
 
     if bin_exists:
         try:
-            v = run_hermes(cfg, "--version").stdout.strip()
-            checks.append({"name": "hermes_version", "status": "pass", "message": v})
+            v = rewrite_cli_hints(run_hermes(cfg, "--version").stdout.strip())
+            checks.append({"name": "tag_version", "status": "pass", "message": v})
         except subprocess.CalledProcessError as exc:
             checks.append({
-                "name": "hermes_version",
+                "name": "tag_version",
                 "status": "fail",
                 "message": exc.stderr.strip() or str(exc),
                 "fix_cmd": "tag setup --refresh",
@@ -4243,7 +4277,7 @@ def _doctor_profile_checks(cfg: dict[str, Any], profile_name: str) -> list[dict[
     checks.append({
         "name": "home",
         "status": "pass" if home_ok else "fail",
-        "message": str(ph) if home_ok else "missing",
+        "message": rewrite_cli_hints(str(ph)) if home_ok else "missing",
         "fix_cmd": None if home_ok else f"tag bootstrap",
     })
     if not home_ok:
@@ -4383,11 +4417,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         }
         if hermes_bin(cfg).exists():
             try:
-                report["hermes_version"] = run_hermes(cfg, "--version").stdout.strip()
+                report["tag_version"] = rewrite_cli_hints(run_hermes(cfg, "--version").stdout.strip())
             except subprocess.CalledProcessError as exc:
-                report["hermes_version_error"] = exc.stderr.strip()
+                report["tag_version_error"] = exc.stderr.strip()
         else:
-            report["hermes_version"] = "not provisioned yet"
+            report["tag_version"] = "not provisioned yet"
 
         profiles_report: dict[str, Any] = {}
         profiles_to_check = (
@@ -4408,7 +4442,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # Rich / plain-text grouped report
     groups: dict[str, list[dict[str, Any]]] = {}
     groups["system"] = _doctor_system_checks(cfg)
-    groups["hermes runtime"] = _doctor_hermes_checks(cfg)
+    groups["tag runtime"] = _doctor_hermes_checks(cfg)
 
     profiles_to_check = (
         [target_profile] if target_profile
@@ -9310,75 +9344,75 @@ def build_parser() -> argparse.ArgumentParser:
     import_cursor.add_argument("--json", action="store_true")
     import_cursor.set_defaults(func=cmd_import_cursor)
 
-    hermes_cmd = sub.add_parser("hermes", help="Pass raw arguments through to the managed runtime binary")
+    hermes_cmd = sub.add_parser("runtime", help="Pass raw arguments through to the managed runtime binary")
     hermes_cmd.add_argument("--profile", help="Run the managed runtime inside one TAG profile home")
     hermes_cmd.add_argument("--version", dest="hermes_version", action="store_true", help="Show the managed runtime version")
-    hermes_cmd.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    hermes_cmd.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     hermes_cmd.set_defaults(func=cmd_hermes_passthrough)
 
     chat = sub.add_parser("chat", help="Run chat inside a TAG profile")
     chat.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    chat.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    chat.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     chat.set_defaults(func=cmd_chat)
 
     gateway = sub.add_parser("gateway", help="Run gateway commands inside a TAG profile")
     gateway.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    gateway.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    gateway.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     gateway.set_defaults(func=cmd_gateway)
 
     kanban = sub.add_parser("kanban", help="Run Kanban commands inside a TAG profile")
     kanban.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    kanban.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    kanban.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     kanban.set_defaults(func=cmd_kanban)
 
     model = sub.add_parser("model", help="Run model commands inside a TAG profile")
     model.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    model.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    model.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     model.set_defaults(func=cmd_model)
 
     profile = sub.add_parser("profile", help="Run profile commands in the managed TAG environment")
     profile.add_argument("--profile", help="Optional active profile home override")
-    profile.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    profile.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     profile.set_defaults(func=cmd_profile)
 
     status = sub.add_parser("status", help="Run status inside a TAG profile")
     status.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    status.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    status.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     status.set_defaults(func=cmd_status)
 
     config_cmd = sub.add_parser("config", help="Run config inside a TAG profile")
     config_cmd.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    config_cmd.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    config_cmd.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     config_cmd.set_defaults(func=cmd_config)
 
     sessions = sub.add_parser("sessions", help="Run sessions inside a TAG profile")
     sessions.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    sessions.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    sessions.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     sessions.set_defaults(func=cmd_sessions)
 
     skills = sub.add_parser("skills", help="Run skills inside a TAG profile")
     skills.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    skills.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    skills.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     skills.set_defaults(func=cmd_skills)
 
     plugins = sub.add_parser("plugins", help="Run plugins inside a TAG profile")
     plugins.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    plugins.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    plugins.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     plugins.set_defaults(func=cmd_plugins)
 
     tools_cmd = sub.add_parser("tools", help="Run tools inside a TAG profile")
     tools_cmd.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    tools_cmd.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    tools_cmd.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     tools_cmd.set_defaults(func=cmd_tools)
 
     mcp = sub.add_parser("mcp", help="Run MCP commands inside a TAG profile")
     mcp.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    mcp.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    mcp.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     mcp.set_defaults(func=cmd_mcp)
 
     logs = sub.add_parser("logs", help="Run logs inside a TAG profile")
     logs.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    logs.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    logs.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     logs.set_defaults(func=cmd_logs)
 
     dashboard = sub.add_parser("dashboard", help="Run dashboard inside a TAG profile")
@@ -9386,33 +9420,33 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--port", type=int, metavar="N", help="Dashboard port (default: 3333)")
     dashboard.add_argument("--no-browser", action="store_false", dest="open_browser",
                            help="Print URL only; don't open browser tab")
-    dashboard.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    dashboard.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     dashboard.set_defaults(func=cmd_dashboard)
 
     memory = sub.add_parser("memory", help="Run memory inside a TAG profile")
     memory.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    memory.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    memory.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     memory.set_defaults(func=cmd_memory)
 
     completion = sub.add_parser("completion", help="Run completion inside a TAG profile")
     completion.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    completion.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    completion.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     completion.set_defaults(func=cmd_completion)
 
     prompt_size = sub.add_parser("prompt-size", help="Run prompt-size inside a TAG profile")
     prompt_size.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    prompt_size.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    prompt_size.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     prompt_size.set_defaults(func=cmd_prompt_size)
 
     update = sub.add_parser("update", help="Run update inside a TAG profile")
     update.add_argument("--profile", default="orchestrator", help="TAG profile to use")
     update.add_argument("--json", action="store_true", help="When TAG manages the update locally, emit JSON")
-    update.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    update.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     update.set_defaults(func=cmd_update)
 
     tui = sub.add_parser("tui", help="Launch the managed TUI through TAG")
     tui.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    tui.add_argument("hermes_args", nargs=argparse.REMAINDER)
+    tui.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     tui.set_defaults(func=cmd_tui)
 
     # ---- PRD-002: memory-journal ----
@@ -9444,7 +9478,7 @@ def build_parser() -> argparse.ArgumentParser:
         mj_p.set_defaults(func=cmd_memory_journal)
 
     # ---- PRD-004: swarm ----
-    swarm = sub.add_parser("swarm", help="Launch a Hermes Kanban swarm using TAG's profile topology")
+    swarm = sub.add_parser("swarm", help="Launch a TAG Kanban swarm using TAG's profile topology")
     swarm.add_argument("task", help="Task description for the swarm")
     swarm.add_argument("--profile", help="Orchestrator profile (default: master_profile)")
     swarm.add_argument("--type", dest="task_type", default="mixed", choices=("research", "implementation", "review", "mixed"))
