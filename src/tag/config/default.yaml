@@ -96,7 +96,7 @@ profiles:
         default: deepseek/deepseek-v4-pro
   codex-runtime-master:
     description: Codex app-server based master for direct runtime comparison against
-      Hermes-owned orchestration.
+      TAG-managed orchestration.
     tags:
     - codex
     - master

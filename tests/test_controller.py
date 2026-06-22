@@ -415,7 +415,7 @@ def test_safe_extract_rejects_traversal_and_links(tmp_path):
 def test_safe_extract_rejects_corrupt_archive(tmp_path):
     archive = tmp_path / "corrupt.tar.gz"
     archive.write_bytes(b"not-a-real-tarball")
-    with pytest.raises(SystemExit, match="Bundled Hermes archive could not be read:"):
+    with pytest.raises(SystemExit, match="TAG runtime archive could not be read:"):
         TAG.safe_extract_tar_gz(archive, tmp_path / "out")
 
 

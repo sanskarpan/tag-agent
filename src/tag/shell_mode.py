@@ -1,7 +1,7 @@
-"""PRD-019: Natural Language Shell Mode for TAG CLI.
+"""Natural Language Shell Mode for TAG CLI.
 
 Provides an interactive REPL that accepts plain-English instructions and
-routes them to the appropriate Hermes profile via subprocess, with support
+routes them to the appropriate TAG profile via subprocess, with support
 for slash-command shortcuts and automatic task-type classification.
 """
 
@@ -70,7 +70,7 @@ object itself. Example:
 
 
 def classify_input(text: str, cfg: dict[str, Any], profile: str) -> dict[str, Any]:
-    """Call hermes with the classifier prompt and return parsed JSON.
+    """Call the TAG runtime with the classifier prompt and return parsed JSON.
 
     Falls back to a safe default if the subprocess fails or returns
     malformed output.
@@ -165,7 +165,7 @@ def _dispatch_to_hermes(
     *,
     target_profile: str,
 ) -> int:
-    """Run hermes chat -q <text> -Q for the given profile, streaming output live."""
+    """Run TAG runtime chat -q <text> -Q for the given profile, streaming output live."""
     try:
         from tag.controller import (  # noqa: PLC0415
             ensure_runtime_dirs,
@@ -187,7 +187,7 @@ def _dispatch_to_hermes(
         )
         return int(proc.returncode)
     except (subprocess.SubprocessError, OSError) as exc:
-        print(f"error: hermes subprocess failed: {exc}", file=sys.stderr)
+        print(f"error: TAG subprocess failed: {exc}", file=sys.stderr)
         return 1
 
 
@@ -197,7 +197,7 @@ def _dispatch_to_hermes(
 
 
 def run_shell(cfg: dict[str, Any], profile_name: str) -> int:
-    """Run the TAG natural-language shell (PRD-019).
+    """Run the TAG natural-language shell.
 
     Presents an interactive prompt, classifies input, routes to the
     appropriate profile, and handles slash-command shortcuts.

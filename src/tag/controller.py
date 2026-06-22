@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TAG control-plane CLI built on top of Hermes."""
+"""TAG control-plane CLI."""
 
 from __future__ import annotations
 
@@ -1214,8 +1214,11 @@ def rewrite_cli_hints(text: str) -> str:
         rewritten,
         flags=re.IGNORECASE,
     )
+    # BUG-001/002/003: hermes auth/portal have no direct tag equivalent — route through `tag runtime`
+    rewritten = re.sub(r"\bhermes auth\b", f"{label} runtime auth", rewritten, flags=re.IGNORECASE)
+    rewritten = re.sub(r"\bhermes portal\b", f"{label} runtime portal", rewritten, flags=re.IGNORECASE)
     rewritten = re.sub(
-        r"\bhermes (?=(auth|config|model|setup|update|gateway|sessions|doctor|tools|portal|status|plugins|skills|mcp|logs|memory|completion|prompt-size|chat|--resume|-c)\b)",
+        r"\bhermes (?=(config|model|setup|update|gateway|sessions|doctor|tools|status|plugins|skills|mcp|logs|memory|completion|prompt-size|chat|--resume|-c)\b)",
         f"{label} ",
         rewritten,
         flags=re.IGNORECASE,
@@ -1224,7 +1227,8 @@ def rewrite_cli_hints(text: str) -> str:
     rewritten = re.sub(r"\btag/tag\b", "tag", rewritten, flags=re.IGNORECASE)
     # BUG-004/BUG-005: version strings from the runtime binary
     rewritten = re.sub(r"\bHermes Agent\b", "TAG", rewritten, flags=re.IGNORECASE)
-    rewritten = re.sub(r"\bhermes-agent\b", "tag-agent", rewritten, flags=re.IGNORECASE)
+    # BUG-005: only rewrite bare "hermes-agent" (not "hermes-agent-upstream" dir names — they're real paths)
+    rewritten = re.sub(r"\bhermes-agent(?!-upstream\b)", "tag-agent", rewritten, flags=re.IGNORECASE)
     rewritten = re.sub(r"\bthis Hermes profile\b", "this TAG profile", rewritten, flags=re.IGNORECASE)
     rewritten = re.sub(r"\bActive Hermes profile\b", "Active TAG profile", rewritten, flags=re.IGNORECASE)
     rewritten = re.sub(r"\bHermes profile\b", "TAG profile", rewritten, flags=re.IGNORECASE)
@@ -1233,6 +1237,18 @@ def rewrite_cli_hints(text: str) -> str:
     rewritten = re.sub(
         r'(?:/[^/\s]+)+/\.tag/runtime/home/\.hermes/profiles/',
         '~/.tag/runtime/profiles/',
+        rewritten,
+    )
+    # BUG-005: rewrite managed hermes-agent-upstream dir to stable display path
+    rewritten = re.sub(
+        r'(?:/[^/\s]+)+/\.tag/managed/hermes-agent-upstream',
+        '~/.tag/managed/runtime',
+        rewritten,
+    )
+    # BUG-019: tilde-shorten any remaining absolute ~/.tag/runtime/home paths
+    rewritten = re.sub(
+        r'(?:/[^/\s]+)+/\.tag/runtime/home/',
+        '~/.tag/runtime/home/',
         rewritten,
     )
     # BUG-010: bare ~/.hermes path shown in `tag profile`
@@ -2021,6 +2037,10 @@ def doctor_prerequisites(cfg: dict[str, Any]) -> dict[str, Any]:
         "hermes_checkout_kind": hermes_checkout_kind(root),
         "hermes_python_exists": python_bin.exists(),
         "bundled_hermes_available": bundled_hermes_archive().exists(),
+        # TAG-branded aliases (hermes_* kept for internal compat)
+        "tag_runtime_exists": root.exists(),
+        "tag_runtime_kind": hermes_checkout_kind(root),
+        "tag_python_exists": python_bin.exists(),
         "patch_status": patch_status(cfg),
         "tui_dist_exists": tui_dist.exists(),
         "tui_react_installed": tui_react.exists(),
@@ -2066,24 +2086,24 @@ def safe_extract_tar_gz(archive: Path, target: Path) -> None:
                 member_name = member.name
                 pure = PurePosixPath(member_name)
                 if pure.is_absolute() or ".." in pure.parts:
-                    raise SystemExit(f"Bundled Hermes archive contains an unsafe entry: {member_name}")
+                    raise SystemExit(f"TAG runtime archive contains an unsafe entry: {member_name}")
                 if member.issym() or member.islnk():
-                    raise SystemExit(f"Bundled Hermes archive contains an unsupported link entry: {member_name}")
+                    raise SystemExit(f"TAG runtime archive contains an unsupported link entry: {member_name}")
                 if not (member.isdir() or member.isfile()):
-                    raise SystemExit(f"Bundled Hermes archive contains an unsupported entry type: {member_name}")
+                    raise SystemExit(f"TAG runtime archive contains an unsupported entry type: {member_name}")
                 dest = (target / member_name).resolve()
                 if target_real != dest and target_real not in dest.parents:
-                    raise SystemExit(f"Bundled Hermes archive contains a path traversal entry: {member_name}")
+                    raise SystemExit(f"TAG runtime archive contains a path traversal entry: {member_name}")
             for member in members:
                 tf.extract(member, target)
     except (tarfile.TarError, OSError) as exc:
-        raise SystemExit(f"Bundled Hermes archive could not be read: {archive}") from exc
+        raise SystemExit(f"TAG runtime archive could not be read: {archive}") from exc
 
 
 def extract_bundled_hermes(root: Path) -> dict[str, Any]:
     archive = bundled_hermes_archive()
     if not archive.exists():
-        raise SystemExit("Bundled Hermes snapshot is not available in this TAG build.")
+        raise SystemExit("TAG runtime bundle is not available in this build.")
     ensure_parent(root)
     if root.exists():
         shutil.rmtree(root)
@@ -4406,10 +4426,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "package_root": str(package_root()),
             "tag_home": str(tag_home()),
             "managed_root": str(managed_root()),
-            "hermes_root": str(hermes_root(cfg)),
-            "hermes_bin_exists": hermes_bin(cfg).exists(),
+            "tag_runtime_root": rewrite_cli_hints(str(hermes_root(cfg))),
+            "tag_bin_exists": hermes_bin(cfg).exists(),
             "home": env["HOME"],
-            "hermes_home": env["HERMES_HOME"],
+            "tag_runtime_home": env["HERMES_HOME"],
             "codex_home": env["CODEX_HOME"],
             "config": str(config_path(args.config)),
             "benchmark_suite": str(benchmark_suite_path(None)),
@@ -4473,7 +4493,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         print(f"  {item['profile']}: {item['status']}")
     print("Rendered:")
     for item in rendered:
-        print(f"  {item['profile']}: {item['config']}")
+        print(f"  {item['profile']}: {rewrite_cli_hints(item['config'])}")
     return 0
 
 
@@ -4484,7 +4504,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         print(json.dumps(rendered, indent=2))
         return 0
     for item in rendered:
-        print(f"{item['profile']}: {item['config']}")
+        print(f"{item['profile']}: {rewrite_cli_hints(item['config'])}")
     return 0
 
 
@@ -9456,12 +9476,12 @@ def build_parser() -> argparse.ArgumentParser:
     mj_save = mj_sub.add_parser("save", help="Save a key→value fact")
     mj_save.add_argument("key", help="Fact key (e.g. 'project context')")
     mj_save.add_argument("value", help="Fact value")
-    mj_save.add_argument("--profile", help="Profile (default: master_profile)")
+    mj_save.add_argument("--profile", help="Profile (default: orchestrator)")
     mj_save.add_argument("--ttl-days", type=int, metavar="N", dest="ttl_days")
     mj_save.add_argument("--json", action="store_true")
 
     mj_list = mj_sub.add_parser("list", help="List journal entries")
-    mj_list.add_argument("--profile", help="Profile (default: master_profile)")
+    mj_list.add_argument("--profile", help="Profile (default: orchestrator)")
     mj_list.add_argument("--json", action="store_true")
 
     mj_forget = mj_sub.add_parser("forget", help="Delete a journal entry by ID")
@@ -9469,7 +9489,7 @@ def build_parser() -> argparse.ArgumentParser:
     mj_forget.add_argument("--json", action="store_true")
 
     mj_clear = mj_sub.add_parser("clear", help="Clear all journal entries for a profile")
-    mj_clear.add_argument("--profile", help="Profile (default: master_profile)")
+    mj_clear.add_argument("--profile", help="Profile (default: orchestrator)")
     mj_clear.add_argument("--confirm", action="store_true")
     mj_clear.add_argument("--json", action="store_true")
 
@@ -9480,7 +9500,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- PRD-004: swarm ----
     swarm = sub.add_parser("swarm", help="Launch a TAG Kanban swarm using TAG's profile topology")
     swarm.add_argument("task", help="Task description for the swarm")
-    swarm.add_argument("--profile", help="Orchestrator profile (default: master_profile)")
+    swarm.add_argument("--profile", help="Orchestrator profile (default: orchestrator)")
     swarm.add_argument("--type", dest="task_type", default="mixed", choices=("research", "implementation", "review", "mixed"))
     swarm.add_argument("--board", help="Kanban board name (default: from config)")
     swarm.add_argument("--no-wait", action="store_true", dest="no_wait",
@@ -9505,7 +9525,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     q_add = queue_sub.add_parser("add", help="Queue a task to run in the background")
     q_add.add_argument("task", help="Task description")
-    q_add.add_argument("--profile", help="Profile to use (default: master_profile)")
+    q_add.add_argument("--profile", help="Profile to use (default: orchestrator)")
     q_add.add_argument("--type", dest="task_type", default="mixed")
     q_add.add_argument("--priority", type=int, default=5)
     q_add.add_argument("--no-notify", action="store_true")
@@ -9626,17 +9646,17 @@ def build_parser() -> argparse.ArgumentParser:
     trace_export.add_argument("--trace-id", metavar="ID", dest="trace_id")
     trace_export.add_argument("--profile")
     # PRD-032: replay, diff, checkpoint, snapshot
-    trace_replay = trace_sub.add_parser("replay", help="Replay a captured trace snapshot (PRD-032)")
+    trace_replay = trace_sub.add_parser("replay", help="Replay a captured trace snapshot")
     trace_replay.add_argument("trace_id", metavar="TRACE_ID")
     trace_replay.add_argument("--json", action="store_true")
-    trace_diff = trace_sub.add_parser("diff", help="Diff two traces span-by-span (PRD-032)")
+    trace_diff = trace_sub.add_parser("diff", help="Diff two traces span-by-span")
     trace_diff.add_argument("trace_a", metavar="TRACE_A")
     trace_diff.add_argument("trace_b", metavar="TRACE_B")
     trace_diff.add_argument("--json", action="store_true")
-    trace_checkpoint = trace_sub.add_parser("checkpoint", help="List snapshots for a trace (PRD-032)")
+    trace_checkpoint = trace_sub.add_parser("checkpoint", help="List snapshots for a trace")
     trace_checkpoint.add_argument("trace_id", metavar="TRACE_ID")
     trace_checkpoint.add_argument("--json", action="store_true")
-    trace_snapshot = trace_sub.add_parser("snapshot", help="Capture a trace snapshot (PRD-032)")
+    trace_snapshot = trace_sub.add_parser("snapshot", help="Capture a trace snapshot")
     trace_snapshot.add_argument("trace_id", metavar="TRACE_ID")
     for tp in [trace, trace_list, trace_show, trace_export,
                trace_replay, trace_diff, trace_checkpoint, trace_snapshot]:
@@ -9722,7 +9742,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ---- PRD-019: shell ----
     shell_cmd = sub.add_parser("shell", help="Open interactive natural-language TAG shell")
-    shell_cmd.add_argument("--profile", help="Profile to use (default: master_profile)")
+    shell_cmd.add_argument("--profile", help="Profile to use (default: orchestrator)")
     shell_cmd.set_defaults(func=cmd_shell)
 
     # ---- PRD-020: review-pr / ci ----
@@ -9750,7 +9770,7 @@ def build_parser() -> argparse.ArgumentParser:
     loop_sub = loop_cmd.add_subparsers(dest="loop_subcommand")
     loop_start = loop_sub.add_parser("start", help="Start an autonomous loop")
     loop_start.add_argument("--goal", required=True, help="Goal text the loop works toward")
-    loop_start.add_argument("--profile", help="Profile to run (default: master_profile)")
+    loop_start.add_argument("--profile", help="Profile to run (default: orchestrator)")
     loop_start.add_argument("--max-iters", type=int, default=10, dest="max_iters",
                             help="Maximum number of iterations (default: 10)")
     loop_start.add_argument("--approval", choices=["auto", "human"], default="auto",
@@ -9901,7 +9921,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ---- PRD-031: route fallback ----
     # Extend the existing 'route' command with a 'fallback' subgroup
-    route_fallback_cmd = sub.add_parser("route-fallback", help="Manage model fallback chains (PRD-031)")
+    route_fallback_cmd = sub.add_parser("route-fallback", help="Manage model fallback chains")
     rf_sub = route_fallback_cmd.add_subparsers(dest="fallback_subcommand")
     rf_add = rf_sub.add_parser("add", help="Add a fallback chain")
     rf_add.add_argument("--primary", required=True, help="Primary model ID")
@@ -9931,7 +9951,7 @@ def build_parser() -> argparse.ArgumentParser:
     # (already registered above — we just need to add the new subcommands)
 
     # ---- PRD-033: dependency-aware task queue / DAG ----
-    dag_cmd = sub.add_parser("dag", help="DAG workflow engine for queue jobs (PRD-033)")
+    dag_cmd = sub.add_parser("dag", help="DAG workflow engine for queue jobs")
     dag_sub = dag_cmd.add_subparsers(dest="dag_subcommand")
     dag_show = dag_sub.add_parser("show", help="Show job dependency graph")
     dag_show.add_argument("job_ids", nargs="*", metavar="JOB_ID", help="Job IDs to show (default: all)")
@@ -9947,7 +9967,7 @@ def build_parser() -> argparse.ArgumentParser:
     for dp in [dag_cmd, dag_show, dag_save, dag_run, dag_list]:
         dp.set_defaults(func=cmd_dag)
 
-    qext_cmd = sub.add_parser("queue-dep", help="Add queue job with dependencies (PRD-033)")
+    qext_cmd = sub.add_parser("queue-dep", help="Add queue job with dependencies")
     qext_sub = qext_cmd.add_subparsers(dest="queue_ext_subcommand")
     qadd = qext_sub.add_parser("add", help="Add a queue job with --depends-on")
     qadd.add_argument("task", metavar="TASK")
@@ -9963,7 +9983,7 @@ def build_parser() -> argparse.ArgumentParser:
         qp.set_defaults(func=cmd_queue_extended)
 
     # ---- PRD-034: secret scanning ----
-    sec_cmd = sub.add_parser("security", help="Secret scanning and security auditing (PRD-034)")
+    sec_cmd = sub.add_parser("security", help="Secret scanning and security auditing")
     sec_cmd.add_argument("--json", action="store_true")
     sec_sub = sec_cmd.add_subparsers(dest="security_subcommand")
     sec_scan = sec_sub.add_parser("scan", help="Scan files for secrets")
@@ -9976,7 +9996,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.set_defaults(func=cmd_security)
 
     # ---- PRD-035: IDE Bridge / LSP ----
-    lsp_cmd = sub.add_parser("lsp", help="TAG IDE Bridge / LSP server (PRD-035)")
+    lsp_cmd = sub.add_parser("lsp", help="TAG IDE Bridge / LSP server")
     lsp_sub = lsp_cmd.add_subparsers(dest="lsp_subcommand")
     lsp_start = lsp_sub.add_parser("start", help="Start LSP server")
     lsp_start.add_argument("--port", type=int, default=7878, help="TCP port (0=stdio)")
@@ -9987,14 +10007,14 @@ def build_parser() -> argparse.ArgumentParser:
         lp.set_defaults(func=cmd_lsp)
 
     # ---- PRD-036: Web Dashboard ----
-    web_cmd = sub.add_parser("web", help="Local web dashboard (FastAPI+React) (PRD-036)")
+    web_cmd = sub.add_parser("web", help="Local web dashboard (FastAPI+React)")
     web_cmd.add_argument("--port", type=int, default=8787)
     web_cmd.add_argument("--host", default="127.0.0.1")
     web_cmd.add_argument("--no-browser", action="store_true")
     web_cmd.set_defaults(func=cmd_web)
 
     # ---- PRD-037: Agent Personas ----
-    persona_cmd = sub.add_parser("persona", help="Agent persona management (PRD-037)")
+    persona_cmd = sub.add_parser("persona", help="Agent persona management")
     persona_sub = persona_cmd.add_subparsers(dest="persona_subcommand")
     pa_list = persona_sub.add_parser("list", help="List available personas")
     pa_list.add_argument("--json", action="store_true")
@@ -10019,7 +10039,7 @@ def build_parser() -> argparse.ArgumentParser:
         pp.set_defaults(func=cmd_persona)
 
     # ---- PRD-038: Diff-Aware Context Injection ----
-    diff_cmd = sub.add_parser("diff-context", help="Inject git diff context for agent runs (PRD-038)")
+    diff_cmd = sub.add_parser("diff-context", help="Inject git diff context for agent runs")
     diff_cmd.add_argument("--ref", default="HEAD", help="Git ref to diff against")
     diff_cmd.add_argument("--staged", action="store_true", help="Diff staged changes only")
     diff_cmd.add_argument("--pr", type=int, metavar="PR_NUMBER", help="GitHub PR number")
@@ -10033,7 +10053,7 @@ def build_parser() -> argparse.ArgumentParser:
     diff_cmd.set_defaults(func=cmd_diff_inject)
 
     # ---- PRD-039: Token Budget Enforcement ----
-    budget_cmd = sub.add_parser("budget", help="Per-profile token budget enforcement (PRD-039)")
+    budget_cmd = sub.add_parser("budget", help="Per-profile token budget enforcement")
     budget_sub = budget_cmd.add_subparsers(dest="budget_subcommand")
     b_set = budget_sub.add_parser("set", help="Set token budget")
     b_set.add_argument("--profile")
@@ -10054,7 +10074,7 @@ def build_parser() -> argparse.ArgumentParser:
         bp.set_defaults(func=cmd_budget)
 
     # ---- PRD-040: Notification Hooks ----
-    notify_cmd = sub.add_parser("notify", help="Notification hooks (Slack, email, desktop) (PRD-040)")
+    notify_cmd = sub.add_parser("notify", help="Notification hooks (Slack, email, desktop)")
     notify_sub = notify_cmd.add_subparsers(dest="notify_subcommand")
     n_add = notify_sub.add_parser("add", help="Add a notification hook")
     n_add.add_argument("--event", default="run.completed")
@@ -10078,7 +10098,7 @@ def build_parser() -> argparse.ArgumentParser:
         np.set_defaults(func=cmd_notify)
 
     # ---- PRD-041: OTel GenAI Span Cost Attribution ----
-    otel_cmd = sub.add_parser("otel-export", help="Export spans with OTel GenAI semconv attributes (PRD-041)")
+    otel_cmd = sub.add_parser("otel-export", help="Export spans with OTel GenAI semconv attributes")
     otel_cmd.add_argument("--trace-id", dest="trace_id", metavar="TRACE_ID")
     otel_cmd.add_argument("--endpoint", help="OTLP HTTP endpoint (e.g. http://localhost:4318)")
     otel_cmd.add_argument("--semconv", default="1.28.0", help="Override OTel GenAI semconv version")
@@ -10087,7 +10107,7 @@ def build_parser() -> argparse.ArgumentParser:
     otel_cmd.set_defaults(func=cmd_otel_export)
 
     # ---- PRD-042: Architect/Editor Agent Split ----
-    split_cmd = sub.add_parser("split", help="Architect/Editor agent split execution (PRD-042)")
+    split_cmd = sub.add_parser("split", help="Architect/Editor agent split execution")
     split_sub = split_cmd.add_subparsers(dest="split_subcommand")
     sp_list = split_sub.add_parser("list", help="List split runs")
     sp_list.add_argument("--json", action="store_true")
@@ -10104,7 +10124,7 @@ def build_parser() -> argparse.ArgumentParser:
         ssp.set_defaults(func=cmd_split)
 
     # ---- PRD-043: Vector-Based Tool Retrieval ----
-    tr_cmd = sub.add_parser("tool-index", help="Vector tool retrieval for MCP registry (PRD-043)")
+    tr_cmd = sub.add_parser("tool-index", help="Vector tool retrieval for MCP registry")
     tr_sub = tr_cmd.add_subparsers(dest="tr_subcommand")
     tr_index = tr_sub.add_parser("index", help="Build tool embedding index")
     tr_search = tr_sub.add_parser("search", help="Search tools by query")
@@ -10117,7 +10137,7 @@ def build_parser() -> argparse.ArgumentParser:
         tp.set_defaults(func=cmd_tool_retrieval)
 
     # ---- PRD-044: AgentOps Session Observability ----
-    ao_cmd = sub.add_parser("agentops", help="AgentOps session observability (PRD-044)")
+    ao_cmd = sub.add_parser("agentops", help="AgentOps session observability")
     ao_sub = ao_cmd.add_subparsers(dest="agentops_subcommand")
     ao_status = ao_sub.add_parser("status", help="Show AgentOps integration status")
     ao_status.add_argument("--json", action="store_true")
