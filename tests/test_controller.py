@@ -248,14 +248,14 @@ def test_build_parser_exposes_extended_hermes_surface():
         "update",
     ):
         assert command in help_text
-    hermes_help = next(
+    runtime_help = next(
         choice.format_help()
         for action in parser._actions
         if isinstance(action, TAG.argparse._SubParsersAction)
         for name, choice in action.choices.items()
-        if name == "hermes"
+        if name == "runtime"
     )
-    assert "managed runtime" in hermes_help
+    assert "managed runtime" in runtime_help
 
 
 def test_hermes_root_falls_back_to_discovered_checkout(tmp_path, monkeypatch):
