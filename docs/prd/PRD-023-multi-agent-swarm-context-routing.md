@@ -758,3 +758,152 @@ The following OWASP LLM Top 10 (2025) and agent cheat sheet items are explicitly
 - Coordinator LLM JSON reliability may require retry logic and iteration on the system prompt (OQ-01). Allocate 2–3 days of prompt engineering in Sprint 1.
 - `psutil` may not be in the existing dependency set; verify before Sprint 1.
 - SQLite WAL mode interaction with existing `open_db()` usage requires regression testing against PRD-004 and PRD-012 features.
+
+---
+
+## Enhancement: Per-Wave Self-Review and Swarm Self-Improvement Loop
+
+**Added:** v0.7.2 planning cycle — inspired by Sakana AI Darwin Gödel Machine (arXiv:2505.22954) peer-review mechanism and MagenticOne autonomous replanning.
+
+### Background
+
+The base PRD-023 runs each wave of agents once and feeds results to the synthesis step. Sakana AI's **Darwin Gödel Machine (DGM)** demonstrates that adding a *peer-review mechanism* between agent waves — where a reviewer agent critiques and refines prior outputs before the next wave begins — substantially improves result quality. DGM's self-improving agent went from 20% → 50% on SWE-bench by discovering this peer-review pattern autonomously. TAG can implement the peer-review wave as an explicit `--self-review` flag without any evolutionary self-modification.
+
+### New Flags
+
+```bash
+# Append a reviewer wave after each agent wave
+tag swarm run \
+    --goal "Refactor the authentication module for security and test coverage" \
+    --coordinator-profile orchestrator \
+    --max-agents 4 \
+    --self-review \
+    --review-profile reviewer
+
+# Self-review with explicit wave count (run N review iterations before synthesis)
+tag swarm run \
+    --goal "Design the caching layer and implement Redis integration" \
+    --max-agents 4 \
+    --self-review --review-rounds 2 \
+    --review-profile reviewer \
+    --review-threshold 0.8   # stop early if reviewer scores ≥ 0.8
+
+# Full self-improvement loop: review → refine → review → refine (up to N rounds)
+tag swarm run \
+    --goal "Fix all failing tests in the auth module" \
+    --max-agents 4 \
+    --self-improve --improve-rounds 3 \
+    --review-profile reviewer \
+    --refine-profile coder
+```
+
+### Self-Review Wave Protocol
+
+When `--self-review` is active, after each agent wave completes:
+
+1. **Aggregate wave outputs** — collect all subtask outputs from the wave into a single review document.
+2. **Invoke reviewer** — call `--review-profile` (default: `reviewer`) with the aggregated outputs and original goal:
+
+```
+Goal: {goal}
+
+The following outputs were produced by wave {n} agents:
+{aggregated_outputs}
+
+Review these outputs for:
+- Correctness and completeness relative to the goal
+- Consistency across agents (no contradictions)
+- Missing work items that were not addressed
+- Quality issues that need refinement
+
+Respond with:
+SCORE: <float 0.0-1.0>
+ISSUES: <bulleted list of issues, or "none">
+REFINEMENTS_NEEDED: <list of specific refinements, or "none">
+```
+
+3. **Parse reviewer response** — extract SCORE, ISSUES, REFINEMENTS_NEEDED.
+4. **Decision logic:**
+   - If SCORE ≥ `--review-threshold` (default 0.8): proceed to synthesis.
+   - If REFINEMENTS_NEEDED is not empty: spawn a new wave addressing the refinements, then loop.
+   - If `--review-rounds` exceeded: proceed to synthesis regardless.
+
+5. **Store review in context bus** — write reviewer output to `swarm_context` with key `review_wave_{n}` and `value_type=json_object`, so subsequent waves can read the critique.
+
+### Self-Improvement Loop (`--self-improve`)
+
+`--self-improve` extends `--self-review` with active refinement:
+
+```
+Review wave n:   Reviewer critiques wave n outputs
+Refinement wave: Coder/researcher agents address specific issues flagged by reviewer
+Review wave n+1: Reviewer scores the refined outputs
+... (up to --improve-rounds iterations)
+Synthesis:       Final synthesis of the best-scored wave outputs
+```
+
+This replicates DGM's peer-review loop at the workflow layer. Each iteration is recorded in `swarm_tasks` with `task_id = review_wave_{n}` or `refine_wave_{n}`, preserving the full improvement trajectory for debugging.
+
+### New DB Columns
+
+```sql
+-- On swarm_runs:
+ALTER TABLE swarm_runs ADD COLUMN self_review INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE swarm_runs ADD COLUMN review_rounds INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE swarm_runs ADD COLUMN review_threshold REAL NOT NULL DEFAULT 0.8;
+ALTER TABLE swarm_runs ADD COLUMN review_profile TEXT;
+ALTER TABLE swarm_runs ADD COLUMN improve_rounds INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE swarm_runs ADD COLUMN refine_profile TEXT;
+ALTER TABLE swarm_runs ADD COLUMN best_wave_score REAL;
+ALTER TABLE swarm_runs ADD COLUMN best_wave_number INTEGER;
+
+-- On swarm_tasks:
+ALTER TABLE swarm_tasks ADD COLUMN wave_number INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE swarm_tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'work'
+    CHECK(task_kind IN ('work','review','refinement','synthesis'));
+ALTER TABLE swarm_tasks ADD COLUMN review_score REAL;
+ALTER TABLE swarm_tasks ADD COLUMN review_issues_json TEXT;
+```
+
+### Implementation in SwarmRunner
+
+```python
+def run(self) -> dict[str, Any]:
+    manifest = self._coordinator.produce_manifest(...)
+    waves = self._build_waves(manifest["tasks"])
+
+    best_score = 0.0
+    best_wave_outputs = {}
+
+    for wave_n, wave_task_ids in enumerate(waves):
+        results = self._run_wave(wave_task_ids, task_by_id)
+
+        if self._self_review:
+            review = self._run_review_wave(results, wave_n)
+            score = review.get("score", 0.0)
+            if score > best_score:
+                best_score = score
+                best_wave_outputs = {r.task_id: r.output for r in results}
+
+            if score >= self._review_threshold:
+                break  # early stop: quality sufficient
+
+            if self._improve_rounds > 0 and wave_n < self._improve_rounds:
+                refinements = review.get("refinements_needed", [])
+                if refinements:
+                    results = self._run_refinement_wave(results, refinements, wave_n)
+
+    return self._synthesize(list(best_wave_outputs.values()), self._manifest.get("synthesis_profile"))
+```
+
+### Testing Requirements (Self-Review extension)
+
+| Test | Assertion |
+|---|---|
+| `test_swarm_self_review_appends_wave` | `swarm_tasks` has a `task_kind=review` row after each work wave |
+| `test_swarm_review_score_stored` | Review task row has `review_score` populated |
+| `test_swarm_early_stop_on_threshold` | Score ≥ threshold stops loop before `--review-rounds` exhausted |
+| `test_swarm_refinement_wave` | `--self-improve` creates `task_kind=refinement` rows |
+| `test_swarm_best_wave_tracked` | `swarm_runs.best_wave_number` points to highest-scoring wave |
+| `test_swarm_context_bus_review` | Reviewer output written to context bus as `review_wave_0` key |
+| `test_swarm_improve_rounds_terminates` | Loop stops at `--improve-rounds` regardless of score |

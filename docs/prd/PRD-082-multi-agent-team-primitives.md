@@ -1058,5 +1058,177 @@ Consistent with **M (1-2 weeks)** effort estimate. The complexity is rated 3/5: 
 
 ---
 
+---
+
+## Enhancement: Trinity-Style Dynamic Role Assignment
+
+**Added:** v0.7.2 planning cycle — inspired by Sakana AI Trinity (ICLR 2026, arXiv:2604.xxxxx) and Conductor (ICLR 2026).
+
+### Background
+
+The initial PRD defines team orchestration with static roles: each profile is assigned one role (researcher, coder, reviewer) and keeps it for the entire run. Sakana AI's **Trinity** paper demonstrates that a compact evolved coordinator — under 20K parameters — dynamically assigns **Thinker**, **Worker**, and **Verifier** roles to a pool of LLMs *turn-by-turn*, not run-by-run. Their companion **Conductor** paper trains a 7B RL model to write *different specialist instructions* for each worker model per turn. Together they achieve 83.9% on LiveCodeBench and 87.5% on GPQA-Diamond by continuously re-assigning roles based on the current conversational state.
+
+TAG cannot train a Conductor — that requires RL fine-tuning on millions of tokens. But the *role rotation* pattern is implementable at the software layer using TAG's existing profile system and the `teams.py` orchestration runtime.
+
+### New Team Strategy: `TrinityRotation`
+
+```bash
+# Create a Trinity-style rotating-role team
+tag team create trinity-dev \
+    --members researcher,coder,reviewer \
+    --strategy trinity \
+    --coordinator orchestrator \
+    --max-turns 12
+
+# Run a goal through the team
+tag team run trinity-dev \
+    --goal "Implement a Redis-backed rate limiter with tests and a benchmark"
+
+# Trinity strategy emits per-turn role assignments in trace
+tag team trace <run-id>
+```
+
+**How it works:**
+
+1. Before each turn, the `orchestrator` coordinator profile (acting as Trinity's evolved coordinator) is called with the current conversation history and emits a JSON role assignment:
+
+```json
+{
+  "turn": 3,
+  "assignments": {
+    "coder": "worker",
+    "reviewer": "verifier",
+    "researcher": "thinker"
+  },
+  "rationale": "coder has produced a draft; reviewer should now verify correctness; researcher should think about edge cases"
+}
+```
+
+2. **Thinker** speaks first: generates a chain-of-thought about the current state and what's needed next (not yet acting).
+3. **Worker** acts on the Thinker's reasoning: writes code, makes edits, calls tools.
+4. **Verifier** critiques the Worker's output, requests corrections, or approves it for the next turn.
+5. Roles rotate on each turn based on the coordinator's judgment — the coder can become the verifier if the verifier proved to be the best critic in prior turns.
+
+### Role Assignment Schema
+
+```json
+{
+  "turn": 3,
+  "assignments": {
+    "<profile_name>": "thinker | worker | verifier | idle"
+  },
+  "rationale": "<one-sentence explanation>",
+  "next_speaker": "<profile_name>"
+}
+```
+
+`idle` agents skip the turn and receive only a summary, preserving their context window. This is Trinity's key efficiency: agents not assigned an active role are not called, avoiding redundant API calls.
+
+### Conductor-Inspired Specialist Instructions
+
+When the coordinator assigns roles, it also emits *per-agent turn instructions* — a brief, targeted directive for each active agent in this turn:
+
+```json
+{
+  "turn_instructions": {
+    "coder": "Focus on the Redis connection pool initialization in the rate_limiter.py module. Use hiredis for performance.",
+    "reviewer": "Verify that the atomic INCR + EXPIRE Redis sequence is race-condition-free under concurrent requests.",
+    "researcher": "Think about whether sliding window or token bucket semantics are more appropriate for this use case."
+  }
+}
+```
+
+These instructions are prepended to each agent's context for this turn. They replicate Conductor's key capability — writing "specialized natural-language instructions for each worker LLM" — without training a 7B model.
+
+### Implementation Details
+
+**New strategy class in `teams.py`:**
+
+```python
+class TrinityRotationStrategy:
+    def __init__(self, coordinator_profile: str, max_turns: int):
+        self.coordinator = coordinator_profile
+        self.max_turns = max_turns
+
+    def assign_roles(self, history: list[dict], members: list[str]) -> dict:
+        """Call coordinator to assign Thinker/Worker/Verifier roles for this turn."""
+        prompt = TRINITY_ROLE_ASSIGNMENT_PROMPT.format(
+            history=_format_history(history),
+            members=", ".join(members),
+        )
+        raw = _invoke_profile(self.coordinator, prompt)
+        return _parse_json_safe(raw) or _fallback_assignment(members)
+
+    def run(self, goal: str, team: Team) -> TeamResult:
+        """Execute the Trinity rotation loop for up to max_turns."""
+        history = [{"role": "system", "content": goal}]
+        for turn in range(self.max_turns):
+            assignment = self.assign_roles(history, [m.name for m in team.members])
+            if assignment.get("status") == "done":
+                break
+            thinker, worker, verifier = _extract_roles(assignment, team)
+            if thinker:
+                thought = _run_turn(thinker, history, role="thinker",
+                                    instruction=assignment["turn_instructions"].get(thinker.name, ""))
+                history.append({"role": thinker.name, "kind": "thought", "content": thought})
+            if worker:
+                action = _run_turn(worker, history, role="worker",
+                                   instruction=assignment["turn_instructions"].get(worker.name, ""))
+                history.append({"role": worker.name, "kind": "action", "content": action})
+            if verifier:
+                verdict = _run_turn(verifier, history, role="verifier",
+                                    instruction=assignment["turn_instructions"].get(verifier.name, ""))
+                history.append({"role": verifier.name, "kind": "verdict", "content": verdict})
+                if "APPROVED" in verdict.upper():
+                    break
+        return _synthesize_history(history)
+```
+
+### New DB Column
+
+```sql
+ALTER TABLE team_runs ADD COLUMN strategy_metadata_json TEXT;
+-- Stores per-turn role assignments for trace replay and debugging
+```
+
+### New CLI Flags for Trinity
+
+```bash
+# Existing: tag team create <name> --members A,B,C --strategy roundrobin
+# New:
+tag team create <name> --members A,B,C --strategy trinity \
+    --coordinator orchestrator \
+    --max-turns 15 \
+    --require-verifier-approval  # don't proceed to next turn until verifier approves
+
+# Inspect role assignments per turn
+tag team trace <run-id> --show-roles
+# Output shows:
+# Turn 1: researcher=thinker, coder=worker, reviewer=verifier
+# Turn 2: coder=thinker, reviewer=worker, researcher=verifier
+# Turn 3: researcher=idle, coder=worker, reviewer=verifier → APPROVED
+
+# Export turn-by-turn transcript
+tag team trace <run-id> --format json > transcript.json
+```
+
+### Performance Characteristics
+
+- **Coordinator overhead:** 1 extra LLM call per turn (coordinator role assignment). For 12 turns, 12 coordinator calls + up to 36 member calls = 48 total calls max.
+- **Efficiency gain vs RoundRobin:** Idle agents (role=`idle`) skip the turn, saving 1/3 of calls on average when one agent is idle per turn.
+- **Quality vs RoundRobin:** Trinity paper shows 15–25% quality improvement over static round-robin on complex reasoning tasks by concentrating the right expertise at the right moment.
+
+### Testing Requirements (Trinity extension)
+
+| Test | Assertion |
+|---|---|
+| `test_trinity_role_assignment_parses` | Coordinator JSON parsed correctly; thinker/worker/verifier extracted |
+| `test_trinity_role_rotation` | Role assignments differ between turns (coordinator actually rotates) |
+| `test_trinity_idle_skips` | Member with role=idle not called for that turn |
+| `test_trinity_verifier_stops` | APPROVED in verifier output terminates the turn loop |
+| `test_trinity_fallback_assignment` | Malformed coordinator JSON → fallback round-robin assignment |
+| `test_trinity_turn_instructions` | Each active member's prompt contains its turn instruction |
+| `test_trinity_max_turns_terminates` | Loop stops at max_turns even without APPROVED |
+
 *GitHub issue: #347*
 

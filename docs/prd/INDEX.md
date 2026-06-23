@@ -26,6 +26,26 @@ See [FEATURES_ROADMAP.md](../FEATURES_ROADMAP.md) for the full cluster map.
 
 ---
 
+## Cluster K — Sakana AI Competitive Gap PRDs (PRD-126 to PRD-127)
+
+Added in v0.7.2 planning cycle after competitive research against Sakana AI (Tokyo lab, $2.65B valuation, Jun 2026).
+These PRDs address capabilities where Sakana leads and where TAG can close the gap at the software layer without GPU compute.
+
+| PRD | Feature | Gap Addressed | Priority | Effort |
+|-----|---------|--------------|----------|--------|
+| [126](PRD-126-inference-time-tree-search-solve.md) | `tag solve` — Inference-time multi-model tree search (AB-MCTS inspired) | Sakana AB-MCTS / TreeQuest — multi-model inference-time scaling | P1 | L |
+| [127](PRD-127-evolutionary-profile-optimization.md) | `tag evolve` — Evolutionary profile configuration optimization | Sakana Evolutionary Model Merging / CycleQD / ShinkaEvolve | P2 | L |
+
+**Enhancements to existing PRDs (same sprint cycle):**
+
+| PRD | Enhancement | Gap Addressed |
+|-----|------------|--------------|
+| [PRD-082](PRD-082-multi-agent-team-primitives.md) | Trinity-style dynamic Thinker/Worker/Verifier role assignment per turn | Sakana Trinity (ICLR 2026) — evolved coordinator with per-turn role rotation |
+| [PRD-101](PRD-101-self-consistency-ensemble.md) | Diverse-profile ensemble with reviewer-judge + tournament + synthesize modes | Sakana Conductor (ICLR 2026) — multi-model orchestration with specialist instructions |
+| [PRD-023](PRD-023-multi-agent-swarm-context-routing.md) | Per-wave self-review (`--self-review`) + self-improvement loop (`--self-improve`) | Sakana DGM — peer-review mechanism that improved SWE-bench 20%→50% |
+
+---
+
 ## Priority Matrix (PRD-001 to PRD-044)
 
 | PRD | Feature | Priority | Effort | Status |

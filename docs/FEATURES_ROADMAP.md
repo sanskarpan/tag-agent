@@ -459,6 +459,43 @@ tag run --samples 3 --vote majority --profile coder "refactor the auth module"
 
 ---
 
+### Cluster K — Sakana AI Competitive Gaps (5 features across 2 new PRDs + 3 enhancements)
+
+Added v0.7.2 — competitive research against Sakana AI (Tokyo, $2.65B, Jun 2026).
+Addresses evolutionary AI, multi-model orchestration, and inference-time scaling capabilities where Sakana leads.
+
+**New PRDs:**
+
+| Feature | Target file | Difficulty | Impact | PRD |
+|---|---|---|---|---|
+| `tag solve` — inference-time multi-model tree search (AB-MCTS: wide/deep/adaptive strategies, Thompson Sampling bandit, tournament/beam/synthesis modes) | `solver.py` | 4 | 5 | PRD-126 |
+| `tag evolve` — evolutionary profile config optimization (genetic crossover+mutation, QD selection, Pareto front, novelty rejection, LLM-driven mutation) | `evolver.py` | 4 | 4 | PRD-127 |
+
+**Enhancements to existing PRDs:**
+
+| Feature | Target file | Difficulty | Impact | PRD Enhanced |
+|---|---|---|---|---|
+| Trinity-style dynamic Thinker/Worker/Verifier role rotation with per-turn specialist instructions (Conductor-inspired) | `teams.py` | 3 | 5 | PRD-082 |
+| Diverse-profile ensemble with reviewer-judge + tournament + synthesize + pareto vote modes (Conductor-inspired) | `ensemble.py` | 2 | 4 | PRD-101 |
+| Per-wave self-review (`--self-review`) + self-improvement loop (`--self-improve`, `--improve-rounds`) | `swarm.py` + `controller.py` | 2 | 4 | PRD-023 |
+
+**Sakana capability gap summary:**
+
+| Sakana System | TAG Gap | Closed By |
+|---|---|---|
+| AB-MCTS / TreeQuest (NeurIPS 2025) | No inference-time tree search | PRD-126 `tag solve` |
+| Evolutionary Model Merging (Nature MI) / CycleQD / ShinkaEvolve | No config-space evolutionary search | PRD-127 `tag evolve` |
+| Trinity (ICLR 2026) — per-turn role assignment | Static profile roles in team runs | PRD-082 Trinity enhancement |
+| Conductor (ICLR 2026) — specialist instructions per worker LLM | Single-profile ensemble only | PRD-101 diverse-profile ensemble |
+| Darwin Gödel Machine — peer-review mechanism (SWE-bench 20→50%) | No post-wave review or refinement | PRD-023 self-review enhancement |
+
+**Remaining Sakana capabilities NOT in scope (require training compute):**
+- RL-trained 7B Conductor model (requires millions of tokens of RL fine-tuning)
+- Evolutionary weight-space model merging (requires GPU compute and open-source model weights)
+- Darwin Gödel Machine source-code self-modification (full RSI; out of scope for CLI tool)
+
+---
+
 ## Implementation Order
 
 Sorted by (impact × feasibility) for execution sequencing:

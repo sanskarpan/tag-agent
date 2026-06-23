@@ -903,5 +903,137 @@ SC_ANSWER_TYPE        = "sc.answer_type"         # str: detected answer type
 
 ---
 
+---
+
+## Enhancement: Diverse-Profile Ensemble with Reviewer-Judge (Conductor-Inspired)
+
+**Added:** v0.7.2 planning cycle — inspired by Sakana AI Conductor (ICLR 2026) and Fugu multi-model orchestration product.
+
+### Background
+
+The base PRD-101 samples N outputs from a *single profile* and majority-votes. Sakana AI's **Conductor** allocates across a *pool of frontier models*, writing different specialist instructions for each worker model per call, then using an LLM judge to select or synthesize the best output. Their **Fugu** product demonstrates 83.9% LiveCodeBench by combining GPT-5, Gemini 2.5, and DeepSeek-R1 outputs through a trained orchestrator.
+
+TAG cannot train a 7B Conductor model. But the *diverse-profile ensemble with reviewer-judge* pattern — run the same goal through N *different* profiles, not N identical calls to the same profile — is implementable using TAG's existing profile system and the LLM-as-judge evaluator (PRD-045).
+
+The key insight: diverse profiles produce *complementary* errors. A coding profile may produce syntactically correct code with subtle logic bugs; a reviewer profile may identify the bugs but produce verbose explanations; an orchestrator profile may produce the cleanest architecture at the expense of implementation detail. A judge that sees all three outputs can synthesize a result better than any single profile.
+
+### New Flags
+
+```bash
+# Diverse-profile ensemble: same goal, different profiles, judge selects best
+tag submit --prompt "Implement a debounce function in TypeScript" \
+           --profiles coder,orchestrator,reviewer \
+           --vote judge \
+           --judge-profile reviewer
+
+# Judge synthesizes the best elements from all profiles (not just selects)
+tag submit --prompt "Write a security review of this OAuth flow" \
+           --profiles reviewer,orchestrator \
+           --vote synthesize \
+           --judge-profile reviewer
+
+# Per-profile custom instructions (Conductor-inspired: specialist instructions per worker)
+tag submit --prompt "Design the caching layer" \
+           --profiles coder,architect,reviewer \
+           --profile-instructions '{"coder": "Focus on Redis implementation.", "architect": "Focus on cache invalidation strategy.", "reviewer": "Focus on consistency guarantees."}' \
+           --vote judge
+
+# Combination: diverse profiles + N samples per profile + embedding vote
+tag submit --prompt "Find all edge cases in this parsing function" \
+           --profiles coder,reviewer \
+           --samples-per-profile 2 \
+           --vote embedding
+```
+
+### Extended Ensemble Modes
+
+| Mode | Flag | Description |
+|---|---|---|
+| `majority` (existing) | `--vote majority` | Majority vote, same profile N samples |
+| `embedding` (existing) | `--vote embedding` | Centroid clustering over embeddings |
+| `judge` (new) | `--vote judge` | LLM judge selects best from N diverse-profile outputs |
+| `synthesize` (new) | `--vote synthesize` | LLM judge synthesizes all outputs into one final answer |
+| `tournament` (new) | `--vote tournament` | Pairwise LLM-judge elimination bracket among outputs |
+| `pareto` (new) | `--vote pareto` | Run judge on quality + cost; select Pareto-optimal output |
+
+### Judge Vote Implementation
+
+```python
+def judge_vote(samples: list[Sample], judge_profile: str,
+               goal: str, mode: str = "select") -> Sample:
+    """Call judge_profile to select or synthesize from N diverse outputs."""
+    prompt = JUDGE_VOTE_PROMPT.format(
+        goal=goal,
+        candidates="\n\n".join(
+            f"--- Candidate {i+1} (profile: {s.profile}) ---\n{s.text}"
+            for i, s in enumerate(samples)
+        ),
+        mode=mode,
+    )
+    result_text = _invoke_profile(judge_profile, prompt)
+    if mode == "select":
+        idx = _parse_selection_index(result_text, len(samples))
+        return samples[idx]
+    else:  # synthesize
+        return Sample(text=result_text, profile="synthesized",
+                      consensus_ratio=1.0)
+```
+
+### Tournament Mode
+
+For N profiles/samples, run pairwise LLM-judge elimination:
+- Round 1: pair (0,1), (2,3), ... → judge picks winner of each pair
+- Repeat until one candidate remains
+- Works for any N; O(N log N) judge calls
+- Logged to `sc_samples` with `round` and `match_id` columns
+
+### Profile-Specific Instructions
+
+When `--profile-instructions` is passed, each profile receives a different system instruction prepended to the shared goal:
+
+```python
+for profile, instruction in profile_instructions.items():
+    full_prompt = f"{instruction}\n\n{goal}"
+    sample = _run_sample(profile, full_prompt, temperature)
+    samples.append(sample)
+```
+
+This replicates Conductor's core differentiator — specialist instructions per worker — at zero training cost.
+
+### Updated DB Schema
+
+```sql
+-- New columns on sc_samples (ALTER TABLE)
+ALTER TABLE sc_samples ADD COLUMN profile TEXT;
+ALTER TABLE sc_samples ADD COLUMN profile_instruction TEXT;
+ALTER TABLE sc_samples ADD COLUMN tournament_round INTEGER;
+ALTER TABLE sc_samples ADD COLUMN tournament_match_id INTEGER;
+ALTER TABLE sc_samples ADD COLUMN judge_selected INTEGER DEFAULT 0;  -- 1 if this sample was selected by judge
+
+-- New ensemble run metadata
+ALTER TABLE sc_runs ADD COLUMN vote_mode TEXT DEFAULT 'majority';
+ALTER TABLE sc_runs ADD COLUMN judge_profile TEXT;
+ALTER TABLE sc_runs ADD COLUMN profiles_json TEXT;  -- JSON array of profiles used
+```
+
+### Performance Characteristics
+
+- **N profiles × 1 sample each:** Same token cost as N samples on one profile; different error modes.
+- **Judge call overhead:** 1 extra call for `judge`/`synthesize` modes; 2K–4K tokens for the judge prompt (judge reads all N outputs).
+- **Tournament overhead:** ceil(log2(N)) rounds × 1 judge call per match = O(N) judge calls total.
+- **Quality vs single-profile:** Conductor paper shows 15–20% improvement on hard reasoning tasks vs best single model; similar gains expected for diverse-profile ensembles.
+
+### New Testing Requirements
+
+| Test | Assertion |
+|---|---|
+| `test_judge_vote_selects_valid` | Returns one of the input samples; index in range |
+| `test_synthesize_mode_returns_text` | Synthesize mode returns non-empty text |
+| `test_tournament_N4` | 4 candidates → 2 rounds → 1 winner |
+| `test_tournament_N1` | 1 candidate → returned immediately, no judge call |
+| `test_diverse_profiles_all_called` | With `--profiles A,B,C`, each profile called exactly once |
+| `test_profile_instructions_prepended` | Each sample's prompt contains its profile-specific instruction |
+| `test_pareto_vote_respects_cost` | Pareto vote prefers lower-cost sample when quality is equal |
+
 *End of PRD-101*
 
