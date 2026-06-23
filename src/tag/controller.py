@@ -508,8 +508,18 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
     _migrate_runs_cost_columns(conn)
     _migrate_prd_021_032_tables(conn)
     _migrate_prd_033_044_tables(conn)
+    _migrate_swarm_tables(conn)
     _prune_old_spans(conn)
     return conn
+
+
+def _migrate_swarm_tables(conn: sqlite3.Connection) -> None:
+    """PRD-023: Context-centric swarm tables (idempotent)."""
+    try:
+        from tag.swarm import migrate_swarm_tables  # noqa: PLC0415
+        migrate_swarm_tables(conn)
+    except Exception:
+        pass
 
 
 def _migrate_prd_021_032_tables(conn: sqlite3.Connection) -> None:
@@ -4111,6 +4121,265 @@ def build_desktop_app(cfg: dict[str, Any], *, force: bool = False) -> dict[str, 
     }
 
 
+# ---------------------------------------------------------------------------
+# PRD-023: Context-centric multi-agent swarm (swarm run/list/status/abort/results)
+# ---------------------------------------------------------------------------
+
+def cmd_swarm_context(args: argparse.Namespace) -> int:
+    """PRD-023: Context-centric swarm orchestration — dispatch subcommands."""
+    sub = getattr(args, "swarm_subcommand", None)
+    if sub == "run":
+        return _cmd_swarm_run(args)
+    if sub == "list":
+        return _cmd_swarm_list(args)
+    if sub == "status":
+        return _cmd_swarm_status(args)
+    if sub == "abort":
+        return _cmd_swarm_abort(args)
+    if sub == "results":
+        return _cmd_swarm_results(args)
+    print("usage: tag swarm run|list|status|abort|results [options]")
+    return 0
+
+
+def _cmd_swarm_run(args: argparse.Namespace) -> int:
+    from tag.swarm import (  # noqa: PLC0415
+        SwarmCoordinator, SwarmRunner, SwarmManifestError,
+        ContextBus, create_swarm_run, insert_swarm_tasks, SWARM_MAX_AGENTS,
+    )
+    cfg = load_config(config_path(args.config))
+    coordinator_profile = getattr(args, "coordinator_profile", None) or cfg["defaults"].get("master_profile", "orchestrator")
+    goal = getattr(args, "goal", "")
+    max_agents = min(int(getattr(args, "max_agents", 4) or 4), SWARM_MAX_AGENTS)
+    failure_policy = getattr(args, "failure_policy", "best_effort") or "best_effort"
+    timeout = int(getattr(args, "timeout_per_agent", 300) or 300)
+    dry_run = getattr(args, "dry_run", False)
+    as_json = getattr(args, "json", False)
+    approve = getattr(args, "approve", False)
+    parallel = not getattr(args, "sequential", False)
+
+    if max_agents > SWARM_MAX_AGENTS:
+        print(f"error: --max-agents must be ≤ {SWARM_MAX_AGENTS}", file=sys.stderr)
+        return 1
+    if not goal:
+        print("error: --goal is required", file=sys.stderr)
+        return 1
+    if failure_policy not in ("abort_on_any", "best_effort", "require_majority"):
+        print("error: invalid --failure-policy value", file=sys.stderr)
+        return 1
+
+    db = open_db(cfg)
+    swarm_id = uuid.uuid4().hex[:12]
+
+    # Step 1: Run coordinator to produce task manifest
+    coordinator = SwarmCoordinator(cfg, coordinator_profile)
+    try:
+        manifest = coordinator.produce_manifest(goal, swarm_id, max_agents)
+    except SwarmManifestError as exc:
+        print(f"error: coordinator failed: {exc}", file=sys.stderr)
+        return 2
+
+    manifest["coordinator_profile"] = coordinator_profile
+
+    if dry_run:
+        print(f"Swarm ID: {swarm_id}")
+        print(f"Goal:     {goal}")
+        print(f"\n{'Task ID':<20} {'Profile':<18} {'Context Type':<14} Context Selector")
+        print("-" * 80)
+        for t in manifest["tasks"]:
+            cs = t.get("context_slice", {})
+            sel = cs.get("selector", "")
+            if isinstance(sel, list):
+                sel = ", ".join(str(s) for s in sel[:3])
+            print(f"{t['task_id']:<20} {t['profile']:<18} {cs.get('type', ''):<14} {str(sel)[:40]}")
+        if as_json:
+            print(json.dumps(manifest, indent=2))
+        return 0
+
+    # Step 2: Persist run + tasks
+    create_swarm_run(db, swarm_id, goal, coordinator_profile, failure_policy, max_agents)
+    insert_swarm_tasks(db, swarm_id, manifest["tasks"])
+
+    print(f"Swarm {swarm_id} — {len(manifest['tasks'])} tasks — policy: {failure_policy}")
+
+    # Step 3: Execute
+    bus = ContextBus(db, swarm_id)
+    runner = SwarmRunner(
+        cfg=cfg, manifest=manifest, bus=bus, conn=db,
+        swarm_id=swarm_id, max_agents=max_agents,
+        timeout_per_agent=timeout, failure_policy=failure_policy,
+        parallel=parallel, approve=approve,
+    )
+    result = runner.run()
+    db.close()
+
+    if as_json:
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+
+    status = result.get("status", "unknown")
+    final = result.get("final_output", "")
+    print(f"\nStatus: {status}")
+    if final:
+        print(f"\n{final}")
+    exit_codes = {"completed": 0, "partial": 5, "failed": 3, "aborted": 4}
+    return exit_codes.get(status, 1)
+
+
+def _cmd_swarm_list(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(args.config))
+    db = open_db(cfg)
+    status_filter = getattr(args, "status", None)
+    where = "WHERE status=?" if status_filter else ""
+    params = (status_filter,) if status_filter else ()
+    rows = db.execute(
+        f"""SELECT swarm_id, goal, status, task_count, started_at, completed_at, total_cost_usd
+            FROM swarm_runs {where} ORDER BY created_at DESC LIMIT 50""",
+        params,
+    ).fetchall()
+    db.close()
+    if getattr(args, "json", False):
+        keys = ["swarm_id", "goal", "status", "task_count", "started_at", "completed_at", "total_cost_usd"]
+        print(json.dumps([dict(zip(keys, r)) for r in rows], indent=2))
+        return 0
+    if not rows:
+        print("No swarm runs found.")
+        return 0
+    print(f"{'Swarm ID':<14} {'Status':<12} {'Tasks':>5} {'Cost':>8}  Goal")
+    print("-" * 80)
+    for r in rows:
+        sid, goal, status, tasks, started, completed, cost = r
+        elapsed = ""
+        if started and completed:
+            try:
+                import datetime
+                s = datetime.datetime.fromisoformat(started.rstrip("Z"))
+                e = datetime.datetime.fromisoformat(completed.rstrip("Z"))
+                secs = int((e - s).total_seconds())
+                elapsed = f"{secs}s"
+            except Exception:
+                pass
+        print(f"{sid:<14} {(status or ''):<12} {(tasks or 0):>5} ${(cost or 0):>7.4f}  {(goal or '')[:45]}")
+    return 0
+
+
+def _cmd_swarm_status(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(args.config))
+    swarm_id = args.swarm_id
+    db = open_db(cfg)
+    run = db.execute(
+        "SELECT swarm_id, goal, status, task_count, started_at, total_cost_usd FROM swarm_runs WHERE swarm_id=?",
+        (swarm_id,),
+    ).fetchone()
+    if not run:
+        print(f"error: swarm {swarm_id!r} not found", file=sys.stderr)
+        db.close()
+        return 1
+    tasks = db.execute(
+        "SELECT task_id, profile, status, started_at, completed_at, cost_usd, error_message FROM swarm_tasks WHERE swarm_id=? ORDER BY id",
+        (swarm_id,),
+    ).fetchall()
+    db.close()
+    if getattr(args, "json", False):
+        print(json.dumps({"run": dict(zip(["swarm_id","goal","status","task_count","started_at","total_cost_usd"], run)),
+                          "tasks": [dict(zip(["task_id","profile","status","started_at","completed_at","cost_usd","error_message"], t)) for t in tasks]}, indent=2))
+        return 0
+    print(f"Swarm:  {run[0]}  ({run[2]})  tasks={run[3]}  cost=${run[5] or 0:.4f}")
+    print(f"Goal:   {run[1]}")
+    print(f"\n{'Task ID':<22} {'Profile':<18} {'Status':<14} Cost")
+    print("-" * 70)
+    for t in tasks:
+        err = f"  [{t[6][:40]}]" if t[6] else ""
+        print(f"{t[0]:<22} {(t[1] or ''):<18} {(t[2] or ''):<14} ${(t[5] or 0):.4f}{err}")
+    return 0
+
+
+def _cmd_swarm_abort(args: argparse.Namespace) -> int:
+    import signal as _signal
+    cfg = load_config(config_path(args.config))
+    swarm_id = args.swarm_id
+    db = open_db(cfg)
+    pids = db.execute(
+        "SELECT pid FROM swarm_tasks WHERE swarm_id=? AND status='running' AND pid IS NOT NULL",
+        (swarm_id,),
+    ).fetchall()
+    killed = 0
+    for (pid,) in pids:
+        try:
+            import os as _os
+            pgid = _os.getpgid(pid)
+            _os.killpg(pgid, _signal.SIGTERM)
+            killed += 1
+        except Exception:
+            pass
+    db.execute(
+        "UPDATE swarm_tasks SET status='failed', error_message='aborted by user' WHERE swarm_id=? AND status='running'",
+        (swarm_id,),
+    )
+    db.execute(
+        "UPDATE swarm_runs SET status='aborted', completed_at=? WHERE swarm_id=?",
+        (_now_utc(), swarm_id),
+    )
+    db.commit()
+    db.close()
+    print(f"Swarm {swarm_id} aborted — {killed} process(es) signalled.")
+    return 0
+
+
+def _cmd_swarm_results(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(args.config))
+    swarm_id = args.swarm_id
+    db = open_db(cfg)
+    run = db.execute(
+        "SELECT swarm_id, goal, status, final_output, total_cost_usd FROM swarm_runs WHERE swarm_id=?",
+        (swarm_id,),
+    ).fetchone()
+    if not run:
+        print(f"error: swarm {swarm_id!r} not found", file=sys.stderr)
+        db.close()
+        return 1
+    tasks = db.execute(
+        "SELECT task_id, profile, status, cost_usd, tokens_prompt, tokens_completion, output, error_message FROM swarm_tasks WHERE swarm_id=? ORDER BY id",
+        (swarm_id,),
+    ).fetchall()
+    include_ctx = getattr(args, "include_context", False)
+    ctx_rows: list = []
+    if include_ctx:
+        from tag.swarm import ContextBus  # noqa: PLC0415
+        bus = ContextBus(db, swarm_id)
+        ctx_rows = bus.full_audit()
+    db.close()
+    fmt = getattr(args, "format", "table")
+    if fmt == "json":
+        out = {
+            "swarm_id": run[0], "goal": run[1], "status": run[2],
+            "final_output": run[3], "total_cost_usd": run[4],
+            "tasks": [dict(zip(["task_id","profile","status","cost_usd","tokens_prompt","tokens_completion","output","error_message"], t)) for t in tasks],
+        }
+        if include_ctx:
+            out["context_bus"] = ctx_rows
+        print(json.dumps(out, indent=2))
+        return 0
+    print(f"Swarm:  {run[0]}  ({run[2]})  total_cost=${run[4] or 0:.4f}")
+    print(f"Goal:   {run[1]}\n")
+    print(f"{'Task ID':<22} {'Status':<14} {'Tokens':>8} {'Cost':>8}")
+    print("-" * 60)
+    for t in tasks:
+        print(f"{t[0]:<22} {(t[2] or ''):<14} {(t[4] or 0) + (t[5] or 0):>8} ${(t[3] or 0):>7.4f}")
+    if run[3]:
+        print(f"\n── Final Output ──\n{run[3]}")
+    if include_ctx and ctx_rows:
+        print(f"\n── Context Bus ({len(ctx_rows)} entries) ──")
+        for e in ctx_rows:
+            print(f"  [{e['written_by']}] {e['key']} = {json.dumps(e['value'])[:80]}")
+    return 0
+
+
+def _now_utc() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 def cmd_desktop(args: argparse.Namespace) -> int:
     """PRD-007: Build and launch the Electron desktop app."""
     cfg = load_config(config_path(args.config))
@@ -7682,78 +7951,270 @@ es.onmessage=e=>{{
 # PRD-030: Prompt Cache Analytics
 # ---------------------------------------------------------------------------
 
+def _cache_savings(
+    cache_read_tokens: int, cache_creation_tokens: int, model_id: str
+) -> tuple[float, float, float]:
+    """Returns (savings_usd, write_premium_usd, net_savings_usd)."""
+    entry = _COST_TABLE.get(model_id or "", {"prompt": 0.003, "completion": 0.015})
+    input_rate = entry.get("prompt", 0.003)
+    savings = (cache_read_tokens / 1_000) * input_rate * 0.9
+    write_mult = 2.0 if "haiku" in (model_id or "").lower() else 1.25
+    write_premium = (cache_creation_tokens / 1_000) * input_rate * (write_mult - 1.0)
+    return savings, write_premium, savings - write_premium
+
+
+def _parse_since(since: str) -> str:
+    """Convert '7d', '2w', '1m' to an ISO cutoff string."""
+    import datetime
+    unit = since[-1].lower()
+    n = int(since[:-1])
+    delta = {"d": datetime.timedelta(days=n), "w": datetime.timedelta(weeks=n),
+             "m": datetime.timedelta(days=n * 30)}.get(unit, datetime.timedelta(days=n))
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - delta
+    return cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def cmd_cache(args: argparse.Namespace) -> int:
-    """PRD-030: Prompt cache analytics — hit rate and cost savings per profile."""
+    """PRD-030: Prompt cache analytics — stats/trend/tips subcommands."""
+    sub = getattr(args, "cache_subcommand", None) or "stats"
+    if sub == "stats":
+        return _cmd_cache_stats(args)
+    if sub == "trend":
+        return _cmd_cache_trend(args)
+    if sub == "tips":
+        return _cmd_cache_tips(args)
+    print("usage: tag cache stats|trend|tips [options]")
+    return 0
+
+
+def _cmd_cache_stats(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(getattr(args, "config", None)))
     db_path = runtime_db_path(cfg)
     _json = getattr(args, "json", False)
+    profile_filter = getattr(args, "profile", None)
+    model_filter = getattr(args, "model", None)
+    since = getattr(args, "since", "7d") or "7d"
+    warn_threshold = getattr(args, "warn_threshold", None)
+
     if not db_path.exists():
-        print(json.dumps([]) if _json else "No runs database found.")
+        msg = {"error": "No runs database"} if _json else "No runs database found."
+        print(json.dumps(msg) if _json else msg)
         return 0
 
     conn = sqlite3.connect(str(db_path))
     try:
-        # Check columns exist
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
         has_cache = "cache_read_tokens" in cols and "cache_creation_tokens" in cols
-        if not has_cache:
-            print(json.dumps([]) if _json else "No cache data recorded yet (cache columns not present).")
-            return 0
 
-        profile_filter = getattr(args, "profile", None)
-        where = "WHERE master_profile=?" if profile_filter else ""
-        params = (profile_filter,) if profile_filter else ()
+        cutoff = _parse_since(since)
+        where_parts = ["created_at >= ?"]
+        params: list = [cutoff]
+        if profile_filter:
+            where_parts.append("master_profile=?"); params.append(profile_filter)
+        if model_filter:
+            where_parts.append("model_id=?"); params.append(model_filter)
+        where = "WHERE " + " AND ".join(where_parts)
 
-        rows = conn.execute(
-            f"""SELECT master_profile, model_id,
-                   SUM(prompt_tokens) as pt,
-                   SUM(completion_tokens) as ct,
-                   SUM(total_tokens) as tt,
-                   SUM(COALESCE(cache_read_tokens, 0)) as crt,
-                   SUM(COALESCE(cache_creation_tokens, 0)) as cct,
-                   SUM(COALESCE(estimated_cost_usd, 0)) as cost,
-                   COUNT(*) as runs
-                FROM runs {where}
-                GROUP BY master_profile, model_id
-                ORDER BY tt DESC
-                LIMIT 20""",
-            params,
-        ).fetchall()
+        if has_cache:
+            rows = conn.execute(
+                f"""SELECT master_profile, model_id,
+                       SUM(prompt_tokens), SUM(completion_tokens),
+                       SUM(COALESCE(cache_read_tokens,0)),
+                       SUM(COALESCE(cache_creation_tokens,0)),
+                       SUM(COALESCE(estimated_cost_usd,0)), COUNT(*)
+                    FROM runs {where}
+                    GROUP BY master_profile, model_id
+                    ORDER BY SUM(COALESCE(cache_read_tokens,0)) DESC LIMIT 30""",
+                params,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"""SELECT master_profile, model_id,
+                       SUM(prompt_tokens), SUM(completion_tokens),
+                       0, 0, SUM(COALESCE(estimated_cost_usd,0)), COUNT(*)
+                    FROM runs {where}
+                    GROUP BY master_profile, model_id
+                    ORDER BY SUM(prompt_tokens) DESC LIMIT 30""",
+                params,
+            ).fetchall()
     finally:
         conn.close()
 
     if not rows:
-        print(json.dumps([]) if _json else "No run data found.")
+        msg = [] if _json else "No run data found for the given filters."
+        print(json.dumps(msg) if _json else msg)
         return 0
 
+    warned = False
     if _json:
         out = []
         for r in rows:
-            total_input = (r[2] or 0)
-            cache_read = (r[5] or 0)
-            hit_rate = cache_read / total_input if total_input > 0 else 0.0
-            # Cache reads cost 0.1x; savings vs full price
-            savings_tokens = cache_read * 0.9  # 90% discount on reads
+            pt = r[2] or 0; crt = r[4] or 0; cct = r[5] or 0
+            hit_rate = crt / pt if pt > 0 else None
+            savings, write_prem, net = _cache_savings(crt, cct, r[1] or "")
             out.append({
                 "profile": r[0], "model": r[1],
-                "prompt_tokens": r[2], "completion_tokens": r[3],
-                "cache_read_tokens": r[5], "cache_creation_tokens": r[6],
-                "cache_hit_rate": round(hit_rate, 4),
-                "estimated_savings_tokens": int(savings_tokens),
-                "total_cost_usd": r[7],
-                "runs": r[8],
+                "window_days": since, "runs_total": r[7],
+                "prompt_tokens": pt, "completion_tokens": r[3] or 0,
+                "cache_read_tokens": crt, "cache_creation_tokens": cct,
+                "hit_rate": round(hit_rate, 4) if hit_rate is not None else None,
+                "savings_usd": round(savings, 6), "write_premium_usd": round(write_prem, 6),
+                "net_savings_usd": round(net, 6), "total_cost_usd": r[6] or 0,
             })
+            if warn_threshold and hit_rate is not None and hit_rate < warn_threshold:
+                warned = True
         print(json.dumps(out, indent=2))
+        return 1 if warned else 0
+
+    # Table output
+    print(f"\nPrompt Cache Analytics — last {since}\n")
+    for r in rows:
+        profile, model, pt, ct, crt, cct, cost, runs = r
+        pt = pt or 0; crt = crt or 0; cct = cct or 0
+        hit_rate = crt / pt if pt > 0 else 0.0
+        savings, write_prem, net = _cache_savings(crt, cct, model or "")
+        if warn_threshold and pt > 0 and hit_rate < warn_threshold:
+            warned = True
+            print(f"  [WARN] {profile}: hit rate {hit_rate:.1%} below threshold {warn_threshold:.0%}")
+        print(f"  Profile: {profile}  |  Model: {model}")
+        print(f"  {'Runs':<22} {runs}")
+        print(f"  {'Total input tokens':<22} {pt:,}")
+        print(f"  {'Cache write tokens':<22} {cct:,}  ({cct/pt*100:.1f}%)" if pt else f"  {'Cache write tokens':<22} {cct:,}")
+        print(f"  {'Cache read tokens':<22} {crt:,}  ({hit_rate:.1%} hit rate)")
+        print(f"  {'Write premium':<22} ${write_prem:.4f}")
+        print(f"  {'Read savings':<22} ${savings:.4f}")
+        print(f"  {'Net savings':<22} ${net:.4f}")
+        print()
+    return 1 if warned else 0
+
+
+def _cmd_cache_trend(args: argparse.Namespace) -> int:
+    import datetime, shutil
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db_path = runtime_db_path(cfg)
+    profile_filter = getattr(args, "profile", None)
+    days = int(getattr(args, "days", 30) or 30)
+
+    if not db_path.exists():
+        print("No runs database found.")
         return 0
 
-    print(f"{'Profile':<20} {'Model':<36} {'Prompt':>8} {'CacheRead':>10} {'HitRate':>8} {'Savings':>10}")
-    print("-" * 100)
-    for r in rows:
-        profile, model, pt, ct, tt, crt, cct, cost, runs = r
-        hit_rate = (crt / pt * 100) if pt else 0.0
-        savings_tokens = (crt or 0) * 0.9
-        print(f"{(profile or ''):<20} {(model or ''):<36} {(pt or 0):>8} "
-              f"{(crt or 0):>10} {hit_rate:>7.1f}% {int(savings_tokens):>10}")
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+        has_cache = "cache_read_tokens" in cols
+        cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+        where = "WHERE created_at >= ?" + (" AND master_profile=?" if profile_filter else "")
+        params = [cutoff] + ([profile_filter] if profile_filter else [])
+        if has_cache:
+            rows = conn.execute(
+                f"""SELECT date(created_at) as day,
+                       SUM(prompt_tokens), SUM(COALESCE(cache_read_tokens,0))
+                    FROM runs {where}
+                    GROUP BY day ORDER BY day""", params
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT date(created_at) as day, SUM(prompt_tokens), 0 FROM runs {where} GROUP BY day ORDER BY day",
+                params
+            ).fetchall()
+    finally:
+        conn.close()
+
+    data = {r[0]: (r[1] or 0, r[2] or 0) for r in rows}
+    today = datetime.date.today()
+    start = today - datetime.timedelta(days=days - 1)
+    term_width = shutil.get_terminal_size((80, 24)).columns
+    bar_width = max(10, term_width - 40)
+
+    label = f"Cache hit rate — {profile_filter or 'all profiles'} — last {days} days\n"
+    print(label)
+    for i in range(days):
+        day = (start + datetime.timedelta(days=i)).isoformat()
+        if day not in data:
+            print(f"  {day}  (no data)")
+            continue
+        pt, crt = data[day]
+        hit = crt / pt if pt > 0 else 0.0
+        bar = "█" * int(hit * bar_width)
+        print(f"  {day}  {bar:<{bar_width}}  {hit:.0%}")
+    return 0
+
+
+def _cmd_cache_tips(args: argparse.Namespace) -> int:
+    cfg = load_config(config_path(getattr(args, "config", None)))
+    db_path = runtime_db_path(cfg)
+    profile = getattr(args, "profile", None)
+    if not profile:
+        print("error: --profile is required for cache tips", file=sys.stderr)
+        return 1
+    if not db_path.exists():
+        print("No runs database found.")
+        return 0
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+        has_cache = "cache_read_tokens" in cols
+        if has_cache:
+            rows = conn.execute(
+                "SELECT prompt, cache_read_tokens, prompt_tokens, created_at FROM runs "
+                "WHERE master_profile=? ORDER BY created_at DESC LIMIT 20",
+                (profile,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT prompt, 0, prompt_tokens, created_at FROM runs "
+                "WHERE master_profile=? ORDER BY created_at DESC LIMIT 20",
+                (profile,),
+            ).fetchall()
+    finally:
+        conn.close()
+
+    print(f"Cache tips for profile: {profile}\n")
+    if not rows:
+        print("  No run history found for this profile.")
+        return 0
+
+    # SHA stability check
+    shas = [hashlib.sha256((r[0] or "").encode()).hexdigest() for r in rows]
+    stable_pairs = sum(a == b for a, b in zip(shas, shas[1:]))
+    stability = stable_pairs / max(len(shas) - 1, 1)
+
+    # Hit rate
+    total_pt = sum(r[2] or 0 for r in rows)
+    total_crt = sum(r[1] or 0 for r in rows)
+    hit_rate = total_crt / total_pt if total_pt > 0 else 0.0
+
+    # Prompt length
+    recent_prompt = rows[0][0] or ""
+    est_tokens = len(recent_prompt.split()) * 1.3
+
+    if hit_rate < 0.3:
+        print(f"  [WARN] Cache hit rate is {hit_rate:.0%} over the last {len(rows)} runs (threshold: 30%)")
+    else:
+        print(f"  [OK]   Cache hit rate is {hit_rate:.0%} over the last {len(rows)} runs")
+
+    if est_tokens > 1024:
+        print(f"  [INFO] System prompt is ~{int(est_tokens):,} tokens — large enough to benefit from caching")
+    else:
+        print(f"  [INFO] System prompt is ~{int(est_tokens):,} tokens — below 1024 token caching threshold")
+
+    print("\nRecommendations:")
+    n = 0
+    if stability < 0.5:
+        n += 1
+        print(f"  {n}. System prompt SHA changed in {len(shas)-1-stable_pairs}/{len(shas)-1} consecutive runs.")
+        print("     A volatile prompt prevents cache reuse. Move dynamic content to the user-turn message.")
+    if hit_rate < 0.3 and est_tokens > 1024:
+        n += 1
+        print(f"  {n}. Add a cache_control breakpoint at the end of your static system prompt block:")
+        print('     {"cache_control": {"type": "ephemeral"}} in your system message.')
+    if hit_rate < 0.3 and not has_cache:
+        n += 1
+        print(f"  {n}. Cache token columns not present — upgrade to tag-agent 0.7.1+ to track cache metrics.")
+    if n == 0:
+        print("  No specific issues detected — cache appears healthy.")
     return 0
 
 
@@ -9498,15 +9959,56 @@ def build_parser() -> argparse.ArgumentParser:
         mj_p.set_defaults(func=cmd_memory_journal)
 
     # ---- PRD-004: swarm ----
-    swarm = sub.add_parser("swarm", help="Launch a TAG Kanban swarm using TAG's profile topology")
-    swarm.add_argument("task", help="Task description for the swarm")
+    swarm = sub.add_parser("swarm", help="Multi-agent swarm orchestration")
+    swarm_sub = swarm.add_subparsers(dest="swarm_subcommand")
+
+    # Legacy kanban-based swarm (PRD-004) — keep as default positional
+    swarm.add_argument("task", nargs="?", help="Task description (kanban swarm — legacy)")
     swarm.add_argument("--profile", help="Orchestrator profile (default: orchestrator)")
     swarm.add_argument("--type", dest="task_type", default="mixed", choices=("research", "implementation", "review", "mixed"))
     swarm.add_argument("--board", help="Kanban board name (default: from config)")
-    swarm.add_argument("--no-wait", action="store_true", dest="no_wait",
-                       help="Create swarm tasks but don't block waiting for completion")
+    swarm.add_argument("--no-wait", action="store_true", dest="no_wait")
     swarm.add_argument("--json", action="store_true")
     swarm.set_defaults(func=cmd_swarm)
+
+    # PRD-023: context-centric swarm subcommands
+    sw_run = swarm_sub.add_parser("run", help="Launch a context-centric multi-agent swarm")
+    sw_run.add_argument("--goal", required=True, help="Natural-language goal for the swarm")
+    sw_run.add_argument("--coordinator-profile", dest="coordinator_profile", help="Profile to use as coordinator")
+    sw_run.add_argument("--max-agents", dest="max_agents", type=int, default=4, help="Max concurrent sub-agents (cap: 10)")
+    sw_run.add_argument("--failure-policy", dest="failure_policy", default="best_effort",
+                        choices=("abort_on_any", "best_effort", "require_majority"))
+    sw_run.add_argument("--timeout-per-agent", dest="timeout_per_agent", type=int, default=300)
+    sw_run.add_argument("--approve", action="store_true", help="Pause for approval before each subtask")
+    sw_run.add_argument("--sequential", action="store_true", help="Dispatch agents sequentially (default: parallel)")
+    sw_run.add_argument("--dry-run", dest="dry_run", action="store_true", help="Show manifest without running agents")
+    sw_run.add_argument("--json", action="store_true")
+    sw_run.set_defaults(func=cmd_swarm_context)
+
+    sw_list = swarm_sub.add_parser("list", help="List swarm runs")
+    sw_list.add_argument("--status", choices=("running", "completed", "aborted", "failed", "partial"))
+    sw_list.add_argument("--json", action="store_true")
+    sw_list.set_defaults(func=cmd_swarm_context)
+
+    sw_status = swarm_sub.add_parser("status", help="Show per-agent status for a swarm")
+    sw_status.add_argument("swarm_id", metavar="SWARM_ID")
+    sw_status.add_argument("--watch", action="store_true")
+    sw_status.add_argument("--json", action="store_true")
+    sw_status.set_defaults(func=cmd_swarm_context)
+
+    sw_abort = swarm_sub.add_parser("abort", help="Abort a running swarm")
+    sw_abort.add_argument("swarm_id", metavar="SWARM_ID")
+    sw_abort.set_defaults(func=cmd_swarm_context)
+
+    sw_results = swarm_sub.add_parser("results", help="Show results and final output for a swarm")
+    sw_results.add_argument("swarm_id", metavar="SWARM_ID")
+    sw_results.add_argument("--format", choices=("table", "json"), default="table")
+    sw_results.add_argument("--include-context", dest="include_context", action="store_true")
+    sw_results.set_defaults(func=cmd_swarm_context)
+
+    for sw_p in [swarm, sw_run, sw_list, sw_status, sw_abort, sw_results]:
+        if "config" not in {a.dest for a in sw_p._actions}:
+            sw_p.add_argument("--config", help=argparse.SUPPRESS)
 
     # ---- PRD-007: desktop ----
     desktop = sub.add_parser("desktop", help="Build and launch Electron desktop app")
@@ -9913,10 +10415,26 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- PRD-030: cache ----
     cache_cmd = sub.add_parser("cache", help="Prompt cache analytics")
     cache_sub = cache_cmd.add_subparsers(dest="cache_subcommand")
+
     cache_stats = cache_sub.add_parser("stats", help="Show cache hit rates and savings per profile")
     cache_stats.add_argument("--profile", help="Filter to a specific profile")
+    cache_stats.add_argument("--since", default="7d", help="Time window: 7d, 2w, 1m (default: 7d)")
+    cache_stats.add_argument("--model", help="Filter by model ID")
+    cache_stats.add_argument("--warn-threshold", dest="warn_threshold", type=float, default=0.5,
+                             help="Hit-rate below this fraction triggers a warning (default: 0.50)")
     cache_stats.add_argument("--json", action="store_true")
-    for cp in [cache_cmd, cache_stats]:
+
+    cache_trend = cache_sub.add_parser("trend", help="Show cache hit-rate trend over time (ASCII chart)")
+    cache_trend.add_argument("--profile", help="Filter to a specific profile")
+    cache_trend.add_argument("--since", default="30d", help="Time window (default: 30d)")
+    cache_trend.add_argument("--buckets", type=int, default=14, help="Number of time buckets (default: 14)")
+    cache_trend.add_argument("--json", action="store_true")
+
+    cache_tips = cache_sub.add_parser("tips", help="Show actionable recommendations to improve cache efficiency")
+    cache_tips.add_argument("--profile", help="Filter to a specific profile")
+    cache_tips.add_argument("--since", default="7d")
+
+    for cp in [cache_cmd, cache_stats, cache_trend, cache_tips]:
         cp.set_defaults(func=cmd_cache)
 
     # ---- PRD-031: route fallback ----

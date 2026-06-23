@@ -976,7 +976,7 @@ class TestEnhancedDoctor:
         # rc==1 expected when profile homes don't exist (fail checks); 0 if env has them
         assert rc in (0, 1)
         data = json.loads(capsys.readouterr().out)
-        assert "hermes_bin_exists" in data
+        assert "tag_bin_exists" in data
         assert "profiles" in data
 
     def test_cmd_doctor_returns_1_when_fail(self, tmp_path, monkeypatch, capsys):

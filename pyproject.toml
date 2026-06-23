@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tag-agent"
-version = "0.7.1"
+version = "0.7.2"
 description = "Orchestrate AI agents from your terminal — multi-source credential import, swarm topology, background queue, live dashboard"
 readme = "README.md"
 # Upper bound is load-bearing, not cosmetic. uv resolves the project's
