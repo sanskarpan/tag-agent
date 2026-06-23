@@ -1,17 +1,22 @@
-"""Lightweight span-based tracing for TAG agent runs (PRD-013).
+"""Lightweight span-based tracing for TAG agent runs (PRD-013, PRD-046, PRD-048).
 
 Public API
 ----------
 open_span(trace_id, name, profile=None, model_id=None, parent_id=None) -> Span
-close_span(span, status='ok', prompt_tokens=0, completion_tokens=0, error_msg=None)
+open_tool_span(trace_id, tool_name, parent_id=None, **attrs) -> Span
+close_span(span, status='ok', prompt_tokens=0, completion_tokens=0, error_msg=None, cost_usd=None)
 save_spans_to_db(db_path: Path, spans: list[Span]) -> None
 render_trace_terminal(spans: list[Span]) -> str
+migrate_spans_table(conn: sqlite3.Connection) -> None
 
 No global state: callers own the list of Span objects.
 
 Backward-compatible helpers (kept for controller.py integration):
   Tracer  -- context-manager-based tracer backed by an open sqlite3.Connection
   export_spans_otlp(rows, endpoint, headers) -> bool
+
+PRD-046: kind field + cost_usd field + open_tool_span + TraceProcessor protocol + ProcessorChain
+PRD-048: SPAN_KINDS export + migrate_spans_table
 """
 from __future__ import annotations
 
@@ -23,7 +28,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, Generator, Protocol
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +46,13 @@ def _monotonic_to_wall(mono: float) -> str:
         mono - time.monotonic() + time.time(), tz=timezone.utc
     )
     return wall.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Constants (PRD-048)
+# ---------------------------------------------------------------------------
+
+SPAN_KINDS: list[str] = ["llm", "tool", "agent", "chain", "embedding", "retrieval"]
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +79,9 @@ class Span:
     completion_tokens  Tokens consumed as completion/output.
     attributes      Arbitrary key-value metadata.
     error_msg       Human-readable error description (None when status == 'ok').
+    kind            Span kind: one of SPAN_KINDS ('llm', 'tool', 'agent',
+                    'chain', 'embedding', 'retrieval').  (PRD-046)
+    cost_usd        Estimated cost in US dollars for this span, or None.  (PRD-046)
     """
 
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
@@ -83,6 +98,8 @@ class Span:
     completion_tokens: int = 0
     attributes: dict[str, Any] = field(default_factory=dict)
     error_msg: str | None = None
+    kind: str = "llm"
+    cost_usd: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +112,7 @@ def open_span(
     profile: str | None = None,
     model_id: str | None = None,
     parent_id: str | None = None,
+    kind: str = "llm",
 ) -> Span:
     """Create and return a new open Span.
 
@@ -108,6 +126,7 @@ def open_span(
     profile:    Optional TAG profile name.
     model_id:   Optional LLM model identifier.
     parent_id:  Optional ID of a parent Span (enables nested/tree traces).
+    kind:       Span kind, one of SPAN_KINDS.  Defaults to 'llm'.
     """
     return Span(
         trace_id=trace_id,
@@ -115,7 +134,37 @@ def open_span(
         profile=profile,
         model_id=model_id,
         parent_id=parent_id,
+        kind=kind,
     )
+
+
+def open_tool_span(
+    trace_id: str,
+    tool_name: str,
+    parent_id: str | None = None,
+    **attrs: Any,
+) -> Span:
+    """Create and return a new open Span with kind='tool'.  (PRD-046)
+
+    Convenience wrapper around :func:`open_span` for tool invocations.
+    Any extra keyword arguments are stored as span attributes.
+
+    Parameters
+    ----------
+    trace_id:   Groups this span with other spans from the same logical run.
+    tool_name:  Human-readable name of the tool being invoked.
+    parent_id:  Optional ID of a parent Span.
+    **attrs:    Arbitrary key-value attributes stored on the span.
+    """
+    span = Span(
+        trace_id=trace_id,
+        name=tool_name,
+        parent_id=parent_id,
+        kind="tool",
+    )
+    if attrs:
+        span.attributes.update(attrs)
+    return span
 
 
 def close_span(
@@ -124,6 +173,7 @@ def close_span(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     error_msg: str | None = None,
+    cost_usd: float | None = None,
 ) -> None:
     """Close an open Span, recording timing and outcome.
 
@@ -136,6 +186,7 @@ def close_span(
     prompt_tokens:      Tokens consumed as prompt/input.
     completion_tokens:  Tokens consumed as completion/output.
     error_msg:          Human-readable error message (if any).
+    cost_usd:           Estimated cost in US dollars for this span.  (PRD-046)
     """
     if span.finished_at is not None:
         # Already closed; avoid double-closing.
@@ -147,6 +198,7 @@ def close_span(
     span.prompt_tokens = prompt_tokens
     span.completion_tokens = completion_tokens
     span.error_msg = error_msg
+    span.cost_usd = cost_usd
 
     # Compute duration_ms from ISO strings.
     try:
@@ -177,7 +229,9 @@ CREATE TABLE IF NOT EXISTS spans (
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     attributes        TEXT NOT NULL DEFAULT '{}',
-    error_msg         TEXT
+    error_msg         TEXT,
+    kind              TEXT NOT NULL DEFAULT 'llm',
+    cost_usd          REAL
 );
 """
 
@@ -185,8 +239,9 @@ _INSERT_SPAN = """
 INSERT OR REPLACE INTO spans
   (id, trace_id, parent_id, name, profile, model_id,
    started_at, finished_at, duration_ms, status,
-   prompt_tokens, completion_tokens, attributes, error_msg)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+   prompt_tokens, completion_tokens, attributes, error_msg,
+   kind, cost_usd)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 """
 
 
@@ -229,6 +284,8 @@ def save_spans_to_db(db_path: Path, spans: list[Span]) -> None:
                     s.completion_tokens,
                     json.dumps(s.attributes),
                     s.error_msg,
+                    s.kind,
+                    s.cost_usd,
                 )
                 for s in spans
             ],
@@ -236,6 +293,28 @@ def save_spans_to_db(db_path: Path, spans: list[Span]) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def migrate_spans_table(conn: sqlite3.Connection) -> None:
+    """Add PRD-046/PRD-048 columns to an existing ``spans`` table.  (PRD-048)
+
+    Safe to call on a database that already has the new columns; the
+    ``ALTER TABLE`` errors are silently swallowed.
+
+    Parameters
+    ----------
+    conn:  An open :class:`sqlite3.Connection` to the database to migrate.
+    """
+    for sql in (
+        "ALTER TABLE spans ADD COLUMN kind TEXT NOT NULL DEFAULT 'llm'",
+        "ALTER TABLE spans ADD COLUMN cost_usd REAL",
+    ):
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            # Column already exists — ignore.
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -271,11 +350,17 @@ def render_trace_terminal(spans: list[Span]) -> str:
         filled = max(1, int((ms / total_ms) * width))
         return "█" * filled + "░" * (width - filled)
 
+    def _cost_str(s: Span) -> str:
+        if s.cost_usd is None:
+            return ""
+        return f"  ${s.cost_usd:.4f}"
+
     def _label(s: Span) -> str:
         dur = s.duration_ms or 0
         bar = _bar(dur)
         tokens = f"{s.prompt_tokens}↑{s.completion_tokens}↓"
-        return f"{s.name}  {bar}  {dur}ms  {tokens}"
+        cost = _cost_str(s)
+        return f"{s.name}  {bar}  {dur}ms  {tokens}{cost}"
 
     def _status_color(status: str) -> str:
         return {"ok": "green", "timeout": "yellow"}.get(status, "red")
@@ -332,6 +417,85 @@ def render_trace_terminal(spans: list[Span]) -> str:
         _render_plain(root, 0)
 
     return "\n".join(lines) if lines else "(no root spans)"
+
+
+# ---------------------------------------------------------------------------
+# TraceProcessor protocol and ProcessorChain  (PRD-046)
+# ---------------------------------------------------------------------------
+
+class TraceProcessor(Protocol):
+    """Protocol for objects that observe trace and span lifecycle events.
+
+    Implement this protocol to plug custom behaviour into the tracing system
+    (e.g. streaming spans to an external observability platform, computing
+    cost summaries, writing to a message queue, etc.).
+    """
+
+    def on_trace_start(self, trace_id: str, metadata: dict) -> None:
+        """Called when a new trace begins."""
+        ...
+
+    def on_trace_end(self, trace_id: str, spans: list[Span]) -> None:
+        """Called when a trace is finalised with all its spans."""
+        ...
+
+    def on_span_start(self, span: Span) -> None:
+        """Called immediately after a span is opened."""
+        ...
+
+    def on_span_end(self, span: Span) -> None:
+        """Called immediately after a span is closed."""
+        ...
+
+
+class ProcessorChain:
+    """Fan-out container that forwards lifecycle events to multiple processors.
+
+    Usage
+    -----
+    chain = ProcessorChain([MyProcessor(), AnotherProcessor()])
+    chain.on_trace_start(trace_id, {})
+    # ... run spans ...
+    chain.on_trace_end(trace_id, spans)
+
+    Any processor that raises an exception is skipped silently so that one
+    misbehaving processor cannot interrupt tracing.
+    """
+
+    def __init__(self, processors: list[TraceProcessor] | None = None) -> None:
+        self.processors: list[TraceProcessor] = list(processors or [])
+
+    def add(self, processor: TraceProcessor) -> None:
+        """Append *processor* to the chain."""
+        self.processors.append(processor)
+
+    def on_trace_start(self, trace_id: str, metadata: dict) -> None:
+        for p in self.processors:
+            try:
+                p.on_trace_start(trace_id, metadata)
+            except Exception:
+                pass
+
+    def on_trace_end(self, trace_id: str, spans: list[Span]) -> None:
+        for p in self.processors:
+            try:
+                p.on_trace_end(trace_id, spans)
+            except Exception:
+                pass
+
+    def on_span_start(self, span: Span) -> None:
+        for p in self.processors:
+            try:
+                p.on_span_start(span)
+            except Exception:
+                pass
+
+    def on_span_end(self, span: Span) -> None:
+        for p in self.processors:
+            try:
+                p.on_span_end(span)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +557,8 @@ class Tracer:
                 span.completion_tokens,
                 json.dumps(span.attributes),
                 span.error_msg,
+                span.kind,
+                span.cost_usd,
             ),
         )
         self._db.commit()
@@ -418,6 +584,7 @@ def export_spans_otlp(
         "id", "trace_id", "parent_id", "name", "profile", "model_id",
         "started_at", "finished_at", "duration_ms", "status",
         "prompt_tokens", "completion_tokens", "attributes", "error_msg",
+        "kind", "cost_usd",
     ]
 
     spans_json = [dict(zip(col_names, r)) for r in rows]
@@ -475,4 +642,3 @@ def export_spans_otlp(
             return True
     except urllib.error.URLError:
         return False
-

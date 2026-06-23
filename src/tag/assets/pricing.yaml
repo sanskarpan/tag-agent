@@ -1,0 +1,220 @@
+# TAG LLM Pricing Table
+# ---------------------
+# Fields per entry:
+#   model_id               — exact API model string used in requests
+#   input_usd_per_1m       — cost in USD per 1,000,000 input tokens
+#   output_usd_per_1m      — cost in USD per 1,000,000 output tokens
+#   cache_read_multiplier  — fraction of input price charged for cached reads
+#                            (optional; default 0.1, i.e. 10 % of input price)
+#   batch_multiplier       — fraction of standard price charged for batch API
+#                            (optional; default 0.5, i.e. 50 % of standard price)
+#
+# Prices are USD and reflect publicly listed rates as of 2026-06.
+# Update this file whenever a provider revises its pricing.
+# ---------------------
+
+models:
+
+  # ── Anthropic Claude ────────────────────────────────────────────────────────
+
+  # Claude Sonnet 4.6 — balanced speed / intelligence, 1 M context
+  - model_id: claude-sonnet-4-6
+    input_usd_per_1m: 3.00
+    output_usd_per_1m: 15.00
+    cache_read_multiplier: 0.1
+
+  # Claude Opus 4.8 — most capable Opus-tier model, 1 M context
+  - model_id: claude-opus-4-8
+    input_usd_per_1m: 15.00
+    output_usd_per_1m: 75.00
+    cache_read_multiplier: 0.1
+
+  # Claude Haiku 4.5 — fastest / most cost-effective, 200 K context
+  - model_id: claude-haiku-4-5
+    input_usd_per_1m: 0.80
+    output_usd_per_1m: 4.00
+    cache_read_multiplier: 0.1
+    batch_multiplier: 0.5
+
+  # Claude Haiku 4.5 dated snapshot
+  - model_id: claude-haiku-4-5-20251001
+    input_usd_per_1m: 0.80
+    output_usd_per_1m: 4.00
+    cache_read_multiplier: 0.1
+    batch_multiplier: 0.5
+
+  # Claude Sonnet 4.5 — previous-generation balanced model
+  - model_id: claude-sonnet-4-5
+    input_usd_per_1m: 3.00
+    output_usd_per_1m: 15.00
+    cache_read_multiplier: 0.1
+
+  # Claude 3.5 Sonnet (2024-10-22 snapshot) — widely used snapshot
+  - model_id: claude-3-5-sonnet-20241022
+    input_usd_per_1m: 3.00
+    output_usd_per_1m: 15.00
+    cache_read_multiplier: 0.1
+
+  # Claude 3.5 Haiku (2024-10-22 snapshot)
+  - model_id: claude-3-5-haiku-20241022
+    input_usd_per_1m: 0.80
+    output_usd_per_1m: 4.00
+    cache_read_multiplier: 0.1
+
+  # Claude 3 Opus (2024-02-29 snapshot) — retired but kept for legacy cost tracking
+  - model_id: claude-3-opus-20240229
+    input_usd_per_1m: 15.00
+    output_usd_per_1m: 75.00
+    cache_read_multiplier: 0.1
+
+  # Anthropic via OpenRouter / proxy prefix
+  - model_id: anthropic/claude-3-haiku
+    input_usd_per_1m: 0.25
+    output_usd_per_1m: 1.25
+    cache_read_multiplier: 0.1
+
+  # ── OpenAI GPT ──────────────────────────────────────────────────────────────
+
+  # GPT-4o — latest multimodal flagship
+  - model_id: gpt-4o
+    input_usd_per_1m: 2.50
+    output_usd_per_1m: 10.00
+
+  # GPT-4o mini — cost-efficient small model
+  - model_id: gpt-4o-mini
+    input_usd_per_1m: 0.15
+    output_usd_per_1m: 0.60
+
+  # GPT-4 Turbo — high-capability GPT-4 variant with large context
+  - model_id: gpt-4-turbo
+    input_usd_per_1m: 10.00
+    output_usd_per_1m: 30.00
+
+  # GPT-4 — original GPT-4
+  - model_id: gpt-4
+    input_usd_per_1m: 30.00
+    output_usd_per_1m: 60.00
+
+  # GPT-3.5 Turbo — fast, low-cost completion model
+  - model_id: gpt-3.5-turbo
+    input_usd_per_1m: 0.50
+    output_usd_per_1m: 1.50
+
+  # OpenAI GPT-4o 2024-08-06 snapshot (via OpenRouter / proxy prefix)
+  - model_id: openai/gpt-4o-2024-08-06
+    input_usd_per_1m: 2.50
+    output_usd_per_1m: 10.00
+
+  # ── OpenAI o-series (reasoning models) ──────────────────────────────────────
+
+  # o1 — advanced reasoning, slow
+  - model_id: o1
+    input_usd_per_1m: 15.00
+    output_usd_per_1m: 60.00
+
+  # o1-mini — smaller reasoning model
+  - model_id: o1-mini
+    input_usd_per_1m: 3.00
+    output_usd_per_1m: 12.00
+
+  # o3-mini — compact o3-family reasoning model
+  - model_id: o3-mini
+    input_usd_per_1m: 1.10
+    output_usd_per_1m: 4.40
+
+  # o4-mini — compact o4-family reasoning model
+  - model_id: o4-mini
+    input_usd_per_1m: 1.10
+    output_usd_per_1m: 4.40
+
+  # ── Google Gemini ────────────────────────────────────────────────────────────
+
+  # Gemini 2.5 Pro — Google's most capable multimodal model
+  - model_id: gemini-2.5-pro
+    input_usd_per_1m: 1.25
+    output_usd_per_1m: 10.00
+
+  # Gemini 2.5 Flash — fast, cost-efficient Gemini 2.5 variant
+  - model_id: gemini-2.5-flash
+    input_usd_per_1m: 0.15
+    output_usd_per_1m: 0.60
+
+  # Gemini 1.5 Pro — long-context (up to 2 M tokens) flagship
+  - model_id: gemini-1.5-pro
+    input_usd_per_1m: 1.25
+    output_usd_per_1m: 5.00
+
+  # Gemini 1.5 Flash — fast, low-cost Gemini 1.5 variant
+  - model_id: gemini-1.5-flash
+    input_usd_per_1m: 0.075
+    output_usd_per_1m: 0.30
+
+  # ── DeepSeek ────────────────────────────────────────────────────────────────
+
+  # DeepSeek V4 Flash — fast, economical DeepSeek model
+  - model_id: deepseek/deepseek-v4-flash
+    input_usd_per_1m: 0.14
+    output_usd_per_1m: 0.28
+
+  # DeepSeek V4 Pro — full-capability DeepSeek V4
+  - model_id: deepseek/deepseek-v4-pro
+    input_usd_per_1m: 0.27
+    output_usd_per_1m: 1.10
+
+  # DeepSeek R1 — open reasoning model
+  - model_id: deepseek/deepseek-r1
+    input_usd_per_1m: 0.55
+    output_usd_per_1m: 2.19
+
+  # ── Mistral ─────────────────────────────────────────────────────────────────
+
+  # Mistral Large — most capable Mistral commercial model
+  - model_id: mistral-large-latest
+    input_usd_per_1m: 2.00
+    output_usd_per_1m: 6.00
+
+  # Mistral Medium — mid-tier Mistral model
+  - model_id: mistral-medium-latest
+    input_usd_per_1m: 0.40
+    output_usd_per_1m: 1.20
+
+  # Mistral Small — lightweight, fast Mistral model
+  - model_id: mistral-small-latest
+    input_usd_per_1m: 0.10
+    output_usd_per_1m: 0.30
+
+  # ── Qwen (Alibaba) ──────────────────────────────────────────────────────────
+
+  # Qwen3 Coder — code-specialised Qwen3 model
+  - model_id: qwen/qwen3-coder
+    input_usd_per_1m: 0.50
+    output_usd_per_1m: 2.00
+
+  # Qwen Plus — general-purpose Qwen commercial model
+  - model_id: qwen/qwen-plus
+    input_usd_per_1m: 0.40
+    output_usd_per_1m: 1.20
+
+  # ── Meta Llama ───────────────────────────────────────────────────────────────
+
+  # Llama 3.3 70B Instruct — large open-weight instruction model
+  - model_id: meta-llama/llama-3.3-70b-instruct
+    input_usd_per_1m: 0.23
+    output_usd_per_1m: 0.40
+
+  # Llama 3.1 8B Instruct — small, fast open-weight model
+  - model_id: meta-llama/llama-3.1-8b-instruct
+    input_usd_per_1m: 0.06
+    output_usd_per_1m: 0.09
+
+  # ── Cohere ───────────────────────────────────────────────────────────────────
+
+  # Cohere Command R+ — high-capability RAG-optimised model
+  - model_id: cohere/command-r-plus
+    input_usd_per_1m: 2.50
+    output_usd_per_1m: 10.00
+
+  # Cohere Command R — lighter RAG-optimised model
+  - model_id: cohere/command-r
+    input_usd_per_1m: 0.15
+    output_usd_per_1m: 0.60
