@@ -140,10 +140,23 @@ def rewrite_cli_hints(text: str) -> str:
     def replace_inner(inner: str) -> str:
         return re.sub(r"\bhermes\b", label, inner, flags=re.IGNORECASE)
 
+    # BUG-001: hermes auth/portal map to a DIFFERENT command shape (`tag runtime auth`,
+    # not `tag auth` — which does not exist). These multi-word special-cases MUST run
+    # before the generic code-span / subcommand substitutions below, otherwise the bare
+    # `\bhermes\b`->label pass inside backticks rewrites `hermes auth` -> `tag auth` and
+    # this special-case can no longer match.
+    rewritten = re.sub(r"\bhermes auth\b", f"{label} runtime auth", text, flags=re.IGNORECASE)
+    rewritten = re.sub(r"\bhermes portal\b", f"{label} runtime portal", rewritten, flags=re.IGNORECASE)
+    # BUG-004: specific Title-Case product strings must run before the generic lowercase
+    # `hermes <subcommand>` rule (which lists `status`/`config` and would emit "tag Status").
+    rewritten = re.sub(r"\bHermes Configuration\b", "TAG Configuration", rewritten)
+    rewritten = re.sub(r"\bHermes Status\b", "TAG Status", rewritten)
+    rewritten = re.sub(r"\bHermes Runtime\b", "TAG Runtime", rewritten, flags=re.IGNORECASE)
+
     rewritten = re.sub(
         r"`([^`\n]*\bhermes\b[^`\n]*)`",
         lambda match: f"`{replace_inner(match.group(1))}`",
-        text,
+        rewritten,
         flags=re.IGNORECASE,
     )
     rewritten = re.sub(
@@ -152,9 +165,6 @@ def rewrite_cli_hints(text: str) -> str:
         rewritten,
         flags=re.IGNORECASE,
     )
-    # BUG-001/002/003: hermes auth/portal have no direct tag equivalent — route through `tag runtime`
-    rewritten = re.sub(r"\bhermes auth\b", f"{label} runtime auth", rewritten, flags=re.IGNORECASE)
-    rewritten = re.sub(r"\bhermes portal\b", f"{label} runtime portal", rewritten, flags=re.IGNORECASE)
     rewritten = re.sub(
         r"\bhermes (?=(config|model|setup|update|gateway|sessions|doctor|tools|status|plugins|skills|mcp|logs|memory|completion|prompt-size|chat|--resume|-c)\b)",
         f"{label} ",
@@ -191,10 +201,8 @@ def rewrite_cli_hints(text: str) -> str:
     )
     # BUG-010: bare ~/.hermes path shown in `tag profile`
     rewritten = rewritten.replace("~/.hermes", "~/.tag/profiles")
-    # BUG-001: title box strings like "⚕ Hermes Configuration" and "Hermes Status"
-    rewritten = re.sub(r"\bHermes Configuration\b", "TAG Configuration", rewritten)
-    rewritten = re.sub(r"\bHermes Status\b", "TAG Status", rewritten)
-    rewritten = re.sub(r"\bHermes Runtime\b", "TAG Runtime", rewritten, flags=re.IGNORECASE)
+    # (Hermes Configuration/Status/Runtime title strings are rewritten earlier, before the
+    # generic subcommand rule, so casing stays consistent — see BUG-004 block above.)
     # BUG-011: re-centre box titles after brand substitution shortened them
     rewritten = _fix_box_title_alignment(rewritten)
     # Catch any remaining standalone Hermes brand references that aren't filesystem paths
@@ -206,14 +214,25 @@ _BOX_TITLE_RE = re.compile(r"┌(─+)┐\n│([^\n]*)│\n└(─+)┘", re.MUL
 
 
 def _fix_box_title_alignment(text: str) -> str:
-    """BUG-011: Re-centre box titles that were shortened by brand substitution."""
+    """BUG-011: Re-centre box titles that were shortened by brand substitution.
+
+    Brand substitution (e.g. ``Hermes``->``TAG``) shrinks the title text without
+    re-padding the box, so the trailing ``│`` is pulled left and the frame breaks.
+    Re-centre any title line whose width no longer matches the border — not just the
+    ``⚕``-icon panels (BUG-003: non-icon titles like "TAG Status" were left broken).
+    """
     def recentre(m: re.Match) -> str:
         top_dashes, content, bot_dashes = m.group(1), m.group(2), m.group(3)
-        if "⚕" not in content:
-            return m.group(0)
         inner_width = len(top_dashes)
-        icon_pos = content.index("⚕")
-        title_part = content[icon_pos:].rstrip()
+        # For ⚕ panels, drop any leading padding and re-centre from the icon onward;
+        # for plain titles, re-centre the stripped title text.
+        if "⚕" in content:
+            title_part = content[content.index("⚕"):].strip()
+        else:
+            title_part = content.strip()
+        # Leave well-formed lines untouched; never widen a title that overflows the box.
+        if len(content) == inner_width or len(title_part) > inner_width:
+            return m.group(0)
         centred = title_part.center(inner_width)
         return f"┌{top_dashes}┐\n│{centred}│\n└{bot_dashes}┘"
     return _BOX_TITLE_RE.sub(recentre, text)
