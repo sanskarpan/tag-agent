@@ -86,12 +86,48 @@ def test_rewrite_cli_hints_prefers_tag_commands():
         "Resume this session with:\n  hermes --resume abc123\n"
         "  │ 📚 skill     hermes-agent  0.0s"
     )
-    assert "`tag auth add openrouter`" in rewritten
+    # BUG-001: `hermes auth` -> `tag runtime auth` (a bare `tag auth` command does NOT exist).
+    assert "`tag runtime auth add openrouter`" in rewritten
+    assert "`tag auth`" not in rewritten
     assert "the active TAG profile env file" in rewritten
     assert "this TAG profile" in rewritten
     assert "proper TAG auth/config flow" in rewritten
     assert "tag --resume abc123" in rewritten
     assert "skill     tag-agent" in rewritten
+
+
+def test_rewrite_cli_hints_auth_remediation_is_runnable():
+    """BUG-001 regression: the auth-failure hint must name a real command."""
+    out = TAG.rewrite_cli_hints("Codex auth is missing access_token. Run `hermes auth` to re-authenticate.")
+    assert "`tag runtime auth`" in out
+    assert "`tag auth`" not in out
+    assert "`hermes" not in out
+    # `hermes portal` has the same shape and must also route through `tag runtime`.
+    assert "`tag runtime portal`" in TAG.rewrite_cli_hints("Open `hermes portal`.")
+
+
+def test_rewrite_cli_hints_preserves_functional_env_vars():
+    """BUG-002: HERMES_* env-var names are read by the runtime — must NOT be rebranded."""
+    out = TAG.rewrite_cli_hints("Use --accept-hooks / HERMES_ACCEPT_HOOKS=1 to auto-accept.")
+    assert "HERMES_ACCEPT_HOOKS" in out
+
+
+def test_rewrite_cli_hints_product_name_casing_is_consistent():
+    """BUG-004: title strings keep TAG casing, not lowercase 'tag Status'."""
+    assert TAG.rewrite_cli_hints("Hermes Status") == "TAG Status"
+    assert TAG.rewrite_cli_hints("Hermes Configuration") == "TAG Configuration"
+    assert TAG.rewrite_cli_hints("Hermes Runtime") == "TAG Runtime"
+
+
+def test_rewrite_cli_hints_recentres_box_titles():
+    """BUG-003: brand-shortened box titles must stay framed, icon or not."""
+    W = 30
+    def box(title: str) -> str:
+        return "┌" + "─" * W + "┐\n│" + title.center(W) + "│\n└" + "─" * W + "┘"
+    for raw in ("⚕ Hermes Configuration", "Hermes Status"):
+        lines = TAG.rewrite_cli_hints(box(raw)).splitlines()
+        widths = {len(line) for line in lines}
+        assert len(widths) == 1, f"misaligned box for {raw!r}: {widths}"
 
 
 def test_infrastructure_failure_reason_detects_codex_auth_failure():
