@@ -17,6 +17,9 @@
   "files": [
     "bin",
     "src/tag/*.py",
+    "src/tag/core/*.py",
+    "src/tag/cmd/*.py",
+    "src/tag/integrations/*.py",
     "src/tag/assets",
     "src/tag/config",
     "src/tag/docs",
