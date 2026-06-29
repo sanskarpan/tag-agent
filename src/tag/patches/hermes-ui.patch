@@ -905,7 +905,7 @@ index 121b9011c..a81ef8a06 100644
 +    expect(appended).toContainEqual(
 +      expect.objectContaining({
 +        role: 'assistant',
-+        text: 'Run `tag auth add openrouter` or edit the active TAG profile env file first.'
++        text: 'Run `tag runtime auth add openrouter` or edit the active TAG profile env file first.'
 +      })
 +    )
 +  })
@@ -1301,6 +1301,19 @@ index 4f2bbb5ea..bf679870d 100644
  import { flat } from '../lib/text.js'
  import type { Theme } from '../theme.js'
  import type { PanelSection, SessionInfo } from '../types.js'
+@@ -45,8 +46,9 @@ import { artWidth, caduceus, CADUCEUS_WIDTH, logo, LOGO_WIDTH } from '../banner.j
+ // Terminals can't scale glyphs, so "responsive" means picking a layout that
+ // fits the available columns. Thresholds are picked so each tier reads
+ // comfortably without forcing wrap or truncation drift on box-drawing edges.
+-const TAG_FULL = 'Nous Research · Messenger of the Digital Gods'
+-const TAG_MID = 'Messenger of the Digital Gods'
+-const TAG_TINY = 'Nous Research'
++const _isTag = process.env.HERMES_BIN_LABEL?.trim().toLowerCase() === 'tag'
++const TAG_FULL = _isTag ? 'TAG · Terminal Agent Gateway' : 'Nous Research · Messenger of the Digital Gods'
++const TAG_MID = _isTag ? 'Terminal Agent Gateway' : 'Messenger of the Digital Gods'
++const TAG_TINY = _isTag ? 'TAG' : 'Nous Research'
+ const HIDE_BELOW = 34
+ const COMPACT_FROM = 58
 @@ -402,7 +403,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
                - run{' '}
              </Text>
@@ -1377,7 +1390,7 @@ diff --git a/ui-tui/src/lib/externalCli.ts b/ui-tui/src/lib/externalCli.ts
 index 7ff88f2b8..5e32db389 100644
 --- a/ui-tui/src/lib/externalCli.ts
 +++ b/ui-tui/src/lib/externalCli.ts
-@@ -6,6 +6,40 @@ export interface LaunchResult {
+@@ -6,6 +6,42 @@ export interface LaunchResult {
  }
  
  const resolveHermesBin = () => process.env.HERMES_BIN?.trim() || 'hermes'
@@ -1404,9 +1417,11 @@ index 7ff88f2b8..5e32db389 100644
 +export const formatCliCommand = (args: readonly string[] | string[]) => replaceBareCommand(`hermes ${args.join(' ')}`.trim())
 +export const rewriteCliHints = (text: string) =>
 +  text
++    .replace(/\bhermes auth\b/gi, `${resolveCliLabel()} runtime auth`)
++    .replace(/\bhermes portal\b/gi, `${resolveCliLabel()} runtime portal`)
 +    .replace(/`([^`\n]*\bhermes\b[^`\n]*)`/gi, (_match, inner) => `\`${replaceBareCommand(inner)}\``)
 +    .replace(/'([^'\n]*\bhermes\b[^'\n]*)'/gi, (_match, inner) => `'${replaceBareCommand(inner)}'`)
-+    .replace(/\bhermes (?=(auth|config|model|setup|update|gateway|sessions|doctor|tools|portal|status|plugins|skills|mcp|logs|memory|completion|prompt-size)\b)/gi, `${resolveCliLabel()} `)
++    .replace(/\bhermes (?=(config|model|setup|update|gateway|sessions|doctor|tools|status|plugins|skills|mcp|logs|memory|completion|prompt-size)\b)/gi, `${resolveCliLabel()} `)
 +    .replace(/\bHermes\/tag\b/gi, 'TAG')
 +    .replace(/\btag\/tag\b/gi, 'tag')
 +    .replace(/\bHermes Agent\b/gi, 'TAG')
