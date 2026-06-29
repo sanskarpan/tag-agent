@@ -920,37 +920,13 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     swe_cmd.set_defaults(func=cmd_swe_solve)
 
     # ── PRD-065/068: memory+ extensions ────────────────────────────────────
-    # New top-level `mem2` for gc/extract/tier/fact/episode/vector to avoid conflict.
-    mem2_cmd = sub.add_parser("mem2", help="Advanced memory: gc, extract, tier, fact, episodes, vectors")
-    mem2_sub = mem2_cmd.add_subparsers(dest="mem_subcommand")
-    mem2_gc = mem2_sub.add_parser("gc", help="Run memory garbage collection")
-    mem2_gc.add_argument("--profile", default=None)
-    mem2_gc.add_argument("--all-profiles", action="store_true")
-    mem2_gc.add_argument("--dry-run", action="store_true")
-    mem2_extract = mem2_sub.add_parser("extract", help="Extract memories from last run output")
-    mem2_extract.add_argument("run_id", metavar="RUN_ID")
-    mem2_extract.add_argument("--profile", default=None)
-    mem2_tier = mem2_sub.add_parser("tier", help="List memories by tier (core/recall/archival)")
-    mem2_tier.add_argument("--profile", default=None)
-    mem2_tier.add_argument("--tier", default=None, choices=["core", "recall", "archival"])
-    mem2_fact = mem2_sub.add_parser("fact", help="Temporal fact versioning")
-    mem2_fact.add_argument("action", choices=["update", "history", "list-at"])
-    mem2_fact.add_argument("--id", default=None, dest="fact_id")
-    mem2_fact.add_argument("--content", default=None)
-    mem2_fact.add_argument("--at", default=None, help="ISO timestamp for list-at")
-    mem2_fact.add_argument("--profile", default=None)
-    mem2_episode = mem2_sub.add_parser("episode", help="Episodic memory sessions")
-    mem2_episode.add_argument("action", choices=["start", "end", "list", "get"])
-    mem2_episode.add_argument("--id", default=None, dest="episode_id")
-    mem2_episode.add_argument("--summary", default=None)
-    mem2_episode.add_argument("--profile", default=None)
-    mem2_vector = mem2_sub.add_parser("store", help="Store or search vector embeddings")
-    mem2_vector.add_argument("action", choices=["store", "search", "rebuild"])
-    mem2_vector.add_argument("--query", default=None)
-    mem2_vector.add_argument("--id", default=None, dest="memory_id")
-    mem2_vector.add_argument("--profile", default=None)
-    for ap in [mem2_cmd, mem2_gc, mem2_extract, mem2_tier, mem2_fact, mem2_episode, mem2_vector]:
-        ap.set_defaults(func=cmd_mem_ext)
+    # NOTE: the top-level `mem2` subparser (gc/extract/tier/fact/episode/store)
+    # is registered by tag.cmd.memory.register(), which owns the memory surface.
+    # Registering it here too raised `argparse.ArgumentError: conflicting
+    # subparser: mem2` on Python 3.11–3.13 (the supported runtimes), crashing
+    # build_parser() — and the duplicate aborted every command registered after
+    # it (graph, …). The `cmd_mem_ext` handler in this module is retained for
+    # backward-compatible imports.
 
     # ── PRD-070: entity graph ───────────────────────────────────────────────
     graph_cmd = sub.add_parser("graph", help="Entity knowledge graph")
