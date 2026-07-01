@@ -189,6 +189,9 @@ def create_rule(
     notify_channels: Optional[list[str]] = None,
 ) -> AlertRule:
     """Persist a new AlertRule and return it."""
+    if not name or not name.strip():
+        raise ValueError("Alert rule name must not be empty")
+    name = name.strip()
     if metric not in [m.value for m in AlertMetric]:
         raise ValueError(f"Unknown metric: {metric!r}")
     if condition not in ("lt", "gt", "lte", "gte"):
