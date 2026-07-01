@@ -43,25 +43,62 @@ def _field_matches(field: str, value: int, lo: int, hi: int) -> bool:
     return value == int(field)
 
 
+# Schedulable cron aliases → their 5-field equivalents. ``@reboot`` is
+# deliberately absent: a polling daemon has no "boot" event to fire it on, so it
+# is rejected at validation time rather than accepted and left permanently dead.
+_ALIAS_EXPANSION = {
+    "@yearly":   "0 0 1 1 *",
+    "@annually": "0 0 1 1 *",
+    "@monthly":  "0 0 1 * *",
+    "@weekly":   "0 0 * * 0",
+    "@daily":    "0 0 * * *",
+    "@midnight": "0 0 * * *",
+    "@hourly":   "0 * * * *",
+}
+
+_CRON_ALIASES = frozenset(_ALIAS_EXPANSION)
+
+
+def _dow_matches(field: str, cron_dow: int) -> bool:
+    """Match a cron day-of-week field, treating both 0 and 7 as Sunday.
+
+    *cron_dow* is already in cron space (0=Sun .. 6=Sat).
+    """
+    if _field_matches(field, cron_dow, 0, 7):
+        return True
+    # Sunday is expressible as either 0 or 7 in cron; try the alternate form.
+    if cron_dow == 0 and _field_matches(field, 7, 0, 7):
+        return True
+    return False
+
+
 def cron_matches(expr: str, dt: datetime) -> bool:
     """Return True if *dt* matches the 5-field cron expression *expr*."""
-    parts = expr.strip().split()
+    expr_expanded = _ALIAS_EXPANSION.get(expr.strip().lower(), expr)
+    parts = expr_expanded.strip().split()
     if len(parts) != 5:
         raise ValueError(f"Invalid cron expression (need 5 fields): {expr!r}")
     minute, hour, dom, month, dow = parts
-    return (
+
+    # Python's weekday() is 0=Mon..6=Sun; cron's dow is 0/7=Sun,1=Mon..6=Sat.
+    cron_dow = (dt.weekday() + 1) % 7
+
+    if not (
         _field_matches(minute, dt.minute, 0, 59)
         and _field_matches(hour, dt.hour, 0, 23)
-        and _field_matches(dom, dt.day, 1, 31)
         and _field_matches(month, dt.month, 1, 12)
-        and _field_matches(dow, dt.weekday(), 0, 6)  # 0=Mon in Python, 0=Sun in cron → shift
-    )
+    ):
+        return False
 
+    dom_match = _field_matches(dom, dt.day, 1, 31)
+    dow_match = _dow_matches(dow, cron_dow)
 
-_CRON_ALIASES = frozenset({
-    "@reboot", "@yearly", "@annually", "@monthly",
-    "@weekly", "@daily", "@midnight", "@hourly",
-})
+    # POSIX: when BOTH day-of-month and day-of-week are restricted (neither is
+    # ``*``), a day matches if EITHER field matches (OR). Otherwise the two are
+    # combined with the rest via AND.
+    if dom != "*" and dow != "*":
+        return dom_match or dow_match
+    return dom_match and dow_match
 
 
 def validate_cron_expression(expr: str) -> None:
