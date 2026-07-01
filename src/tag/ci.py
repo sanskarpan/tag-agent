@@ -803,6 +803,26 @@ def install_github_action(
 # PRD-059: SAST vulnerability auto-remediation
 # ---------------------------------------------------------------------------
 
+def _normalize_sarif_path(raw: str) -> str:
+    """Normalise a SARIF artifact URI into a safe repo-relative path.
+
+    Decodes ``file://`` URIs correctly (the old ``raw[8:]`` slice dropped the
+    leading slash and left ``..`` traversal intact), then strips any leading
+    slashes and ``..`` segments so the result can never escape the repository
+    root when later joined against it.
+    """
+    if not raw:
+        return ""
+    if raw.startswith("file:"):
+        from urllib.parse import unquote, urlparse
+        raw = unquote(urlparse(raw).path)
+    # Collapse . / .. and redundant separators, then force repo-relative.
+    import posixpath
+    norm = posixpath.normpath(raw.replace("\\", "/"))
+    parts = [p for p in norm.split("/") if p not in ("", ".", "..")]
+    return "/".join(parts)
+
+
 def parse_sarif(sarif_path: Path) -> list[dict]:
     """Parse a SARIF file and return a flat list of findings.
 
@@ -873,12 +893,8 @@ def parse_sarif(sarif_path: Path) -> list[dict]:
                 physical = location.get("physicalLocation", {})
                 artifact = physical.get("artifactLocation", {})
                 region = physical.get("region", {})
-                path = artifact.get("uri", "")
-                # Strip common URI prefixes.
-                if path.startswith("file:///"):
-                    path = path[8:]
-                elif path.startswith("file://"):
-                    path = path[7:]
+                # Decode file:// URIs and constrain to a safe repo-relative path.
+                path = _normalize_sarif_path(artifact.get("uri", ""))
                 start_line = region.get("startLine", 0)
 
                 findings.append(
@@ -1009,16 +1025,33 @@ def fix_sarif_vulns(
     vulns = parse_sarif(sarif_path)
     results: list[dict] = []
 
+    # Auto-remediation may only touch files inside the repository. Resolve every
+    # finding path against the repo root and reject anything that escapes it, so
+    # a crafted SARIF cannot redirect writes to e.g. /etc/cron.d/evil.
+    repo_root = Path.cwd().resolve()
+
     for vuln in vulns:
         file_path = vuln.get("path", "")
         record: dict = {"vuln": vuln, "fix_applied": False, "commit_sha": None}
 
-        if not file_path or not Path(file_path).exists():
+        if not file_path:
+            results.append(record)
+            continue
+
+        target = (repo_root / file_path).resolve()
+        try:
+            target.relative_to(repo_root)
+        except ValueError:
+            # Path escapes the repository — skip it entirely.
+            results.append(record)
+            continue
+
+        if not target.exists():
             results.append(record)
             continue
 
         try:
-            file_content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+            file_content = target.read_text(encoding="utf-8", errors="replace")
         except OSError:
             results.append(record)
             continue
@@ -1039,17 +1072,17 @@ def fix_sarif_vulns(
         fixed_content = proc.stdout.strip()
 
         if not dry_run:
-            Path(file_path).write_text(fixed_content, encoding="utf-8")
+            target.write_text(fixed_content, encoding="utf-8")
             record["fix_applied"] = True
 
             if auto_commit:
-                subprocess.run(["git", "add", file_path], capture_output=True)
+                subprocess.run(["git", "add", str(target)], capture_output=True)
                 commit_result = subprocess.run(
                     [
                         "git",
                         "commit",
                         "-m",
-                        f"fix({vuln['rule_id']}): auto-remediate {Path(file_path).name} "
+                        f"fix({vuln['rule_id']}): auto-remediate {target.name} "
                         f"line {vuln['start_line']}",
                     ],
                     capture_output=True,
