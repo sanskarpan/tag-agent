@@ -255,6 +255,7 @@ def _cmd_import_generic(
     source_path_attr: str | None,
     display_name: str,
     extra_kwargs: dict[str, Any] | None = None,
+    source_kwarg: str | None = None,
 ) -> int:
     cfg = load_config(config_path(args.config))
     ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
@@ -271,8 +272,11 @@ def _cmd_import_generic(
     kwargs: dict[str, Any] = {"profile_name": args.profile}
     if source_path_attr and getattr(args, source_path_attr, None):
         raw = getattr(args, source_path_attr)
+        # The argparse dest (source_path_attr) often differs from the import
+        # function's parameter name (source_kwarg); pass under the fn's name.
+        key = source_kwarg or source_path_attr
         try:
-            kwargs[source_path_attr] = Path(raw).expanduser().resolve()
+            kwargs[key] = Path(raw).expanduser().resolve()
         except (OSError, RuntimeError) as exc:
             raise SystemExit(f"Cannot resolve path '{raw}': {exc}") from exc
     if extra_kwargs:
@@ -302,6 +306,7 @@ def cmd_import_opencode(args: argparse.Namespace) -> int:
         import_fn=import_opencode_into_profile,
         no_auth_msg="No opencode credentials found. Expected ~/.local/share/opencode/auth.json.",
         source_path_attr="opencode_data_dir",
+        source_kwarg="source_data_dir",
         display_name="opencode",
     )
 
@@ -316,6 +321,7 @@ def cmd_import_zed(args: argparse.Namespace) -> int:
             "env vars (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.)."
         ),
         source_path_attr="zed_config",
+        source_kwarg="source_zed_config",
         display_name="Zed",
     )
 
@@ -329,6 +335,7 @@ def cmd_import_copilot(args: argparse.Namespace) -> int:
             "or set GITHUB_TOKEN in your environment."
         ),
         source_path_attr="gh_config",
+        source_kwarg="source_gh_config",
         display_name="GitHub Copilot",
     )
 
@@ -342,6 +349,7 @@ def cmd_import_aider(args: argparse.Namespace) -> int:
             "with at least one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, etc."
         ),
         source_path_attr="aider_home",
+        source_kwarg="source_home",
         display_name="Aider",
     )
 
@@ -355,6 +363,7 @@ def cmd_import_aws(args: argparse.Namespace) -> int:
             "AWS_SECRET_ACCESS_KEY in your environment."
         ),
         source_path_attr="aws_dir",
+        source_kwarg="source_aws_dir",
         display_name="AWS Bedrock",
     )
 
@@ -368,6 +377,7 @@ def cmd_import_cursor(args: argparse.Namespace) -> int:
             "Models (BYOK) and ensure Cursor has been run at least once."
         ),
         source_path_attr="cursor_dir",
+        source_kwarg="source_cursor_dir",
         display_name="Cursor",
     )
 
