@@ -42,7 +42,9 @@ _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", ".qa-venv312",
 _SKIP_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff",
               ".ttf", ".eot", ".mp4", ".mov", ".zip", ".tar", ".gz",
               ".pyc", ".pyo", ".so", ".dylib", ".dll", ".exe"}
-_MAX_FILE_BYTES = 1_000_000  # 1 MB
+_MAX_FILE_BYTES = 10_000_000  # 10 MB — covers realistic source/config/env/log
+                              # files; the old 1 MB cap silently reported larger
+                              # secret-bearing files as clean.
 
 
 def _shannon_entropy(s: str) -> float:
