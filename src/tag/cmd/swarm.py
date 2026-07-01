@@ -442,6 +442,10 @@ def _cmd_swarm_abort(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
     swarm_id = args.swarm_id
     db = open_db(cfg)
+    if not db.execute("SELECT 1 FROM swarm_runs WHERE swarm_id=? LIMIT 1", (swarm_id,)).fetchone():
+        db.close()
+        print(f"error: swarm {swarm_id!r} not found", file=sys.stderr)
+        return 1
     pids = db.execute(
         "SELECT pid FROM swarm_tasks WHERE swarm_id=? AND status='running' AND pid IS NOT NULL",
         (swarm_id,),
