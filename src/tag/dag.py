@@ -66,15 +66,24 @@ def all_deps_satisfied(conn: sqlite3.Connection, job_id: str) -> bool:
     return True
 
 
+# Terminal statuses that mean a dependency can never succeed. A dependent of
+# any of these must be cascade-failed rather than left pending forever (B046).
+_FAILED_DEP_STATUSES = {"failed", "cancelled", "timed_out"}
+
+
 def has_failed_dep(conn: sqlite3.Connection, job_id: str) -> str | None:
-    """Return the first failed dependency ID, or None if none have failed."""
+    """Return the first terminally-failed dependency ID, or None.
+
+    Covers 'failed', 'cancelled', and 'timed_out' — any of which mean the
+    dependency will never reach 'done', so the dependent should be failed too.
+    """
     row = conn.execute("SELECT deps_json FROM queue_jobs WHERE id=?", (job_id,)).fetchone()
     if not row or not row[0]:
         return None
     deps: list[str] = json.loads(row[0] or "[]")
     for dep_id in deps:
         status = _get_job_status(conn, dep_id)
-        if status == "failed":
+        if status in _FAILED_DEP_STATUSES:
             return dep_id
     return None
 
@@ -99,9 +108,10 @@ def promote_ready_jobs(conn: sqlite3.Connection) -> list[str]:
         # Check for failed deps — if any dep failed, cascade-fail this job
         failed_dep = has_failed_dep(conn, job_id)
         if failed_dep:
+            dep_status = _get_job_status(conn, failed_dep) or "failed"
             conn.execute(
                 "UPDATE queue_jobs SET status='failed', error=? WHERE id=?",
-                (f"dependency {failed_dep} failed", job_id),
+                (f"dependency {failed_dep} {dep_status}", job_id),
             )
             continue
         if all_deps_satisfied(conn, job_id):
@@ -131,6 +141,9 @@ def add_job(
 ) -> str:
     """Insert a new job with optional dependency list. Returns the new job ID."""
     ensure_schema(conn)
+    # Strip null bytes for parity with `queue add` and kanban._clean_text (B095):
+    # SQLite/display truncate at an embedded NUL, silently corrupting the task.
+    task = (task or "").replace("\x00", "")
     job_id = uuid.uuid4().hex[:16]
     now = _utc_now()
     deps = depends_on or []
@@ -196,9 +209,13 @@ def show_dag(conn: sqlite3.Connection, job_ids: list[str] | None = None) -> str:
     if not rows:
         return "No jobs found."
 
+    # Cover both the DAG vocabulary (pending/ready/done/failed) and the queue
+    # vocabulary (queued/running/done/failed/cancelled) since both share the
+    # queue_jobs table (B097).
     _STATUS_ICON = {
         "ready": "⏳", "running": "▶", "done": "✓", "failed": "✗",
-        "pending": "○", "cancelled": "⊘",
+        "pending": "○", "cancelled": "⊘", "queued": "•",
+        "timed_out": "⌛", "skipped": "–",
     }
 
     lines = ["Job Dependency Graph", "=" * 40]
@@ -248,8 +265,26 @@ class DagSpec:
         return cls.from_dict(json.loads(s))
 
 
+def validate_dag_spec(spec: DagSpec) -> None:
+    """Validate a DAG spec at save time. Raises ValueError on bad input (B098)."""
+    if not spec.name or not str(spec.name).strip():
+        raise ValueError("DAG name must not be empty.")
+    steps = spec.steps
+    if not isinstance(steps, list):
+        raise ValueError(
+            f"DAG steps must be a JSON array of step objects, got "
+            f"{type(steps).__name__}."
+        )
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise ValueError(f"DAG step {i} must be an object, got {type(step).__name__}.")
+        if not str(step.get("task", "")).strip():
+            raise ValueError(f"DAG step {i} is missing required non-empty 'task'.")
+
+
 def save_dag(conn: sqlite3.Connection, spec: DagSpec) -> str:
     ensure_schema(conn)
+    validate_dag_spec(spec)
     dag_id = uuid.uuid4().hex[:12]
     conn.execute(
         """INSERT INTO queue_dags(id, name, spec_json, created_at) VALUES(?,?,?,?)
