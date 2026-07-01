@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tag-agent"
-version = "0.8.1"
+version = "0.8.2"
 description = "Orchestrate AI agents from your terminal — multi-source credential import, swarm topology, background queue, live dashboard"
 readme = "README.md"
 # Upper bound is load-bearing, not cosmetic. uv resolves the project's
@@ -261,15 +261,18 @@ tag = "tag.cli:main"
 
 [tool.setuptools.package-data]
 # Non-package data directories physically nested under the `tag` package
-# (assets/config/docs/patches have no __init__.py, so packages.find skips
-# them). Declaring them here ships them inside the wheel; MANIFEST.in ships
-# them in the sdist. `vendor/` is deliberately excluded — the 54MB upstream
-# tarball is not a runtime artifact and must not be baked into the wheel.
+# (assets/config/docs/patches/vendor have no __init__.py, so packages.find
+# skips them). Declaring them here ships them inside the wheel; MANIFEST.in
+# ships them in the sdist. `vendor/` holds the bundled upstream runtime
+# tarball that `tag setup` extracts — it is INTENTIONALLY bundled so install
+# works offline and the branding patch applies against the exact pinned
+# snapshot (a fresh git clone of upstream may not be patch-compatible).
 tag = [
   "assets/**/*",
   "config/**/*",
   "docs/**/*",
   "patches/**/*",
+  "vendor/**/*",
 ]
 
 [tool.setuptools.packages.find]
