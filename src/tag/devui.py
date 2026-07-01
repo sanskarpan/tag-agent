@@ -35,6 +35,22 @@ def _query_db(db_path: str | Path, sql: str, params: tuple = ()) -> list[dict]:
         return []
 
 
+def _safe_limit(raw: str, default: int = 50, maximum: int = 1000) -> int:
+    """Parse a `limit` query param defensively.
+
+    A non-integer value (e.g. ``?limit=abc``) or a negative value (which SQLite
+    treats as unbounded) falls back to *default*; oversized values are clamped
+    to *maximum*. Never raises, so the endpoint can't crash on hostile input.
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if value < 0:
+        return default
+    return min(value, maximum)
+
+
 # ---------------------------------------------------------------------------
 # Inline HTML dashboard
 # ---------------------------------------------------------------------------
@@ -388,7 +404,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # No wildcard CORS: these endpoints expose local spans/costs/memories.
+        # A `*` ACAO would let any visited web page read them cross-origin,
+        # defeating the 127.0.0.1 bind.
         self.end_headers()
         self.wfile.write(body)
 
@@ -415,11 +433,12 @@ class _Handler(BaseHTTPRequestHandler):
         db = self.db_path
 
         if path == "/" or path == "":
-            html = _DASHBOARD_HTML.replace("__DB_PATH__", db)
-            self._send_html(html)
+            # The template carries no __DB_PATH__ token (dead substitution) and
+            # the absolute host DB path must not be embedded in the page.
+            self._send_html(_DASHBOARD_HTML)
 
         elif path == "/health":
-            self._send_json({"status": "ok", "db": db})
+            self._send_json({"status": "ok"})
 
         elif path == "/api/stats":
             spans_rows = _query_db(db, "SELECT COUNT(*) AS n, SUM(cost_usd) AS c FROM spans")
@@ -434,11 +453,10 @@ class _Handler(BaseHTTPRequestHandler):
                 "total_runs": total_runs or 0,
                 "total_cost_usd": round(float(total_cost or 0), 6),
                 "total_memories": total_mem or 0,
-                "db": db,
             })
 
         elif path == "/api/spans":
-            limit = int(qp("limit", "50"))
+            limit = _safe_limit(qp("limit", "50"), 50)
             trace_id = qp("trace_id")
             if trace_id:
                 rows = _query_db(
@@ -455,7 +473,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(rows)
 
         elif path == "/api/eval_runs":
-            limit = int(qp("limit", "20"))
+            limit = _safe_limit(qp("limit", "20"), 20)
             rows = _query_db(
                 db,
                 "SELECT * FROM eval_runs ORDER BY created_at DESC LIMIT ?",
@@ -464,7 +482,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(rows)
 
         elif path == "/api/judge_runs":
-            limit = int(qp("limit", "20"))
+            limit = _safe_limit(qp("limit", "20"), 20)
             rows = _query_db(
                 db,
                 "SELECT * FROM judge_runs ORDER BY created_at DESC LIMIT ?",
@@ -473,7 +491,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(rows)
 
         elif path == "/api/memories":
-            limit = int(qp("limit", "50"))
+            limit = _safe_limit(qp("limit", "50"), 50)
             profile = qp("profile")
             if profile:
                 rows = _query_db(
@@ -490,7 +508,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(rows)
 
         elif path == "/api/alerts":
-            limit = int(qp("limit", "20"))
+            limit = _safe_limit(qp("limit", "20"), 20)
             rows = _query_db(
                 db,
                 "SELECT * FROM alert_firings ORDER BY fired_at DESC LIMIT ?",
@@ -519,6 +537,7 @@ class DevUIServer:
         self.host = host
         self.port = port
         self._server: HTTPServer | None = None
+        self._thread: threading.Thread | None = None
 
     def _build_server(self) -> HTTPServer:
         db_path = self.db_path
@@ -550,7 +569,13 @@ class DevUIServer:
         self._server = self._build_server()
         t = threading.Thread(target=self._server.serve_forever, daemon=True)
         t.start()
+        self._thread = t
         print(f"TAG DevUI running at {self.url}  (db: {self.db_path})", flush=True)
+
+    def wait(self) -> None:
+        """Block until the background serve thread exits (or Ctrl-C)."""
+        if self._thread is not None:
+            self._thread.join()
 
     def stop(self) -> None:
         """Shut down the server if running."""
@@ -581,7 +606,15 @@ def cmd_devui(args: Any) -> int:
     server = DevUIServer(db_path=db_path, host=host, port=port)
 
     if background:
+        # The serve loop runs in a daemon thread, which the interpreter kills on
+        # exit. Returning immediately would let the CLI tear down the process and
+        # silently stop serving (a false-success no-op), so block on the thread
+        # to keep the server alive until interrupted.
         server.start_background()
+        try:
+            server.wait()
+        except KeyboardInterrupt:
+            server.stop()
         return 0
     else:
         server.start()
