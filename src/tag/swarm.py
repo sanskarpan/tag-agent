@@ -72,8 +72,14 @@ def _validate_manifest(manifest: dict, max_agents: int) -> None:
                         f"Overlapping context_slice selector {s!r} in task {tid}"
                     )
                 all_selectors.append(s)
-    # validate dependency graph is acyclic
+    # validate dependency graph: referential integrity + acyclicity
     dep_map = {t["task_id"]: set(t.get("depends_on", [])) for t in tasks}
+    for tid, deps in dep_map.items():
+        unknown = deps - seen_ids
+        if unknown:
+            raise SwarmManifestError(
+                f"Task {tid!r} depends_on unknown task_id(s): {sorted(unknown)}"
+            )
     _assert_acyclic(dep_map)
 
 
@@ -470,7 +476,17 @@ class SwarmRunner:
                 if dep_map[tid].issubset(completed_ids | failed_ids)
             }
             if not ready:
-                # Circular dependency or all failed dependencies
+                # No task's dependencies can ever be satisfied (unknown dep,
+                # cycle, or unmet dependency). Strand them visibly as 'skipped'
+                # rather than silently dropping them so the run cannot report
+                # 'completed' with missing tasks (B049).
+                for tid in remaining:
+                    self._set_task_status(tid, "skipped", "dependencies unsatisfiable")
+                    results.append(TaskResult(
+                        tid, "skipped",
+                        error_message="dependencies unsatisfiable",
+                    ))
+                remaining = set()
                 break
             wave = list(ready)[: self._max_agents]
             wave_results = self._run_wave(wave, task_by_id)
@@ -586,6 +602,15 @@ class SwarmRunner:
         env["TAG_SWARM_TASK_INPUT"] = str(input_path)
         env["TAG_CONTEXT_BUS_OUTPUT"] = str(ctx_out_path)
         env["TAG_SWARM_RESULT_OUTPUT"] = str(result_path)
+        env["TAG_SWARM_PROFILE"] = profile
+        env["TAG_SWARM_TIMEOUT"] = str(self._timeout)
+        # Hand the resolved runtime binary to the sub-agent so it need not
+        # re-load config (swarm_agent_entry reads TAG_HERMES_BIN) — B009.
+        try:
+            from tag.controller import hermes_bin as _hermes_bin_fn  # noqa: PLC0415
+            env["TAG_HERMES_BIN"] = str(_hermes_bin_fn(self._cfg))
+        except Exception:
+            pass
 
         # Update DB: running
         self._conn.execute(
