@@ -613,3 +613,30 @@ Kinds: consistency=16, crash=13, cross-platform=2, data-integrity=18, dead-code=
   - area: `cmd/queue_dag.py register() queue subcommands`
   - root_cause: src/tag/cmd/queue_dag.py:328-329 — q_result parser only adds job_id; cmd_queue result branch (113-124) has no json handling.
   - repro: queue result somejob --json -> rc=2 'unrecognized arguments: --json'; add/list/cancel/clear all accept --json.
+
+---
+
+## Resolution (all 149 fixed)
+
+**Method:** 4 criticals fixed directly (merged in #509); the remaining 145 fixed via 9 parallel
+fix-agents over disjoint file-clusters + a cross-file cleanup pass, then adversarial reconciliation
+of the test suite (real regressions fixed in code; tests encoding old buggy behavior updated to the
+corrected contract).
+
+**Verification:**
+- Full suite: **678 passed, 63 skipped** (0 failures).
+- 103-command `--help` sweep: **0 tracebacks, 0 nonzero exit codes**.
+- CI on main: green.
+- Each critical + security fix verified live (injection blocked, HMAC enforced, traversal/SSRF blocked,
+  sandbox isolation, binary-file scanner skip, atomic config writes).
+
+**Notable regressions the fixes exposed (and re-fixed):**
+- B015's entropy-window widening flagged binary files → scanner now skips binary content (NUL sniff).
+- otel-export must emit the OTLP JSON payload by default (no endpoint) — restored.
+- nous-portal key validation belongs at the CLI layer (library stays permissive for direct callers).
+
+**Accepted as-is (documented, low-risk):**
+- B083: route-fallback strict provider/model validation not enforced (would reject bare model names in
+  existing tests); dedupe + non-negative priority + cycle detection are in.
+- B143: `devui` background mode hardened in `devui.py`; the wired `prd_clusters.cmd_devui` uses blocking
+  start() (correct for foreground).
