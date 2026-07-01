@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -954,6 +955,62 @@ def auto_import_opencode_profiles(cfg: dict[str, Any]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _strip_jsonc(text: str) -> str:
+    """Remove ``//`` and ``/* */`` comments and trailing commas from JSONC text.
+
+    Real Zed ``settings.json`` files are JSONC (JSON with comments/trailing
+    commas). Comment/string handling is character-by-character so that ``//`` or
+    ``/*`` sequences inside string literals are preserved verbatim.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:  # keep escaped char intact
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            i += 2
+            while i < n and text[i] not in "\r\n":
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    stripped = "".join(out)
+    # Drop trailing commas before a closing } or ] (allowed in JSONC, not JSON).
+    stripped = re.sub(r",(\s*[}\]])", r"\1", stripped)
+    return stripped
+
+
+def _load_jsonc(text: str) -> dict[str, Any]:
+    """Parse JSONC text into a dict, tolerating comments and trailing commas."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = json.loads(_strip_jsonc(text))
+    return data if isinstance(data, dict) else {}
+
+
 def _detect_zed_credentials(
     source_zed_config: Path | None = None,
 ) -> dict[str, str]:
@@ -973,7 +1030,7 @@ def _detect_zed_credentials(
 
     if zed_settings.exists():
         try:
-            data = json.loads(zed_settings.read_text(encoding="utf-8"))
+            data = _load_jsonc(zed_settings.read_text(encoding="utf-8"))
             lm = data.get("language_models") or {}
             for provider, cfg_block in lm.items():
                 if not isinstance(cfg_block, dict):
@@ -1550,9 +1607,7 @@ def _estimate_cost(input_tokens: int, output_tokens: int, model_ref: str) -> flo
     if input_tokens == 0 and output_tokens == 0:
         return 0.0
     # Normalise: strip openrouter/ prefix that some refs carry
-    key = model_ref.removeprefix("openrouter/") if hasattr(str, "removeprefix") else (
-        model_ref[len("openrouter/"):] if model_ref.startswith("openrouter/") else model_ref
-    )
+    key = model_ref.removeprefix("openrouter/")
     input_price, output_price = _MODEL_PRICING.get(key, _DEFAULT_PRICING)
     return (input_tokens * input_price + output_tokens * output_price) / 1_000_000.0
 
