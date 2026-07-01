@@ -54,7 +54,9 @@ def cmd_security(args: argparse.Namespace) -> int:
     if sub == "scan":
         path_str = getattr(args, "path", ".") or "."
         scan_path = Path(path_str).resolve()
-        max_files = getattr(args, "max_files", 2000) or 2000
+        max_files = getattr(args, "max_files", 2000)
+        if max_files is None:
+            max_files = 2000
 
         if not scan_path.exists():
             db.close()
@@ -182,9 +184,22 @@ def cmd_persona(args: argparse.Namespace) -> int:
         db.close()
         if removed:
             print(f"Persona '{name}' removed from profile '{profile}'.")
-        else:
-            print(f"Persona '{name}' was not active on profile '{profile}'.")
-        return 0
+            return 0
+        print_error(f"Persona '{name}' was not active on profile '{profile}'.")
+        return 1
+
+    if sub == "delete":
+        name = getattr(args, "name", "")
+        removed = remove_persona(db, name)
+        db.close()
+        if removed:
+            print(f"Installed persona '{name}' deleted.")
+            return 0
+        print_error(
+            f"No installed persona named '{name}' to delete "
+            "(built-in personas cannot be deleted)."
+        )
+        return 1
 
     if sub == "stack":
         profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
@@ -237,8 +252,12 @@ def cmd_diff_inject(args: argparse.Namespace) -> int:
     pr_num = getattr(args, "pr", None)
     ref = getattr(args, "ref", "HEAD") or "HEAD"
     staged = getattr(args, "staged", False)
-    context_lines = getattr(args, "context_lines", 3) or 3
-    max_files = getattr(args, "max_files", 10) or 10
+    context_lines = getattr(args, "context_lines", 3)
+    if context_lines is None:
+        context_lines = 3
+    max_files = getattr(args, "max_files", 10)
+    if max_files is None:
+        max_files = 10
     blocked = getattr(args, "blocked", []) or []
     output_only = getattr(args, "output_only", False)
 
@@ -365,9 +384,11 @@ def cmd_budget(args: argparse.Namespace) -> int:
         db.close()
         if removed:
             print(f"Budget removed for '{profile}'.")
-        else:
-            print(f"No budget found for '{profile}'.")
-        return 0
+            return 0
+        # Match the not-found convention used by sibling delete commands
+        # (notify remove, cron remove, ...): nonzero exit when nothing matched.
+        print_error(f"No budget found for '{profile}'.")
+        return 1
 
     if sub == "check":
         profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
@@ -584,19 +605,21 @@ def cmd_split(args: argparse.Namespace) -> int:
         profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
         spec_json_str = getattr(args, "spec_json", None)
 
-        run_id = create_split_run(db, task, architect, editor, profile)
-
         if spec_json_str:
+            # Validate the spec *before* persisting a run so a malformed spec
+            # doesn't leave an orphaned pending run behind.
             try:
                 spec = ChangeSpec.from_json(spec_json_str)
-                save_spec(db, run_id, spec)
-                db.close()
-                print(f"Split run created: {run_id}  ({len(spec.items)} items from spec)")
-            except (json.JSONDecodeError, KeyError) as exc:
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
                 print_error(f"Invalid spec JSON: {exc}")
                 db.close()
                 return 1
+            run_id = create_split_run(db, task, architect, editor, profile)
+            save_spec(db, run_id, spec)
+            db.close()
+            print(f"Split run created: {run_id}  ({len(spec.items)} items from spec)")
         else:
+            run_id = create_split_run(db, task, architect, editor, profile)
             db.close()
             print(f"Split run created: {run_id}")
             print(f"Architect: {architect}  Editor: {editor}")
@@ -658,7 +681,9 @@ def cmd_tool_retrieval(args: argparse.Namespace) -> int:
 
     if sub == "search":
         query = getattr(args, "query", "")
-        top_k = getattr(args, "top_k", 8) or 8
+        top_k = getattr(args, "top_k", 8)
+        if top_k is None:
+            top_k = 8
         if not query.strip():
             print_error("Query must not be empty.")
             db.close()
@@ -752,6 +777,8 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     pa_remove = persona_sub.add_parser("remove", help="Remove an active persona from a profile")
     pa_remove.add_argument("name", metavar="NAME")
     pa_remove.add_argument("--profile")
+    pa_delete = persona_sub.add_parser("delete", help="Delete an installed (user) persona from the store")
+    pa_delete.add_argument("name", metavar="NAME")
     pa_stack = persona_sub.add_parser("stack", help="Show active persona stack for a profile")
     pa_stack.add_argument("--profile")
     pa_install = persona_sub.add_parser("install", help="Install a persona from a YAML file")
@@ -759,7 +786,7 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     pa_preview = persona_sub.add_parser("preview", help="Preview merged system prompt with active personas")
     pa_preview.add_argument("--profile")
     pa_preview.add_argument("--base-prompt", default="You are a helpful agent.")
-    for pp in [persona_cmd, pa_list, pa_show, pa_apply, pa_remove, pa_stack, pa_install, pa_preview]:
+    for pp in [persona_cmd, pa_list, pa_show, pa_apply, pa_remove, pa_delete, pa_stack, pa_install, pa_preview]:
         pp.set_defaults(func=cmd_persona)
 
     # ---- PRD-038: diff-context ----
