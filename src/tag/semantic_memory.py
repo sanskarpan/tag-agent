@@ -197,8 +197,13 @@ def list_memories(
 ) -> list[dict]:
     """List memories sorted by effective confidence (descending)."""
     ensure_schema(conn)
+    if limit < 0:
+        raise ValueError(f"limit must be non-negative, got {limit}")
     type_clause = " AND memory_type=?" if memory_type else ""
     type_params: list = [memory_type] if memory_type else []
+    # Fetch extra rows (limit*3) so the effective-confidence re-sort below can
+    # reorder across the SQL confidence ordering. A negative bound would make
+    # SQLite treat LIMIT as "unbounded", so the guard above is required first.
     rows = conn.execute(
         f"""SELECT id, content, memory_type, confidence, created_at, accessed_at,
                access_count, source
@@ -494,33 +499,23 @@ def list_memories_by_tier(
 ) -> list[dict]:
     """Return memories in a specific tier, sorted by effective confidence.
 
-    Uses the stored tier column if present (see ensure_tier_schema); otherwise
-    falls back to classifying every memory on-the-fly.
+    Tier membership is classified on-the-fly from each memory's *effective*
+    (age-decayed) confidence via get_memory_tier(). The stored `tier` column is
+    not trusted here: add_memory/update_fact never populate it (rows keep the
+    'archival' DEFAULT), and it would go stale as confidence decays anyway.
     """
     ensure_schema(conn)
     if tier not in MEMORY_TIERS:
         raise ValueError(f"tier must be one of {sorted(MEMORY_TIERS)}, got {tier!r}")
 
-    # Try fast path via stored tier column
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(semantic_memories)").fetchall()}
-    if "tier" in cols:
-        rows = conn.execute(
-            """SELECT id, content, memory_type, confidence, created_at,
-                      accessed_at, access_count, source
-               FROM semantic_memories
-               WHERE profile=? AND tier=?
-               ORDER BY confidence DESC""",
-            (profile, tier),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """SELECT id, content, memory_type, confidence, created_at,
-                      accessed_at, access_count, source
-               FROM semantic_memories
-               WHERE profile=?
-               ORDER BY confidence DESC""",
-            (profile,),
-        ).fetchall()
+    rows = conn.execute(
+        """SELECT id, content, memory_type, confidence, created_at,
+                  accessed_at, access_count, source
+           FROM semantic_memories
+           WHERE profile=?
+           ORDER BY confidence DESC""",
+        (profile,),
+    ).fetchall()
 
     results = []
     for r in rows:
@@ -537,8 +532,7 @@ def list_memories_by_tier(
             "access_count": count,
             "source": src,
         }
-        # When using fallback (no tier column), filter by computed tier
-        if "tier" not in cols and get_memory_tier(mem) != tier:
+        if get_memory_tier(mem) != tier:
             continue
         results.append(mem)
 
@@ -658,6 +652,12 @@ def update_fact(
     ensure_schema(conn)
     ensure_temporal_schema(conn)
 
+    # Reject empty/whitespace content, matching add_memory's guard. The
+    # temporal-versioning path bypasses add_memory, so validate here too.
+    new_content = new_content.strip()
+    if not new_content:
+        raise ValueError("Memory content must not be empty")
+
     row = conn.execute(
         """SELECT id, profile, content, memory_type, confidence, created_at,
                   accessed_at, access_count, source,
@@ -699,12 +699,12 @@ def update_fact(
                (id, profile, content, memory_type, confidence, created_at,
                 accessed_at, access_count, source, valid_at)
            VALUES (?,?,?,?,?,?,?,0,?,?)""",
-        (new_id, old_profile, new_content.strip(), old_type, old_conf,
+        (new_id, old_profile, new_content, old_type, old_conf,
          now, now, old_src, now),
     )
     conn.execute(
         "INSERT INTO semantic_memories_fts(id, profile, content, memory_type) VALUES(?,?,?,?)",
-        (new_id, old_profile, new_content.strip(), old_type),
+        (new_id, old_profile, new_content, old_type),
     )
     conn.commit()
     return new_id
@@ -784,6 +784,16 @@ def list_facts_at(conn: sqlite3.Connection, profile: str, at_time: str) -> list[
     Also checks memory_fact_history for archived versions valid at that time.
     """
     ensure_temporal_schema(conn)
+
+    # Validate at_time is a real ISO-8601 timestamp. The queries below compare
+    # it lexically against stored ISO timestamps, so a malformed value like
+    # 'not-a-date' would sort after every record and match everything.
+    if not isinstance(at_time, str):
+        raise ValueError(f"at_time must be an ISO-8601 timestamp string, got {at_time!r}")
+    try:
+        datetime.fromisoformat(at_time)
+    except ValueError:
+        raise ValueError(f"at_time is not a valid ISO-8601 timestamp: {at_time!r}")
 
     # Live memories valid at at_time
     live_rows = conn.execute(
