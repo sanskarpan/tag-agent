@@ -28,14 +28,20 @@ try:
 except Exception:
     _tag_version = "0.0.0"
 
-INSTRUMENTATION_SCOPE = {
-    "name": "tag-agent",
-    "version": _tag_version,
-    "attributes": [
-        {"key": "otel.semconv.version", "value": {"stringValue": SEMCONV_VERSION}},
-        {"key": "otel.semconv.stability", "value": {"stringValue": "Development"}},
-    ],
-}
+def _build_scope(semconv_version: str = SEMCONV_VERSION) -> dict:
+    """Build an instrumentation scope dict for the given semconv version."""
+    return {
+        "name": "tag-agent",
+        "version": _tag_version,
+        "attributes": [
+            {"key": "otel.semconv.version", "value": {"stringValue": semconv_version}},
+            {"key": "otel.semconv.stability", "value": {"stringValue": "Development"}},
+        ],
+    }
+
+
+# Instrumentation scope sent in OTLP payloads (default pinned version)
+INSTRUMENTATION_SCOPE = _build_scope()
 
 # Model-to-provider mapping for gen_ai.system
 _PROVIDER_MAP: dict[str, str] = {
@@ -48,16 +54,42 @@ _PROVIDER_MAP: dict[str, str] = {
 }
 
 
+# Known provider namespaces used in TAG's "provider/model" model IDs.
+_PROVIDER_NAMESPACES: dict[str, str] = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "google": "google",
+    "mistral": "mistral",
+    "meta": "meta",
+    "meta-llama": "meta",
+    "cohere": "cohere",
+}
+
+
 def detect_provider(model_id: str) -> str:
-    """Infer gen_ai.system from model ID prefix."""
+    """Infer gen_ai.system from a model ID.
+
+    Handles both bare model names (``gpt-4o``) and provider-namespaced IDs
+    (``anthropic/claude-sonnet-4-6``) used throughout TAG configs.
+    """
+    if not model_id:
+        return "unknown"
     m = model_id.lower()
+    # Provider-namespaced form: "provider/model".
+    if "/" in m:
+        namespace, _, rest = m.partition("/")
+        if namespace in _PROVIDER_NAMESPACES:
+            return _PROVIDER_NAMESPACES[namespace]
+        m = rest  # fall through to prefix detection on the model portion
     for prefix, provider in _PROVIDER_MAP.items():
         if m.startswith(prefix):
             return provider
     return "unknown"
 
 
-def map_span_attributes(span: dict[str, Any]) -> dict[str, Any]:
+def map_span_attributes(
+    span: dict[str, Any], *, semconv_version: str = SEMCONV_VERSION
+) -> dict[str, Any]:
     """Return a copy of *span* with OTel GenAI attributes added.
 
     Preserves all original attributes; adds gen_ai.* alongside them.
@@ -79,13 +111,18 @@ def map_span_attributes(span: dict[str, Any]) -> dict[str, Any]:
         attrs["gen_ai.system"] = detect_provider(model_id)
 
     attrs["gen_ai.operation.name"] = "chat"
-    attrs["otel.semconv.version"] = SEMCONV_VERSION
+    attrs["otel.semconv.version"] = semconv_version
 
     result["attributes"] = attrs
     return result
 
 
-def spans_to_otlp_json(spans: list[dict[str, Any]], *, include_metrics: bool = True) -> dict:
+def spans_to_otlp_json(
+    spans: list[dict[str, Any]],
+    *,
+    include_metrics: bool = True,
+    semconv_version: str = SEMCONV_VERSION,
+) -> dict:
     """Build an OTLP JSON payload from a list of span dicts.
 
     Applies OTel GenAI attribute mapping and optionally includes a
@@ -93,11 +130,12 @@ def spans_to_otlp_json(spans: list[dict[str, Any]], *, include_metrics: bool = T
     """
     import uuid
 
+    scope = _build_scope(semconv_version)
     resource_spans = []
     scope_spans: list[dict] = []
 
     for span in spans:
-        mapped = map_span_attributes(span)
+        mapped = map_span_attributes(span, semconv_version=semconv_version)
         attrs = mapped.get("attributes", {})
 
         otlp_attrs = [
@@ -129,7 +167,7 @@ def spans_to_otlp_json(spans: list[dict[str, Any]], *, include_metrics: bool = T
             "attributes": [_kv("service.name", "tag-agent")]
         },
         "scopeSpans": [{
-            "scope": INSTRUMENTATION_SCOPE,
+            "scope": scope,
             "spans": scope_spans,
         }],
     }]
@@ -137,12 +175,16 @@ def spans_to_otlp_json(spans: list[dict[str, Any]], *, include_metrics: bool = T
     payload: dict[str, Any] = {"resourceSpans": resource_spans}
 
     if include_metrics:
-        payload["resourceMetrics"] = _build_token_metrics(spans)
+        payload["resourceMetrics"] = _build_token_metrics(
+            spans, semconv_version=semconv_version
+        )
 
     return payload
 
 
-def _build_token_metrics(spans: list[dict]) -> list[dict]:
+def _build_token_metrics(
+    spans: list[dict], *, semconv_version: str = SEMCONV_VERSION
+) -> list[dict]:
     """Build OTLP metric payload for gen_ai.client.token.usage histogram."""
     data_points = []
     for span in spans:
@@ -178,7 +220,7 @@ def _build_token_metrics(spans: list[dict]) -> list[dict]:
     return [{
         "resource": {"attributes": [_kv("service.name", "tag-agent")]},
         "scopeMetrics": [{
-            "scope": INSTRUMENTATION_SCOPE,
+            "scope": _build_scope(semconv_version),
             "metrics": [{
                 "name": "gen_ai.client.token.usage",
                 "description": "Token usage for GenAI client calls (OTel semconv)",
