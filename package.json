@@ -1,6 +1,6 @@
 {
   "name": "tag-agent",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Orchestrate AI agents from your terminal.",
   "license": "MIT",
   "homepage": "https://github.com/sanskarpan/tag-agent#readme",
@@ -21,6 +21,7 @@
     "src/tag/config",
     "src/tag/docs",
     "src/tag/patches",
+    "src/tag/vendor",
     "README.md",
     "LICENSE",
     "MANIFEST.in",
