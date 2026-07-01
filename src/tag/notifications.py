@@ -206,9 +206,15 @@ def _deliver_email(
 def _deliver_desktop(message: str, title: str = "TAG Notification") -> tuple[bool, None, str]:
     try:
         if sys.platform == "darwin":
-            script = f'display notification "{message}" with title "{title}"'
-            subprocess.run(["osascript", "-e", script], check=True, timeout=5,
-                           capture_output=True)
+            # Pass message/title as osascript argv, never interpolated into the
+            # script — prevents AppleScript/shell injection via notification text.
+            script = (
+                "on run {msg, ttl}\n"
+                "display notification msg with title ttl\n"
+                "end run"
+            )
+            subprocess.run(["osascript", "-e", script, message, title], check=True,
+                           timeout=5, capture_output=True)
         elif sys.platform.startswith("linux"):
             subprocess.run(["notify-send", title, message], check=True, timeout=5,
                            capture_output=True)
