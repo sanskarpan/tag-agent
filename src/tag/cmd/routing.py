@@ -92,11 +92,11 @@ def cmd_route(args: argparse.Namespace) -> int:
     print(f"task_type: {args.task_type}")
     print(f"board: {route['board']}")
     print(f"execution: {route['execution']}")
-    print(f"master: {route['master']['name']} -> {route['master']['model']}")
+    print(f"master: {route['master']['name']} -> {format_model_ref(route['master']['model'])}")
     for worker in route["workers"]:
-        print(f"worker: {worker['name']} -> {worker['model']}")
+        print(f"worker: {worker['name']} -> {format_model_ref(worker['model'])}")
     if route["verifier"]:
-        print(f"verifier: {route['verifier']['name']} -> {route['verifier']['model']}")
+        print(f"verifier: {route['verifier']['name']} -> {format_model_ref(route['verifier']['model'])}")
     return 0
 
 
@@ -161,24 +161,30 @@ def cmd_models(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_set_model(args: argparse.Namespace) -> int:
+    from tag.core.config import update_config
     path = config_path(args.config)
     cfg = load_config(path)
     ensure_profile_exists(cfg, args.profile)
     provider, model = parse_model_ref(args.ref)
-    profile_cfg = cfg.setdefault("profiles", {}).setdefault(args.profile, {}).setdefault("config", {})
 
-    if args.target == "primary":
-        model_cfg = profile_cfg.setdefault("model", {})
-        model_cfg["provider"] = provider
-        model_cfg["default"] = model
-        if args.openai_runtime:
-            model_cfg["openai_runtime"] = args.openai_runtime
-    else:
-        delegation_cfg = profile_cfg.setdefault("delegation", {})
-        delegation_cfg["provider"] = provider
-        delegation_cfg["model"] = model
+    def _mutate(cfg: dict) -> None:
+        profile_cfg = cfg.setdefault("profiles", {}).setdefault(args.profile, {}).setdefault("config", {})
+        if args.target == "primary":
+            model_cfg = profile_cfg.setdefault("model", {})
+            model_cfg["provider"] = provider
+            model_cfg["default"] = model
+            if args.openai_runtime:
+                model_cfg["openai_runtime"] = args.openai_runtime
+        else:
+            delegation_cfg = profile_cfg.setdefault("delegation", {})
+            delegation_cfg["provider"] = provider
+            delegation_cfg["model"] = model
+            if args.openai_runtime:
+                delegation_cfg["openai_runtime"] = args.openai_runtime
 
-    save_config(path, cfg)
+    # Hold the lock across the whole read-modify-write so two set-model calls on
+    # different profiles don't clobber each other (lost-update race, B005).
+    cfg = update_config(path, _mutate)
     render_profiles(cfg, force=True)
 
     result = {
@@ -187,6 +193,8 @@ def cmd_set_model(args: argparse.Namespace) -> int:
         "ref": f"{provider}/{model}",
         "config": str(path),
     }
+    if args.openai_runtime:
+        result["openai_runtime"] = args.openai_runtime
     if args.json:
         print(json.dumps(result, indent=2))
         return 0
@@ -420,6 +428,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
 def cmd_benchmark(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
+    ensure_profile_exists(cfg, args.profile)
     _ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
     suite_path = benchmark_suite_path(args.suite)
     try:
@@ -432,14 +441,20 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     if not suite:
         raise SystemExit("No benchmark cases selected.")
 
-    model_refs = args.model_ref or [
-        collect_assignments(cfg)
-        and next(
-            row["primary_model"]
-            for row in collect_assignments(cfg)
-            if row["profile"] == args.profile
+    if args.model_ref:
+        model_refs = args.model_ref
+    else:
+        primary = next(
+            (row["primary_model"] for row in collect_assignments(cfg)
+             if row["profile"] == args.profile),
+            None,
         )
-    ]
+        if not primary:
+            raise SystemExit(
+                f"No primary model assigned for profile '{args.profile}'. "
+                "Pass --model-ref or set one with `tag set-model`."
+            )
+        model_refs = [primary]
     run_id = f"bench-{slugify(args.profile)}-{uuid.uuid4().hex[:10]}"
     conn = open_db(cfg)
     insert_run(
