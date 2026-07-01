@@ -1679,9 +1679,29 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args) or 0)
     except SystemExit as exc:
-        return int(exc.code or 0)
+        # Honor CPython's SystemExit convention: an int payload is the exit
+        # status; anything else (typically a string message) is printed to
+        # stderr and maps to exit 1. The old `int(exc.code)` crashed with a
+        # ValueError on every `raise SystemExit("message")`.
+        code = exc.code
+        if code is None:
+            return 0
+        if isinstance(code, int):
+            return code
+        print(code, file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
+        print("Aborted.", file=sys.stderr)
         return 130
+    except BrokenPipeError:
+        return 0
+    except Exception as exc:  # noqa: BLE001 — top-level CLI safety net
+        # Never surface a raw traceback to end users. Set TAG_DEBUG=1 to
+        # re-raise for development.
+        if os.environ.get("TAG_DEBUG"):
+            raise
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
