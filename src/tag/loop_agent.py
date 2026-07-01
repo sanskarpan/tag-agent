@@ -83,6 +83,16 @@ def _mark_iteration(
     return iter_id
 
 
+def _current_status(conn: sqlite3.Connection, loop_id: str) -> str | None:
+    row = conn.execute("SELECT status FROM loop_runs WHERE id=?", (loop_id,)).fetchone()
+    return row[0] if row else None
+
+
+def _is_aborted(conn: sqlite3.Connection, loop_id: str) -> bool:
+    """True if the loop was aborted externally (e.g. `tag loop abort`)."""
+    return _current_status(conn, loop_id) == "aborted"
+
+
 def _update_loop_status(conn: sqlite3.Connection, loop_id: str, status: str) -> None:
     now = _utc_now()
     completed = now if status in ("completed", "failed", "aborted", "max_iters") else None
@@ -144,22 +154,37 @@ def _is_goal_achieved(output: str) -> bool:
     return "GOAL_ACHIEVED" in output
 
 
-def _request_approval(loop_id: str, iteration: int, output: str, approval_file: Path) -> bool:
-    """Write a pending approval request; poll for user decision."""
+def _request_approval(
+    loop_id: str,
+    iteration: int,
+    output: str,
+    approval_file: Path,
+    conn: sqlite3.Connection | None = None,
+    timeout_seconds: int = 300,
+) -> bool:
+    """Write a pending approval request; poll for user decision.
+
+    A user approves/denies via `tag loop approve|deny <loop_id>`, which writes
+    the decision into *approval_file*. Also honors an external abort
+    (status='aborted') so the loop does not hang the full timeout (B020/B021).
+    Returns True to continue, False to stop.
+    """
     approval_file.write_text(json.dumps({
         "loop_id": loop_id,
         "iteration": iteration,
         "output_preview": output[:500],
         "decision": "pending",
     }))
-    # Poll up to 5 minutes
-    deadline = time.time() + 300
+    deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        if conn is not None and _is_aborted(conn, loop_id):
+            return False
         try:
             data = json.loads(approval_file.read_text())
-            if data.get("decision") == "continue":
+            decision = data.get("decision")
+            if decision in ("continue", "approve", "approved"):
                 return True
-            if data.get("decision") == "abort":
+            if decision in ("abort", "deny", "denied", "reject"):
                 return False
         except Exception:
             pass
@@ -199,12 +224,29 @@ def main() -> int:
 
     previous_output = ""
     for iteration in range(1, max_iters + 1):
-        _update_loop_status(conn, args.loop_id, "running")
+        # Honor an external abort (`tag loop abort` sets status='aborted').
+        # Check before starting work and do NOT clobber the status back to
+        # 'running' — that was silently overwriting the abort (B020).
+        if _is_aborted(conn, args.loop_id):
+            conn.close()
+            return 0
 
         output, exit_code = _run_iteration(
             args.loop_id, iteration, goal, profile,
             args.config, previous_output,
         )
+
+        # The abort may have arrived while the (long-running) iteration ran.
+        # Record the iteration but stop without overwriting the 'aborted' status.
+        if _is_aborted(conn, args.loop_id):
+            _mark_iteration(
+                conn, args.loop_id, iteration,
+                input_text=goal if iteration == 1 else previous_output[:500],
+                output=output,
+                decision="aborted",
+            )
+            conn.close()
+            return 0
 
         decision = "goal_achieved" if _is_goal_achieved(output) else "continue"
         if exit_code != 0 and not output.strip():
@@ -228,7 +270,7 @@ def main() -> int:
             return 1
 
         if approval == "human" and iteration < max_iters:
-            approved = _request_approval(args.loop_id, iteration, output, approval_file)
+            approved = _request_approval(args.loop_id, iteration, output, approval_file, conn)
             if not approved:
                 _update_loop_status(conn, args.loop_id, "aborted")
                 conn.close()

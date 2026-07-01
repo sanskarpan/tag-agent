@@ -12,7 +12,7 @@ from typing import Any
 
 from tag.core.config import load_config, config_path
 from tag.core.db import open_db, queue_insert_job, queue_list_jobs, queue_get_job, queue_clear_completed, launch_queue_worker
-from tag.core.utils import nonnegative_int
+from tag.core.utils import nonnegative_int, utc_now
 
 try:
     from tag.tui_output import print_error, print_success, print_warning
@@ -32,13 +32,36 @@ def _queue_update_pid(db: Any, job_id: str, pid: int) -> None:
 
 
 def _queue_update_status(db: Any, job_id: str, status: str) -> None:
-    import datetime
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    # timezone-aware ISO-8601 (+00:00), matching created_at written elsewhere
+    # via core.utils.utc_now — not the deprecated, naive utcnow() (B145).
+    now = utc_now()
     db.execute(
         "UPDATE queue_jobs SET status=?, finished_at=? WHERE id=?",
         (status, now, job_id),
     )
     db.commit()
+
+
+def _dispatch_ready_jobs(cfg: dict[str, Any], db: Any, job_ids: list[str]) -> tuple[list[tuple[str, int]], list[str]]:
+    """Launch a worker for every 'ready' job; return (launched, pending).
+
+    launched: list of (job_id, pid). pending: job_ids still waiting on deps.
+    """
+    launched: list[tuple[str, int]] = []
+    pending: list[str] = []
+    for jid in job_ids:
+        row = db.execute("SELECT status FROM queue_jobs WHERE id=?", (jid,)).fetchone()
+        status = row[0] if row else None
+        if status == "ready":
+            try:
+                pid = launch_queue_worker(cfg, jid)
+                _queue_update_pid(db, jid, pid)
+                launched.append((jid, pid))
+            except Exception as exc:
+                print_warning(f"failed to launch worker for {jid}: {exc}")
+        elif status == "pending":
+            pending.append(jid)
+    return launched, pending
 
 
 def _ensure_runtime_dirs(cfg: dict[str, Any]) -> None:
@@ -89,7 +112,19 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
     if sub == "list":
         status_filter = getattr(args, "status_filter", None)
-        limit = getattr(args, "limit", 50) or 50
+        # Honor an explicit 0 (show none) and reject negatives, instead of
+        # `or 50` clobbering 0 / a negative LIMIT returning everything (B047/B087).
+        limit = getattr(args, "limit", 50)
+        if limit is None:
+            limit = 50
+        if limit < 0:
+            db.close()
+            msg = f"--limit must be >= 0, got {limit}."
+            if getattr(args, "json", False):
+                print(json.dumps({"error": msg}))
+            else:
+                print(f"error: {msg}", file=sys.stderr)
+            return 1
         jobs = queue_list_jobs(db, status=status_filter, limit=limit + 1)
         total_indicator = len(jobs) > limit
         if total_indicator:
@@ -113,12 +148,27 @@ def cmd_queue(args: argparse.Namespace) -> int:
     if sub == "result":
         job = queue_get_job(db, args.job_id)
         db.close()
+        as_json = getattr(args, "json", False)
         if not job:
-            print(f"Job '{args.job_id}' not found.", file=sys.stderr)
+            if as_json:
+                print(json.dumps({"error": f"job {args.job_id} not found", "job_id": args.job_id}))
+            else:
+                print(f"Job '{args.job_id}' not found.", file=sys.stderr)
             return 1
         result_path = job.get("result_path")
+        content = None
         if result_path and Path(result_path).exists():
-            print(Path(result_path).read_text())
+            content = Path(result_path).read_text()
+        if as_json:
+            print(json.dumps({
+                "job_id": args.job_id,
+                "status": job.get("status"),
+                "result_path": result_path,
+                "result": content,
+            }))
+            return 0
+        if content is not None:
+            print(content)
         else:
             print(f"No result yet (status: {job['status']})")
         return 0
@@ -198,7 +248,12 @@ def cmd_dag(args: argparse.Namespace) -> int:
             db.close()
             return 1
         spec = DagSpec(name=name, steps=steps)
-        dag_id = save_dag(db, spec)
+        try:
+            dag_id = save_dag(db, spec)
+        except ValueError as exc:
+            db.close()
+            print_error(str(exc))
+            return 1
         db.close()
         print(f"DAG saved: {name} ({dag_id})")
         return 0
@@ -212,10 +267,25 @@ def cmd_dag(args: argparse.Namespace) -> int:
             print_error(str(exc))
             db.close()
             return 1
+        # Actually dispatch the jobs that have no unmet dependencies so they run,
+        # instead of leaving them 'ready' forever with a false 'submitted' message
+        # (B045). Dependent jobs stay 'pending' until promoted.
+        launched, pending = _dispatch_ready_jobs(cfg, db, job_ids)
         db.close()
-        print(f"DAG '{name}' submitted: {len(job_ids)} jobs")
-        for jid in job_ids:
-            print(f"  {jid}")
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "dag": name,
+                "submitted": job_ids,
+                "dispatched": [j for j, _ in launched],
+                "pending": pending,
+            }))
+            return 0
+        print(f"DAG '{name}' submitted: {len(job_ids)} jobs "
+              f"({len(launched)} dispatched, {len(pending)} pending on dependencies)")
+        for jid, pid in launched:
+            print(f"  {jid}  (worker pid {pid})")
+        for jid in pending:
+            print(f"  {jid}  (pending — run `tag queue-dep promote` as dependencies finish)")
         return 0
 
     if sub == "list":
@@ -263,20 +333,33 @@ def cmd_queue_extended(args: argparse.Namespace) -> int:
             print_error(str(exc))
             db.close()
             return 1
+        # Dispatch immediately if the job has no unmet dependencies, so it runs
+        # rather than sitting 'ready' forever (B045).
+        launched, pending = _dispatch_ready_jobs(cfg, db, [job_id])
         db.close()
+        pid = launched[0][1] if launched else None
+        job_status = "dispatched" if launched else "pending"
         if getattr(args, "json", False):
-            print(json.dumps({"job_id": job_id, "status": "added", "depends_on": depends_on}))
+            print(json.dumps({"job_id": job_id, "status": job_status,
+                              "pid": pid, "depends_on": depends_on}))
+        elif pid is not None:
+            print(f"Queue job added: {job_id}  (worker pid {pid})")
         else:
-            print(f"Queue job added: {job_id}")
+            print(f"Queue job added: {job_id}  (pending on dependencies — "
+                  f"run `tag queue-dep promote` as they finish)")
         return 0
 
     if sub == "promote":
         promoted = promote_ready_jobs(db)
+        # Dispatch the jobs we just promoted so the DAG actually progresses (B045).
+        launched, _ = _dispatch_ready_jobs(cfg, db, promoted)
         db.close()
         if getattr(args, "json", False):
-            print(json.dumps({"promoted": promoted}))
+            print(json.dumps({"promoted": promoted, "dispatched": [j for j, _ in launched]}))
         elif promoted:
             print(f"Promoted {len(promoted)} jobs to ready: {', '.join(promoted)}")
+            for jid, pid in launched:
+                print(f"  dispatched {jid}  (worker pid {pid})")
         else:
             print("No jobs promoted.")
         return 0
@@ -321,12 +404,17 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     q_add.add_argument("--json", action="store_true")
 
     q_list = queue_sub.add_parser("list", help="List queued/running/done jobs")
-    q_list.add_argument("--status", dest="status_filter", choices=("queued", "running", "done", "failed", "cancelled"))
+    # queue_jobs is shared with the DAG layer, so accept both vocabularies
+    # (queued/running/done/failed/cancelled and pending/ready/timed_out/skipped).
+    q_list.add_argument("--status", dest="status_filter",
+                        choices=("queued", "pending", "ready", "running", "done",
+                                 "failed", "cancelled", "timed_out", "skipped"))
     q_list.add_argument("--limit", type=int, default=50, metavar="N", help="Max jobs to show (default: 50)")
     q_list.add_argument("--json", action="store_true")
 
     q_result = queue_sub.add_parser("result", help="Show output of a completed job")
     q_result.add_argument("job_id")
+    q_result.add_argument("--json", action="store_true")
 
     q_cancel = queue_sub.add_parser("cancel", help="Cancel a running job")
     q_cancel.add_argument("job_id")
@@ -353,6 +441,7 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     dag_run = dag_sub.add_parser("run", help="Submit a named DAG")
     dag_run.add_argument("name", metavar="NAME")
     dag_run.add_argument("--board", default="default")
+    dag_run.add_argument("--json", action="store_true")
 
     dag_list = dag_sub.add_parser("list", help="List saved DAGs")
     dag_list.add_argument("--json", action="store_true")

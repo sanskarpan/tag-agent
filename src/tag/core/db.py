@@ -65,7 +65,13 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
             last_error = sqlite3.OperationalError(str(exc))
             time.sleep(0.1)
     if last_error is not None:
-        raise last_error
+        # Stay consistent with the print_error + SystemExit(1) convention used
+        # above instead of leaking a raw OperationalError traceback.
+        print_error(
+            f"Database is locked ({last_error}). Another TAG process may be running; "
+            f"retry shortly or check {db_path}."
+        )
+        raise SystemExit(1)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS runs (
@@ -142,9 +148,16 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
           prompt_tokens     INTEGER NOT NULL DEFAULT 0,
           completion_tokens INTEGER NOT NULL DEFAULT 0,
           attributes        TEXT NOT NULL DEFAULT '{}',
-          error_msg         TEXT
+          error_msg         TEXT,
+          kind              TEXT NOT NULL DEFAULT 'llm',
+          cost_usd          REAL
         );
         CREATE INDEX IF NOT EXISTS idx_spans_trace ON spans(trace_id, started_at);
+
+        CREATE TABLE IF NOT EXISTS maintenance_state (
+          name       TEXT PRIMARY KEY,
+          last_run   TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS events (
           id          TEXT PRIMARY KEY,
@@ -194,11 +207,37 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
         """
     )
     _migrate_runs_cost_columns(conn)
+    _migrate_spans_schema(conn)
     _migrate_prd_021_032_tables(conn)
     _migrate_prd_033_044_tables(conn)
     _migrate_swarm_tables(conn)
     _prune_old_spans(conn)
     return conn
+
+
+def _migrate_spans_schema(conn: sqlite3.Connection) -> None:
+    """Bring pre-existing `spans` tables up to the canonical 16-column schema.
+
+    Older databases created the table without the PRD-046 `kind`/`cost_usd`
+    columns, so `tracing.save_spans_to_db` (which inserts all 16 columns) raised
+    'table spans has no column named kind'. `migrate_spans_table` existed for
+    exactly this but had no callers; wire it in here so the persistence layer
+    stays in sync with the live schema.
+    """
+    try:
+        from tag.tracing import migrate_spans_table  # noqa: PLC0415
+        migrate_spans_table(conn)
+    except Exception:
+        # Fallback: add the columns directly if tracing is unavailable.
+        for sql in (
+            "ALTER TABLE spans ADD COLUMN kind TEXT NOT NULL DEFAULT 'llm'",
+            "ALTER TABLE spans ADD COLUMN cost_usd REAL",
+        ):
+            try:
+                conn.execute(sql)
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
 
 
 def _migrate_swarm_tables(conn: sqlite3.Connection) -> None:
@@ -565,12 +604,39 @@ def _migrate_runs_cost_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _prune_old_spans(conn: sqlite3.Connection, days: int = 30) -> None:
-    """Remove spans older than `days` days to keep the DB size bounded."""
+def _prune_old_spans(
+    conn: sqlite3.Connection, days: int = 30, min_interval_hours: int = 24
+) -> None:
+    """Opportunistically remove spans older than `days` days.
+
+    Pruning used to run a DELETE + commit on *every* open_db() — even for
+    read-only commands — taking a write lock and serializing readers. Now we
+    only prune at most once per `min_interval_hours`, gated by a cheap read of
+    the `maintenance_state` table, so the common read path takes no write lock.
+    """
     import datetime as _dt
-    cutoff = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days)).isoformat()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    try:
+        row = conn.execute(
+            "SELECT last_run FROM maintenance_state WHERE name = 'prune_spans'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return
+    if row is not None:
+        try:
+            last_run = _dt.datetime.fromisoformat(row[0])
+            if now - last_run < _dt.timedelta(hours=min_interval_hours):
+                return
+        except (ValueError, TypeError):
+            pass  # unparseable timestamp — fall through and prune
+    cutoff = (now - _dt.timedelta(days=days)).isoformat()
     try:
         conn.execute("DELETE FROM spans WHERE started_at < ?", (cutoff,))
+        conn.execute(
+            "INSERT INTO maintenance_state(name, last_run) VALUES('prune_spans', ?) "
+            "ON CONFLICT(name) DO UPDATE SET last_run = excluded.last_run",
+            (now.isoformat(),),
+        )
         conn.commit()
     except sqlite3.OperationalError:
         pass

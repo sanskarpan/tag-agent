@@ -178,7 +178,9 @@ def cmd_memory_semantic(args: argparse.Namespace) -> int:
             db.close()
             print_error("QUERY required")
             return 1
-        limit = getattr(args, "limit", 10) or 10
+        limit = getattr(args, "limit", 10)
+        if limit is None:
+            limit = 10
         mtype = getattr(args, "memory_type", None)
         results = search_memories(db, profile, query, limit=limit, memory_type=mtype)
         db.close()
@@ -194,7 +196,9 @@ def cmd_memory_semantic(args: argparse.Namespace) -> int:
         return 0
 
     if sub == "list":
-        limit = getattr(args, "limit", 20) or 20
+        limit = getattr(args, "limit", 20)
+        if limit is None:
+            limit = 20
         mtype = getattr(args, "memory_type", None)
         mems = list_memories(db, profile, memory_type=mtype, limit=limit)
         db.close()
@@ -234,6 +238,8 @@ def cmd_memory_semantic(args: argparse.Namespace) -> int:
         return 0
 
     db.close()
+    # No subcommand supplied — print a hint (consistent with the `mem2` group).
+    print("mem subcommands: add, search, list, forget, stats")
     return 0
 
 
@@ -245,6 +251,10 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
     sub = getattr(args, "mem_subcommand", None)
     cfg, profile = _load_cfg_and_profile(args)
     profile = getattr(args, "profile", None) or profile
+    # Ensure the runtime dir exists before any raw sqlite3.connect below, else a
+    # fresh TAG_HOME crashes with "unable to open database file" (unlike the
+    # `mem`/journal paths which call ensure_runtime_dirs via open_db).
+    ensure_runtime_dirs(cfg)
 
     if sub == "gc":
         try:
@@ -293,8 +303,9 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
             print_error(f"Run not found or has no recorded output: {args.run_id!r}")
             return 1
         output_text = "\n\n".join(r[0] for r in rows if r and r[0])
-        memories = auto_extract_post_run(conn, args.run_id, output_text, profile, cfg)
-        print(f"Extracted {len(memories)} memories")
+        # auto_extract_post_run returns an int (count of saved memories), not a list.
+        saved = auto_extract_post_run(conn, args.run_id, output_text, profile, cfg)
+        print(f"Extracted {saved} memories")
         return 0
 
     if sub == "tier":
@@ -336,10 +347,21 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
         ensure_temporal_schema(conn)
         action = args.action
         if action == "update":
-            if not getattr(args, "fact_id", None) or not getattr(args, "content", None):
-                print_error("--id and --content required for fact update")
+            if not getattr(args, "fact_id", None):
+                print_error("--id required for fact update")
                 return 1
-            new_id = update_fact(conn, args.fact_id, args.content, profile=profile)
+            content = getattr(args, "content", None)
+            if content is None:
+                print_error("--content required for fact update")
+                return 1
+            if not content.strip():
+                print_error("--content must not be empty")
+                return 1
+            try:
+                new_id = update_fact(conn, args.fact_id, content, profile=profile)
+            except (ValueError, KeyError) as exc:
+                print_error(str(exc))
+                return 1
             print(f"Updated fact, new id={new_id}")
         elif action == "history":
             hist = get_fact_history(conn, args.fact_id)
@@ -349,7 +371,11 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
             if not at_time:
                 from datetime import datetime, timezone
                 at_time = datetime.now(timezone.utc).isoformat()
-            facts = list_facts_at(conn, profile, at_time)
+            try:
+                facts = list_facts_at(conn, profile, at_time)
+            except ValueError as exc:
+                print_error(str(exc))
+                return 1
             print(json.dumps(facts, indent=2, default=str))
         return 0
 
@@ -379,7 +405,10 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
             if not getattr(args, "episode_id", None):
                 print_error("--id required")
                 return 1
-            end_episode(conn, args.episode_id, summary=getattr(args, "summary", None))
+            ended = end_episode(conn, args.episode_id, summary=getattr(args, "summary", None) or "")
+            if not ended:
+                print_error(f"Episode not found: {args.episode_id!r}")
+                return 1
             print("Episode ended")
         elif action == "list":
             episodes = list_episodes(conn, profile)
@@ -443,13 +472,24 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
             results = search_by_vector(conn, profile, q)
             print(json.dumps(results[:10], indent=2, default=str))
         elif action == "rebuild":
-            rebuild_embeddings(conn, profile)
-            print("Embeddings rebuilt")
+            embedded = rebuild_embeddings(conn, profile)
+            if embedded == 0:
+                print_error(
+                    "No embeddings written — embedding backend unavailable "
+                    "(install sentence-transformers) or no memories to embed."
+                )
+                return 1
+            print(f"Embeddings rebuilt: {embedded}")
         else:
             print_error(f"Unknown store action: {action!r}")
             return 1
         return 0
 
+    if sub is None:
+        # No subcommand supplied — print a hint and exit 0, consistent with the
+        # sibling `mem` group (see cmd_memory_semantic) rather than erroring.
+        print("mem2 subcommands: gc, extract, tier, fact, episode, store")
+        return 0
     print_error(f"Unknown mem subcommand: {sub!r}. Use: gc, extract, tier, fact, episode, store")
     return 1
 
@@ -513,13 +553,13 @@ def register(sub: argparse.Action) -> None:
     mem_search = mem_sub.add_parser("search", help="Full-text search over memories")
     mem_search.add_argument("query", metavar="QUERY")
     mem_search.add_argument("--type", dest="memory_type")
-    mem_search.add_argument("--limit", type=int, default=10)
+    mem_search.add_argument("--limit", type=nonnegative_int, default=10)
     mem_search.add_argument("--profile")
     mem_search.add_argument("--json", action="store_true")
 
     mem_list = mem_sub.add_parser("list", help="List memories sorted by effective confidence")
     mem_list.add_argument("--type", dest="memory_type")
-    mem_list.add_argument("--limit", type=int, default=20)
+    mem_list.add_argument("--limit", type=nonnegative_int, default=20)
     mem_list.add_argument("--profile")
     mem_list.add_argument("--json", action="store_true")
 

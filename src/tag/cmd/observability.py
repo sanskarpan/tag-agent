@@ -8,7 +8,6 @@ import json
 import shutil
 import sqlite3
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +48,9 @@ def _cache_savings(
     cache_read_tokens: int, cache_creation_tokens: int, model_id: str
 ) -> tuple[float, float, float]:
     """Returns (savings_usd, write_premium_usd, net_savings_usd)."""
+    # Clamp negative token counts so savings figures never go negative.
+    cache_read_tokens = max(0, cache_read_tokens or 0)
+    cache_creation_tokens = max(0, cache_creation_tokens or 0)
     entry = _COST_TABLE.get(model_id or "", {"prompt": 0.003, "completion": 0.015})
     input_rate = entry.get("prompt", 0.003)
     savings = (cache_read_tokens / 1_000) * input_rate * 0.9
@@ -57,18 +59,37 @@ def _cache_savings(
     return savings, write_premium, savings - write_premium
 
 
+def _parse_since_delta(since: str) -> datetime.timedelta:
+    """Parse '7d', '2w', '1m' into a timedelta.
+
+    Raises ValueError with a user-facing message on malformed input.
+    """
+    s = (since or "").strip().lower()
+    if len(s) < 2 or not s[:-1].isdigit():
+        raise ValueError("invalid --since value; expected e.g. 7d, 2w, 1m")
+    unit = s[-1]
+    n = int(s[:-1])
+    if unit == "d":
+        return datetime.timedelta(days=n)
+    if unit == "w":
+        return datetime.timedelta(weeks=n)
+    if unit == "m":
+        return datetime.timedelta(days=n * 30)
+    raise ValueError("invalid --since value; expected e.g. 7d, 2w, 1m")
+
+
 def _parse_since(since: str) -> str:
     """Convert '7d', '2w', '1m' to an ISO cutoff string."""
-    unit = since[-1].lower()
-    n = int(since[:-1])
-    delta = {"d": datetime.timedelta(days=n), "w": datetime.timedelta(weeks=n),
-             "m": datetime.timedelta(days=n * 30)}.get(unit, datetime.timedelta(days=n))
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - delta
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - _parse_since_delta(since)
     return cutoff.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def _snapshot_trace(conn: sqlite3.Connection, trace_id: str) -> None:
-    """Capture a full snapshot of the trace into trace_snapshots."""
+def _build_snapshot(conn: sqlite3.Connection, trace_id: str) -> dict | None:
+    """Build an in-memory snapshot of a trace from live spans (read-only).
+
+    Returns the snapshot dict, or None if the trace has no spans. Does not
+    write anything to the database.
+    """
     rows = conn.execute(
         """SELECT id, name, profile, model_id, started_at, finished_at,
                prompt_tokens, completion_tokens, status, attributes, error_msg
@@ -76,11 +97,10 @@ def _snapshot_trace(conn: sqlite3.Connection, trace_id: str) -> None:
         (trace_id,),
     ).fetchall()
     if not rows:
-        return
+        return None
 
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    snap_id = uuid.uuid4().hex[:16]
-    snapshot = {
+    return {
         "trace_id": trace_id,
         "captured_at": now,
         "spans": [
@@ -95,6 +115,21 @@ def _snapshot_trace(conn: sqlite3.Connection, trace_id: str) -> None:
             for r in rows
         ],
     }
+
+
+def _snapshot_trace(conn: sqlite3.Connection, trace_id: str) -> None:
+    """Capture a full snapshot of the trace into trace_snapshots.
+
+    The snapshot row PK is derived deterministically from the trace ID so
+    repeated snapshots of the same trace de-duplicate (INSERT OR REPLACE
+    updates the single existing row) instead of accumulating unbounded rows.
+    """
+    snapshot = _build_snapshot(conn, trace_id)
+    if snapshot is None:
+        return
+
+    now = snapshot["captured_at"]
+    snap_id = hashlib.sha256(trace_id.encode()).hexdigest()[:16]
     conn.execute(
         """INSERT OR REPLACE INTO trace_snapshots(id, trace_id, step_index, snapshot_json, created_at)
            VALUES(?,?,0,?,?)""",
@@ -213,7 +248,10 @@ def cmd_trace(args: argparse.Namespace) -> int:
                 (trace_id,),
             ).fetchall()
             if not rows:
-                print(f"No spans found for trace {trace_id}")
+                if getattr(args, "json", False):
+                    print(json.dumps([]))
+                else:
+                    print(f"No spans found for trace {trace_id}")
                 return 1
             if getattr(args, "json", False):
                 col = ["id","trace_id","parent_id","name","profile","model_id","started_at",
@@ -241,7 +279,6 @@ def cmd_trace(args: argparse.Namespace) -> int:
 
         if sub == "export":
             endpoint = args.endpoint
-            profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
             trace_id = getattr(args, "trace_id", None)
             where = "WHERE trace_id = ?" if trace_id else ""
             params = (trace_id,) if trace_id else ()
@@ -313,18 +350,15 @@ def cmd_trace_extended(args: argparse.Namespace) -> int:
                 "SELECT snapshot_json FROM trace_snapshots WHERE trace_id=? ORDER BY created_at DESC LIMIT 1",
                 (trace_id,),
             ).fetchone()
-            if not row:
-                # Try to build snapshot from live spans
-                _snapshot_trace(conn, trace_id)
-                row = conn.execute(
-                    "SELECT snapshot_json FROM trace_snapshots WHERE trace_id=? ORDER BY created_at DESC LIMIT 1",
-                    (trace_id,),
-                ).fetchone()
-            if not row:
+            if row:
+                snap = json.loads(row[0])
+            else:
+                # Read-only: build a snapshot from live spans without persisting.
+                snap = _build_snapshot(conn, trace_id)
+            if not snap:
                 print_error(f"No snapshot found for trace {trace_id}")
                 return 1
 
-            snap = json.loads(row[0])
             spans = snap.get("spans", [])
             if getattr(args, "json", False):
                 print(json.dumps(snap, indent=2))
@@ -365,13 +399,10 @@ def cmd_trace_extended(args: argparse.Namespace) -> int:
                     "SELECT snapshot_json FROM trace_snapshots WHERE trace_id=? ORDER BY created_at DESC LIMIT 1",
                     (tid,),
                 ).fetchone()
-                if not r:
-                    _snapshot_trace(conn, tid)
-                    r = conn.execute(
-                        "SELECT snapshot_json FROM trace_snapshots WHERE trace_id=? ORDER BY created_at DESC LIMIT 1",
-                        (tid,),
-                    ).fetchone()
-                return json.loads(r[0]) if r else None
+                if r:
+                    return json.loads(r[0])
+                # Read-only: build from live spans without persisting.
+                return _build_snapshot(conn, tid)
 
             snap_a = _load_snap(trace_a)
             snap_b = _load_snap(trace_b)
@@ -463,6 +494,15 @@ def _cmd_cache_stats(args: argparse.Namespace) -> int:
     since = getattr(args, "since", "7d") or "7d"
     warn_threshold = getattr(args, "warn_threshold", None)
 
+    try:
+        cutoff = _parse_since(since)
+    except ValueError as exc:
+        if _json:
+            print(json.dumps({"error": str(exc)}))
+        else:
+            print_error(str(exc))
+        return 1
+
     if not db_path.exists():
         msg = {"error": "No runs database"} if _json else "No runs database found."
         print(json.dumps(msg) if _json else msg)
@@ -473,7 +513,6 @@ def _cmd_cache_stats(args: argparse.Namespace) -> int:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
         has_cache = "cache_read_tokens" in cols and "cache_creation_tokens" in cols
 
-        cutoff = _parse_since(since)
         where_parts = ["created_at >= ?"]
         params: list = [cutoff]
         if profile_filter:
@@ -560,17 +599,32 @@ def _cmd_cache_trend(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(getattr(args, "config", None)))
     db_path = runtime_db_path(cfg)
     profile_filter = getattr(args, "profile", None)
-    days = int(getattr(args, "days", 30) or 30)
+    since = getattr(args, "since", "30d") or "30d"
+    buckets = int(getattr(args, "buckets", 14) or 14)
+    _json = getattr(args, "json", False)
+
+    try:
+        delta = _parse_since_delta(since)
+    except ValueError as exc:
+        if _json:
+            print(json.dumps({"error": str(exc)}))
+        else:
+            print_error(str(exc))
+        return 1
+    days = max(1, delta.days)
 
     if not db_path.exists():
-        print("No runs database found.")
+        if _json:
+            print(json.dumps({"profile": profile_filter, "since": since, "buckets": []}))
+        else:
+            print("No runs database found.")
         return 0
 
     conn = sqlite3.connect(str(db_path))
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
         has_cache = "cache_read_tokens" in cols
-        cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+        cutoff = (datetime.datetime.now(datetime.timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%S")
         where = "WHERE created_at >= ?" + (" AND master_profile=?" if profile_filter else "")
         params = [cutoff] + ([profile_filter] if profile_filter else [])
         if has_cache:
@@ -591,20 +645,46 @@ def _cmd_cache_trend(args: argparse.Namespace) -> int:
     data = {r[0]: (r[1] or 0, r[2] or 0) for r in rows}
     today = datetime.date.today()
     start = today - datetime.timedelta(days=days - 1)
-    term_width = shutil.get_terminal_size((80, 24)).columns
-    bar_width = max(10, term_width - 40)
 
-    label = f"Cache hit rate — {profile_filter or 'all profiles'} — last {days} days\n"
-    print(label)
+    # Build a per-day series across the requested window.
+    series = []
     for i in range(days):
         day = (start + datetime.timedelta(days=i)).isoformat()
-        if day not in data:
-            print(f"  {day}  (no data)")
+        pt, crt = data.get(day, (0, 0))
+        series.append((day, pt, crt))
+
+    # Group days into at most `buckets` contiguous buckets.
+    n_buckets = max(1, min(buckets, days))
+    size = (days + n_buckets - 1) // n_buckets
+    grouped = []
+    for b in range(0, days, size):
+        chunk = series[b:b + size]
+        if not chunk:
             continue
-        pt, crt = data[day]
+        pt = sum(c[1] for c in chunk)
+        crt = sum(c[2] for c in chunk)
         hit = crt / pt if pt > 0 else 0.0
-        bar = "█" * int(hit * bar_width)
-        print(f"  {day}  {bar:<{bar_width}}  {hit:.0%}")
+        grouped.append({
+            "start": chunk[0][0], "end": chunk[-1][0],
+            "prompt_tokens": pt, "cache_read_tokens": crt,
+            "hit_rate": round(hit, 4),
+        })
+
+    if _json:
+        print(json.dumps({
+            "profile": profile_filter,
+            "since": since,
+            "buckets": grouped,
+        }, indent=2))
+        return 0
+
+    term_width = shutil.get_terminal_size((80, 24)).columns
+    bar_width = max(10, term_width - 40)
+    print(f"Cache hit rate — {profile_filter or 'all profiles'} — last {since}\n")
+    for g in grouped:
+        span_label = g["start"] if g["start"] == g["end"] else f"{g['start']}..{g['end']}"
+        bar = "█" * int(g["hit_rate"] * bar_width)
+        print(f"  {span_label:<24}  {bar:<{bar_width}}  {g['hit_rate']:.0%}")
     return 0
 
 
@@ -702,6 +782,7 @@ def cmd_otel_export(args: argparse.Namespace) -> int:
     endpoint = getattr(args, "endpoint", "") or ""
     include_metrics = not getattr(args, "no_metrics", False)
     semconv = getattr(args, "semconv", SEMCONV_VERSION) or SEMCONV_VERSION
+    _json = getattr(args, "json", False)
 
     # Fetch spans
     if trace_id:
@@ -730,9 +811,13 @@ def cmd_otel_export(args: argparse.Namespace) -> int:
         for r in rows
     ]
 
-    payload = spans_to_otlp_json(span_dicts, include_metrics=include_metrics)
+    payload = spans_to_otlp_json(
+        span_dicts, include_metrics=include_metrics, semconv_version=semconv
+    )
 
     if not endpoint:
+        # With no endpoint, emitting the OTLP JSON payload IS the export — this
+        # is the command's primary output (consumers pipe it to a file/collector).
         print(json.dumps(payload, indent=2))
         return 0
 
@@ -744,10 +829,10 @@ def cmd_otel_export(args: argparse.Namespace) -> int:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    metrics_status = None
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            print(f"✓ Exported {len(span_dicts)} spans to {endpoint} (HTTP {resp.status})")
-            print(f"  OTel GenAI semconv version: {semconv}")
+            traces_status = resp.status
         if include_metrics and any(s.get("prompt_tokens") for s in span_dicts):
             metrics_body = json.dumps({"resourceMetrics": payload.get("resourceMetrics", [])}).encode()
             metrics_req = urllib.request.Request(
@@ -757,10 +842,27 @@ def cmd_otel_export(args: argparse.Namespace) -> int:
                 method="POST",
             )
             with urllib.request.urlopen(metrics_req, timeout=30) as resp:
-                print(f"✓ Exported token usage metrics (HTTP {resp.status})")
+                metrics_status = resp.status
     except urllib.error.URLError as exc:
-        print_error(f"OTLP export failed: {exc}")
+        if _json:
+            print(json.dumps({"error": str(exc), "endpoint": endpoint}))
+        else:
+            print_error(f"OTLP export failed: {exc}")
         return 1
+
+    if _json:
+        print(json.dumps({
+            "exported_spans": len(span_dicts),
+            "endpoint": endpoint,
+            "semconv": semconv,
+            "traces_status": traces_status,
+            "metrics_status": metrics_status,
+        }, indent=2))
+    else:
+        print(f"✓ Exported {len(span_dicts)} spans to {endpoint} (HTTP {traces_status})")
+        print(f"  OTel GenAI semconv version: {semconv}")
+        if metrics_status is not None:
+            print(f"✓ Exported token usage metrics (HTTP {metrics_status})")
     return 0
 
 
@@ -802,7 +904,9 @@ def cmd_agentops(args: argparse.Namespace) -> int:
         return 0
 
     if sub == "sessions" or sub is None:
-        limit = getattr(args, "limit", 20) or 20
+        limit = getattr(args, "limit", 20)
+        if limit is None:
+            limit = 20
         sessions = list_sessions(db, limit=limit)
         db.close()
         if getattr(args, "json", False):
@@ -820,7 +924,10 @@ def cmd_agentops(args: argparse.Namespace) -> int:
         session = get_session_for_run(db, run_id)
         db.close()
         if not session:
-            print_error(f"No AgentOps session for run: {run_id}")
+            if getattr(args, "json", False):
+                print(json.dumps({"error": f"No AgentOps session for run: {run_id}"}))
+            else:
+                print_error(f"No AgentOps session for run: {run_id}")
             return 1
         if getattr(args, "json", False):
             print(json.dumps(session, indent=2))
@@ -888,8 +995,9 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     cache_stats.add_argument("--profile", help="Filter to a specific profile")
     cache_stats.add_argument("--since", default="7d", help="Time window: 7d, 2w, 1m (default: 7d)")
     cache_stats.add_argument("--model", help="Filter by model ID")
-    cache_stats.add_argument("--warn-threshold", dest="warn_threshold", type=float, default=0.5,
-                             help="Hit-rate below this fraction triggers a warning (default: 0.50)")
+    cache_stats.add_argument("--warn-threshold", dest="warn_threshold", type=float, default=None,
+                             help="Opt-in: hit-rate below this fraction triggers a warning and "
+                                  "nonzero exit (e.g. --warn-threshold 0.5)")
     cache_stats.add_argument("--json", action="store_true")
 
     cache_trend = cache_sub.add_parser("trend", help="Show cache hit-rate trend over time (ASCII chart)")

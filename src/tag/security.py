@@ -1,6 +1,6 @@
 """PRD-034: Secret Scanning (tag security scan).
 
-Combines Shannon entropy detection (>4.5 bits over 20-char windows) with
+Combines Shannon entropy detection (>4.5 bits over 32-char windows) with
 a named-pattern library of ~15 known credential formats. NEVER logs
 matched plaintext values — only file path, line number, and pattern name.
 """
@@ -58,7 +58,13 @@ def _shannon_entropy(s: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in freq.values())
 
 
-def _high_entropy_windows(line: str, window: int = 20, threshold: float = 4.5) -> list[str]:
+def _high_entropy_windows(line: str, window: int = 32, threshold: float = 4.5) -> list[str]:
+    # NOTE: the maximum Shannon entropy of a length-N string is log2(N); with the
+    # previous 20-char window the ceiling was log2(20)=4.32 < 4.5, so the check
+    # `entropy > 4.5` was mathematically unsatisfiable and the detector never
+    # fired. A 32-char window raises the ceiling to log2(32)=5.0, keeping the
+    # documented 4.5-bit threshold meaningful while still separating random
+    # secrets (~4.5-5.0) from ordinary prose/code (~4.0).
     """Return distinct high-entropy substrings in *line*."""
     hits: list[str] = []
     for i in range(len(line) - window + 1):
@@ -111,9 +117,26 @@ def scan_text(content: str, file: Path) -> list[Finding]:
     return findings
 
 
-def scan_file(path: Path) -> list[Finding]:
-    """Scan a single file. Skips binary, oversized, or unreadable files."""
+def scan_file(path: Path, *, root: Path | None = None) -> list[Finding]:
+    """Scan a single file. Skips binary, oversized, or unreadable files.
+
+    Symlinks are never followed out of the scanned tree: a planted symlink such
+    as ``link_passwd -> /etc/passwd`` would otherwise let the scanner read (and
+    report on) arbitrary out-of-tree files. When *root* is given, a symlink is
+    only scanned if it resolves inside *root*; without a *root* symlinks are
+    skipped entirely.
+    """
     if path.suffix.lower() in _SKIP_EXTS:
+        return []
+    try:
+        if path.is_symlink():
+            if root is None:
+                return []
+            try:
+                path.resolve().relative_to(Path(root).resolve())
+            except (ValueError, OSError):
+                return []
+    except OSError:
         return []
     try:
         size = path.stat().st_size
@@ -122,9 +145,15 @@ def scan_file(path: Path) -> list[Finding]:
     if size > _MAX_FILE_BYTES:
         return []
     try:
-        content = path.read_text(encoding="utf-8", errors="replace")
+        raw = path.read_bytes()
     except OSError:
         return []
+    # Skip binary files — decoding them with errors="replace" and running
+    # entropy detection produces meaningless false positives (e.g. a SQLite DB
+    # or image). A NUL byte in the head is the standard binary sniff.
+    if b"\x00" in raw[:8192]:
+        return []
+    content = raw.decode("utf-8", errors="replace")
     return scan_text(content, path)
 
 
@@ -138,7 +167,7 @@ def scan_directory(root: Path, *, max_files: int = 2000) -> Iterator[Finding]:
             if count >= max_files:
                 return
             fpath = Path(dirpath) / fname
-            for finding in scan_file(fpath):
+            for finding in scan_file(fpath, root=root):
                 yield finding
             count += 1
 

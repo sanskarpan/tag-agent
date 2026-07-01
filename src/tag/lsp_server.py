@@ -187,6 +187,24 @@ class TagLspServer:
         }
 
     # ------------------------------------------------------------------
+    # Session bookkeeping
+    # ------------------------------------------------------------------
+
+    def _mark_stopped(self) -> None:
+        """Flag this session's row as stopped so `lsp status` doesn't report a
+        dead PID as running forever."""
+        if not self.conn:
+            return
+        try:
+            self.conn.execute(
+                "UPDATE lsp_sessions SET status='stopped', stopped_at=? WHERE id=?",
+                (_utc_now(), self._session_id),
+            )
+            self.conn.commit()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
@@ -207,18 +225,21 @@ class TagLspServer:
         stdin = getattr(sys.stdin, "buffer", sys.stdin)
         stdout = sys.stdout
 
-        while not self._shutdown:
-            try:
-                msg = _read_message(stdin)
-                if msg is None:
+        try:
+            while not self._shutdown:
+                try:
+                    msg = _read_message(stdin)
+                    if msg is None:
+                        break
+                    response = self.handle(msg)
+                    if response is not None:
+                        _write_message(stdout, response)
+                except (EOFError, BrokenPipeError):
                     break
-                response = self.handle(msg)
-                if response is not None:
-                    _write_message(stdout, response)
-            except (EOFError, BrokenPipeError):
-                break
-            except Exception:
-                break
+                except Exception:
+                    break
+        finally:
+            self._mark_stopped()
 
     def run_tcp(self, host: str = "127.0.0.1", port: int = 7878) -> None:
         """Run on TCP transport."""
@@ -235,23 +256,26 @@ class TagLspServer:
             except Exception:
                 pass
 
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((host, port))
-            s.listen(1)
-            print(f"TAG LSP server listening on {host}:{port}", file=sys.stderr)
-            conn_sock, _ = s.accept()
-            with conn_sock.makefile("rwb") as f:
-                while not self._shutdown:
-                    try:
-                        msg = _read_message(f)
-                        if msg is None:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((host, port))
+                s.listen(1)
+                print(f"TAG LSP server listening on {host}:{port}", file=sys.stderr)
+                conn_sock, _ = s.accept()
+                with conn_sock.makefile("rwb") as f:
+                    while not self._shutdown:
+                        try:
+                            msg = _read_message(f)
+                            if msg is None:
+                                break
+                            response = self.handle(msg)
+                            if response is not None:
+                                _write_message(f, response)
+                        except Exception:
                             break
-                        response = self.handle(msg)
-                        if response is not None:
-                            _write_message(f, response)
-                    except Exception:
-                        break
+        finally:
+            self._mark_stopped()
 
 
 def get_lsp_status(conn: sqlite3.Connection) -> list[dict]:

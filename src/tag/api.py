@@ -19,7 +19,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -29,12 +29,15 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 def _fetch_runs(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
-    rows = conn.execute(
-        """SELECT id, master_profile, status, created_at, estimated_cost_usd,
-               prompt_tokens, completion_tokens, model_id
-           FROM runs ORDER BY created_at DESC LIMIT ?""",
-        (limit,),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """SELECT id, master_profile, status, created_at, estimated_cost_usd,
+                   prompt_tokens, completion_tokens, model_id
+               FROM runs ORDER BY created_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
     return [
         {
             "id": r[0], "profile": r[1], "status": r[2], "created_at": r[3],
@@ -83,11 +86,14 @@ def _fetch_queue(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
 
 
 def _fetch_cost_summary(conn: sqlite3.Connection) -> list[dict]:
-    rows = conn.execute(
-        """SELECT master_profile, COUNT(*) runs, SUM(estimated_cost_usd) total_cost,
-               SUM(prompt_tokens + completion_tokens) total_tokens, model_id
-           FROM runs GROUP BY master_profile, model_id ORDER BY total_cost DESC"""
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """SELECT master_profile, COUNT(*) runs, SUM(estimated_cost_usd) total_cost,
+                   SUM(prompt_tokens + completion_tokens) total_tokens, model_id
+               FROM runs GROUP BY master_profile, model_id ORDER BY total_cost DESC"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
     return [
         {
             "profile": r[0], "runs": r[1],
@@ -252,7 +258,9 @@ class _Handler(BaseHTTPRequestHandler):
         body = json.dumps(data).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # No wildcard CORS: these endpoints expose local run/cost/trace data.
+        # A `*` ACAO lets any visited web page fetch() this localhost server and
+        # read it cross-origin, defeating the 127.0.0.1 bind.
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -261,7 +269,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # No wildcard CORS on the live data stream (see _send_json).
         self.end_headers()
         try:
             while True:
@@ -286,12 +294,15 @@ class DashboardServer:
         self.db_path = db_path
         self.host = host
         self.port = port
-        self._server: HTTPServer | None = None
+        self._server: ThreadingHTTPServer | None = None
 
     def start(self, *, open_browser: bool = True) -> None:
         # Inject db_path into handler class
         handler = type("Handler", (_Handler,), {"db_path": self.db_path})
-        self._server = HTTPServer((self.host, self.port), handler)
+        # ThreadingHTTPServer (not the single-threaded HTTPServer): the /api/stream
+        # SSE handler blocks its thread indefinitely, so on a plain HTTPServer the
+        # first EventSource client would wedge every other request.
+        self._server = ThreadingHTTPServer((self.host, self.port), handler)
         url = f"http://{self.host}:{self.port}"
         print(f"TAG Dashboard running at {url}")
         if open_browser:
@@ -305,4 +316,7 @@ class DashboardServer:
     def stop(self) -> None:
         if self._server:
             self._server.shutdown()
+            # Also release the listening socket/fd; shutdown() alone only stops
+            # the serve loop, leaking the port on repeated start/stop.
+            self._server.server_close()
 

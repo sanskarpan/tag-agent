@@ -61,7 +61,15 @@ def get_changed_files(
             cwd=str(workdir or Path.cwd()),
         )
         if result.returncode != 0:
-            raise RuntimeError(f"git diff failed: {result.stderr.strip()}")
+            stderr = (result.stderr or "").strip()
+            low = stderr.lower()
+            # In a non-git directory git emits a long "--no-index" usage dump;
+            # collapse that (and the plain not-a-repo fatal) to a concise message
+            # rather than echoing the whole help text into the error / JSON field.
+            if "not a git repository" in low or "usage:" in low or not stderr:
+                raise RuntimeError("not a git repository (or no commits to diff against)")
+            first_line = stderr.splitlines()[0]
+            raise RuntimeError(f"git diff failed: {first_line}")
         files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
         return files
     except FileNotFoundError:

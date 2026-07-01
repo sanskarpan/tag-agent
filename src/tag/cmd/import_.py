@@ -43,6 +43,22 @@ from tag.controller import (
 )
 
 
+def _import_fail(args: argparse.Namespace, message: str, *, payload: dict | None = None, code: int = 1):
+    """Fail an import command with a consistent contract.
+
+    When ``--json`` is set, emit a machine-readable JSON object on stdout (so
+    scripts get valid JSON on *every* outcome, not just success); otherwise
+    fall back to the plain-text ``SystemExit`` behaviour. Always exits nonzero.
+    """
+    if getattr(args, "json", False):
+        out = dict(payload) if payload is not None else {"status": "error"}
+        out.setdefault("status", "error")
+        out.setdefault("error", message)
+        print(json.dumps(out, indent=2))
+        raise SystemExit(code)
+    raise SystemExit(message)
+
+
 def cmd_import_codex(args: argparse.Namespace) -> int:
     from tag.controller import (
         ensure_hermes_ready as _ensure_hermes_ready,
@@ -55,13 +71,14 @@ def cmd_import_codex(args: argparse.Namespace) -> int:
     profiles = cfg.get("profiles", {})
     if args.profile not in profiles:
         available = ", ".join(sorted(profiles))
-        raise SystemExit(f"Unknown profile '{args.profile}'. Available: {available}")
+        _import_fail(args, f"Unknown profile '{args.profile}'. Available: {available}")
 
     _ensure_runtime_dirs(cfg)
     target_home = _profile_home(cfg, args.profile)
     if not target_home.exists():
-        raise SystemExit(
-            f"Profile home does not exist for '{args.profile}'. Run bootstrap first."
+        _import_fail(
+            args,
+            f"Profile home does not exist for '{args.profile}'. Run bootstrap first.",
         )
 
     source_home = (
@@ -77,7 +94,7 @@ def cmd_import_codex(args: argparse.Namespace) -> int:
         source_codex_home=source_home,
     )
     if result["status"] != "imported":
-        raise SystemExit(str(result.get("message", "Codex import failed.")))
+        _import_fail(args, str(result.get("message", "Codex import failed.")), payload=result)
 
     if args.json:
         print(
@@ -103,12 +120,13 @@ def cmd_import_claude(args: argparse.Namespace) -> int:
     profiles = cfg.get("profiles", {})
     if args.profile not in profiles:
         available = ", ".join(sorted(profiles))
-        raise SystemExit(f"Unknown profile '{args.profile}'. Available: {available}")
+        _import_fail(args, f"Unknown profile '{args.profile}'. Available: {available}")
     ensure_runtime_dirs(cfg)
     target_home = profile_home(cfg, args.profile)
     if not target_home.exists():
-        raise SystemExit(
-            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first."
+        _import_fail(
+            args,
+            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first.",
         )
     source_home = (
         Path(args.claude_home).expanduser().resolve()
@@ -122,12 +140,18 @@ def cmd_import_claude(args: argparse.Namespace) -> int:
         use_oauth=getattr(args, "use_oauth", False),
     )
     if result["status"] == "skipped-no-auth":
-        raise SystemExit(
+        _import_fail(
+            args,
             "No Claude credentials found. Set ANTHROPIC_API_KEY or use "
-            "`tag import-claude --use-oauth` to import from claude auth login."
+            "`tag import-claude --use-oauth` to import from claude auth login.",
+            payload=result,
         )
     if result["status"] == "profile-missing":
-        raise SystemExit(f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.")
+        _import_fail(
+            args,
+            f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.",
+            payload=result,
+        )
     if args.json:
         print(json.dumps(result, indent=2))
         return 0
@@ -144,12 +168,13 @@ def cmd_import_gemini(args: argparse.Namespace) -> int:
     profiles = cfg.get("profiles", {})
     if args.profile not in profiles:
         available = ", ".join(sorted(profiles))
-        raise SystemExit(f"Unknown profile '{args.profile}'. Available: {available}")
+        _import_fail(args, f"Unknown profile '{args.profile}'. Available: {available}")
     ensure_runtime_dirs(cfg)
     target_home = profile_home(cfg, args.profile)
     if not target_home.exists():
-        raise SystemExit(
-            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first."
+        _import_fail(
+            args,
+            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first.",
         )
     source_home = (
         Path(args.gemini_home).expanduser().resolve()
@@ -163,13 +188,19 @@ def cmd_import_gemini(args: argparse.Namespace) -> int:
         use_oauth=getattr(args, "use_oauth", False),
     )
     if result["status"] == "skipped-no-auth":
-        raise SystemExit(
+        _import_fail(
+            args,
             "No Gemini credentials found. Set GEMINI_API_KEY (from "
             "https://aistudio.google.com/app/apikey) or use "
-            "`tag import-gemini --use-oauth` to import from ~/.gemini/oauth_creds.json."
+            "`tag import-gemini --use-oauth` to import from ~/.gemini/oauth_creds.json.",
+            payload=result,
         )
     if result["status"] == "profile-missing":
-        raise SystemExit(f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.")
+        _import_fail(
+            args,
+            f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.",
+            payload=result,
+        )
     if args.json:
         print(json.dumps(result, indent=2))
         return 0
@@ -186,12 +217,13 @@ def cmd_import_continue(args: argparse.Namespace) -> int:
     profiles = cfg.get("profiles", {})
     if args.profile not in profiles:
         available = ", ".join(sorted(profiles))
-        raise SystemExit(f"Unknown profile '{args.profile}'. Available: {available}")
+        _import_fail(args, f"Unknown profile '{args.profile}'. Available: {available}")
     ensure_runtime_dirs(cfg)
     target_home = profile_home(cfg, args.profile)
     if not target_home.exists():
-        raise SystemExit(
-            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first."
+        _import_fail(
+            args,
+            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first.",
         )
     source_home = (
         Path(args.continue_home).expanduser().resolve()
@@ -200,12 +232,18 @@ def cmd_import_continue(args: argparse.Namespace) -> int:
     )
     result = import_continue_into_profile(cfg, profile_name=args.profile, source_continue_home=source_home)
     if result["status"] == "skipped-no-auth":
-        raise SystemExit(
+        _import_fail(
+            args,
             "No Continue.dev config found with API keys. "
-            "Expected ~/.continue/config.yaml or ~/.continue/config.json."
+            "Expected ~/.continue/config.yaml or ~/.continue/config.json.",
+            payload=result,
         )
     if result["status"] == "profile-missing":
-        raise SystemExit(f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.")
+        _import_fail(
+            args,
+            f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.",
+            payload=result,
+        )
     if args.json:
         print(json.dumps(result, indent=2))
         return 0
@@ -220,12 +258,13 @@ def cmd_import_mistral(args: argparse.Namespace) -> int:
     profiles = cfg.get("profiles", {})
     if args.profile not in profiles:
         available = ", ".join(sorted(profiles))
-        raise SystemExit(f"Unknown profile '{args.profile}'. Available: {available}")
+        _import_fail(args, f"Unknown profile '{args.profile}'. Available: {available}")
     ensure_runtime_dirs(cfg)
     target_home = profile_home(cfg, args.profile)
     if not target_home.exists():
-        raise SystemExit(
-            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first."
+        _import_fail(
+            args,
+            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first.",
         )
     source_home = (
         Path(args.vibe_home).expanduser().resolve()
@@ -234,12 +273,18 @@ def cmd_import_mistral(args: argparse.Namespace) -> int:
     )
     result = import_mistral_into_profile(cfg, profile_name=args.profile, source_vibe_home=source_home)
     if result["status"] == "skipped-no-auth":
-        raise SystemExit(
+        _import_fail(
+            args,
             "No Mistral credentials found. Set MISTRAL_API_KEY or ensure "
-            "`mistral-vibe` has written ~/.vibe/.env."
+            "`mistral-vibe` has written ~/.vibe/.env.",
+            payload=result,
         )
     if result["status"] == "profile-missing":
-        raise SystemExit(f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.")
+        _import_fail(
+            args,
+            f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.",
+            payload=result,
+        )
     if args.json:
         print(json.dumps(result, indent=2))
         return 0
@@ -262,12 +307,13 @@ def _cmd_import_generic(
     profiles = cfg.get("profiles", {})
     if args.profile not in profiles:
         available = ", ".join(sorted(profiles))
-        raise SystemExit(f"Unknown profile '{args.profile}'. Available: {available}")
+        _import_fail(args, f"Unknown profile '{args.profile}'. Available: {available}")
     ensure_runtime_dirs(cfg)
     target_home = profile_home(cfg, args.profile)
     if not target_home.exists():
-        raise SystemExit(
-            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first."
+        _import_fail(
+            args,
+            f"Profile home does not exist for '{args.profile}'. Run `tag bootstrap` first.",
         )
     kwargs: dict[str, Any] = {"profile_name": args.profile}
     if source_path_attr and getattr(args, source_path_attr, None):
@@ -278,14 +324,18 @@ def _cmd_import_generic(
         try:
             kwargs[key] = Path(raw).expanduser().resolve()
         except (OSError, RuntimeError) as exc:
-            raise SystemExit(f"Cannot resolve path '{raw}': {exc}") from exc
+            _import_fail(args, f"Cannot resolve path '{raw}': {exc}")
     if extra_kwargs:
         kwargs.update(extra_kwargs)
     result = import_fn(cfg, **kwargs)
     if result["status"] == "skipped-no-auth":
-        raise SystemExit(no_auth_msg)
+        _import_fail(args, no_auth_msg, payload=result)
     if result["status"] == "profile-missing":
-        raise SystemExit(f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.")
+        _import_fail(
+            args,
+            f"Profile '{args.profile}' home does not exist. Run `tag bootstrap` first.",
+            payload=result,
+        )
     if args.json:
         print(json.dumps(result, indent=2))
         return 0
@@ -422,7 +472,11 @@ def import_supermemory_into_profile(
     ph = profile_home(cfg, profile_name)
     if not ph.exists():
         return {"status": "profile-missing"}
-    creds = {"SUPERMEMORY_API_KEY": api_key} if api_key else _detect_supermemory_credentials(source_config_dir)
+    creds = (
+        {"SUPERMEMORY_API_KEY": api_key}
+        if api_key and api_key.strip()
+        else _detect_supermemory_credentials(source_config_dir)
+    )
     if not creds:
         return {"status": "skipped-no-auth"}
     env_file = ph / ".env"
@@ -483,8 +537,10 @@ def import_honcho_into_profile(
     creds = _detect_honcho_credentials(source_config)
     if base_url:
         creds["HONCHO_BASE_URL"] = base_url
-    if not creds:
-        return {"status": "skipped-no-auth"}
+    # A base URL is configuration, not a credential. Require an actual API key
+    # before reporting a successful credential import.
+    if "HONCHO_API_KEY" not in creds:
+        return {"status": "skipped-no-auth", "profile": profile_name}
     env_file = ph / ".env"
     for key, value in creds.items():
         _upsert_env_line(env_file, key, value)
@@ -492,6 +548,12 @@ def import_honcho_into_profile(
 
 
 def cmd_import_supermemory(args: argparse.Namespace) -> int:
+    api_key = getattr(args, "api_key", None)
+    if api_key is not None and not api_key.strip():
+        _import_fail(
+            args,
+            "Supermemory API key is empty or whitespace-only. Pass a non-empty --api-key.",
+        )
     return _cmd_import_generic(
         args,
         import_fn=import_supermemory_into_profile,
@@ -599,13 +661,22 @@ def cmd_import_nous_portal(args: argparse.Namespace) -> int:
         p = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
         if p not in profiles_cfg:
             available = ", ".join(sorted(profiles_cfg))
-            raise SystemExit(f"Unknown profile '{p}'. Available: {available}")
+            _import_fail(args, f"Unknown profile '{p}'. Available: {available}")
         profiles_to_update = [p]
 
     api_key_arg = getattr(args, "api_key", None) or None
-    if api_key_arg is not None and len(api_key_arg) < 20:
+
+    # Validate the effective key length at the CLI layer — covering both
+    # --api-key AND env/config-detected keys (B120). The library import fn does
+    # not validate, so direct callers keep control.
+    effective_key = api_key_arg
+    if effective_key is None:
+        detected = _detect_nous_portal_credentials()
+        effective_key = detected.get("NOUS_PORTAL_API_KEY") or None
+    if effective_key is not None and len(effective_key) < 20:
         raise SystemExit(
-            f"API key too short ({len(api_key_arg)} chars); Nous Portal keys are at least 20 characters"
+            f"API key too short ({len(effective_key)} chars); "
+            "Nous Portal keys are at least 20 characters"
         )
 
     results = []
@@ -619,18 +690,22 @@ def cmd_import_nous_portal(args: argparse.Namespace) -> int:
         )
         results.append(result)
 
+    # A no-credentials / invalid-key outcome must exit nonzero even under --json,
+    # so scripts can't mistake "nothing was written" for success.
+    any_ok = any(r["status"] == "ok" for r in results)
+
     if getattr(args, "json", False):
         print(json.dumps(results, indent=2))
-        return 0
+        return 0 if any_ok else 1
 
-    any_ok = False
     for r in results:
         profile_name = r.get("profile", "?")
         if r["status"] == "ok":
             print(f"  ✓ {profile_name}: Nous Portal gateway enabled")
-            any_ok = True
         elif r["status"] == "skipped-no-auth":
             print(f"  – {profile_name}: no credentials found")
+        elif r["status"] == "invalid-key":
+            print(f"  ✗ {profile_name}: {r.get('error', 'invalid API key')}")
         else:
             print(f"  ✗ {profile_name}: {r['status']}")
 
@@ -779,7 +854,7 @@ def cmd_import_docker(args: argparse.Namespace) -> int:
     profile_name = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
     if profile_name not in cfg.get("profiles", {}):
         available = ", ".join(sorted(cfg.get("profiles", {})))
-        raise SystemExit(f"Unknown profile '{profile_name}'. Available: {available}")
+        _import_fail(args, f"Unknown profile '{profile_name}'. Available: {available}")
     ensure_runtime_dirs(cfg)
     result = import_docker_into_profile(
         cfg,
@@ -796,6 +871,7 @@ def cmd_import_docker(args: argparse.Namespace) -> int:
             print(f"  ⚠ Warning: {result.get('warning', 'Docker daemon not running')}")
     else:
         print(f"✗ {profile_name}: {result['status']}")
+        return 1
     return 0
 
 
@@ -805,7 +881,7 @@ def cmd_import_ssh(args: argparse.Namespace) -> int:
     profile_name = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
     if profile_name not in cfg.get("profiles", {}):
         available = ", ".join(sorted(cfg.get("profiles", {})))
-        raise SystemExit(f"Unknown profile '{profile_name}'. Available: {available}")
+        _import_fail(args, f"Unknown profile '{profile_name}'. Available: {available}")
     ensure_runtime_dirs(cfg)
     port_arg = getattr(args, "port", None)
     result = import_ssh_into_profile(
@@ -822,8 +898,11 @@ def cmd_import_ssh(args: argparse.Namespace) -> int:
         return 0
     if result["status"] == "ok":
         print(f"✓ {profile_name}: SSH backend configured (host: {args.host})")
+        if result.get("warning"):
+            print(f"  ⚠ Warning: {result['warning']}")
     else:
         print(f"✗ {profile_name}: {result['status']}")
+        return 1
     return 0
 
 
@@ -833,7 +912,7 @@ def cmd_import_modal(args: argparse.Namespace) -> int:
     profile_name = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
     if profile_name not in cfg.get("profiles", {}):
         available = ", ".join(sorted(cfg.get("profiles", {})))
-        raise SystemExit(f"Unknown profile '{profile_name}'. Available: {available}")
+        _import_fail(args, f"Unknown profile '{profile_name}'. Available: {available}")
     ensure_runtime_dirs(cfg)
     result = import_modal_into_profile(
         cfg,
@@ -855,7 +934,7 @@ def cmd_import_daytona(args: argparse.Namespace) -> int:
     profile_name = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
     if profile_name not in cfg.get("profiles", {}):
         available = ", ".join(sorted(cfg.get("profiles", {})))
-        raise SystemExit(f"Unknown profile '{profile_name}'. Available: {available}")
+        _import_fail(args, f"Unknown profile '{profile_name}'. Available: {available}")
     ensure_runtime_dirs(cfg)
     result = import_daytona_into_profile(
         cfg,

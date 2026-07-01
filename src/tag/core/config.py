@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -39,9 +39,31 @@ def load_config(path: Path) -> dict[str, Any]:
         raise SystemExit(f"Config file not found: {path}")
     except yaml.YAMLError as exc:
         raise SystemExit(f"Config at {path} is not valid YAML: {exc}")
+    except OSError as exc:
+        # IsADirectoryError / PermissionError / etc. — surface a clean, consistent
+        # 'Config at <path> ...' message instead of a raw errno string.
+        reason = exc.strerror or str(exc)
+        raise SystemExit(f"Config at {path} could not be read: {reason}")
     if not isinstance(data, dict):
         raise SystemExit(f"Config at {path} must be a YAML object.")
     return data
+
+
+def _write_config_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Render *payload* into a sibling temp file and os.replace() it into place."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(payload, fh, sort_keys=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def save_config(path: Path, payload: dict[str, Any]) -> None:
@@ -58,19 +80,36 @@ def save_config(path: Path, payload: dict[str, Any]) -> None:
     try:
         if fcntl is not None:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                yaml.safe_dump(payload, fh, sort_keys=False)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-        except BaseException:
+        _write_config_atomic(path, payload)
+    finally:
+        if fcntl is not None:
             try:
-                os.unlink(tmp)
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
             except OSError:
                 pass
-            raise
+        lock_fh.close()
+
+
+def update_config(path: Path, mutate: "Callable[[dict[str, Any]], Any]") -> dict[str, Any]:
+    """Atomically read-modify-write a config file under an exclusive lock.
+
+    `save_config`'s lock only guards the write, so two concurrent
+    load_config -> mutate -> save_config cycles (e.g. `tag set-model` on two
+    different profiles) can still clobber each other's field — a lost update.
+    This helper holds the advisory lock across the *entire* read-modify-write,
+    so sibling updates both persist. Pass a `mutate(cfg)` callback that edits
+    the loaded config in place. Returns the persisted config dict.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_fh = open(lock_path, "w")
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        cfg = load_config(path)
+        mutate(cfg)
+        _write_config_atomic(path, cfg)
+        return cfg
     finally:
         if fcntl is not None:
             try:

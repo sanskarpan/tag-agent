@@ -292,19 +292,31 @@ def _build_message(rule: AlertRule, actual_value: float) -> str:
     )
 
 
+#: Default suppression window (seconds) preventing a persistently-true rule
+#: from re-firing on every check. Consulted against rule.last_triggered_at.
+DEFAULT_COOLDOWN_SECONDS = 3600.0
+
+
 def check_alerts(
     conn: sqlite3.Connection,
     metrics: dict[str, float],
+    *,
+    cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
 ) -> list[AlertFiring]:
     """
     Evaluate all enabled rules against *metrics*.
 
     For each rule that fires, an AlertFiring is persisted to alert_firings and
     the rule's last_triggered_at is updated.  Returns the list of new firings.
+
+    A rule that fired within the last *cooldown_seconds* is suppressed (no new
+    firing) so a persistently-true condition does not accumulate duplicate
+    firings on every check. Pass ``cooldown_seconds=0`` to disable suppression.
     """
     rules = list_rules(conn, enabled_only=True)
     fired: list[AlertFiring] = []
-    now = _utc_now()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
 
     for rule in rules:
         if rule.metric not in metrics:
@@ -312,6 +324,17 @@ def check_alerts(
         actual = metrics[rule.metric]
         if not evaluate_rule(rule, actual):
             continue
+
+        # Cooldown: suppress a repeat firing while still within the window.
+        if cooldown_seconds and rule.last_triggered_at:
+            try:
+                last_dt = datetime.fromisoformat(rule.last_triggered_at)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                if (now_dt - last_dt).total_seconds() < cooldown_seconds:
+                    continue
+            except (ValueError, TypeError):
+                pass
 
         firing_id = _new_id()
         message = _build_message(rule, actual)

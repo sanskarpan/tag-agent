@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import sys
 from types import ModuleType
 from typing import List
 
@@ -25,7 +26,15 @@ _MODULE_NAMES = [
 def _load_module(name: str) -> ModuleType | None:
     try:
         return importlib.import_module(f"tag.cmd.{name}")
-    except ImportError:
+    except Exception as exc:
+        # Don't silently drop a whole command group. Warn to stderr so a broken
+        # module is diagnosable (a bare `except ImportError` also let SyntaxError
+        # and other import-time errors propagate, crashing the whole CLI).
+        print(
+            f"warning: command module 'tag.cmd.{name}' failed to load and its "
+            f"commands are unavailable: {exc.__class__.__name__}: {exc}",
+            file=sys.stderr,
+        )
         return None
 
 

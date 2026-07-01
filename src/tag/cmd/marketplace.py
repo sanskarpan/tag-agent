@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from tag.core.config import load_config, config_path
-from tag.core.paths import runtime_db_path, hermes_root, tag_home, runtime_home, ensure_runtime_dirs
+from tag.core.paths import runtime_db_path, hermes_root, tag_home, runtime_home, profile_home, ensure_runtime_dirs
 from tag.core.db import open_db
 from tag.core.utils import nonnegative_int, utc_now
 
@@ -32,6 +32,60 @@ except Exception:
 def _profile_sha256(path: Path) -> str:
     import hashlib
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _validate_profile_name(name: str) -> str:
+    """Reject path separators / traversal / absolute paths in a profile name.
+
+    A profile name maps to a directory/file under a profiles root, so anything
+    other than a plain slug could be used to write outside that root
+    (e.g. ``../PWNED`` or ``/tmp/ABSPWN``).
+    """
+    import re
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name or ""):
+        raise ValueError(
+            f"Invalid profile name: {name!r} "
+            "(use letters, digits, dot, dash, underscore; no path separators)."
+        )
+    return name
+
+
+def _validate_fetch_url(url: str) -> None:
+    """Restrict outbound fetches to public http/https hosts (SSRF / file:// guard).
+
+    Rejects non-http(s) schemes (notably ``file://``) and refuses to connect to
+    loopback, link-local (incl. cloud metadata 169.254.169.254), private,
+    reserved, multicast or unspecified addresses.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"unsupported URL scheme {parsed.scheme or '(none)'!r}: only http/https are allowed"
+        )
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL has no host")
+
+    candidates: list[Any] = []
+    try:
+        candidates = [ipaddress.ip_address(host)]
+    except ValueError:
+        # Hostname — resolve best-effort. If resolution fails the connection
+        # will fail anyway, so don't block on that.
+        try:
+            for info in socket.getaddrinfo(host, None):
+                candidates.append(ipaddress.ip_address(info[4][0]))
+        except (socket.gaierror, ValueError, OSError):
+            candidates = []
+
+    for ip in candidates:
+        if (ip.is_loopback or ip.is_link_local or ip.is_private
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise ValueError(f"refusing to fetch from non-public address {ip} (host {host!r})")
 
 
 def _dashboard_snapshot(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -137,6 +191,19 @@ def cmd_profile_marketplace(args: argparse.Namespace) -> int:
             print_error("URL required (e.g. https://raw.githubusercontent.com/user/repo/main/profile.yaml)")
             return 1
         name = getattr(args, "name", None) or Path(url).stem
+        try:
+            name = _validate_profile_name(name)
+        except ValueError as exc:
+            db.close()
+            print_error(str(exc))
+            return 1
+
+        try:
+            _validate_fetch_url(url)
+        except ValueError as exc:
+            db.close()
+            print_error(f"Refused to fetch profile: {exc}")
+            return 1
 
         try:
             response = urllib.request.urlopen(url, timeout=15)  # noqa: S310
@@ -157,9 +224,12 @@ def cmd_profile_marketplace(args: argparse.Namespace) -> int:
             return 1
 
         sha = hashlib.sha256(content).hexdigest()
-        profiles_dir = runtime_home(cfg) / "profiles"
-        profiles_dir.mkdir(parents=True, exist_ok=True)
-        local_path = profiles_dir / f"{name}.yaml"
+        # Store where the runtime actually reads profiles from
+        # (runtime_home/.hermes/profiles/<name>/config.yaml), consistent with
+        # `template import` and `mcp-registry enable`.
+        profile_dir = profile_home(cfg, name)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        local_path = profile_dir / "config.yaml"
         local_path.write_bytes(content)
 
         now = utc_now()
@@ -229,7 +299,11 @@ def cmd_profile_marketplace(args: argparse.Namespace) -> int:
         return 0
 
     db.close()
-    return 0
+    if sub is None:
+        print_error("marketplace: a subcommand is required (pull, push, list)")
+    else:
+        print_error(f"Unknown marketplace subcommand: {sub!r}")
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -393,9 +467,14 @@ def cmd_sandbox(args: argparse.Namespace) -> int:
             return 1
         backend = getattr(args, "backend", "restricted") or "restricted"
         image = getattr(args, "image", "python:3.12-slim") or "python:3.12-slim"
-        timeout = getattr(args, "timeout", 60) or 60
+        timeout = args.timeout if getattr(args, "timeout", None) is not None else 60
 
-        result = run_in_sandbox(db, command, backend=backend, image=image, timeout=timeout)
+        try:
+            result = run_in_sandbox(db, command, backend=backend, image=image, timeout=timeout)
+        except ValueError as exc:
+            db.close()
+            print_error(str(exc))
+            return 1
         db.close()
 
         if getattr(args, "json", False):
@@ -498,7 +577,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
-        server = http.server.HTTPServer(("127.0.0.1", port), _Handler)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Handler)
         url = f"http://127.0.0.1:{port}"
         print(f"TAG dashboard server: {url}  (Ctrl+C to stop)")
 

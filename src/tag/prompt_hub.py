@@ -113,7 +113,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 def _now_iso() -> str:
-    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    from tag.core.utils import utc_now
+    return utc_now()
 
 
 def _extract_variables(content: str) -> list[str]:
@@ -176,6 +177,8 @@ def save_prompt(
     parent_version_id: str | None = None,
 ) -> PromptVersion:
     """Save a new version of a named prompt and return the PromptVersion."""
+    if not name or not name.strip():
+        raise ValueError("Prompt name must not be empty or blank")
     conn.row_factory = sqlite3.Row
     cursor = conn.execute(
         "SELECT COALESCE(MAX(version), 0) FROM prompt_versions WHERE name = ?",
@@ -318,8 +321,8 @@ def diff_versions(conn: sqlite3.Connection, name: str, v1: int, v2: int) -> str:
     if pv2 is None:
         raise ValueError(f"Prompt '{name}' version {v2} not found.")
 
-    lines1 = pv1.content.splitlines(keepends=True)
-    lines2 = pv2.content.splitlines(keepends=True)
+    lines1 = pv1.content.splitlines()
+    lines2 = pv2.content.splitlines()
 
     diff = difflib.unified_diff(
         lines1,
@@ -328,7 +331,7 @@ def diff_versions(conn: sqlite3.Connection, name: str, v1: int, v2: int) -> str:
         tofile=f"{name} v{v2}",
         lineterm="",
     )
-    return "".join(diff)
+    return "\n".join(diff)
 
 
 # ---------------------------------------------------------------------------

@@ -240,12 +240,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             report["tag_version"] = "not provisioned yet"
 
         profiles_report: dict[str, Any] = {}
+        defined_profiles = cfg.get("profiles") or {}
         profiles_to_check = (
             [target_profile] if target_profile
-            else list(cfg.get("profiles", {}).keys())
+            else list(defined_profiles.keys())
         )
         for p in profiles_to_check:
-            profiles_report[p] = _doctor_profile_checks(cfg, p)
+            if p not in defined_profiles:
+                profiles_report[p] = [{
+                    "name": "profile",
+                    "status": "fail",
+                    "message": f"unknown profile '{p}' — not defined in config",
+                }]
+            else:
+                profiles_report[p] = _doctor_profile_checks(cfg, p)
         report["profiles"] = profiles_report
         print(json.dumps(report, indent=2))
         has_fail = any(
@@ -260,12 +268,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     groups["system"] = _doctor_system_checks(cfg)
     groups["tag runtime"] = _doctor_hermes_checks(cfg)
 
+    defined_profiles = cfg.get("profiles") or {}
     profiles_to_check = (
         [target_profile] if target_profile
-        else list(cfg.get("profiles", {}).keys())
+        else list(defined_profiles.keys())
     )
     for p in profiles_to_check:
-        groups[f"profile: {p}"] = _doctor_profile_checks(cfg, p)
+        if p not in defined_profiles:
+            groups[f"profile: {p}"] = [{
+                "name": "profile",
+                "status": "fail",
+                "message": f"unknown profile '{p}' — not defined in config",
+            }]
+        else:
+            groups[f"profile: {p}"] = _doctor_profile_checks(cfg, p)
 
     print_doctor_report(groups)
 
@@ -305,6 +321,9 @@ def cmd_render(args: argparse.Namespace) -> int:
     rendered = render_profiles(cfg, force=args.force)
     if args.json:
         print(json.dumps(rendered, indent=2))
+        return 0
+    if not rendered:
+        print_warning("no profiles defined in config")
         return 0
     for item in rendered:
         print(f"{item['profile']}: {rewrite_cli_hints(item['config'])}")

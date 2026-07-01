@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from tag.core.config import load_config, config_path
-from tag.core.paths import runtime_db_path
+from tag.core.paths import runtime_db_path, ensure_runtime_dirs
 from tag.core.utils import nonnegative_int, utc_now
 
 try:
@@ -31,6 +31,9 @@ def _load_cfg_and_profile(args):
     return cfg, profile
 
 def _db_for_profile(profile, cfg):
+    # Ensure the runtime dir tree exists so a raw sqlite3.connect() on a fresh
+    # TAG_HOME doesn't fail with "unable to open database file" (B090).
+    ensure_runtime_dirs(cfg)
     return runtime_db_path(cfg)
 
 
@@ -128,6 +131,9 @@ def cmd_eval_dataset(args: argparse.Namespace) -> int:
     conn = _sq3.connect(str(db_path))
     ensure_schema(conn)
     if sub == "create":
+        if get_dataset(conn, args.name) is not None:
+            print_error(f"Dataset already exists: {args.name!r}")
+            return 1
         ds = create_dataset(conn, args.name, getattr(args, "description", ""))
         print(f"Created dataset '{ds.name}' (id={ds.id}, v{ds.version})")
         return 0
@@ -236,7 +242,7 @@ def cmd_alert(args: argparse.Namespace) -> int:
         else:
             if firings:
                 for f in firings:
-                    print(f"[{f.severity.upper()}] {f.rule_name}: {f.actual_value:.4f} {f.condition} {f.threshold}")
+                    print(f.message)
             else:
                 print("No alerts firing")
         return 0
@@ -281,7 +287,7 @@ def cmd_annotate(args: argparse.Namespace) -> int:
         if not tasks:
             print("Queue is empty")
         for t in tasks:
-            print(f"[{t.id}] {t.task_type}:{t.source_id}\n  {t.question}\n  Content: {t.content[:200]}")
+            print(f"[{t.id}] {t.source_type}:{t.source_id}\n  {t.question}\n  Content: {t.content[:200]}")
         return 0
     if sub == "label":
         ok = submit_label(conn, args.task_id, args.label, notes=getattr(args, "notes", None))
@@ -322,6 +328,9 @@ def cmd_prompt_hub(args: argparse.Namespace) -> int:
     conn = _sq3.connect(str(db_path))
     ensure_schema(conn)
     if sub == "save":
+        if not args.name or not args.name.strip():
+            print_error("Prompt name must not be empty or blank")
+            return 1
         p = Path(args.file)
         if not p.exists():
             print_error(f"Prompt file not found: {args.file}")
@@ -343,7 +352,7 @@ def cmd_prompt_hub(args: argparse.Namespace) -> int:
             print(json.dumps([vars(p) if hasattr(p, "__dict__") else dict(p) for p in prompts], indent=2, default=str))
         else:
             for p in prompts:
-                print(f"{p.name:<40} v{p.version}")
+                print(f"{p['name']:<40} v{p['latest_version']} ({p['versions_count']} versions)")
         return 0
     if sub == "diff":
         diff = diff_versions(conn, args.name, args.v1, args.v2)
@@ -422,7 +431,7 @@ def cmd_webhook_server(args: argparse.Namespace) -> int:
     if sub == "listen" or sub is None:
         port = getattr(args, "port", 8765)
         host = getattr(args, "host", "127.0.0.1")
-        secret = os.environ.get("TAG_WEBHOOK_SECRET") or None
+        secret = getattr(args, "secret", None) or os.environ.get("TAG_WEBHOOK_SECRET") or None
         conn.close()  # WebhookServer opens its own connection from db_path
         server = WebhookServer(db_path=str(db_path), cfg=cfg, host=host, port=port, secret=secret)
         if secret is None:
@@ -476,8 +485,10 @@ def cmd_ci_ext(args: argparse.Namespace) -> int:
         if diff_arg:
             p = Path(diff_arg)
             diff = p.read_text() if p.exists() else diff_arg
-        out = generate_tests(diff, profile, cfg, out=getattr(args, "out", None))
-        print(out)
+        out_path = getattr(args, "out", None)
+        result = generate_tests(diff, profile, cfg,
+                                output_path=Path(out_path) if out_path else None)
+        print(result)
         return 0
     if sub == "install-action":
         wf_type = getattr(args, "type", "eval")
@@ -703,8 +714,8 @@ def cmd_entity_graph(args: argparse.Namespace) -> int:
     try:
         import sqlite3 as _sq3
         from tag.entity_graph import (ensure_schema, query_graph, format_graph_summary,
-                                       get_entity_neighbors, extract_entities_from_memory,
-                                       add_entity, detect_communities)
+                                       get_entity_neighbors, extract_and_store_from_memory,
+                                       detect_communities)
         from tag.semantic_memory import ensure_schema as sm_ensure, list_memories
     except ImportError as e:
         print_error(f"entity_graph not available: {e}")
@@ -723,22 +734,33 @@ def cmd_entity_graph(args: argparse.Namespace) -> int:
             print(summary)
         return 0
     if sub == "query":
-        # query_graph exposes entity_name/entity_type/limit (single-level
-        # neighborhood); it has no depth-traversal parameter.
+        depth = getattr(args, "depth", 2) or 2
         result = query_graph(conn, profile, entity_name=args.entity)
+        # Honor --depth: enrich the first matched entity with its neighborhood.
+        ents = result.get("entities", []) if isinstance(result, dict) else []
+        if ents and ents[0].get("id"):
+            result["neighborhood"] = get_entity_neighbors(
+                conn, ents[0]["id"], max_depth=depth
+            )
         print(json.dumps(result, indent=2, default=str))
         return 0
     if sub == "build":
         sm_ensure(conn)
         memories = list_memories(conn, profile)
-        count = 0
+        ent_count = rel_count = 0
         for m in memories:
-            entities = extract_entities_from_memory(m.get("content", ""), profile)
-            for ent in entities:
-                add_entity(conn, ent["name"], ent.get("type", "unknown"), profile)
-                count += 1
-        detect_communities(conn, profile)
-        print(f"Built graph from {len(memories)} memories, extracted {count} entities")
+            # extract_and_store_from_memory adds entities (with the correct
+            # entity_type) AND co-occurrence relations.
+            e, r = extract_and_store_from_memory(
+                conn, m.get("id", ""), m.get("content", ""), profile
+            )
+            ent_count += e
+            rel_count += r
+        communities = detect_communities(conn, profile)
+        print(
+            f"Built graph from {len(memories)} memories: {ent_count} entities, "
+            f"{rel_count} relations, {len(communities)} communities"
+        )
         return 0
     print_error(f"Unknown graph subcommand: {sub!r}")
     return 1
@@ -750,6 +772,7 @@ def cmd_entity_graph(args: argparse.Namespace) -> int:
 def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     # ── PRD-046/047: pricing ────────────────────────────────────────────────
     pricing_cmd = sub.add_parser("pricing", help="LLM pricing table (cost-per-span)")
+    pricing_cmd.add_argument("--json", action="store_true")
     pricing_sub = pricing_cmd.add_subparsers(dest="pricing_subcommand")
     pr_list = pricing_sub.add_parser("list", help="List all known model prices")
     pr_list.add_argument("--json", action="store_true")
@@ -892,6 +915,8 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     wh_listen.add_argument("--port", type=int, default=8765)
     wh_listen.add_argument("--host", default="127.0.0.1")
     wh_listen.add_argument("--profile", default=None)
+    wh_listen.add_argument("--secret", default=None,
+                           help="HMAC secret to verify signatures (or set TAG_WEBHOOK_SECRET)")
     wh_rule_add = wh_sub.add_parser("rule-add", help="Add a trigger rule")
     wh_rule_add.add_argument("--platform", required=True, choices=["github", "linear", "slack"])
     wh_rule_add.add_argument("--event", required=True)

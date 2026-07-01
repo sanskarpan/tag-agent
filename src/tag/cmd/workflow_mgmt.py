@@ -38,6 +38,8 @@ from tag.core.paths import (
     tag_home,
     hermes_root,
     hermes_bin as _hermes_bin,
+    runtime_home as _runtime_home,
+    profile_home as _profile_home,
     runtime_db_path as _runtime_db_path,
     profile_exec_env as _profile_exec_env,
     ensure_runtime_dirs as _ensure_runtime_dirs,
@@ -62,6 +64,58 @@ def _safe_profile_path(base: Path, profile: str) -> Path:
     except ValueError:
         raise SystemExit(f"Invalid profile name (path traversal detected): {profile!r}")
     return resolved
+
+
+def _default_master_profile(cfg: dict[str, Any]) -> str:
+    """The configured default master profile.
+
+    The real key is ``cfg['defaults']['master_profile']``; ``cfg.get('master_profile')``
+    is always ``None`` so it silently falls back to 'orchestrator', ignoring a
+    user-set default.
+    """
+    return cfg.get("defaults", {}).get("master_profile", "orchestrator")
+
+
+def _runtime_profile_dir(cfg: dict[str, Any], profile: str) -> Path:
+    """The profile directory the runtime actually reads
+    (runtime_home/.hermes/profiles/<profile>), with a path-traversal guard."""
+    return _safe_profile_path(_runtime_home(cfg) / ".hermes" / "profiles", profile)
+
+
+def _validate_fetch_url(url: str) -> None:
+    """Restrict outbound fetches to public http/https hosts (SSRF / file:// guard).
+
+    Rejects non-http(s) schemes (notably ``file://``) and refuses to connect to
+    loopback, link-local (incl. cloud metadata 169.254.169.254), private,
+    reserved, multicast or unspecified addresses.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"unsupported URL scheme {parsed.scheme or '(none)'!r}: only http/https are allowed"
+        )
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL has no host")
+
+    candidates: list[Any] = []
+    try:
+        candidates = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            for info in socket.getaddrinfo(host, None):
+                candidates.append(ipaddress.ip_address(info[4][0]))
+        except (socket.gaierror, ValueError, OSError):
+            candidates = []
+
+    for ip in candidates:
+        if (ip.is_loopback or ip.is_link_local or ip.is_private
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise ValueError(f"refusing to fetch from non-public address {ip} (host {host!r})")
 
 
 # ---------------------------------------------------------------------------
@@ -132,19 +186,24 @@ def cmd_mcp_registry(args: argparse.Namespace) -> int:
         if not info:
             print_error(f"Unknown MCP server: {name}")
             return 1
-        profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+        profile = getattr(args, "profile", None) or _default_master_profile(cfg)
         cfg_block = info.get("config", {})
-        profile_dir = _safe_profile_path(tag_home() / "profiles", profile)
-        profile_cfg_path = profile_dir / "lab-config.yaml"
+        # Write to the profile config the runtime actually loads
+        # (runtime_home/.hermes/profiles/<profile>/config.yaml), using hermes'
+        # top-level `mcp_servers` mapping keyed by server name.
+        profile_dir = _runtime_profile_dir(cfg, profile)
+        profile_cfg_path = profile_dir / "config.yaml"
         if profile_cfg_path.exists():
             with profile_cfg_path.open() as fh:
                 pcfg = yaml.safe_load(fh) or {}
         else:
             pcfg = {}
-        mcp_list: list = pcfg.setdefault("mcp_servers", [])
-        existing_names = [e.get("name") for e in mcp_list]
-        if name not in existing_names:
-            mcp_list.append({"name": name, **cfg_block})
+        mcp_servers = pcfg.get("mcp_servers")
+        if not isinstance(mcp_servers, dict):
+            mcp_servers = {}
+        pcfg["mcp_servers"] = mcp_servers
+        if name not in mcp_servers:
+            mcp_servers[name] = cfg_block
             profile_cfg_path.parent.mkdir(parents=True, exist_ok=True)
             _write_yaml(profile_cfg_path, pcfg, force=True)
             print_success(f"Enabled MCP server '{name}' for profile '{profile}'")
@@ -154,14 +213,18 @@ def cmd_mcp_registry(args: argparse.Namespace) -> int:
 
     if sub == "disable":
         name = args.server_name
-        profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
-        profile_dir = _safe_profile_path(tag_home() / "profiles", profile)
-        profile_cfg_path = profile_dir / "lab-config.yaml"
+        profile = getattr(args, "profile", None) or _default_master_profile(cfg)
+        profile_dir = _runtime_profile_dir(cfg, profile)
+        profile_cfg_path = profile_dir / "config.yaml"
         if profile_cfg_path.exists():
             with profile_cfg_path.open() as fh:
                 pcfg = yaml.safe_load(fh) or {}
-            mcp_list = pcfg.get("mcp_servers", [])
-            pcfg["mcp_servers"] = [e for e in mcp_list if e.get("name") != name]
+            mcp_servers = pcfg.get("mcp_servers")
+            if isinstance(mcp_servers, dict):
+                mcp_servers.pop(name, None)
+                pcfg["mcp_servers"] = mcp_servers
+            elif isinstance(mcp_servers, list):
+                pcfg["mcp_servers"] = [e for e in mcp_servers if e.get("name") != name]
             _write_yaml(profile_cfg_path, pcfg, force=True)
             print_success(f"Disabled MCP server '{name}' for profile '{profile}'")
         else:
@@ -193,10 +256,12 @@ def cmd_template(args: argparse.Namespace) -> int:
     sub = getattr(args, "template_subcommand", None)
 
     if sub == "export" or sub is None:
-        profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
-        profile_dir = tag_home() / "profiles" / profile
+        profile = getattr(args, "profile", None) or _default_master_profile(cfg)
+        # Read the profile's real config/env from where the runtime stores them
+        # (runtime_home/.hermes/profiles/<profile>), not the phantom tag_home dir.
+        profile_dir = _profile_home(cfg, profile)
         env_file = profile_dir / ".env"
-        cfg_file = profile_dir / "lab-config.yaml"
+        cfg_file = profile_dir / "config.yaml"
 
         template: dict[str, Any] = {
             "name": profile,
@@ -246,7 +311,10 @@ def cmd_template(args: argparse.Namespace) -> int:
                 "(use letters, digits, dot, dash, underscore; no path separators)."
             )
             return 1
-        profile_dir = tag_home() / "profiles" / profile
+        # Create the profile where the runtime reads profiles from
+        # (runtime_home/.hermes/profiles/<profile>), so the imported profile is
+        # actually visible to the agent.
+        profile_dir = _profile_home(cfg, profile)
         if profile_dir.exists():
             print_error(f"Profile '{profile}' already exists; choose a different --profile name.")
             return 1
@@ -265,7 +333,7 @@ def cmd_template(args: argparse.Namespace) -> int:
 
         cfg_data = tmpl.get("config", {})
         if cfg_data:
-            _write_yaml(profile_dir / "lab-config.yaml", cfg_data, force=True)
+            _write_yaml(profile_dir / "config.yaml", cfg_data, force=True)
 
         print_success(f"Template imported as profile '{profile}'")
         return 0
@@ -273,7 +341,12 @@ def cmd_template(args: argparse.Namespace) -> int:
     if sub == "fetch":
         url = args.url
         try:
-            with urllib.request.urlopen(url, timeout=15) as resp:
+            _validate_fetch_url(url)
+        except ValueError as exc:
+            print_error(f"Refused to fetch template: {exc}")
+            return 1
+        try:
+            with urllib.request.urlopen(url, timeout=15) as resp:  # noqa: S310
                 tmpl_text = resp.read().decode()
         except urllib.error.URLError as exc:
             print_error(f"Failed to fetch template: {exc}")
@@ -355,11 +428,11 @@ def cmd_hooks(args: argparse.Namespace) -> int:
 
     if sub == "list" or sub is None:
         hooks_cfg: dict[str, Any] = cfg.get("hooks", {})
-        if not hooks_cfg:
-            print("No hooks configured.")
-            return 0
         if getattr(args, "json", False):
             print(json.dumps(hooks_cfg, indent=2))
+            return 0
+        if not hooks_cfg:
+            print("No hooks configured.")
             return 0
         for event_type, hook_list in hooks_cfg.items():
             print(f"\n  {event_type}:")
@@ -373,12 +446,14 @@ def cmd_hooks(args: argparse.Namespace) -> int:
             print("No hook log found.")
             return 0
         conn = sqlite3.connect(str(db_path))
-        rows = conn.execute(
-            "SELECT id, hook_name, event_id, status, response, fired_at "
-            "FROM hook_log ORDER BY fired_at DESC LIMIT ?",
-            (getattr(args, "limit", 50),),
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                "SELECT id, hook_name, event_id, status, response, fired_at "
+                "FROM hook_log ORDER BY fired_at DESC LIMIT ?",
+                (getattr(args, "limit", 50),),
+            ).fetchall()
+        finally:
+            conn.close()
         if getattr(args, "json", False):
             print(json.dumps([
                 {"id": r[0], "hook_name": r[1], "event_type": r[2],
@@ -395,7 +470,15 @@ def cmd_hooks(args: argparse.Namespace) -> int:
     if sub == "test":
         event_type = args.event_type
         payload = {"event_type": event_type, "test": "true", "timestamp": str(dt.datetime.now(dt.timezone.utc))}
-        fired = _fire_hooks(cfg, event_type, payload)
+        db_path = _runtime_db_path(cfg)
+        # Ensure the hook_log schema exists so fired test hooks are recorded.
+        try:
+            open_db(cfg).close()
+        except Exception:
+            pass
+        fired = _fire_hooks(cfg, event_type, payload, db_path=db_path)
+        if fired == 0:
+            print_warning(f"No hooks matched event '{event_type}'")
         print_success(f"Fired {fired} hook(s) for event '{event_type}'")
         return 0
 
@@ -417,12 +500,14 @@ def cmd_compare(args: argparse.Namespace) -> int:
             print("No benchmark database found.")
             return 0
         conn = sqlite3.connect(str(db_path))
-        rows = conn.execute(
-            "SELECT id, suite_path, created_at, status, models FROM benchmark_comparisons "
-            "ORDER BY created_at DESC LIMIT ?",
-            (getattr(args, "limit", 20),),
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                "SELECT id, suite_path, created_at, status, models FROM benchmark_comparisons "
+                "ORDER BY created_at DESC LIMIT ?",
+                (getattr(args, "limit", 20),),
+            ).fetchall()
+        finally:
+            conn.close()
         if getattr(args, "json", False):
             print(json.dumps([
                 {"id": r[0], "suite_path": r[1], "created_at": r[2], "status": r[3], "models": r[4]}
@@ -438,23 +523,30 @@ def cmd_compare(args: argparse.Namespace) -> int:
     if sub == "show":
         comparison_id = args.comparison_id
         if not db_path.exists():
-            print("No benchmark database found.")
-            return 0
-        conn = sqlite3.connect(str(db_path))
-        meta = conn.execute(
-            "SELECT id, suite_path, created_at, status, models FROM benchmark_comparisons WHERE id = ?",
-            (comparison_id,),
-        ).fetchone()
-        if not meta:
-            print_error(f"Comparison '{comparison_id}' not found")
-            conn.close()
+            if getattr(args, "json", False):
+                print(json.dumps({"error": "no benchmark database found", "id": comparison_id}))
+            else:
+                print_error("No benchmark database found.")
             return 1
-        results = conn.execute(
-            "SELECT model_id, case_id, quality_score, latency_ms, prompt_tokens, completion_tokens, output "
-            "FROM benchmark_results WHERE comparison_id = ? ORDER BY case_id, quality_score DESC",
-            (comparison_id,),
-        ).fetchall()
-        conn.close()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            meta = conn.execute(
+                "SELECT id, suite_path, created_at, status, models FROM benchmark_comparisons WHERE id = ?",
+                (comparison_id,),
+            ).fetchone()
+            if not meta:
+                if getattr(args, "json", False):
+                    print(json.dumps({"error": f"comparison {comparison_id!r} not found", "id": comparison_id}))
+                else:
+                    print_error(f"Comparison '{comparison_id}' not found")
+                return 1
+            results = conn.execute(
+                "SELECT model_id, case_id, quality_score, latency_ms, prompt_tokens, completion_tokens, output "
+                "FROM benchmark_results WHERE comparison_id = ? ORDER BY case_id, quality_score DESC",
+                (comparison_id,),
+            ).fetchall()
+        finally:
+            conn.close()
         if getattr(args, "json", False):
             print(json.dumps({
                 "id": meta[0], "suite_path": meta[1], "created_at": meta[2],
@@ -476,7 +568,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         return 0
 
     if sub == "run":
-        profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+        profile = getattr(args, "profile", None) or _default_master_profile(cfg)
         model_refs = getattr(args, "model_ref", [])
         suite_path = getattr(args, "suite", None)
         if not model_refs:
@@ -544,25 +636,38 @@ def cmd_compare(args: argparse.Namespace) -> int:
 
 def cmd_context(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(getattr(args, "config", None)))
-    profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+    profile = getattr(args, "profile", None) or _default_master_profile(cfg)
     sub = getattr(args, "context_subcommand", None)
 
     if sub == "show" or sub is None:
+        # hermes `sessions list` only supports --source/--limit (no --json).
         result = subprocess.run(
-            [str(_hermes_bin(cfg)), "sessions", "list", "--json"],
+            [str(_hermes_bin(cfg)), "sessions", "list"],
             env=_profile_exec_env(cfg, profile),
             capture_output=True, text=True,
         )
         if result.returncode != 0:
-            print_error(f"Failed to list sessions: {result.stderr.strip()}")
+            if getattr(args, "json", False):
+                print(json.dumps({"error": result.stderr.strip() or "sessions list failed"}))
+            else:
+                print_error(f"Failed to list sessions: {result.stderr.strip()}")
             return 1
         try:
             sessions = json.loads(result.stdout)
         except json.JSONDecodeError:
-            print(result.stdout)
-            return 0
+            sessions = None
         if getattr(args, "json", False):
-            print(json.dumps(sessions, indent=2))
+            if sessions is not None:
+                print(json.dumps(sessions, indent=2))
+            else:
+                print(json.dumps({"raw": result.stdout.strip()}))
+            return 0
+        if sessions is None:
+            # hermes printed a human-readable table — pass it through.
+            if result.stdout.strip():
+                print(result.stdout, end="")
+            else:
+                print(f"No active sessions for profile '{profile}'")
             return 0
         if not sessions:
             print(f"No active sessions for profile '{profile}'")
@@ -580,7 +685,9 @@ def cmd_context(args: argparse.Namespace) -> int:
         if not session_id:
             print_error("Provide --session-id")
             return 1
-        cmd_args = [str(_hermes_bin(cfg)), "sessions", "compress", session_id]
+        # hermes exposes context compression as `sessions optimize` (there is no
+        # `sessions compress` subcommand).
+        cmd_args = [str(_hermes_bin(cfg)), "sessions", "optimize", session_id]
         result = subprocess.run(
             cmd_args, env=_profile_exec_env(cfg, profile),
             capture_output=True, text=True,
@@ -593,19 +700,20 @@ def cmd_context(args: argparse.Namespace) -> int:
 
     if sub == "trim":
         session_id = getattr(args, "session_id", None)
-        keep_last = getattr(args, "keep_last", 10)
         if not session_id:
             print_error("Provide --session-id")
             return 1
+        # hermes has no `sessions trim`/`--keep-last`; `sessions optimize` is the
+        # supported context-reduction subcommand.
         result = subprocess.run(
-            [str(_hermes_bin(cfg)), "sessions", "trim", session_id, "--keep-last", str(keep_last)],
+            [str(_hermes_bin(cfg)), "sessions", "optimize", session_id],
             env=_profile_exec_env(cfg, profile),
             capture_output=True, text=True,
         )
         if result.returncode != 0:
             print_error(f"Context trim failed: {result.stderr.strip()}")
             return 1
-        print_success(f"Trimmed session '{session_id}' to last {keep_last} turns")
+        print_success(f"Trimmed (optimized) session '{session_id}'")
         return 0
 
     print_error(f"Unknown subcommand: {sub}")
@@ -618,7 +726,7 @@ def cmd_context(args: argparse.Namespace) -> int:
 
 def cmd_shell(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(getattr(args, "config", None)))
-    profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+    profile = getattr(args, "profile", None) or _default_master_profile(cfg)
     try:
         from tag.shell_mode import run_shell
         return run_shell(cfg, profile)
@@ -656,7 +764,56 @@ def cmd_route_fallback(args: argparse.Namespace) -> int:
             db.close()
             print_error(f"--condition must be one of: {', '.join(sorted(valid_conditions))}")
             return 1
-        priority = getattr(args, "priority", 1) or 1
+        # Preserve an explicit --priority 0 (don't let `or` clobber it) and bound it.
+        priority = getattr(args, "priority", 1)
+        if priority is None:
+            priority = 1
+        if priority < 0:
+            db.close()
+            print_error("--priority must be >= 0")
+            return 1
+
+        # Reject exact duplicates (profile, primary, fallback, condition).
+        existing = db.execute(
+            "SELECT id FROM route_fallbacks WHERE profile=? AND primary_model=? "
+            "AND fallback_model=? AND condition=?",
+            (profile, primary, fallback, condition),
+        ).fetchone()
+        if existing:
+            db.close()
+            print_error(
+                f"Fallback already exists for {primary} -> {fallback} "
+                f"(condition={condition}) in profile '{profile}'"
+            )
+            return 1
+
+        # Reject a fallback that would close a cycle (e.g. A->B then B->A):
+        # walk existing edges from the new fallback and see if it reaches primary.
+        edges: dict[str, set[str]] = {}
+        for r in db.execute(
+            "SELECT primary_model, fallback_model FROM route_fallbacks WHERE profile=?",
+            (profile,),
+        ).fetchall():
+            edges.setdefault(r[0], set()).add(r[1])
+        stack = [fallback]
+        seen: set[str] = set()
+        creates_cycle = False
+        while stack:
+            node = stack.pop()
+            if node == primary:
+                creates_cycle = True
+                break
+            if node in seen:
+                continue
+            seen.add(node)
+            stack.extend(edges.get(node, ()))
+        if creates_cycle:
+            db.close()
+            print_error(
+                f"Refusing to add fallback: {primary} -> {fallback} would create a cycle"
+            )
+            return 1
+
         fb_id = uuid.uuid4().hex[:8]
         db.execute(
             """INSERT INTO route_fallbacks(id, profile, primary_model, fallback_model,
@@ -726,11 +883,13 @@ def cmd_route_fallback(args: argparse.Namespace) -> int:
         ).fetchone()
         db.close()
         if not row:
+            # A valid query that simply has no fallback configured is not an
+            # error (consistent with `list` on an empty profile) — exit 0.
             if getattr(args, "json", False):
                 print(json.dumps({"primary": primary, "fallback": None, "condition": condition}))
             else:
                 print(f"No fallback configured for {primary!r} on condition={condition!r}")
-            return 1
+            return 0
         if getattr(args, "json", False):
             print(json.dumps({"primary": primary, "fallback": row[0], "condition": condition}))
         else:

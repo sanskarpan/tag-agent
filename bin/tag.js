@@ -13,9 +13,17 @@ const RUNTIME_HOME =
   path.join(os.homedir(), ".tag", "npm-runtime", VERSION);
 const VENV_DIR = path.join(RUNTIME_HOME, "venv");
 const STAMP_FILE = path.join(VENV_DIR, ".tag-package-version");
+// `--reinstall-runtime` is a launcher directive, not user data: honor it only
+// as the leading argument so it can't collide with a downstream value the child
+// legitimately receives (e.g. `tag submit --flag --reinstall-runtime`).
 const FORCE_REINSTALL =
   process.env.TAG_NPM_FORCE_REINSTALL === "1" ||
-  process.argv.includes("--reinstall-runtime");
+  process.argv[2] === "--reinstall-runtime";
+
+// Synchronous sleep with no dependencies — used to poll the install lock.
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
 
 function fail(message, code = 1) {
   console.error(message);
@@ -114,26 +122,100 @@ function ensureRuntime() {
   }
 
   const tagBin = venvTagBinary();
-  const stamp = readStamp();
-  if (!FORCE_REINSTALL && fs.existsSync(tagBin) && stamp === VERSION) {
+  if (!FORCE_REINSTALL && fs.existsSync(tagBin) && readStamp() === VERSION) {
     return tagBin;
   }
 
   fs.mkdirSync(RUNTIME_HOME, { recursive: true });
-  run(python.cmd, [...python.launcherArgs, "-m", "venv", VENV_DIR]);
 
-  const venvPython = venvPythonBinary();
-  run(venvPython, ["-m", "ensurepip", "--upgrade"]);
-  run(venvPython, ["-m", "pip", "install", "--upgrade", "pip"]);
-  run(venvPython, ["-m", "pip", "install", PACKAGE_ROOT]);
-  writeStamp();
-  return venvTagBinary();
+  // Serialize concurrent cold first-runs with an advisory lock: two racing
+  // `tag <cmd>` invocations must not both run `python -m venv` + pip install
+  // into the same shared VENV_DIR, which corrupts the interpreter.
+  const lockPath = path.join(RUNTIME_HOME, ".install.lock");
+  const releaseLock = acquireInstallLock(lockPath);
+  try {
+    // Re-check under the lock: the process we waited on may have finished the
+    // install, in which case there is nothing left to do.
+    if (!FORCE_REINSTALL && fs.existsSync(tagBin) && readStamp() === VERSION) {
+      return tagBin;
+    }
+
+    run(python.cmd, [...python.launcherArgs, "-m", "venv", VENV_DIR]);
+
+    const venvPython = venvPythonBinary();
+    run(venvPython, ["-m", "ensurepip", "--upgrade"]);
+    run(venvPython, ["-m", "pip", "install", "--upgrade", "pip"]);
+    run(venvPython, ["-m", "pip", "install", PACKAGE_ROOT]);
+    writeStamp();
+    return venvTagBinary();
+  } finally {
+    releaseLock();
+  }
+}
+
+// Acquire an exclusive advisory lock via O_EXCL create, polling until free.
+// Returns a release() that removes the lock. A stale lock older than the
+// timeout is forcibly reclaimed so a crashed installer can't wedge every
+// future invocation.
+function acquireInstallLock(lockPath, timeoutMs = 600000) {
+  const start = Date.now();
+  while (true) {
+    try {
+      const fd = fs.openSync(lockPath, "wx");
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      return () => {
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+          /* already gone */
+        }
+      };
+    } catch (err) {
+      if (err.code !== "EEXIST") {
+        throw err;
+      }
+      let age = Infinity;
+      try {
+        age = Date.now() - fs.statSync(lockPath).mtimeMs;
+      } catch {
+        // Lock vanished between open and stat — retry immediately.
+        continue;
+      }
+      if (age > timeoutMs || Date.now() - start > timeoutMs) {
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+          /* another waiter reclaimed it */
+        }
+        continue;
+      }
+      sleepSync(250);
+    }
+  }
 }
 
 function main() {
   try {
+    // Strip only a leading `--reinstall-runtime` (the launcher directive);
+    // any later occurrence is genuine user data destined for the child.
+    let forwardedArgs = process.argv.slice(2);
+    if (forwardedArgs[0] === "--reinstall-runtime") {
+      forwardedArgs = forwardedArgs.slice(1);
+    }
+
+    // Fast path: `--version` needs no Python runtime, so short-circuit before
+    // ensureRuntime() to avoid triggering a multi-minute cold venv build just
+    // to print a version string.
+    if (
+      forwardedArgs.length === 1 &&
+      (forwardedArgs[0] === "--version" || forwardedArgs[0] === "-V")
+    ) {
+      process.stdout.write(`${VERSION}\n`);
+      process.exit(0);
+    }
+
     const tagBin = ensureRuntime();
-    const forwardedArgs = process.argv.slice(2).filter((arg) => arg !== "--reinstall-runtime");
     const result = spawnSync(tagBin, forwardedArgs, {
       stdio: "inherit",
       env: process.env,
@@ -141,7 +223,14 @@ function main() {
     if (result.error) {
       throw result.error;
     }
-    process.exit(result.status || 0);
+    // Signal death yields {status:null, signal:'SIGTERM'}: surface it as a
+    // non-zero exit (128+signo, the shell convention) so CI/`set -e`/watchdogs
+    // detect the failure instead of seeing a masked exit 0.
+    if (result.signal) {
+      const signo = os.constants.signals[result.signal];
+      process.exit(signo ? 128 + signo : 1);
+    }
+    process.exit(result.status == null ? 1 : result.status);
   } catch (error) {
     fail(`TAG npm launcher error: ${error.message || String(error)}`);
   }

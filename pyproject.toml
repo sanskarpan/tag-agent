@@ -258,43 +258,23 @@ all = [
 
 [project.scripts]
 tag = "tag.cli:main"
-hermes = "hermes_cli.main:main"
-hermes-agent = "run_agent:main"
-hermes-acp = "acp_adapter.entry:main"
-
-[tool.setuptools]
-py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "utils", "mcp_serve"]
-
-[tool.setuptools.data-files]
-# i18n catalogs. locales/ is a bare data directory (no __init__.py), so it is
-# neither a package (packages.find) nor package-data (which attaches to a
-# package). data-files ships it in the wheel; MANIFEST.in `graft locales`
-# ships it in the sdist. Without this, sealed installs (pip wheel, Nix store
-# venv) drop the catalogs and gateway/CLI commands surface raw i18n keys like
-# `gateway.reset.header_default` (#27632, #35374, #23943).
-locales = ["locales/*.yaml"]
 
 [tool.setuptools.package-data]
-hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
-gateway = ["assets/**/*"]
-plugins = [
-  "*/dashboard/manifest.json",
-  "*/dashboard/dist/*",
-  "*/dashboard/dist/**/*",
-  # Plugin discovery (hermes_cli/plugins.py) reads a plugin.yaml/plugin.yml
-  # manifest from each bundled plugin directory to register it. Wheels only
-  # carry files declared here, so without this glob the wheel ships every
-  # plugin's Python code but none of its manifests — the scan finds zero
-  # plugins and all gateway platforms fail with "No adapter available for
-  # <platform>" (#34034), web-search providers go missing (#28149), etc.
-  "**/plugin.yaml",
-  "**/plugin.yml",
-  "**/README.md",
+# Non-package data directories physically nested under the `tag` package
+# (assets/config/docs/patches have no __init__.py, so packages.find skips
+# them). Declaring them here ships them inside the wheel; MANIFEST.in ships
+# them in the sdist. `vendor/` is deliberately excluded — the 54MB upstream
+# tarball is not a runtime artifact and must not be baked into the wheel.
+tag = [
+  "assets/**/*",
+  "config/**/*",
+  "docs/**/*",
+  "patches/**/*",
 ]
 
 [tool.setuptools.packages.find]
-where = [".", "src"]
-include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "tag", "tag.*"]
+where = ["src"]
+include = ["tag", "tag.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

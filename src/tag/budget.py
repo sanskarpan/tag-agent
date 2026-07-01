@@ -125,10 +125,14 @@ def list_budgets(conn: sqlite3.Connection) -> list[dict]:
 def used_tokens(conn: sqlite3.Connection, profile: str, period: str = "daily") -> int:
     """Total prompt+completion tokens consumed by *profile* within current window."""
     window_start = _window_start(period)
+    # Count tokens from every run in the window regardless of status: a pre-run
+    # gate must reflect tokens already consumed by in-flight and failed runs,
+    # otherwise the hard cap can be overshot by concurrent/failed work. Runs that
+    # never produced tokens contribute 0 via COALESCE.
     row = conn.execute(
         """SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
            FROM runs
-           WHERE master_profile=? AND created_at >= ? AND status='completed'""",
+           WHERE master_profile=? AND created_at >= ?""",
         (profile, window_start),
     ).fetchone()
     return int(row[0]) if row else 0

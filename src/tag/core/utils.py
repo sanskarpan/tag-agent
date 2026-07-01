@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 from typing import Any, TextIO
@@ -33,8 +34,24 @@ def read_dotenv(path: Path) -> dict[str, str]:
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+        # Strip an optional `export ` prefix (shell-style .env files) so lookups
+        # by the bare env-var name succeed.
+        if line.startswith(("export ", "export\t")):
+            line = line[len("export"):].lstrip()
         key, value = line.split("=", 1)
-        values[key.strip()] = value.strip()
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        # Dequote a fully quoted value (keeping its contents verbatim); for an
+        # unquoted value, drop a trailing inline comment introduced by ` #`.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        else:
+            comment_idx = value.find(" #")
+            if comment_idx != -1:
+                value = value[:comment_idx].rstrip()
+        values[key] = value
     return values
 
 
@@ -58,8 +75,10 @@ def _upsert_env_line(env_file: Path, key: str, value: str) -> None:
     replaced = False
     out = []
     for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(prefix) or stripped.lstrip("# ").startswith(prefix):
+        # Only replace the first *active* KEY= line. Commented/disabled keys stay
+        # disabled and later duplicates are left as-is, so we never re-activate a
+        # commented key or emit two active KEY= lines.
+        if not replaced and line.strip().startswith(prefix):
             out.append(new_line)
             replaced = True
         else:
@@ -67,6 +86,12 @@ def _upsert_env_line(env_file: Path, key: str, value: str) -> None:
     if not replaced:
         out.append(new_line)
     env_file.write_text("\n".join(out) + "\n", encoding="utf-8")
+    # Files created here hold API keys / tokens; keep them owner-only (0600),
+    # matching ~/.aws/credentials and ~/.claude/.credentials.json.
+    try:
+        os.chmod(env_file, 0o600)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +125,22 @@ def write_yaml(path: Path, payload: dict[str, Any], force: bool) -> None:
     if path.exists() and not force:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
-        yaml.safe_dump(payload, fh, sort_keys=False)
+    # Atomic write: render into a sibling temp file and os.replace() it in, so a
+    # concurrent reader always sees the whole old or whole new file — never a
+    # truncated mid-write (render_profiles calls this force=True on every render).
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(payload, fh, sort_keys=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def write_text(path: Path, content: str, force: bool) -> None:
@@ -205,12 +244,29 @@ def rewrite_cli_hints(text: str) -> str:
     # generic subcommand rule, so casing stays consistent — see BUG-004 block above.)
     # BUG-011: re-centre box titles after brand substitution shortened them
     rewritten = _fix_box_title_alignment(rewritten)
-    # Catch any remaining standalone Hermes brand references that aren't filesystem paths
-    rewritten = re.sub(r"(?<![/.])\bHermes\b(?![-/.])", "TAG", rewritten)
+    # Catch any remaining standalone Hermes brand references that aren't filesystem paths.
+    # Case-insensitive so a bare lowercase "hermes" in prose is rewritten too; the
+    # lookbehind/lookahead still exempt path-like tokens (e.g. ~/.hermes, hermes-agent).
+    rewritten = re.sub(r"(?<![/.])\bHermes\b(?![-/.])", "TAG", rewritten, flags=re.IGNORECASE)
     return rewritten
 
 
 _BOX_TITLE_RE = re.compile(r"┌(─+)┐\n│([^\n]*)│\n└(─+)┘", re.MULTILINE)
+
+
+def _display_width(text: str) -> int:
+    """Return the terminal display width of *text* in columns.
+
+    East-Asian wide/fullwidth glyphs (CJK, many emoji) occupy two columns;
+    zero-width combining marks occupy none. Everything else counts as one.
+    """
+    import unicodedata
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
 
 
 def _fix_box_title_alignment(text: str) -> str:
@@ -230,10 +286,16 @@ def _fix_box_title_alignment(text: str) -> str:
             title_part = content[content.index("⚕"):].strip()
         else:
             title_part = content.strip()
-        # Leave well-formed lines untouched; never widen a title that overflows the box.
-        if len(content) == inner_width or len(title_part) > inner_width:
+        # Width math in display columns (not code points) so wide CJK/emoji glyphs
+        # do not shift the closing border. Leave well-formed lines untouched; never
+        # widen a title that overflows the box.
+        title_width = _display_width(title_part)
+        if _display_width(content) == inner_width or title_width > inner_width:
             return m.group(0)
-        centred = title_part.center(inner_width)
+        total_pad = inner_width - title_width
+        left = total_pad // 2
+        right = total_pad - left
+        centred = " " * left + title_part + " " * right
         return f"┌{top_dashes}┐\n│{centred}│\n└{bot_dashes}┘"
     return _BOX_TITLE_RE.sub(recentre, text)
 

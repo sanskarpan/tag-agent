@@ -130,15 +130,43 @@ def managed_root() -> Path:
     return tag_home() / "managed"
 
 
+def _config_section(cfg: dict[str, Any], key: str) -> dict[str, Any]:
+    """Return the top-level mapping at *key*, tolerating a present-but-null value.
+
+    A section written as ``runtime:`` (null) or ``runtime: {}`` should behave as
+    an empty mapping; a scalar (e.g. ``runtime: astring``) is a clear config
+    error naming the key rather than an opaque 'str has no attribute get'.
+    """
+    section = cfg.get(key)
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise SystemExit(f"Config field '{key}' must be a YAML object.")
+    return section
+
+
+def _runtime_path_value(cfg: dict[str, Any], key: str, default: str) -> str:
+    """Read a runtime path setting, falling back to *default* when unset/blank.
+
+    An empty string (``home_dir: ""``) must not silently resolve to the TAG_HOME
+    root; treat blank/null as 'use the documented default'.
+    """
+    raw = _config_section(cfg, "runtime").get(key, default)
+    if raw is None:
+        return default
+    value = str(raw).strip()
+    return value or default
+
+
 def hermes_root(cfg: dict[str, Any] | None = None) -> Path:
     override = os.environ.get("TAG_HERMES_ROOT", "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    configured = resolve_home_relative(
-        str(cfg.get("upstream", {}).get("checkout_dir", DEFAULT_HERMES_CHECKOUT))
-        if cfg is not None
-        else DEFAULT_HERMES_CHECKOUT
-    )
+    if cfg is not None:
+        checkout = str(_config_section(cfg, "upstream").get("checkout_dir", DEFAULT_HERMES_CHECKOUT) or DEFAULT_HERMES_CHECKOUT)
+    else:
+        checkout = DEFAULT_HERMES_CHECKOUT
+    configured = resolve_home_relative(checkout)
     if configured.exists():
         return configured
     discovered = discover_local_hermes_checkout()
@@ -152,34 +180,31 @@ def hermes_bin(cfg: dict[str, Any] | None = None) -> Path:
 
 
 def runtime_home(cfg: dict[str, Any]) -> Path:
-    value = cfg.get("runtime", {}).get("home_dir", "runtime/home")
-    return resolve_home_relative(str(value))
+    return resolve_home_relative(_runtime_path_value(cfg, "home_dir", "runtime/home"))
 
 
 def runtime_codex_home(cfg: dict[str, Any]) -> Path:
     override = os.environ.get("TAG_CODEX_HOME")
     if override:
         return Path(override).expanduser().resolve()
-    value = cfg.get("runtime", {}).get("codex_home", "runtime/home/.codex")
-    return resolve_home_relative(str(value))
+    return resolve_home_relative(_runtime_path_value(cfg, "codex_home", "runtime/home/.codex"))
 
 
 def runtime_db_path(cfg: dict[str, Any]) -> Path:
-    value = cfg.get("runtime", {}).get("db_path", "runtime/tag.sqlite3")
-    return resolve_home_relative(str(value))
+    return resolve_home_relative(_runtime_path_value(cfg, "db_path", "runtime/tag.sqlite3"))
 
 
 def hermes_repo_url(cfg: dict[str, Any]) -> str:
     return str(
         os.environ.get(
             "TAG_HERMES_REPO",
-            cfg.get("upstream", {}).get("repo", "https://github.com/NousResearch/Hermes-Agent.git"),
+            _config_section(cfg, "upstream").get("repo", "https://github.com/NousResearch/Hermes-Agent.git"),
         )
     )
 
 
 def hermes_ref(cfg: dict[str, Any]) -> str:
-    return str(os.environ.get("TAG_HERMES_REF", cfg.get("upstream", {}).get("ref", "main")))
+    return str(os.environ.get("TAG_HERMES_REF", _config_section(cfg, "upstream").get("ref", "main")))
 
 
 def hermes_env(cfg: dict[str, Any]) -> dict[str, str]:

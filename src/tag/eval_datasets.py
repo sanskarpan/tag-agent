@@ -151,27 +151,28 @@ def import_from_eval_runs(
     profile: str | None = None,
 ) -> EvalDataset:
     ensure_schema(conn)
+    # Guarantee the eval_framework tables exist so an empty history yields an
+    # empty (not errored) import rather than an OperationalError.
+    from tag.eval_framework import ensure_schema as _eval_ensure_schema
+    _eval_ensure_schema(conn)
     ds = create_dataset(conn, dataset_name, source_type="from_runs")
-    try:
-        profile_clause = "AND r.profile=?" if profile else ""
-        profile_params: list[Any] = [profile] if profile else []
-        rows = conn.execute(
-            f"""SELECT c.id, c.input, c.expected_output, c.metadata_json
-                FROM eval_cases c
-                JOIN eval_runs r ON c.run_id=r.id
-                WHERE r.created_at >= datetime('now', '-{int(since_days)} days')
-                {profile_clause}
-                AND c.status='pass'
-                ORDER BY r.created_at DESC
-                LIMIT ?""",
-            profile_params + [limit],
-        ).fetchall()
-        for row in rows:
-            add_case(conn, ds.id, row[0], row[1] or "",
-                     expected_output=row[2],
-                     metadata=json.loads(row[3] or "{}"))
-    except Exception:
-        pass
+    profile_clause = "AND r.profile=?" if profile else ""
+    profile_params: list[Any] = [profile] if profile else []
+    rows = conn.execute(
+        f"""SELECT c.id, c.input, c.output, c.score
+            FROM eval_cases c
+            JOIN eval_runs r ON c.eval_run_id=r.id
+            WHERE r.created_at >= datetime('now', '-{int(since_days)} days')
+            {profile_clause}
+            AND c.passed=1
+            ORDER BY r.created_at DESC
+            LIMIT ?""",
+        profile_params + [limit],
+    ).fetchall()
+    for row in rows:
+        add_case(conn, ds.id, row[0], row[1] or "",
+                 expected_output=row[2],
+                 metadata={"score": row[3]})
     # Return refreshed dataset
     conn.row_factory = sqlite3.Row
     row = conn.execute("SELECT * FROM eval_datasets WHERE id=?", (ds.id,)).fetchone()
@@ -192,19 +193,21 @@ def export_to_yaml(conn: sqlite3.Connection, dataset_id: str) -> str:
     ).fetchall()
     conn.row_factory = None
 
-    lines = [
-        f"name: {ds.name}",
-        f"description: {ds.description or ''}",
-        "cases:",
-    ]
+    import yaml
+
+    case_list: list[dict[str, Any]] = []
     for c in cases:
-        inp = str(c["input"]).replace('"', '\\"')
-        lines.append(f'  - id: {c["case_id"]}')
-        lines.append(f'    input: "{inp}"')
+        case: dict[str, Any] = {"id": c["case_id"], "input": str(c["input"])}
         if c["expected_output"]:
-            exp = str(c["expected_output"]).replace('"', '\\"')
-            lines.append(f'    expected_output: "{exp}"')
-    return "\n".join(lines) + "\n"
+            case["expected_output"] = str(c["expected_output"])
+        case_list.append(case)
+
+    doc = {
+        "name": ds.name,
+        "description": ds.description or "",
+        "cases": case_list,
+    }
+    return yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
 
 
 def list_datasets(conn: sqlite3.Connection) -> list[EvalDataset]:

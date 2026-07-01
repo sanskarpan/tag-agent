@@ -90,7 +90,10 @@ def verify_signature(
     secret: str,
 ) -> bool:
     if not secret:
-        return True
+        # Without a configured secret we cannot cryptographically verify the
+        # payload, so we must NOT report the signature as valid. Callers decide
+        # whether to enforce (reject) or merely record signature_valid=False.
+        return False
     secret_bytes = secret.encode("utf-8") if isinstance(secret, str) else secret
 
     if platform == WebhookPlatform.GITHUB:
@@ -236,7 +239,12 @@ def match_rules(
 
 def _event_matches(pattern: str, event_type: str) -> bool:
     import fnmatch
-    return fnmatch.fnmatch(event_type, pattern) or event_type.startswith(pattern.rstrip("*"))
+    # Match exactly, or via an explicit shell-style wildcard (e.g. "pull_request.*").
+    # An empty pattern matches nothing, and the previous unanchored startswith()
+    # fallback (which fired "issue" for "issues.opened") is intentionally gone.
+    if not pattern:
+        return False
+    return fnmatch.fnmatch(event_type, pattern)
 
 
 def list_events(
@@ -381,11 +389,14 @@ class WebhookServer:
         port: int = 8080,
         secret: str | None = None,
     ) -> None:
+        import os
         self._db_path = Path(db_path)
         self._cfg = cfg
         self._host = host
         self._port = port
-        self._secret = secret
+        # Allow the signing secret to be supplied via the environment so
+        # verification is reachable even when the CLI does not pass secret=.
+        self._secret = secret or os.environ.get("TAG_WEBHOOK_SECRET") or None
         self._server: http.server.HTTPServer | None = None
 
     def start(self) -> None:
@@ -404,3 +415,6 @@ class WebhookServer:
     def stop(self) -> None:
         if self._server:
             self._server.shutdown()
+            # Also release the listening socket/fd; shutdown() alone only stops
+            # the serve loop, leaking the port on repeated start/stop.
+            self._server.server_close()
