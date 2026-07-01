@@ -188,12 +188,20 @@ def cmd_profile_marketplace(args: argparse.Namespace) -> int:
             db.close()
             print_error("profile name required")
             return 1
-        # Find the profile file
+        # Find the profile file — either a pulled profile (flat profiles/<name>.yaml)
+        # or a bootstrapped profile (.hermes/profiles/<name>/config.yaml).
         profiles_dir = runtime_home(cfg) / "profiles"
         candidates = list(profiles_dir.glob(f"{profile_name}.yaml"))
         if not candidates:
+            bootstrapped = runtime_home(cfg) / ".hermes" / "profiles" / profile_name / "config.yaml"
+            if bootstrapped.exists():
+                candidates = [bootstrapped]
+        if not candidates:
             db.close()
-            print_error(f"Profile file not found: {profiles_dir}/{profile_name}.yaml")
+            print_error(
+                f"Profile not found: {profile_name!r} (looked in {profiles_dir}/ and "
+                f"{runtime_home(cfg)}/.hermes/profiles/{profile_name}/)"
+            )
             return 1
         pfile = candidates[0]
         sha = _profile_sha256(pfile)

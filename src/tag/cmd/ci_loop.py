@@ -286,12 +286,16 @@ def cmd_loop(args: argparse.Namespace) -> int:
             db.close()
             print_error("LOOP_ID required")
             return 1
-        db.execute(
+        cur = db.execute(
             "UPDATE loop_runs SET status='aborted', updated_at=? WHERE id=? AND status='running'",
             (utc_now(), loop_id),
         )
         db.commit()
+        affected = cur.rowcount
         db.close()
+        if affected == 0:
+            print_error(f"No running loop found: {loop_id}")
+            return 1
         print(f"abort requested: {loop_id}")
         return 0
 
@@ -469,7 +473,13 @@ def cmd_workspace(args: argparse.Namespace) -> int:
     root = Path(getattr(args, "path", None) or ".").resolve()
 
     if sub == "index":
-        max_files = getattr(args, "max_files", 500) or 500
+        if not root.is_dir():
+            db.close()
+            print_error(f"Not a directory: {root}")
+            return 1
+        max_files = getattr(args, "max_files", None)
+        if max_files is None:
+            max_files = 500
         result = index_workspace(db, root, max_files=max_files)
         db.close()
         if getattr(args, "json", False):

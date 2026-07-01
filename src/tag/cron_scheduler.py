@@ -75,24 +75,43 @@ def validate_cron_expression(expr: str) -> None:
     field_names = ["minute", "hour", "day-of-month", "month", "day-of-week"]
     ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)]
     for field, name, (lo, hi) in zip(parts, field_names, ranges):
-        if field == "*":
+        _validate_cron_field(field, name, lo, hi, expr)
+
+
+def _validate_cron_field(field: str, name: str, lo: int, hi: int, expr: str) -> None:
+    """Validate a single cron field, rejecting negatives, zero steps, and
+    reversed ranges — the old regex treated ``-`` purely as a range separator,
+    so ``-1`` silently parsed as ``1`` and ``*/0``/``50-10`` slipped through."""
+    if field == "*":
+        return
+
+    def _check_value(v: int) -> None:
+        if not (lo <= v <= hi):
+            raise ValueError(f"Cron {name} value {v} out of range [{lo}-{hi}] in {expr!r}")
+
+    for item in field.split(","):
+        if item == "":
+            raise ValueError(f"Empty element in cron {name} field of {expr!r}")
+        # Optional step: base/step
+        if "/" in item:
+            item, _, step_part = item.partition("/")
+            if not re.fullmatch(r"[0-9]+", step_part) or int(step_part) == 0:
+                raise ValueError(f"Invalid cron step {step_part!r} in {name} of {expr!r}")
+        if item == "*":
             continue
-        # Strip step/range/list markers and validate each numeric token
-        cleaned = re.sub(r"[0-9,\-/\*]", "", field)
-        if cleaned:
-            raise ValueError(f"Invalid cron field {field!r} ({name}) in expression {expr!r}")
-        # Validate all literal numbers are in range
-        for token in re.split(r"[,\-/]", field):
-            if token == "*" or not token:
-                continue
-            try:
-                val = int(token)
-            except ValueError:
-                continue
-            if not (lo <= val <= hi):
-                raise ValueError(
-                    f"Cron {name} value {val} out of range [{lo}-{hi}] in {expr!r}"
-                )
+        if "-" in item:
+            bounds = item.split("-")
+            if len(bounds) != 2 or not all(re.fullmatch(r"[0-9]+", b) for b in bounds):
+                raise ValueError(f"Invalid cron range {item!r} in {name} of {expr!r}")
+            start, end = int(bounds[0]), int(bounds[1])
+            if start > end:
+                raise ValueError(f"Reversed cron range {item!r} in {name} of {expr!r}")
+            _check_value(start)
+            _check_value(end)
+        else:
+            if not re.fullmatch(r"[0-9]+", item):
+                raise ValueError(f"Invalid cron value {item!r} in {name} of {expr!r}")
+            _check_value(int(item))
 
 
 # ---------------------------------------------------------------------------
