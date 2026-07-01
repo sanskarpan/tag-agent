@@ -1,3 +1,10 @@
+> **⚠️ SUPERSEDED (strategic direction changed).** This analysis recommended *staying Python* under the
+> assumption that the Hermes-Python coupling was **permanent**. Leadership has since reframed Hermes as a
+> **transitional** dependency and made single-binary distribution/adoption the top priority — which this
+> document itself named as the exact condition that flips the answer to native Go. See
+> **[NATIVE_HARNESS_STRATEGY.md](NATIVE_HARNESS_STRATEGY.md)** for the current direction. Kept for the
+> reasoning trail (bug-forensics, weighted criteria) which remains valid.
+
 # TAG — Stack Decision (Go / Rust / Python / Hybrid)
 
 > Evidence-based evaluation of the best implementation stack for TAG, produced by a multi-agent
