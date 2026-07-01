@@ -422,9 +422,16 @@ def cmd_webhook_server(args: argparse.Namespace) -> int:
     if sub == "listen" or sub is None:
         port = getattr(args, "port", 8765)
         host = getattr(args, "host", "127.0.0.1")
-        server = WebhookServer(conn=conn, host=host, port=port, cfg=cfg)
+        secret = os.environ.get("TAG_WEBHOOK_SECRET") or None
+        conn.close()  # WebhookServer opens its own connection from db_path
+        server = WebhookServer(db_path=str(db_path), cfg=cfg, host=host, port=port, secret=secret)
+        if secret is None:
+            print_warning(
+                "No TAG_WEBHOOK_SECRET set — unsigned webhooks will be accepted. "
+                "Bind is localhost-only; set a secret before exposing the port."
+            )
         print(f"Webhook server listening on {host}:{port} — Ctrl+C to stop")
-        server.serve_forever()
+        server.start()
         return 0
     if sub == "rule-add":
         rule = wh_create_rule(conn, args.platform, args.event, args.profile,
