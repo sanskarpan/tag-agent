@@ -44,22 +44,43 @@ def run_eval_ci(
 
     actual_threshold = fail_below if fail_below is not None else threshold
 
-    run_id, summary = eval_framework.create_eval_run(conn, suite_path, profile)
-    suite = eval_framework.load_suite(suite_path)
+    suite_file = Path(suite_path)
+    if not suite_file.exists():
+        raise FileNotFoundError(f"Eval suite not found: {suite_path}")
+
+    import subprocess
+    import sys as _sys
+
+    run_id = eval_framework.create_eval_run(conn, suite_path, profile)
+    suite = eval_framework.load_suite(suite_file)
+    cases = suite.get("cases", [])
     failures: list[dict] = []
     passed_count = 0
 
-    for case in suite.get("cases", []):
-        result = eval_framework.score_case(case, profile, cfg)
-        eval_framework.record_case_result(conn, run_id, case, result)
-        if result.get("passed"):
+    for case in cases:
+        case_id = case.get("id", "?")
+        input_text = case.get("input", "")
+        # Produce model output by running the case through `tag submit` — the
+        # same path the `tag eval run` command uses.
+        proc = subprocess.run(
+            [_sys.executable, "-m", "tag", "submit", "--task-type", "mixed",
+             "--prompt", input_text, "--master-profile", profile, "--source", "eval"],
+            capture_output=True, text=True, timeout=300,
+        )
+        output = proc.stdout
+        ok, score, reason = eval_framework.score_case(case, output)
+        eval_framework.record_case_result(
+            conn, run_id, case_id, input_text, output,
+            passed=ok, score=score, failure_reason=reason,
+        )
+        if ok:
             passed_count += 1
         else:
-            failures.append({"id": case.get("id","?"), "reason": result.get("reason","")})
+            failures.append({"id": case_id, "reason": reason or ""})
 
-    total = len(suite.get("cases", []))
+    total = len(cases)
     pass_rate = passed_count / total if total else 0.0
-    eval_framework.finalize_eval_run(conn, run_id, pass_rate)
+    eval_framework.finalize_eval_run(conn, run_id)
 
     judge_pass_rate = None
     if judge_model:
@@ -135,14 +156,15 @@ def scaffold_github_action(
     profile: str = "reviewer",
     threshold: float = 0.85,
 ) -> str:
+    # These must match real TAG commands (verified against the CLI parsers).
     types = {
-        "eval": (
-            f"tag eval ci --suite tests/eval_suite.yaml --profile {profile} "
-            f"--fail-below {threshold}"
+        "eval": f"tag eval-ci run tests/eval_suite.yaml --threshold {threshold}",
+        "review": (
+            "tag review-pr --repo ${{ github.repository }} "
+            "--pr ${{ github.event.number }} --post-comments"
         ),
-        "review": f"tag ci review --repo ${{{{ github.repository }}}} --pr ${{{{ github.event.number }}}} --post-comment",
-        "test-gen": "tag ci test-gen --diff-from-staged --profile coder",
-        "fix-vuln": "tag ci fix-vuln --sarif results.sarif --profile security",
+        "test-gen": "tag agentic-ci test-gen --diff diff.patch --profile coder",
+        "fix-vuln": "tag agentic-ci fix-vuln results.sarif --profile reviewer",
     }
     run_cmd = types.get(workflow_type, types["eval"])
     return textwrap.dedent(f"""\
