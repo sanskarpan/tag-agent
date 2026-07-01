@@ -67,12 +67,20 @@ def _write_config_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 
 def save_config(path: Path, payload: dict[str, Any]) -> None:
-    """Persist config atomically and serialized across concurrent writers.
+    """Persist a fully-formed *payload* atomically, serialized across writers.
 
-    Two `tag set-model` invocations racing on the same file used to interleave
-    into torn YAML that bricked every later config read. We now take an
-    advisory lock for the duration and swap the file in with an atomic
-    `os.replace`, so a reader always sees either the old or the new file whole.
+    This is the write-only primitive: it takes an advisory lock only for the
+    duration of the atomic `os.replace`, so a reader always sees either the old
+    or the new file whole (two racing writes can't interleave into torn YAML).
+
+    IMPORTANT — do NOT use this for read-modify-write. Its lock guards only the
+    write, not a surrounding load_config -> mutate -> save_config cycle, so two
+    concurrent cycles can still clobber each other's field (the B005 lost-update
+    race). Callers that load, mutate, then persist MUST use `update_config`,
+    which holds the lock across the entire read-modify-write. `save_config`
+    remains for the "I already hold the complete payload, just persist it
+    safely" case (and is re-exported for backwards compatibility); it has no
+    current in-tree caller, but is retained as the single-writer primitive.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
