@@ -128,10 +128,17 @@ def _fetch_linear_issue(issue_ref: str, *, token: str | None = None) -> Issue:
     if not api_key:
         raise RuntimeError("LINEAR_API_KEY not set")
     import urllib.request
-    query = """{"query": "{ issue(id: \\"%s\\") { id title description url labels { nodes { name } } assignee { name } } }"}""" % issue_ref
+    # Use a GraphQL variables map instead of interpolating the issue ref into the
+    # query string — a quote in issue_ref would otherwise break the JSON/GraphQL
+    # body or inject fields.
+    graphql = (
+        "query($id: String!) { issue(id: $id) { id title description url "
+        "labels { nodes { name } } assignee { name } } }"
+    )
+    body = json.dumps({"query": graphql, "variables": {"id": issue_ref}})
     req = urllib.request.Request(
         "https://api.linear.app/graphql",
-        data=query.encode(),
+        data=body.encode(),
         headers={"Content-Type": "application/json", "Authorization": api_key},
         method="POST",
     )
