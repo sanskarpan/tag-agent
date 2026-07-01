@@ -138,8 +138,13 @@ def load_persona_file(path: Path) -> dict:
     """Load and validate a persona YAML file."""
     if not path.exists():
         raise FileNotFoundError(f"Persona file not found: {path}")
-    with path.open() as fh:
-        data = yaml.safe_load(fh)
+    try:
+        with path.open() as fh:
+            data = yaml.safe_load(fh)
+    except yaml.YAMLError as exc:
+        # Surface a friendly validation message instead of the raw parser dump.
+        reason = str(getattr(exc, "problem", None) or exc).strip().splitlines()[0]
+        raise ValueError(f"Invalid persona file: {reason}") from exc
     if not isinstance(data, dict):
         raise ValueError("Persona must be a YAML mapping")
     if "style_prompt" not in data:
@@ -150,8 +155,28 @@ def load_persona_file(path: Path) -> dict:
 
 
 def install_persona(conn: sqlite3.Connection, persona: dict, source: str = "user") -> str:
-    """Insert or replace a persona. Returns the id."""
+    """Insert or replace a persona. Returns the id.
+
+    Built-in persona names are protected: installing over one would permanently
+    shadow the builtin (``_seed_builtins`` uses INSERT OR IGNORE and never
+    re-seeds), so we refuse rather than allow an override.
+    """
     ensure_schema(conn)
+    name = persona["name"]
+    if source != "builtin" and name in BUILTIN_PERSONAS:
+        raise ValueError(
+            f"'{name}' is a built-in persona and cannot be overwritten; "
+            "choose a different name."
+        )
+    # Guard against a builtin that has already been seeded into the table.
+    existing = conn.execute(
+        "SELECT source FROM personas WHERE name=?", (name,)
+    ).fetchone()
+    if source != "builtin" and existing and existing[0] == "builtin":
+        raise ValueError(
+            f"'{name}' is a built-in persona and cannot be overwritten; "
+            "choose a different name."
+        )
     persona_id = uuid.uuid4().hex[:12]
     conn.execute(
         """INSERT INTO personas(id, name, description, style_prompt, inject, tags_json, source, created_at)
