@@ -267,11 +267,55 @@ def run_dag(conn: sqlite3.Connection, dag_name: str, board: str = "default") -> 
     if not row:
         raise ValueError(f"DAG not found: {dag_name!r}")
     spec = DagSpec.from_json(row[0])
-    submitted: list[str] = []  # index → job_id
+    steps = spec.steps
+    if not isinstance(steps, list):
+        raise ValueError(
+            f"DAG {dag_name!r} has malformed steps (expected a list, got "
+            f"{type(steps).__name__})."
+        )
 
-    for i, step in enumerate(spec.steps):
-        dep_indices = step.get("depends_on", [])
-        dep_job_ids = [submitted[idx] for idx in dep_indices if idx < len(submitted)]
+    # Pre-index step names so dependencies can be given as either integer
+    # indices or step names.
+    name_to_index: dict[str, int] = {}
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise ValueError(f"DAG {dag_name!r} step {i} is not an object.")
+        if "task" not in step:
+            raise ValueError(f"DAG {dag_name!r} step {i} is missing required 'task'.")
+        nm = step.get("name")
+        if nm:
+            name_to_index[str(nm)] = i
+
+    submitted: list[str] = []  # index → job_id
+    for i, step in enumerate(steps):
+        dep_refs = step.get("depends_on", []) or []
+        if not isinstance(dep_refs, list):
+            raise ValueError(f"DAG {dag_name!r} step {i} 'depends_on' must be a list.")
+        dep_job_ids: list[str] = []
+        for ref in dep_refs:
+            if isinstance(ref, bool):
+                raise ValueError(f"DAG {dag_name!r} step {i} has an invalid dependency {ref!r}.")
+            if isinstance(ref, int):
+                idx = ref
+            elif isinstance(ref, str):
+                if ref not in name_to_index:
+                    raise ValueError(
+                        f"DAG {dag_name!r} step {i} depends on unknown step {ref!r}."
+                    )
+                idx = name_to_index[ref]
+            else:
+                raise ValueError(f"DAG {dag_name!r} step {i} has an invalid dependency {ref!r}.")
+            if idx == i:
+                raise ValueError(f"DAG {dag_name!r} step {i} cannot depend on itself.")
+            if idx < 0 or idx >= i:
+                # A dependency must reference an earlier (already-submitted) step.
+                # Forward references and out-of-range indices indicate a cycle or
+                # an ordering error — fail loudly instead of silently dropping it.
+                raise ValueError(
+                    f"DAG {dag_name!r} step {i} depends on step {ref!r}, which is not an "
+                    f"earlier step (cycles and forward references are not allowed)."
+                )
+            dep_job_ids.append(submitted[idx])
         job_id = add_job(
             conn, step["task"],
             profile=step.get("profile"),
