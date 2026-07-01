@@ -90,8 +90,10 @@ def _upsert_env_line(env_file: Path, key: str, value: str) -> None:
     replaced = False
     out = []
     for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(prefix) or stripped.lstrip("# ").startswith(prefix):
+        # Only replace the first *active* KEY= line. Commented/disabled keys stay
+        # disabled and later duplicates are left as-is, so we never re-activate a
+        # commented key or emit two active KEY= lines.
+        if not replaced and line.strip().startswith(prefix):
             out.append(new_line)
             replaced = True
         else:
@@ -99,6 +101,25 @@ def _upsert_env_line(env_file: Path, key: str, value: str) -> None:
     if not replaced:
         out.append(new_line)
     env_file.write_text("\n".join(out) + "\n", encoding="utf-8")
+    # Files created here hold API keys / tokens; keep them owner-only (0600).
+    try:
+        os.chmod(env_file, 0o600)
+    except OSError:
+        pass
+
+
+def _config_profiles(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return the ``profiles`` mapping, tolerating a present-but-null section.
+
+    ``profiles:`` (null) behaves as an empty mapping; a scalar is a clear config
+    error naming the key instead of a cryptic 'NoneType has no attribute items'.
+    """
+    profiles = cfg.get("profiles")
+    if profiles is None:
+        return {}
+    if not isinstance(profiles, dict):
+        raise SystemExit("Config field 'profiles' must be a YAML object.")
+    return profiles
 
 
 def slugify(text: str) -> str:
@@ -227,7 +248,7 @@ def run_profile_python(
 
 def render_profiles(cfg: dict[str, Any], force: bool) -> list[dict[str, str]]:
     results: list[dict[str, str]] = []
-    profiles = cfg.get("profiles", {})
+    profiles = _config_profiles(cfg)
     for name, profile in profiles.items():
         home = profile_home(cfg, name)
         config_file = home / "config.yaml"
@@ -309,7 +330,7 @@ def render_profiles(cfg: dict[str, Any], force: bool) -> list[dict[str, str]]:
 
 def bootstrap_profiles(cfg: dict[str, Any]) -> list[dict[str, str]]:
     created: list[dict[str, str]] = []
-    profiles = cfg.get("profiles", {})
+    profiles = _config_profiles(cfg)
     for name, profile in profiles.items():
         home = profile_home(cfg, name)
         if home.exists():
@@ -342,9 +363,13 @@ def resolve_route(cfg: dict[str, Any], task_type: str, master_override: str | No
 
     master = master_override or defaults.get("master_profile")
     workers = worker_override or route.get("workers", [])
+    # De-duplicate worker profiles (preserving order): a repeated --worker-profile
+    # would otherwise spawn the same worker twice and double-insert DB steps.
+    seen_workers: set[str] = set()
+    workers = [w for w in workers if not (w in seen_workers or seen_workers.add(w))]
     verifier = route.get("verifier")
 
-    profiles = cfg.get("profiles", {})
+    profiles = _config_profiles(cfg)
     snapshot = {
         "master_profile": master,
         "board": defaults.get("board", "default"),
@@ -503,7 +528,7 @@ def load_openrouter_catalog(cfg: dict[str, Any], profile_name: str) -> list[dict
 
 
 def ensure_profile_exists(cfg: dict[str, Any], profile_name: str) -> None:
-    profiles = cfg.get("profiles", {})
+    profiles = _config_profiles(cfg)
     if profile_name not in profiles:
         available = ", ".join(sorted(profiles))
         raise SystemExit(f"Unknown profile '{profile_name}'. Available: {available}")
@@ -534,11 +559,22 @@ def apply_route_model_overrides(
             )
         worker_name, ref = item.split("=", 1)
         overrides[worker_name.strip()] = parse_model_ref(ref)
+    matched: set[str] = set()
     for worker in route["workers"]:
         if worker["name"] not in overrides:
             continue
         provider, model = overrides[worker["name"]]
         worker["model"] = {"provider": provider, "default": model}
+        matched.add(worker["name"])
+    # Surface overrides that name a non-worker (typo detection) instead of
+    # silently ignoring them.
+    unknown = [name for name in overrides if name not in matched]
+    if unknown:
+        worker_names = ", ".join(w["name"] for w in route["workers"]) or "(none)"
+        raise SystemExit(
+            f"Worker override names a non-worker profile: {', '.join(sorted(unknown))}. "
+            f"Route workers: {worker_names}."
+        )
     return route
 
 
