@@ -21,7 +21,7 @@ from tag.core.paths import (
 )
 from tag.core.db import open_db
 from tag.core.run import run_hermes
-from tag.core.profile import render_profiles, bootstrap_profiles
+from tag.core.profile import render_profiles, bootstrap_profiles, _config_profiles
 from tag.core.utils import nonnegative_int, utc_now, write_yaml, write_text
 
 try:
@@ -239,10 +239,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         else:
             report["tag_version"] = "not provisioned yet"
 
+        # Include the same system/runtime checks as text mode so runtime/patch
+        # failures land in the payload AND affect the exit code (parity with text).
+        system_checks = _doctor_system_checks(cfg)
+        hermes_checks = _doctor_hermes_checks(cfg)
+        report["system"] = system_checks
+        report["tag runtime"] = hermes_checks
+
         profiles_report: dict[str, Any] = {}
-        defined_profiles = cfg.get("profiles") or {}
+        defined_profiles = _config_profiles(cfg)
         profiles_to_check = (
-            [target_profile] if target_profile
+            [target_profile] if target_profile is not None
             else list(defined_profiles.keys())
         )
         for p in profiles_to_check:
@@ -258,7 +265,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(json.dumps(report, indent=2))
         has_fail = any(
             c.get("status") == "fail"
-            for checks_list in profiles_report.values()
+            for checks_list in (system_checks, hermes_checks, *profiles_report.values())
             for c in checks_list
         )
         return 1 if has_fail else 0
@@ -268,9 +275,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     groups["system"] = _doctor_system_checks(cfg)
     groups["tag runtime"] = _doctor_hermes_checks(cfg)
 
-    defined_profiles = cfg.get("profiles") or {}
+    defined_profiles = _config_profiles(cfg)
     profiles_to_check = (
-        [target_profile] if target_profile
+        [target_profile] if target_profile is not None
         else list(defined_profiles.keys())
     )
     for p in profiles_to_check:
