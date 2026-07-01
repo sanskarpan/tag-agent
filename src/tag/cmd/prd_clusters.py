@@ -99,7 +99,14 @@ def cmd_eval_judge(args: argparse.Namespace) -> int:
                                    judge_model=getattr(args, "judge_model", "claude-sonnet-4-6"),
                                    criteria=getattr(args, "criteria", None),
                                    cfg=cfg)
-        print(result)
+        if getattr(args, "json", False):
+            print(json.dumps(
+                result,
+                default=lambda o: vars(o) if hasattr(o, "__dict__") else str(o),
+                indent=2,
+            ))
+        else:
+            print(result)
         return 0
     print_error(f"Unknown subcommand: {sub!r}")
     return 1
@@ -235,6 +242,12 @@ def cmd_alert(args: argparse.Namespace) -> int:
         return 0
     if sub == "firings":
         firings = get_recent_firings(conn, limit=getattr(args, "limit", 20))
+        if getattr(args, "json", False):
+            print(json.dumps(
+                [vars(f) if hasattr(f, "__dict__") else dict(f) for f in firings],
+                indent=2, default=str,
+            ))
+            return 0
         for f in firings:
             print(f"[{f.severity}] {f.rule_name}: {f.actual_value:.4f} at {f.fired_at}")
         return 0
@@ -309,8 +322,12 @@ def cmd_prompt_hub(args: argparse.Namespace) -> int:
     conn = _sq3.connect(str(db_path))
     ensure_schema(conn)
     if sub == "save":
-        content = Path(args.file).read_text()
-        pv = save_prompt(conn, args.name, content, notes=getattr(args, "notes", None))
+        p = Path(args.file)
+        if not p.exists():
+            print_error(f"Prompt file not found: {args.file}")
+            return 1
+        content = p.read_text()
+        pv = save_prompt(conn, args.name, content, message=getattr(args, "notes", None))
         print(f"Saved '{pv.name}' v{pv.version} (id={pv.id})")
         return 0
     if sub == "get":
@@ -699,8 +716,9 @@ def cmd_entity_graph(args: argparse.Namespace) -> int:
             print(summary)
         return 0
     if sub == "query":
-        result = query_graph(conn, profile, entity_name=args.entity,
-                             max_depth=getattr(args, "depth", 2))
+        # query_graph exposes entity_name/entity_type/limit (single-level
+        # neighborhood); it has no depth-traversal parameter.
+        result = query_graph(conn, profile, entity_name=args.entity)
         print(json.dumps(result, indent=2, default=str))
         return 0
     if sub == "build":
