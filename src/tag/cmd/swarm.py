@@ -162,10 +162,17 @@ def cmd_swarm(args: argparse.Namespace) -> int:
     import tag.kanban as _kanban  # noqa: PLC0415
 
     # Bare `tag swarm` (no task, no subcommand) — print usage instead of crashing
-    # on a None task (B008).
+    # on a None task (B008). Honor --json so scripts always get valid JSON (C045).
     if getattr(args, "task", None) is None:
-        print('usage: tag swarm "<task>" [--profile P] [--type T] [--board B] [--no-wait] [--json]')
-        print("       tag swarm run|list|status|abort|results [options]")
+        usage = [
+            'usage: tag swarm "<task>" [--profile P] [--type T] [--board B] [--no-wait] [--json]',
+            "       tag swarm run|list|status|abort|results [options]",
+        ]
+        if getattr(args, "json", False):
+            print(json.dumps({"error": "no task provided", "usage": usage}, indent=2))
+        else:
+            for line in usage:
+                print(line)
         return 0
 
     cfg = load_config(config_path(args.config))
@@ -676,4 +683,7 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[name-defi
 
     for sw_p in [swarm, sw_run, sw_list, sw_status, sw_abort, sw_results]:
         if "config" not in {a.dest for a in sw_p._actions}:
-            sw_p.add_argument("--config", help=argparse.SUPPRESS)
+            # default=SUPPRESS so an absent subparser --config does NOT write
+            # None over the value the global `tag --config X` already parsed
+            # (C001). `tag <cmd> --config X` still works since the arg is present.
+            sw_p.add_argument("--config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
