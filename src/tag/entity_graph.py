@@ -237,6 +237,21 @@ def add_relation(
     source_memory_id: str | None = None,
 ) -> Relation:
     ensure_schema(conn)
+    # Idempotent: a relation is uniquely identified by
+    # (source, target, relation_type). Re-running the build (or re-adding the
+    # same co-occurrence pair from another memory) must not create duplicates
+    # (C021). If it already exists, return the existing row unchanged.
+    existing = conn.execute(
+        """SELECT id, confidence, source_memory_id, created_at FROM relations
+           WHERE source_entity_id=? AND target_entity_id=? AND relation_type=?""",
+        (source_id, target_id, relation_type),
+    ).fetchone()
+    if existing is not None:
+        return Relation(
+            id=existing[0], source_entity_id=source_id, target_entity_id=target_id,
+            relation_type=relation_type, confidence=existing[1],
+            source_memory_id=existing[2], created_at=existing[3],
+        )
     rel_id = uuid.uuid4().hex[:12]
     now = _utc_now()
     conn.execute(
@@ -250,6 +265,33 @@ def add_relation(
         relation_type=relation_type, confidence=confidence,
         source_memory_id=source_memory_id, created_at=now,
     )
+
+
+def reset_graph(conn: sqlite3.Connection, profile: str) -> None:
+    """Clear all graph state (entities, their relations, communities) for a
+    profile so a rebuild starts from a clean slate.
+
+    Without this, re-running `graph build` re-increments every entity's
+    mention_count and (before add_relation was made idempotent) duplicated
+    relations — corrupting community detection and mention_count ranking
+    (C021). Relations have no profile column, so they are removed by endpoint
+    membership before the entities are deleted.
+    """
+    ensure_schema(conn)
+    ids = [r[0] for r in conn.execute(
+        "SELECT id FROM entities WHERE profile=?", (profile,)
+    ).fetchall()]
+    if ids:
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(
+            f"""DELETE FROM relations
+                WHERE source_entity_id IN ({placeholders})
+                   OR target_entity_id IN ({placeholders})""",
+            ids + ids,
+        )
+    conn.execute("DELETE FROM entities WHERE profile=?", (profile,))
+    conn.execute("DELETE FROM entity_communities WHERE profile=?", (profile,))
+    conn.commit()
 
 
 def extract_and_store_from_memory(
@@ -377,11 +419,18 @@ def query_graph(
     relations = []
     if entity_ids:
         placeholders = ",".join("?" * len(entity_ids))
+        # A relation "belongs to profile P" iff BOTH endpoints are entities in P
+        # — the same definition detect_communities and format_graph_summary use
+        # (C034). Within that, keep the OR match so an entity-filtered query
+        # still returns every in-profile relation that touches the matched set;
+        # dangling cross-profile relations are excluded.
         relations = conn.execute(
-            f"""SELECT * FROM relations
-                WHERE source_entity_id IN ({placeholders})
-                   OR target_entity_id IN ({placeholders})""",
-            entity_ids + entity_ids,
+            f"""SELECT r.* FROM relations r
+                WHERE (r.source_entity_id IN ({placeholders})
+                       OR r.target_entity_id IN ({placeholders}))
+                  AND r.source_entity_id IN (SELECT id FROM entities WHERE profile=?)
+                  AND r.target_entity_id IN (SELECT id FROM entities WHERE profile=?)""",
+            entity_ids + entity_ids + [profile, profile],
         ).fetchall()
 
     conn.row_factory = None
@@ -399,6 +448,7 @@ def get_entity_neighbors(
 ) -> dict:
     ensure_schema(conn)
     visited: set[str] = set()
+    seen_relations: set[str] = set()
     frontier = {entity_id}
     all_entities: list[dict] = []
     all_relations: list[dict] = []
@@ -420,7 +470,11 @@ def get_entity_neighbors(
                 (eid, eid),
             ).fetchall()
             for r in rels:
-                all_relations.append(dict(r))
+                # A relation between two visited endpoints is fetched once per
+                # endpoint; emit it at most once (C020).
+                if r["id"] not in seen_relations:
+                    seen_relations.add(r["id"])
+                    all_relations.append(dict(r))
                 other = r["target_entity_id"] if r["source_entity_id"] == eid else r["source_entity_id"]
                 if other not in visited:
                     new_frontier.add(other)
@@ -435,10 +489,14 @@ def format_graph_summary(conn: sqlite3.Connection, profile: str) -> str:
     n_entities = conn.execute(
         "SELECT COUNT(*) FROM entities WHERE profile=?", (profile,)
     ).fetchone()[0]
+    # A relation belongs to profile P iff BOTH endpoints are in P — matching
+    # detect_communities and query_graph so all three counts agree (C034).
     n_relations = conn.execute(
         """SELECT COUNT(*) FROM relations r
-           JOIN entities e ON r.source_entity_id=e.id WHERE e.profile=?""",
-        (profile,),
+           JOIN entities e1 ON r.source_entity_id=e1.id
+           JOIN entities e2 ON r.target_entity_id=e2.id
+           WHERE e1.profile=? AND e2.profile=?""",
+        (profile, profile),
     ).fetchone()[0]
     communities = detect_communities(conn, profile)
     return (
