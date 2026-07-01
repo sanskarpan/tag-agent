@@ -49,6 +49,12 @@ class ChangeItem:
 
     @classmethod
     def from_dict(cls, d: dict) -> "ChangeItem":
+        if not isinstance(d, dict):
+            raise ValueError(
+                f"each change item must be a JSON object, got {type(d).__name__}"
+            )
+        if "file" not in d or "description" not in d:
+            raise ValueError("each change item requires 'file' and 'description' fields")
         return cls(
             id=d.get("id", uuid.uuid4().hex[:8]),
             file=d["file"],
@@ -79,13 +85,16 @@ class ChangeSpec:
 
     @classmethod
     def from_json(cls, text: str) -> "ChangeSpec":
-        d = json.loads(text)
-        items = [ChangeItem.from_dict(i) for i in d.get("items", [])]
-        return cls(task=d.get("task", ""), items=items, rationale=d.get("rationale", ""))
+        return cls.from_dict(json.loads(text))
 
     @classmethod
     def from_dict(cls, d: dict) -> "ChangeSpec":
-        items = [ChangeItem.from_dict(i) for i in d.get("items", [])]
+        if not isinstance(d, dict):
+            raise ValueError(f"change spec must be a JSON object, got {type(d).__name__}")
+        raw_items = d.get("items", [])
+        if not isinstance(raw_items, list):
+            raise ValueError(f"'items' must be a list, got {type(raw_items).__name__}")
+        items = [ChangeItem.from_dict(i) for i in raw_items]
         return cls(task=d.get("task", ""), items=items, rationale=d.get("rationale", ""))
 
 
