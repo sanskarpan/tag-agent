@@ -344,6 +344,13 @@ def bootstrap_profiles(cfg: dict[str, Any]) -> list[dict[str, str]]:
             run_hermes(cfg, *cmd)
         except subprocess.CalledProcessError as exc:
             message = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+            # Concurrent bootstrap (TOCTOU): another racer created the profile
+            # between our home.exists() check above and this create. bootstrap
+            # is documented-idempotent, so absorb the loser's failure instead of
+            # aborting with a fatal SystemExit.
+            if "already exists" in message.lower():
+                created.append({"profile": name, "status": "existing"})
+                continue
             raise SystemExit(f"Failed to create TAG-managed profile '{name}': {message}") from exc
         created.append({"profile": name, "status": "created"})
     return created
