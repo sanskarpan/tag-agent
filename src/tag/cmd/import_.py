@@ -673,11 +673,19 @@ def cmd_import_nous_portal(args: argparse.Namespace) -> int:
     if effective_key is None:
         detected = _detect_nous_portal_credentials()
         effective_key = detected.get("NOUS_PORTAL_API_KEY") or None
-    if effective_key is not None and len(effective_key) < 20:
-        raise SystemExit(
-            f"API key too short ({len(effective_key)} chars); "
-            "Nous Portal keys are at least 20 characters"
-        )
+    if effective_key is not None:
+        # Reject whitespace-only keys before the length check (a run of >=20
+        # spaces would otherwise pass and be written verbatim to .env, C014) —
+        # matching the import-supermemory contract.
+        if not effective_key.strip():
+            raise SystemExit(
+                "API key is empty or whitespace-only; pass a non-empty --api-key"
+            )
+        if len(effective_key.strip()) < 20:
+            raise SystemExit(
+                f"API key too short ({len(effective_key.strip())} chars); "
+                "Nous Portal keys are at least 20 characters"
+            )
 
     results = []
     for p in profiles_to_update:

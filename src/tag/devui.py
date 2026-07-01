@@ -418,10 +418,6 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def _qs(self, parsed: Any, key: str, default: str = "") -> str:
-        vals = parsed.query_params.get(key, [default])
-        return vals[0] if vals else default
-
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)

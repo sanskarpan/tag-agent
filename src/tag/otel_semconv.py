@@ -87,6 +87,20 @@ def detect_provider(model_id: str) -> str:
     return "unknown"
 
 
+def _otlp_status_code(status: Any) -> int:
+    """Map a TAG span status to an OTLP StatusCode.
+
+    OTLP codes: UNSET=0, OK=1, ERROR=2. A missing/unset status must map to
+    UNSET(0), not ERROR(2) — otherwise status-less spans inflate backend error
+    rates (C039).
+    """
+    if status == "ok":
+        return 1
+    if status in (None, "", "unset"):
+        return 0
+    return 2
+
+
 def map_span_attributes(
     span: dict[str, Any], *, semconv_version: str = SEMCONV_VERSION
 ) -> dict[str, Any]:
@@ -155,7 +169,7 @@ def spans_to_otlp_json(
             "startTimeUnixNano": str(_iso_to_ns(mapped.get("started_at", ""))),
             "endTimeUnixNano": str(_iso_to_ns(mapped.get("finished_at", ""))),
             "attributes": otlp_attrs,
-            "status": {"code": 1 if mapped.get("status") == "ok" else 2},
+            "status": {"code": _otlp_status_code(mapped.get("status"))},
         }
         if parent_id:
             otlp_span["parentSpanId"] = parent_id[:16].zfill(16)

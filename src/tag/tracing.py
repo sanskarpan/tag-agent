@@ -601,7 +601,10 @@ def export_spans_otlp(
                                 (s.get("duration_ms") or 0) * 1_000_000
                             ),
                             "status": {
-                                "code": 1 if s["status"] == "ok" else 2
+                                # OTLP status: UNSET(0) for unset/missing, OK(1),
+                                # ERROR(2) otherwise — don't map "no status" to ERROR.
+                                "code": (1 if s.get("status") == "ok"
+                                         else 0 if not s.get("status") else 2)
                             },
                             "attributes": [
                                 {

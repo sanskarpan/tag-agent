@@ -190,7 +190,16 @@ def rewrite_cli_hints(text: str) -> str:
     # `hermes <subcommand>` rule (which lists `status`/`config` and would emit "tag Status").
     rewritten = re.sub(r"\bHermes Configuration\b", "TAG Configuration", rewritten)
     rewritten = re.sub(r"\bHermes Status\b", "TAG Status", rewritten)
-    rewritten = re.sub(r"\bHermes Runtime\b", "TAG Runtime", rewritten, flags=re.IGNORECASE)
+    # BUG-004/C048: "Hermes Runtime" is a Title-Case product name -> "TAG Runtime", but
+    # lowercase prose like "hermes runtime" must stay lowercase ("tag runtime") — do not
+    # force Title-Case mid-sentence. Preserve the matched "runtime" word's own casing and
+    # pick TAG/tag from the case of the brand token that was actually written.
+    rewritten = re.sub(
+        r"\bhermes( runtime)\b",
+        lambda m: ("TAG" if m.group(0)[0].isupper() else "tag") + m.group(1),
+        rewritten,
+        flags=re.IGNORECASE,
+    )
 
     rewritten = re.sub(
         r"`([^`\n]*\bhermes\b[^`\n]*)`",
@@ -242,12 +251,18 @@ def rewrite_cli_hints(text: str) -> str:
     rewritten = rewritten.replace("~/.hermes", "~/.tag/profiles")
     # (Hermes Configuration/Status/Runtime title strings are rewritten earlier, before the
     # generic subcommand rule, so casing stays consistent — see BUG-004 block above.)
-    # BUG-011: re-centre box titles after brand substitution shortened them
-    rewritten = _fix_box_title_alignment(rewritten)
     # Catch any remaining standalone Hermes brand references that aren't filesystem paths.
     # Case-insensitive so a bare lowercase "hermes" in prose is rewritten too; the
-    # lookbehind/lookahead still exempt path-like tokens (e.g. ~/.hermes, hermes-agent).
-    rewritten = re.sub(r"(?<![/.])\bHermes\b(?![-/.])", "TAG", rewritten, flags=re.IGNORECASE)
+    # lookbehind/lookahead still exempt path-like tokens (e.g. ~/.hermes, hermes-agent)
+    # AND email local-parts / @handles (C012: "hermes@host" and "@hermes" must survive —
+    # a brand token adjacent to '@' is an address/handle, not a product reference).
+    rewritten = re.sub(r"(?<![/.@])\bHermes\b(?![-/.@])", "TAG", rewritten, flags=re.IGNORECASE)
+    # BUG-011/C011: re-centre box titles AFTER every brand substitution (including the
+    # catch-all above) has shortened them. Running this earlier only re-centred the three
+    # hard-coded pre-realign titles (Hermes Configuration/Status/Runtime); the catch-all
+    # then shortened any *other* title and re-broke the frame. Keep it last so widths are
+    # measured against the final, fully-rewritten title text.
+    rewritten = _fix_box_title_alignment(rewritten)
     return rewritten
 
 

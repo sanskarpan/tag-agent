@@ -1543,7 +1543,11 @@ def _doctor_profile_checks(cfg: dict[str, Any], profile_name: str) -> list[dict[
     if home_ok:
         env_file = home / ".env"
         env_vals = read_dotenv(env_file) if env_file.exists() else {}
-        api_key_vars = [k for k in env_vals if k.endswith("_API_KEY") or k.endswith("_TOKEN")]
+        api_key_vars = [
+            k for k in env_vals
+            if (k.endswith("_API_KEY") or k.endswith("_TOKEN"))
+            and str(env_vals[k]).strip()
+        ]
         checks.append({
             "name": "OPENROUTER_API_KEY" if not api_key_vars else api_key_vars[0],
             "status": "pass" if api_key_vars else "warn",

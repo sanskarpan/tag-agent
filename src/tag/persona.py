@@ -238,9 +238,16 @@ def apply_persona(
     profile: str,
     persona_name: str,
     session_id: str | None = None,
+    valid_profiles: "set[str] | list[str] | None" = None,
 ) -> None:
-    """Activate a persona for a profile (session-scoped if session_id given)."""
+    """Activate a persona for a profile (session-scoped if session_id given).
+
+    When *valid_profiles* is supplied, the target profile must be one of them —
+    otherwise state would accumulate for profiles that will never exist (C025).
+    """
     ensure_schema(conn)
+    if valid_profiles is not None and profile not in valid_profiles:
+        raise ValueError(f"Unknown profile: {profile!r}")
     p = get_persona(conn, persona_name)
     if not p:
         raise ValueError(f"Persona not found: {persona_name!r}")

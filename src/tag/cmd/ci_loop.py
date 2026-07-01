@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -322,6 +323,11 @@ def cmd_loop(args: argparse.Namespace) -> int:
         db.close()
         if not loop_id:
             return _emit_error(args, "LOOP_ID required")
+        # Validate loop_id is a plain slug BEFORE building the file path — an
+        # unvalidated id like '../pwned' escapes loop-approvals and clobbers
+        # arbitrary *.json files (path traversal, C013).
+        if not re.match(r'^[A-Za-z0-9][A-Za-z0-9._-]*$', loop_id):
+            return _emit_error(args, f"Invalid loop id: {loop_id!r}")
         # Producer for the human-approval gate that loop_agent._request_approval
         # polls: write the decision into loop-approvals/<id>.json next to the DB.
         # The worker reads data["decision"] and treats "continue" as approve and

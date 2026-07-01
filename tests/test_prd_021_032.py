@@ -552,7 +552,9 @@ class TestProfileMarketplace:
         mock_resp = MagicMock()
         mock_resp.read.return_value = fake_yaml
 
-        with patch("urllib.request.urlopen", return_value=mock_resp), \
+        # marketplace pull fetches through a hardened SSRF-safe opener
+        # (_safe_urlopen), not urllib.request.urlopen directly.
+        with patch("tag.cmd.marketplace._safe_urlopen", return_value=mock_resp), \
              patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
             args = make_args(
                 marketplace_subcommand="pull",
@@ -572,7 +574,7 @@ class TestProfileMarketplace:
         mock_resp.read.return_value = b"[not: valid: yaml: :"
 
         import urllib.error
-        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("network error")), \
+        with patch("tag.cmd.marketplace._safe_urlopen", side_effect=urllib.error.URLError("network error")), \
              patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
             args = make_args(
                 marketplace_subcommand="pull",

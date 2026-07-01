@@ -374,7 +374,9 @@ def list_tasks(
     if not include_archived:
         query += " AND t.status != 'archived'" if parent_id else " AND status != 'archived'"
     query += " ORDER BY priority DESC, created_at ASC"
-    if limit:
+    # Respect an explicit limit=0 (return zero rows) — `if limit:` treated 0 as
+    # falsy and dropped the LIMIT clause, returning every row (C038).
+    if limit is not None:
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]

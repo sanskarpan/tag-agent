@@ -287,13 +287,14 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
 
     if sub == "extract":
         try:
-            import sqlite3 as _sq3
             from tag.memory_extractor import auto_extract_post_run
         except ImportError as e:
             print_error(f"memory_extractor not available: {e}")
             return 1
-        db_path = _db_for_profile(profile, cfg)
-        conn = _sq3.connect(str(db_path))
+        # open_db creates the runs/steps schema (and runtime dirs) so a fresh
+        # TAG_HOME doesn't crash with 'no such table: steps' when extract is the
+        # first DB-touching command (C037).
+        conn = open_db(cfg)
         # Run output lives in the per-step `steps.output` column (the `runs`
         # table has no output column). Concatenate the run's step outputs.
         rows = conn.execute(
@@ -531,7 +532,10 @@ def register(sub: argparse.Action) -> None:
 
     for mj_p in [mj, mj_save, mj_list, mj_forget, mj_clear]:
         if "config" not in {a.dest for a in mj_p._actions}:
-            mj_p.add_argument("--config", help=argparse.SUPPRESS)
+            # default=SUPPRESS so an absent subparser --config does NOT write
+            # None over the value the global `tag --config X` already parsed
+            # (C001). `tag <cmd> --config X` still works since the arg is present.
+            mj_p.add_argument("--config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
         mj_p.set_defaults(func=cmd_memory_journal)
 
     # ---- PRD-025: mem (semantic memory) ----

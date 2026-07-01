@@ -85,6 +85,17 @@ def _run_restricted(
     if sys.platform == "darwin":
         sandbox_exec = shutil.which("sandbox-exec")
         if sandbox_exec:
+            # Deny reads of the user's home tree (secrets like ~/.ssh, ~/.aws,
+            # browser cookies, keychains) while still allowing the process to
+            # read/write its own run directory. The run_dir subpath is allowed
+            # AFTER the home denial so a scratch dir under $HOME still works.
+            home = str(Path.home())
+            sensitive_home = [
+                f'{home}/.ssh', f'{home}/.aws', f'{home}/.gnupg',
+                f'{home}/.config', f'{home}/.gcloud', f'{home}/.kube',
+                f'{home}/.docker', f'{home}/Library/Keychains',
+            ]
+            deny_home = " ".join(f'(subpath "{p}")' for p in sensitive_home)
             profile = (
                 "(version 1)\n"
                 "(allow default)\n"
@@ -93,6 +104,13 @@ def _run_restricted(
                 ' (subpath "/etc") (subpath "/private/etc")'
                 ' (subpath "/var/db") (subpath "/private/var/db")'
                 ' (literal "/etc/master.passwd") (literal "/private/etc/master.passwd"))\n'
+                # Deny reading the user's home tree by default (protects secrets).
+                f'(deny file-read* (subpath "{home}"))\n'
+                # Explicitly deny sensitive credential dirs for reads AND writes.
+                f'(deny file-read* file-write* {deny_home})\n'
+                # Re-allow read/write access to the sandbox run directory so the
+                # command can operate on its own scratch/working files.
+                f'(allow file-read* file-write* (subpath "{run_dir}"))\n'
                 '(deny file-write*'
                 ' (subpath "/usr") (subpath "/bin") (subpath "/sbin")'
                 ' (subpath "/System") (subpath "/Library"))\n'

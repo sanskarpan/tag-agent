@@ -118,6 +118,99 @@ def _validate_fetch_url(url: str) -> None:
             raise ValueError(f"refusing to fetch from non-public address {ip} (host {host!r})")
 
 
+def _ip_is_blocked(addr: str) -> bool:
+    """True if *addr* is a non-public (SSRF-sensitive) IP literal."""
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return False
+    return (ip.is_loopback or ip.is_link_local or ip.is_private
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _safe_urlopen(url, *, timeout: int = 15):
+    """SSRF-hardened urlopen: pins the resolved IP at connect time and refuses
+    redirects to non-public addresses.
+
+    Closes two holes in the plain ``urllib.request.urlopen``:
+
+    * **Redirect following** — the default opener follows 3xx transparently, so a
+      public ``302 -> http://127.0.0.1/`` reaches internal services. Every
+      redirect target is re-validated with :func:`_validate_fetch_url` and each
+      hop opens a fresh (also pinned) connection.
+    * **DNS rebinding (TOCTOU)** — validation and connection normally resolve DNS
+      independently. The pinned connection re-resolves at connect time and
+      refuses non-public addresses, so a low-TTL record cannot flip to
+      loopback/metadata between validate and fetch.
+    """
+    import http.client
+    import socket as _socket
+
+    def _connect_pinned(conn):
+        infos = _socket.getaddrinfo(conn.host, conn.port, 0, _socket.SOCK_STREAM)
+        for info in infos:
+            if _ip_is_blocked(info[4][0]):
+                raise OSError(
+                    f"refusing to connect to non-public address {info[4][0]} (SSRF protection)"
+                )
+        last_err = None
+        for family, socktype, proto, _canon, sockaddr in infos:
+            sock = None
+            try:
+                sock = _socket.socket(family, socktype, proto)
+                if conn.timeout is not _socket._GLOBAL_DEFAULT_TIMEOUT:
+                    sock.settimeout(conn.timeout)
+                if getattr(conn, "source_address", None):
+                    sock.bind(conn.source_address)
+                sock.connect(sockaddr)
+                return sock
+            except OSError as exc:
+                last_err = exc
+                if sock is not None:
+                    sock.close()
+        raise last_err if last_err is not None else OSError("connection failed")
+
+    class _PinnedHTTPConnection(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = _connect_pinned(self)
+            if self._tunnel_host:
+                self._tunnel()
+
+    class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+        def connect(self):
+            self.sock = _connect_pinned(self)
+            if self._tunnel_host:
+                self._tunnel()
+                server_hostname = self._tunnel_host
+            else:
+                server_hostname = self.host
+            self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+    class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_PinnedHTTPConnection, req)
+
+    class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(_PinnedHTTPSConnection, req)
+
+    class _GuardRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            try:
+                _validate_fetch_url(newurl)
+            except ValueError as exc:
+                raise urllib.error.HTTPError(
+                    newurl, code, f"blocked redirect: {exc}", headers, fp
+                )
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = urllib.request.build_opener(
+        _PinnedHTTPHandler, _PinnedHTTPSHandler, _GuardRedirect
+    )
+    return opener.open(url, timeout=timeout)
+
+
 # ---------------------------------------------------------------------------
 # PRD-014: MCP Server Registry
 # ---------------------------------------------------------------------------
@@ -329,7 +422,15 @@ def cmd_template(args: argparse.Namespace) -> int:
                     lines.append(f"# {k}=<fill in>")
                 else:
                     lines.append(f"{k}={v}")
-            env_file.write_text("\n".join(lines) + "\n")
+            # Create the .env with 0600 *before* writing secrets, so an imported
+            # ANTHROPIC_API_KEY etc. is never briefly world/group readable (0644).
+            import os as _os
+            fd = _os.open(str(env_file), _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+            try:
+                _os.write(fd, ("\n".join(lines) + "\n").encode())
+            finally:
+                _os.close(fd)
+            _os.chmod(env_file, 0o600)
 
         cfg_data = tmpl.get("config", {})
         if cfg_data:
@@ -346,7 +447,7 @@ def cmd_template(args: argparse.Namespace) -> int:
             print_error(f"Refused to fetch template: {exc}")
             return 1
         try:
-            with urllib.request.urlopen(url, timeout=15) as resp:  # noqa: S310
+            with _safe_urlopen(url, timeout=15) as resp:  # noqa: S310
                 tmpl_text = resp.read().decode()
         except urllib.error.URLError as exc:
             print_error(f"Failed to fetch template: {exc}")
@@ -362,16 +463,22 @@ def cmd_template(args: argparse.Namespace) -> int:
 # PRD-016: Webhook Event Hooks
 # ---------------------------------------------------------------------------
 
-def _interpolate(template: str, payload: dict[str, Any]) -> str:
+def _interpolate(template: str, payload: dict[str, Any], *, shell_safe: bool = False) -> str:
+    import shlex
     for k, v in payload.items():
-        template = template.replace(f"{{{{{k}}}}}", str(v))
+        # Payload values are data (e.g. event title/body) and may be
+        # attacker-influenced. When the result is fed to a shell, quote each
+        # substituted value so it can't break out of its argument / inject
+        # commands (`; rm -rf ~`, `$(...)`, backticks, ...).
+        rendered = shlex.quote(str(v)) if shell_safe else str(v)
+        template = template.replace(f"{{{{{k}}}}}", rendered)
     return template
 
 
 def _execute_hook(hook: dict[str, Any], payload: dict[str, Any]) -> bool:
     hook_type = hook.get("type", "shell")
     if hook_type == "shell":
-        cmd_str = _interpolate(hook.get("command", ""), payload)
+        cmd_str = _interpolate(hook.get("command", ""), payload, shell_safe=True)
         try:
             result = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, timeout=30)
             return result.returncode == 0
@@ -379,13 +486,19 @@ def _execute_hook(hook: dict[str, Any], payload: dict[str, Any]) -> bool:
             return False
     if hook_type == "webhook":
         url = hook.get("url", "")
+        # Share the SSRF guard used by template fetch / notifications so a
+        # config-driven webhook hook cannot reach loopback/link-local/metadata.
+        try:
+            _validate_fetch_url(url)
+        except ValueError:
+            return False
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
             url, data=data, method="POST",
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=10):
+            with _safe_urlopen(req, timeout=10):
                 return True
         except urllib.error.URLError:
             return False

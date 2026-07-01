@@ -203,6 +203,90 @@ def _validate_outbound_url(url: str) -> str | None:
     return None
 
 
+def _ip_is_blocked(addr: str) -> bool:
+    """True if *addr* is a non-public (SSRF-sensitive) IP literal."""
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return False
+    return (ip.is_loopback or ip.is_link_local or ip.is_private
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _safe_urlopen(url, *, timeout: int = 10):
+    """SSRF-hardened urlopen: pins the resolved IP at connect time and refuses
+    redirects to non-public addresses.
+
+    ``_validate_outbound_url`` only checks the first hop; the default opener then
+    follows 3xx redirects and re-resolves DNS independently, so a public
+    ``302 -> http://169.254.169.254/`` (or a DNS-rebinding record) reaches
+    internal/metadata addresses. Here every redirect is re-validated and every
+    connection (including each redirect hop) re-resolves and refuses non-public
+    IPs at connect time.
+    """
+    import http.client
+
+    def _connect_pinned(conn):
+        infos = socket.getaddrinfo(conn.host, conn.port, 0, socket.SOCK_STREAM)
+        for info in infos:
+            if _ip_is_blocked(info[4][0]):
+                raise OSError(
+                    f"refusing to connect to non-public address {info[4][0]} (SSRF protection)"
+                )
+        last_err = None
+        for family, socktype, proto, _canon, sockaddr in infos:
+            sock = None
+            try:
+                sock = socket.socket(family, socktype, proto)
+                if conn.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                    sock.settimeout(conn.timeout)
+                if getattr(conn, "source_address", None):
+                    sock.bind(conn.source_address)
+                sock.connect(sockaddr)
+                return sock
+            except OSError as exc:
+                last_err = exc
+                if sock is not None:
+                    sock.close()
+        raise last_err if last_err is not None else OSError("connection failed")
+
+    class _PinnedHTTPConnection(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = _connect_pinned(self)
+            if self._tunnel_host:
+                self._tunnel()
+
+    class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+        def connect(self):
+            self.sock = _connect_pinned(self)
+            if self._tunnel_host:
+                self._tunnel()
+                server_hostname = self._tunnel_host
+            else:
+                server_hostname = self.host
+            self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+    class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_PinnedHTTPConnection, req)
+
+    class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(_PinnedHTTPSConnection, req)
+
+    class _GuardRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            err = _validate_outbound_url(newurl)
+            if err:
+                raise urllib.error.HTTPError(newurl, code, f"blocked redirect: {err}", headers, fp)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = urllib.request.build_opener(
+        _PinnedHTTPHandler, _PinnedHTTPSHandler, _GuardRedirect
+    )
+    return opener.open(url, timeout=timeout)
+
+
 def _deliver_slack(webhook_url: str, message: str) -> tuple[bool, int | None, str]:
     """POST a Slack message. Returns (ok, http_status, error_msg)."""
     unsafe = _validate_outbound_url(webhook_url)
@@ -215,7 +299,7 @@ def _deliver_slack(webhook_url: str, message: str) -> tuple[bool, int | None, st
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _safe_urlopen(req, timeout=10) as resp:
             return True, resp.status, ""
     except urllib.error.HTTPError as exc:
         return False, exc.code, str(exc)
@@ -290,7 +374,7 @@ def _deliver_webhook(url: str, payload: dict, headers: dict | None = None) -> tu
         h.update(headers)
     req = urllib.request.Request(url, data=body, headers=h, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _safe_urlopen(req, timeout=10) as resp:
             return True, resp.status, ""
     except urllib.error.HTTPError as exc:
         return False, exc.code, str(exc)

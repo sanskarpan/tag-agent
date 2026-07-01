@@ -88,6 +88,100 @@ def _validate_fetch_url(url: str) -> None:
             raise ValueError(f"refusing to fetch from non-public address {ip} (host {host!r})")
 
 
+def _ip_is_blocked(addr: str) -> bool:
+    """True if *addr* is a non-public (SSRF-sensitive) IP literal."""
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return False
+    return (ip.is_loopback or ip.is_link_local or ip.is_private
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _safe_urlopen(url, *, timeout: int = 15):
+    """SSRF-hardened urlopen: pins the resolved IP at connect time and refuses
+    redirects to non-public addresses.
+
+    Two SSRF holes the plain ``urllib.request.urlopen`` leaves open are closed:
+
+    * **Redirect following** — the default global opener transparently follows
+      3xx redirects, so a public ``302 -> http://127.0.0.1/`` reaches internal
+      services. Here every redirect target is re-validated with
+      :func:`_validate_fetch_url`, and each hop opens a fresh (also pinned)
+      connection.
+    * **DNS rebinding (TOCTOU)** — validation and connection normally resolve
+      DNS independently. The pinned connection re-resolves at connect time and
+      refuses to connect to any non-public address, so a low-TTL record cannot
+      flip to loopback/metadata between validate and fetch.
+    """
+    import http.client
+    import socket as _socket
+
+    def _connect_pinned(conn):
+        infos = _socket.getaddrinfo(conn.host, conn.port, 0, _socket.SOCK_STREAM)
+        for info in infos:
+            if _ip_is_blocked(info[4][0]):
+                raise OSError(
+                    f"refusing to connect to non-public address {info[4][0]} (SSRF protection)"
+                )
+        last_err = None
+        for family, socktype, proto, _canon, sockaddr in infos:
+            sock = None
+            try:
+                sock = _socket.socket(family, socktype, proto)
+                if conn.timeout is not _socket._GLOBAL_DEFAULT_TIMEOUT:
+                    sock.settimeout(conn.timeout)
+                if getattr(conn, "source_address", None):
+                    sock.bind(conn.source_address)
+                sock.connect(sockaddr)
+                return sock
+            except OSError as exc:
+                last_err = exc
+                if sock is not None:
+                    sock.close()
+        raise last_err if last_err is not None else OSError("connection failed")
+
+    class _PinnedHTTPConnection(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = _connect_pinned(self)
+            if self._tunnel_host:
+                self._tunnel()
+
+    class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+        def connect(self):
+            self.sock = _connect_pinned(self)
+            if self._tunnel_host:
+                self._tunnel()
+                server_hostname = self._tunnel_host
+            else:
+                server_hostname = self.host
+            self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+    class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_PinnedHTTPConnection, req)
+
+    class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(_PinnedHTTPSConnection, req)
+
+    class _GuardRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            try:
+                _validate_fetch_url(newurl)
+            except ValueError as exc:
+                raise urllib.error.HTTPError(
+                    newurl, code, f"blocked redirect: {exc}", headers, fp
+                )
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = urllib.request.build_opener(
+        _PinnedHTTPHandler, _PinnedHTTPSHandler, _GuardRedirect
+    )
+    return opener.open(url, timeout=timeout)
+
+
 def _dashboard_snapshot(cfg: dict[str, Any]) -> dict[str, Any]:
     """Read current TAG state for dashboard display — pure SQLite, no hermes."""
     from tag.core.db import queue_list_jobs
@@ -206,7 +300,7 @@ def cmd_profile_marketplace(args: argparse.Namespace) -> int:
             return 1
 
         try:
-            response = urllib.request.urlopen(url, timeout=15)  # noqa: S310
+            response = _safe_urlopen(url, timeout=15)  # noqa: S310
             content = response.read()
         except urllib.error.URLError as exc:
             db.close()
@@ -257,6 +351,15 @@ def cmd_profile_marketplace(args: argparse.Namespace) -> int:
         if not profile_name:
             db.close()
             print_error("profile name required")
+            return 1
+        # Validate the name is a plain slug before joining it into a path, so a
+        # traversal name (e.g. ../../../tmp/secret) cannot disclose the path +
+        # SHA256 of an arbitrary config.yaml. Symmetric with `pull` (:_validate_profile_name).
+        try:
+            profile_name = _validate_profile_name(profile_name)
+        except ValueError as exc:
+            db.close()
+            print_error(str(exc))
             return 1
         # Find the profile file — either a pulled profile (flat profiles/<name>.yaml)
         # or a bootstrapped profile (.hermes/profiles/<name>/config.yaml).
@@ -564,7 +667,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Access-Control-Allow-Origin", "*")
+                # No wildcard CORS on this local data stream (it carries run/queue
+                # task text, journal + kanban counts). A wildcard ACAO would let any
+                # web page EventSource this 127.0.0.1 endpoint cross-origin,
+                # defeating the loopback bind. Consistent with api.py / devui.py.
                 self.end_headers()
                 try:
                     while True:

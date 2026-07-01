@@ -88,6 +88,7 @@ def verify_signature(
     payload_bytes: bytes,
     signature_header: str,
     secret: str,
+    timestamp: str = "",
 ) -> bool:
     if not secret:
         # Without a configured secret we cannot cryptographically verify the
@@ -106,12 +107,18 @@ def verify_signature(
         return hmac.compare_digest(computed, sig_hex)
 
     if platform == WebhookPlatform.SLACK:
-        # v0=<hex> over "v0:<timestamp>:<body>"
-        # For simplicity, verify the hex against body only (timestamp in header separately)
+        # X-Slack-Signature: v0=<hex> where the HMAC is computed over the
+        # signature base string "v0:{X-Slack-Request-Timestamp}:{raw body}".
+        # See https://api.slack.com/authentication/verifying-requests-from-slack
         if not signature_header.startswith("v0="):
             return False
+        if not timestamp:
+            # Slack always sends X-Slack-Request-Timestamp; without it we cannot
+            # reconstruct the signed base string, so verification must fail.
+            return False
         sig_hex = signature_header[3:]
-        computed = hmac.new(secret_bytes, payload_bytes, hashlib.sha256).hexdigest()
+        base_string = b"v0:" + timestamp.encode("utf-8") + b":" + payload_bytes
+        computed = hmac.new(secret_bytes, base_string, hashlib.sha256).hexdigest()
         return hmac.compare_digest(computed, sig_hex)
 
     # LINEAR and GENERIC: standard HMAC-SHA256 hex
@@ -237,6 +244,22 @@ def match_rules(
     return matched
 
 
+def _build_task_text(platform: str, event_type: str, event_info: dict) -> str:
+    """Build the queue-job prompt text for a webhook-triggered task."""
+    header = f"Webhook {platform} {event_type}".strip()
+    parts = [header]
+    title = (event_info.get("title") or "").strip()
+    body = (event_info.get("body") or "").strip()
+    url = (event_info.get("url") or "").strip()
+    if title:
+        parts.append(f"Title: {title}")
+    if body:
+        parts.append(body)
+    if url:
+        parts.append(f"URL: {url}")
+    return "\n\n".join(parts)
+
+
 def _event_matches(pattern: str, event_type: str) -> bool:
     import fnmatch
     # Match exactly, or via an explicit shell-style wildcard (e.g. "pull_request.*").
@@ -270,6 +293,9 @@ def list_events(
 
 
 class _WebhookHandler(http.server.BaseHTTPRequestHandler):
+    # Cap inbound webhook bodies to avoid unbounded reads/memory (10 MiB).
+    _MAX_BODY_BYTES = 10 * 1024 * 1024
+
     def log_message(self, *args: Any) -> None:
         pass
 
@@ -313,7 +339,19 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
             return
 
         platform = path_parts[1].lower()
-        length = int(self.headers.get("Content-Length", 0))
+
+        # Validate Content-Length before reading the body: a non-numeric header
+        # must not raise an uncaught ValueError (which drops the response), and a
+        # negative/oversized value must not trigger read-until-EOF or unbounded
+        # memory use. Reject malformed lengths with 400 and cap the body size.
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._send_json(400, {"error": "invalid Content-Length"})
+            return
+        if length < 0 or length > self._MAX_BODY_BYTES:
+            self._send_json(400, {"error": "invalid Content-Length"})
+            return
         body_bytes = self.rfile.read(length)
 
         # Signature verification
@@ -323,7 +361,8 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
             or self.headers.get("X-Linear-Signature", "")
             or self.headers.get("X-Slack-Signature", "")
         )
-        valid = verify_signature(platform, body_bytes, sig_header, secret)
+        slack_ts = self.headers.get("X-Slack-Request-Timestamp", "")
+        valid = verify_signature(platform, body_bytes, sig_header, secret, slack_ts)
         # Enforce the signature: when a secret is configured, reject a request
         # that fails HMAC verification BEFORE parsing/matching/enqueuing.
         # Without this gate a forged request could enqueue arbitrary agent work.
@@ -358,18 +397,37 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
             )
             conn.commit()
 
-            # Enqueue tasks for matched rules
+            # Enqueue a queue job for each matched rule and launch a detached
+            # worker. queue_worker has no enqueue(); the real job-creation path
+            # is core.db.queue_insert_job(...) + launch_queue_worker(cfg, id),
+            # the same one the `tag queue add` CLI uses. Both write/read the same
+            # runtime DB, so a worker launched here finds the row we insert.
+            from tag.core.db import (
+                queue_insert_job,
+                queue_update_pid,
+                launch_queue_worker,
+            )
+
+            cfg = getattr(self.server, "_cfg", None)
             for rule in rules:
-                try:
-                    from tag import queue_worker
-                    queue_worker.enqueue(
-                        conn,
-                        task_type=rule.action,
-                        profile=rule.profile,
-                        payload={"event": event_info, "rule_id": rule.id},
-                    )
-                except Exception:
-                    pass
+                job_id = uuid.uuid4().hex[:8]
+                task_text = _build_task_text(platform, event_type, event_info)
+                queue_insert_job(
+                    conn,
+                    job_id,
+                    rule.profile,
+                    task_text,
+                    task_type=(rule.action or "mixed"),
+                )
+                # Job row is now persisted (this is the dispatch of record).
+                # Launching the worker subprocess is best-effort: if it fails the
+                # queued row can still be picked up later, so don't fail the POST.
+                if cfg is not None:
+                    try:
+                        pid = launch_queue_worker(cfg, job_id)
+                        queue_update_pid(conn, job_id, pid)
+                    except Exception:
+                        pass
 
             self._send_json(200, {
                 "event_id": event_id,
@@ -403,6 +461,9 @@ class WebhookServer:
         self._server = http.server.HTTPServer((self._host, self._port), _WebhookHandler)
         self._server._db_path = self._db_path
         self._server._secret = self._secret
+        # Expose cfg to the request handler so matched rules can launch the
+        # detached queue worker via launch_queue_worker(cfg, job_id).
+        self._server._cfg = self._cfg
         url = f"http://{self._host}:{self._port}"
         print(f"TAG webhook server listening on {url}")
         self._server.serve_forever()

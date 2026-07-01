@@ -198,7 +198,10 @@ def export_to_yaml(conn: sqlite3.Connection, dataset_id: str) -> str:
     case_list: list[dict[str, Any]] = []
     for c in cases:
         case: dict[str, Any] = {"id": c["case_id"], "input": str(c["input"])}
-        if c["expected_output"]:
+        # Preserve an explicitly-set expected_output, including '' — only omit
+        # it when it was never set (NULL). A truthiness test dropped '' and made
+        # it indistinguishable from None on re-import (C022).
+        if c["expected_output"] is not None:
             case["expected_output"] = str(c["expected_output"])
         case_list.append(case)
 

@@ -206,8 +206,11 @@ function main() {
 
     // Fast path: `--version` needs no Python runtime, so short-circuit before
     // ensureRuntime() to avoid triggering a multi-minute cold venv build just
-    // to print a version string.
+    // to print a version string. Skip this fast path when a runtime reinstall
+    // was requested (`--reinstall-runtime --version`) so the reinstall isn't
+    // silently dropped — fall through to ensureRuntime(), then print version.
     if (
+      !FORCE_REINSTALL &&
       forwardedArgs.length === 1 &&
       (forwardedArgs[0] === "--version" || forwardedArgs[0] === "-V")
     ) {
