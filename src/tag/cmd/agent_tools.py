@@ -168,7 +168,10 @@ def cmd_persona(args: argparse.Namespace) -> int:
         profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
         session_id = getattr(args, "session_id", None)
         try:
-            apply_persona(db, profile, name, session_id=session_id)
+            apply_persona(
+                db, profile, name, session_id=session_id,
+                valid_profiles=set(cfg.get("profiles", {})),
+            )
         except ValueError as exc:
             print_error(str(exc))
             db.close()
@@ -203,6 +206,10 @@ def cmd_persona(args: argparse.Namespace) -> int:
 
     if sub == "stack":
         profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        if profile not in cfg.get("profiles", {}):
+            db.close()
+            print_error(f"Unknown profile: {profile!r}")
+            return 1
         personas = get_active_personas(db, profile)
         db.close()
         if not personas:
@@ -605,25 +612,41 @@ def cmd_split(args: argparse.Namespace) -> int:
         profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
         spec_json_str = getattr(args, "spec_json", None)
 
+        want_json = getattr(args, "json", False)
         if spec_json_str:
             # Validate the spec *before* persisting a run so a malformed spec
             # doesn't leave an orphaned pending run behind.
             try:
                 spec = ChangeSpec.from_json(spec_json_str)
             except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
-                print_error(f"Invalid spec JSON: {exc}")
+                if want_json:
+                    print(json.dumps({"error": f"Invalid spec JSON: {exc}"}))
+                else:
+                    print_error(f"Invalid spec JSON: {exc}")
                 db.close()
                 return 1
             run_id = create_split_run(db, task, architect, editor, profile)
             save_spec(db, run_id, spec)
             db.close()
-            print(f"Split run created: {run_id}  ({len(spec.items)} items from spec)")
+            if want_json:
+                print(json.dumps({
+                    "run_id": run_id, "architect": architect, "editor": editor,
+                    "profile": profile, "items": len(spec.items),
+                }))
+            else:
+                print(f"Split run created: {run_id}  ({len(spec.items)} items from spec)")
         else:
             run_id = create_split_run(db, task, architect, editor, profile)
             db.close()
-            print(f"Split run created: {run_id}")
-            print(f"Architect: {architect}  Editor: {editor}")
-            print(f"\nArchitect system prompt:\n{ARCHITECT_SYSTEM}")
+            if want_json:
+                print(json.dumps({
+                    "run_id": run_id, "architect": architect, "editor": editor,
+                    "profile": profile,
+                }))
+            else:
+                print(f"Split run created: {run_id}")
+                print(f"Architect: {architect}  Editor: {editor}")
+                print(f"\nArchitect system prompt:\n{ARCHITECT_SYSTEM}")
         return 0
 
     db.close()
@@ -862,6 +885,7 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     sp_plan.add_argument("--editor", default="claude-haiku-4-5")
     sp_plan.add_argument("--profile")
     sp_plan.add_argument("--spec-json", dest="spec_json", help="Optional pre-built spec JSON")
+    sp_plan.add_argument("--json", action="store_true")
     for ssp in [split_cmd, sp_list, sp_show, sp_plan]:
         ssp.set_defaults(func=cmd_split)
 
