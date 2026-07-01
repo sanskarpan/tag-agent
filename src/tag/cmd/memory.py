@@ -154,7 +154,11 @@ def cmd_memory_semantic(args: argparse.Namespace) -> int:
             print_error("Memory content required (positional argument or --content)")
             return 1
         mtype = getattr(args, "memory_type", "fact") or "fact"
-        confidence = getattr(args, "confidence", 1.0) or 1.0
+        # Do NOT use `or 1.0` — that silently rewrites an explicit
+        # `--confidence 0` to 1.0 and bypasses add_memory's (0, 1] range check.
+        confidence = getattr(args, "confidence", 1.0)
+        if confidence is None:
+            confidence = 1.0
         try:
             mem_id = add_memory(db, profile, content, memory_type=mtype, confidence=confidence)
         except ValueError as exc:
@@ -251,7 +255,17 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
             return 1
         db_path = _db_for_profile(profile, cfg)
         conn = _sq3.connect(str(db_path))
-        config = GCConfig(dry_run=getattr(args, "dry_run", False))
+        config = GCConfig()
+        if getattr(args, "dry_run", False):
+            # The GC engine (run_gc) has no non-mutating mode, so a dry run must
+            # never evict/merge/promote. Report intent without changing state.
+            print(
+                f"dry-run: GC preview for '{profile}' — no changes made. "
+                f"Re-run without --dry-run to evict/merge/promote "
+                f"(cap={config.max_memories_per_profile}, "
+                f"min_confidence={config.min_confidence_to_keep})."
+            )
+            return 0
         if getattr(args, "all_profiles", False):
             results = run_gc_all_profiles(conn, config=config)
             for r in results:
@@ -270,14 +284,16 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
             return 1
         db_path = _db_for_profile(profile, cfg)
         conn = _sq3.connect(str(db_path))
-        # Read run output from the runs table
-        row = conn.execute(
-            "SELECT output FROM runs WHERE id=? LIMIT 1", (args.run_id,)
-        ).fetchone()
-        if not row:
-            print_error(f"Run not found: {args.run_id!r}")
+        # Run output lives in the per-step `steps.output` column (the `runs`
+        # table has no output column). Concatenate the run's step outputs.
+        rows = conn.execute(
+            "SELECT output FROM steps WHERE run_id=? ORDER BY id", (args.run_id,)
+        ).fetchall()
+        if not rows:
+            print_error(f"Run not found or has no recorded output: {args.run_id!r}")
             return 1
-        memories = auto_extract_post_run(conn, args.run_id, row[0], profile, cfg)
+        output_text = "\n\n".join(r[0] for r in rows if r and r[0])
+        memories = auto_extract_post_run(conn, args.run_id, output_text, profile, cfg)
         print(f"Extracted {len(memories)} memories")
         return 0
 
@@ -329,7 +345,11 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
             hist = get_fact_history(conn, args.fact_id)
             print(json.dumps(hist, indent=2, default=str))
         elif action == "list-at":
-            facts = list_facts_at(conn, profile, at=getattr(args, "at", None))
+            at_time = getattr(args, "at", None)
+            if not at_time:
+                from datetime import datetime, timezone
+                at_time = datetime.now(timezone.utc).isoformat()
+            facts = list_facts_at(conn, profile, at_time)
             print(json.dumps(facts, indent=2, default=str))
         return 0
 
@@ -353,7 +373,7 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
         ensure_episode_schema(conn)
         action = args.action
         if action == "start":
-            ep_id = start_episode(conn, profile, "CLI session")
+            ep_id = start_episode(conn, profile, getattr(args, "summary", None) or "CLI session")
             print(f"Episode started: {ep_id}")
         elif action == "end":
             if not getattr(args, "episode_id", None):
@@ -363,11 +383,21 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
             print("Episode ended")
         elif action == "list":
             episodes = list_episodes(conn, profile)
-            for ep in episodes:
-                print(ep)
+            print(json.dumps(episodes, indent=2, default=str))
         elif action == "get":
+            if not getattr(args, "episode_id", None):
+                print_error("--id required")
+                return 1
+            record = next(
+                (e for e in list_episodes(conn, profile)
+                 if e.get("episode_id") == args.episode_id or e.get("id") == args.episode_id),
+                None,
+            )
+            if record is None:
+                print_error(f"Episode not found: {args.episode_id!r}")
+                return 1
             memories = get_episode_memories(conn, args.episode_id)
-            print(json.dumps(memories, indent=2, default=str))
+            print(json.dumps({"episode": record, "memories": memories}, indent=2, default=str))
         return 0
 
     if sub == "store":
@@ -379,6 +409,7 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
                 search_by_vector,
                 rebuild_embeddings,
                 store_embedding,
+                embed_text,
             )
         except ImportError as e:
             print_error(f"semantic_memory vectors not available: {e}")
@@ -388,7 +419,26 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
         ensure_schema(conn)
         ensure_vector_schema(conn)
         action = args.action
-        if action == "search":
+        if action == "store":
+            mid = getattr(args, "memory_id", None)
+            if not mid:
+                print_error("--id required for store")
+                return 1
+            row = conn.execute(
+                "SELECT content FROM semantic_memories WHERE id=? AND profile=?",
+                (mid, profile),
+            ).fetchone()
+            if not row:
+                print_error(f"Memory not found: {mid!r} (profile {profile!r})")
+                return 1
+            vec = embed_text(row[0])
+            if vec is None:
+                print_error("Embedding backend unavailable — install sentence-transformers.")
+                return 1
+            store_embedding(conn, mid, vec)
+            conn.commit()
+            print(f"Stored embedding for {mid} ({len(vec)} dims)")
+        elif action == "search":
             q = getattr(args, "query", None) or ""
             results = search_by_vector(conn, profile, q)
             print(json.dumps(results[:10], indent=2, default=str))
