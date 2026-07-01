@@ -37,6 +37,21 @@ def _db_for_profile(profile, cfg):
     return runtime_db_path(cfg)
 
 
+def _open_conn(db_path) -> sqlite3.Connection:
+    """Open the shared runtime SQLite with the same busy_timeout + WAL hardening
+    used by queue_worker / cron_scheduler / core.db (C041).
+
+    A bare sqlite3.connect() has busy_timeout=0, so a writer (e.g. annotate
+    label, prompt save) racing queue_worker/cron_scheduler on tag.sqlite3 can
+    raise an uncaught 'database is locked'. Blocking-and-retrying via
+    busy_timeout keeps concurrent access safe.
+    """
+    conn = sqlite3.connect(str(db_path), timeout=5)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
 # ---------------------------------------------------------------------------
 # PRD-046: pricing command handler
 # ---------------------------------------------------------------------------
@@ -85,34 +100,37 @@ def cmd_eval_judge(args: argparse.Namespace) -> int:
         return 1
     cfg, profile = _load_cfg_and_profile(args)
     db_path = _db_for_profile(profile, cfg)
-    conn = _sq3.connect(str(db_path))
-    ensure_schema(conn)
-    if sub == "list" or sub is None:
-        run_id = getattr(args, "eval_run_id", None)
-        runs = list_judge_runs(conn, eval_run_id=run_id, limit=getattr(args, "limit", 20))
-        if getattr(args, "json", False):
-            print(json.dumps([vars(r) if hasattr(r, "__dict__") else dict(r) for r in runs], indent=2, default=str))
-        else:
-            for r in runs:
-                print(r)
-        return 0
-    if sub == "run":
-        from tag.eval_judge import run_judge_on_eval
-        result = run_judge_on_eval(conn, args.eval_run_id,
-                                   judge_model=getattr(args, "judge_model", "claude-sonnet-4-6"),
-                                   criteria=getattr(args, "criteria", None),
-                                   cfg=cfg)
-        if getattr(args, "json", False):
-            print(json.dumps(
-                result,
-                default=lambda o: vars(o) if hasattr(o, "__dict__") else str(o),
-                indent=2,
-            ))
-        else:
-            print(result)
-        return 0
-    print_error(f"Unknown subcommand: {sub!r}")
-    return 1
+    conn = _open_conn(db_path)
+    try:
+        ensure_schema(conn)
+        if sub == "list" or sub is None:
+            run_id = getattr(args, "eval_run_id", None)
+            runs = list_judge_runs(conn, eval_run_id=run_id, limit=getattr(args, "limit", 20))
+            if getattr(args, "json", False):
+                print(json.dumps([vars(r) if hasattr(r, "__dict__") else dict(r) for r in runs], indent=2, default=str))
+            else:
+                for r in runs:
+                    print(r)
+            return 0
+        if sub == "run":
+            from tag.eval_judge import run_judge_on_eval
+            result = run_judge_on_eval(conn, args.eval_run_id,
+                                       judge_model=getattr(args, "judge_model", "claude-sonnet-4-6"),
+                                       criteria=getattr(args, "criteria", None),
+                                       cfg=cfg)
+            if getattr(args, "json", False):
+                print(json.dumps(
+                    result,
+                    default=lambda o: vars(o) if hasattr(o, "__dict__") else str(o),
+                    indent=2,
+                ))
+            else:
+                print(result)
+            return 0
+        print_error(f"Unknown subcommand: {sub!r}")
+        return 1
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -128,46 +146,49 @@ def cmd_eval_dataset(args: argparse.Namespace) -> int:
         return 1
     cfg, profile = _load_cfg_and_profile(args)
     db_path = _db_for_profile(profile, cfg)
-    conn = _sq3.connect(str(db_path))
-    ensure_schema(conn)
-    if sub == "create":
-        if get_dataset(conn, args.name) is not None:
-            print_error(f"Dataset already exists: {args.name!r}")
-            return 1
-        ds = create_dataset(conn, args.name, getattr(args, "description", ""))
-        print(f"Created dataset '{ds.name}' (id={ds.id}, v{ds.version})")
-        return 0
-    if sub == "list" or sub is None:
-        datasets = list_datasets(conn)
-        if getattr(args, "json", False):
-            print(json.dumps([vars(d) if hasattr(d, "__dict__") else dict(d) for d in datasets], indent=2, default=str))
-        else:
-            for d in datasets:
-                print(f"{d.name:<40} v{d.version}")
-        return 0
-    if sub == "export":
-        ds = get_dataset(conn, args.name)
-        if ds is None:
-            print_error(f"Dataset not found: {args.name!r}")
-            return 1
-        yaml_str = export_to_yaml(conn, ds.id)
-        out = getattr(args, "out", None)
-        if out:
-            Path(out).write_text(yaml_str)
-            print(f"Exported to {out}")
-        else:
-            print(yaml_str)
-        return 0
-    if sub == "delete":
-        ds = get_dataset(conn, args.name)
-        if ds is None:
-            print_error(f"Dataset not found: {args.name!r}")
-            return 1
-        delete_dataset(conn, ds.id)
-        print(f"Deleted dataset '{args.name}'")
-        return 0
-    print_error(f"Unknown subcommand: {sub!r}")
-    return 1
+    conn = _open_conn(db_path)
+    try:
+        ensure_schema(conn)
+        if sub == "create":
+            if get_dataset(conn, args.name) is not None:
+                print_error(f"Dataset already exists: {args.name!r}")
+                return 1
+            ds = create_dataset(conn, args.name, getattr(args, "description", ""))
+            print(f"Created dataset '{ds.name}' (id={ds.id}, v{ds.version})")
+            return 0
+        if sub == "list" or sub is None:
+            datasets = list_datasets(conn)
+            if getattr(args, "json", False):
+                print(json.dumps([vars(d) if hasattr(d, "__dict__") else dict(d) for d in datasets], indent=2, default=str))
+            else:
+                for d in datasets:
+                    print(f"{d.name:<40} v{d.version}")
+            return 0
+        if sub == "export":
+            ds = get_dataset(conn, args.name)
+            if ds is None:
+                print_error(f"Dataset not found: {args.name!r}")
+                return 1
+            yaml_str = export_to_yaml(conn, ds.id)
+            out = getattr(args, "out", None)
+            if out:
+                Path(out).write_text(yaml_str)
+                print(f"Exported to {out}")
+            else:
+                print(yaml_str)
+            return 0
+        if sub == "delete":
+            ds = get_dataset(conn, args.name)
+            if ds is None:
+                print_error(f"Dataset not found: {args.name!r}")
+                return 1
+            delete_dataset(conn, ds.id)
+            print(f"Deleted dataset '{args.name}'")
+            return 0
+        print_error(f"Unknown subcommand: {sub!r}")
+        return 1
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +300,7 @@ def cmd_annotate(args: argparse.Namespace) -> int:
         return 1
     cfg, profile = _load_cfg_and_profile(args)
     db_path = _db_for_profile(profile, cfg)
-    conn = _sq3.connect(str(db_path))
+    conn = _open_conn(db_path)
     ensure_schema(conn)
     if sub == "next" or sub is None:
         batch = getattr(args, "batch", 1)
@@ -325,7 +346,7 @@ def cmd_prompt_hub(args: argparse.Namespace) -> int:
         return 1
     cfg, profile = _load_cfg_and_profile(args)
     db_path = _db_for_profile(profile, cfg)
-    conn = _sq3.connect(str(db_path))
+    conn = _open_conn(db_path)
     ensure_schema(conn)
     if sub == "save":
         if not args.name or not args.name.strip():
@@ -340,9 +361,15 @@ def cmd_prompt_hub(args: argparse.Namespace) -> int:
         print(f"Saved '{pv.name}' v{pv.version} (id={pv.id})")
         return 0
     if sub == "get":
-        pv = get_prompt(conn, args.name, version=getattr(args, "version", None))
+        version = getattr(args, "version", None)
+        pv = get_prompt(conn, args.name, version=version)
         if pv is None:
-            print_error(f"Prompt not found: {args.name!r}")
+            # Distinguish a missing prompt from a missing version, matching
+            # `prompt diff` (C043).
+            if version is not None and get_prompt(conn, args.name) is not None:
+                print_error(f"Prompt {args.name!r} version {version} not found.")
+            else:
+                print_error(f"Prompt not found: {args.name!r}")
             return 1
         print(pv.content)
         return 0
@@ -426,39 +453,44 @@ def cmd_webhook_server(args: argparse.Namespace) -> int:
         return 1
     cfg, profile = _load_cfg_and_profile(args)
     db_path = _db_for_profile(profile, cfg)
-    conn = _sq3.connect(str(db_path))
-    ensure_schema(conn)
-    if sub == "listen" or sub is None:
-        port = getattr(args, "port", 8765)
-        host = getattr(args, "host", "127.0.0.1")
-        secret = getattr(args, "secret", None) or os.environ.get("TAG_WEBHOOK_SECRET") or None
-        conn.close()  # WebhookServer opens its own connection from db_path
-        server = WebhookServer(db_path=str(db_path), cfg=cfg, host=host, port=port, secret=secret)
-        if secret is None:
-            print_warning(
-                "No TAG_WEBHOOK_SECRET set — unsigned webhooks will be accepted. "
-                "Bind is localhost-only; set a secret before exposing the port."
-            )
-        print(f"Webhook server listening on {host}:{port} — Ctrl+C to stop")
-        server.start()
-        return 0
-    if sub == "rule-add":
-        rule = wh_create_rule(conn, args.platform, args.event, args.profile,
-                              getattr(args, "action", "run"))
-        print(f"Rule created: {rule.id}")
-        return 0
-    if sub == "rule-list":
-        rules = wh_list_rules(conn)
-        for r in rules:
-            print(f"{r.id[:8]}  {r.platform:<10} {r.event:<30} {r.action}")
-        return 0
-    if sub == "events":
-        events = list_events(conn, limit=getattr(args, "limit", 20))
-        for e in events:
-            print(e)
-        return 0
-    print_error(f"Unknown subcommand: {sub!r}")
-    return 1
+    conn = _open_conn(db_path)
+    # close() is idempotent, so the early close in the listen branch is safe
+    # under this finally (C044 — deterministic close on every return path).
+    try:
+        ensure_schema(conn)
+        if sub == "listen" or sub is None:
+            port = getattr(args, "port", 8765)
+            host = getattr(args, "host", "127.0.0.1")
+            secret = getattr(args, "secret", None) or os.environ.get("TAG_WEBHOOK_SECRET") or None
+            conn.close()  # WebhookServer opens its own connection from db_path
+            server = WebhookServer(db_path=str(db_path), cfg=cfg, host=host, port=port, secret=secret)
+            if secret is None:
+                print_warning(
+                    "No TAG_WEBHOOK_SECRET set — unsigned webhooks will be accepted. "
+                    "Bind is localhost-only; set a secret before exposing the port."
+                )
+            print(f"Webhook server listening on {host}:{port} — Ctrl+C to stop")
+            server.start()
+            return 0
+        if sub == "rule-add":
+            rule = wh_create_rule(conn, args.platform, args.event, args.profile,
+                                  getattr(args, "action", "run"))
+            print(f"Rule created: {rule.id}")
+            return 0
+        if sub == "rule-list":
+            rules = wh_list_rules(conn)
+            for r in rules:
+                print(f"{r.id[:8]}  {r.platform:<10} {r.event:<30} {r.action}")
+            return 0
+        if sub == "events":
+            events = list_events(conn, limit=getattr(args, "limit", 20))
+            for e in events:
+                print(e)
+            return 0
+        print_error(f"Unknown subcommand: {sub!r}")
+        return 1
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -715,7 +747,7 @@ def cmd_entity_graph(args: argparse.Namespace) -> int:
         import sqlite3 as _sq3
         from tag.entity_graph import (ensure_schema, query_graph, format_graph_summary,
                                        get_entity_neighbors, extract_and_store_from_memory,
-                                       detect_communities)
+                                       detect_communities, reset_graph)
         from tag.semantic_memory import ensure_schema as sm_ensure, list_memories
     except ImportError as e:
         print_error(f"entity_graph not available: {e}")
@@ -734,7 +766,11 @@ def cmd_entity_graph(args: argparse.Namespace) -> int:
             print(summary)
         return 0
     if sub == "query":
-        depth = getattr(args, "depth", 2) or 2
+        # --depth 0 is a valid request (empty neighborhood); don't let `or 2`
+        # clobber the legitimate 0 (C040). argparse default is 2.
+        depth = getattr(args, "depth", 2)
+        if depth is None:
+            depth = 2
         result = query_graph(conn, profile, entity_name=args.entity)
         # Honor --depth: enrich the first matched entity with its neighborhood.
         ents = result.get("entities", []) if isinstance(result, dict) else []
@@ -742,10 +778,27 @@ def cmd_entity_graph(args: argparse.Namespace) -> int:
             result["neighborhood"] = get_entity_neighbors(
                 conn, ents[0]["id"], max_depth=depth
             )
-        print(json.dumps(result, indent=2, default=str))
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            if not ents:
+                print(f"No entities matching {args.entity!r}")
+            else:
+                print(f"{len(ents)} entities matching {args.entity!r} (depth {depth}):")
+                for e in ents:
+                    print(f"  {e.get('name')} ({e.get('entity_type')}) "
+                          f"mentions={e.get('mention_count')}")
+                nb = result.get("neighborhood")
+                if nb:
+                    print(f"  neighborhood: {len(nb.get('entities', []))} entities, "
+                          f"{len(nb.get('relations', []))} relations")
         return 0
     if sub == "build":
         sm_ensure(conn)
+        # Rebuilding must be idempotent: clear prior graph state for this
+        # profile so mention_count isn't re-inflated and relations aren't
+        # accumulated across runs (C021).
+        reset_graph(conn, profile)
         memories = list_memories(conn, profile)
         ent_count = rel_count = 0
         for m in memories:
@@ -757,10 +810,18 @@ def cmd_entity_graph(args: argparse.Namespace) -> int:
             ent_count += e
             rel_count += r
         communities = detect_communities(conn, profile)
-        print(
-            f"Built graph from {len(memories)} memories: {ent_count} entities, "
-            f"{rel_count} relations, {len(communities)} communities"
-        )
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "memories": len(memories),
+                "entities": ent_count,
+                "relations": rel_count,
+                "communities": len(communities),
+            }, indent=2))
+        else:
+            print(
+                f"Built graph from {len(memories)} memories: {ent_count} entities, "
+                f"{rel_count} relations, {len(communities)} communities"
+            )
         return 0
     print_error(f"Unknown graph subcommand: {sub!r}")
     return 1
@@ -988,7 +1049,9 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     graph_query.add_argument("entity", metavar="ENTITY")
     graph_query.add_argument("--profile", default=None)
     graph_query.add_argument("--depth", type=int, default=2)
+    graph_query.add_argument("--json", action="store_true")
     graph_build = graph_sub.add_parser("build", help="Build graph from existing memories")
     graph_build.add_argument("--profile", default=None)
+    graph_build.add_argument("--json", action="store_true")
     for ap in [graph_cmd, graph_show, graph_query, graph_build]:
         ap.set_defaults(func=cmd_entity_graph)
