@@ -347,21 +347,23 @@ def test_cmd_submit_auto_bootstraps_when_hermes_missing(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr(TAG, "cmd_setup", fake_setup)
-    monkeypatch.setattr(
-        TAG,
-        "run_chat_step",
-        lambda *_a, **_k: {
-            "profile": "researcher",
-            "status": "ok",
-            "prompt": "x",
-            "output": "ok",
-            "started_at": "a",
-            "finished_at": "b",
-            "duration_ms": 1,
-            "returncode": 0,
-            "model_ref": "openrouter/model",
-        },
-    )
+    fake_step = {
+        "profile": "researcher",
+        "status": "ok",
+        "prompt": "x",
+        "output": "ok",
+        "started_at": "a",
+        "finished_at": "b",
+        "duration_ms": 1,
+        "returncode": 0,
+        "model_ref": "openrouter/model",
+    }
+    monkeypatch.setattr(TAG, "run_chat_step", lambda *_a, **_k: dict(fake_step))
+    # cmd_submit lives in tag.cmd.routing, which imports run_chat_step from
+    # tag.core.profile directly — patch the symbol it actually calls so the
+    # test never execs a real hermes binary (which only exists on dev machines
+    # with a sibling checkout, making this test env-dependent / red on CI).
+    monkeypatch.setattr("tag.cmd.routing.run_chat_step", lambda *_a, **_k: dict(fake_step))
 
     args = TAG.argparse.Namespace(
         config=str(cfg_path),
@@ -604,7 +606,10 @@ def test_bootstrap_profiles_wraps_hermes_errors(tmp_path, monkeypatch):
         ["hermes", "profile", "create", "bad/name"],
         stderr="invalid profile name",
     )
-    monkeypatch.setattr(TAG, "run_hermes", lambda *_a, **_k: (_ for _ in ()).throw(err))
+    # bootstrap_profiles lives in tag.core.profile and calls that module's own
+    # run_hermes (not tag.core.run.run_hermes, which the controller re-exports),
+    # so patch the symbol it actually invokes.
+    monkeypatch.setattr("tag.core.profile.run_hermes", lambda *_a, **_k: (_ for _ in ()).throw(err))
     with pytest.raises(SystemExit, match="Failed to create TAG-managed profile 'bad/name'"):
         TAG.bootstrap_profiles(cfg)
 
