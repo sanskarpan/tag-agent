@@ -234,8 +234,22 @@ def cmd_template(args: argparse.Namespace) -> int:
         if not isinstance(tmpl, dict):
             print_error(f"Template file '{tmpl_path}' does not contain a valid YAML mapping")
             return 1
-        profile = getattr(args, "profile", None) or tmpl.get("name", "imported")
+        import re as _re
+        profile = str(getattr(args, "profile", None) or tmpl.get("name") or "imported").strip()
+        # A profile name maps to a directory under TAG_HOME/profiles. Reject
+        # anything that isn't a plain slug so a crafted `name:` in an untrusted
+        # template cannot escape the profiles dir (path traversal / absolute
+        # path) or inject separators/newlines.
+        if not _re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", profile):
+            print_error(
+                f"Invalid profile name: {profile!r} "
+                "(use letters, digits, dot, dash, underscore; no path separators)."
+            )
+            return 1
         profile_dir = tag_home() / "profiles" / profile
+        if profile_dir.exists():
+            print_error(f"Profile '{profile}' already exists; choose a different --profile name.")
+            return 1
         profile_dir.mkdir(parents=True, exist_ok=True)
 
         env_data = tmpl.get("env", {})
@@ -712,7 +726,10 @@ def cmd_route_fallback(args: argparse.Namespace) -> int:
         ).fetchone()
         db.close()
         if not row:
-            print(f"No fallback configured for {primary!r} on condition={condition!r}")
+            if getattr(args, "json", False):
+                print(json.dumps({"primary": primary, "fallback": None, "condition": condition}))
+            else:
+                print(f"No fallback configured for {primary!r} on condition={condition!r}")
             return 1
         if getattr(args, "json", False):
             print(json.dumps({"primary": primary, "fallback": row[0], "condition": condition}))
