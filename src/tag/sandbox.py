@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -51,10 +52,18 @@ def _run_restricted(
     workdir: Path | None = None,
 ) -> tuple[int, str, str]:
     """Run command in a restricted subprocess. Returns (exit_code, stdout, stderr)."""
+    if timeout <= 0:
+        # A non-positive timeout would be passed straight to subprocess.run:
+        # 0/negative causes an immediate/way-past-deadline TimeoutExpired, so
+        # the command "always times out". Reject it instead.
+        return 1, "", f"Invalid timeout {timeout}: must be > 0 seconds"
+
     env = {
         "PATH": "/usr/bin:/bin:/usr/local/bin",
         "HOME": str(workdir or Path.home()),
     }
+    run_dir = str((workdir or Path.cwd()).resolve())
+
     # On Linux, set resource limits via preexec_fn
     preexec = None
     if sys.platform.startswith("linux"):
@@ -66,6 +75,36 @@ def _run_restricted(
             mem = 512 * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
         preexec = _set_limits
+
+    # On macOS there are no rlimit-based namespaces available here, and without
+    # any confinement `restricted` was just an unsandboxed host command runner
+    # (it could read /etc/passwd and open network sockets). Wrap the command in
+    # sandbox-exec with a profile that blocks all network egress and denies
+    # read/write of sensitive system locations while still allowing the process
+    # to load system libraries and work under its run directory + tmp.
+    if sys.platform == "darwin":
+        sandbox_exec = shutil.which("sandbox-exec")
+        if sandbox_exec:
+            profile = (
+                "(version 1)\n"
+                "(allow default)\n"
+                "(deny network*)\n"
+                '(deny file-read* file-write*'
+                ' (subpath "/etc") (subpath "/private/etc")'
+                ' (subpath "/var/db") (subpath "/private/var/db")'
+                ' (literal "/etc/master.passwd") (literal "/private/etc/master.passwd"))\n'
+                '(deny file-write*'
+                ' (subpath "/usr") (subpath "/bin") (subpath "/sbin")'
+                ' (subpath "/System") (subpath "/Library"))\n'
+            )
+            command = [sandbox_exec, "-p", profile] + list(command)
+        else:
+            return (
+                127,
+                "",
+                "sandbox-exec not available: cannot isolate on this platform. "
+                "Use --backend docker for isolated execution.",
+            )
 
     try:
         proc = subprocess.run(
@@ -132,6 +171,8 @@ def run_in_sandbox(
     ensure_schema(conn)
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
+    if timeout <= 0:
+        raise ValueError(f"timeout must be > 0 seconds, got {timeout}")
 
     run_id = uuid.uuid4().hex[:12]
     now = _utc_now()
