@@ -30,6 +30,31 @@ except Exception:
     def print_warning(msg): print(f"warning: {msg}", file=sys.stderr)
 
 
+def _master_profile(cfg: dict[str, Any]) -> str:
+    """Resolve the default master profile with one consistent, defensive lookup.
+
+    Some configs nest it under ``defaults.master_profile`` and some put it at the
+    top level; a minimal config may have neither. Previously loop/cron used an
+    unguarded ``cfg['defaults']['master_profile']`` (KeyError on a minimal
+    config) while review-pr/ci used ``cfg.get('master_profile', ...)`` — this
+    unifies both paths.
+    """
+    return (
+        (cfg.get("defaults") or {}).get("master_profile")
+        or cfg.get("master_profile")
+        or "orchestrator"
+    )
+
+
+def _emit_error(args: argparse.Namespace, msg: str, code: int = 1) -> int:
+    """Emit an error respecting ``--json``: valid JSON when requested, else plain."""
+    if getattr(args, "json", False):
+        print(json.dumps({"error": msg}))
+    else:
+        print_error(msg)
+    return code
+
+
 # ---------------------------------------------------------------------------
 # PRD-020: review-pr
 # ---------------------------------------------------------------------------
@@ -38,7 +63,7 @@ def cmd_review_pr(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(getattr(args, "config", None)))
     repo = getattr(args, "repo", None)
     pr_number = getattr(args, "pr", None)
-    profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+    profile = getattr(args, "profile", None) or _master_profile(cfg)
     post_comments = getattr(args, "post_comments", False)
 
     try:
@@ -99,7 +124,7 @@ def cmd_review_pr(args: argparse.Namespace) -> int:
 def cmd_ci(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(getattr(args, "config", None)))
     sub = getattr(args, "ci_subcommand", None)
-    profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+    profile = getattr(args, "profile", None) or _master_profile(cfg)
 
     try:
         from tag.ci import (
@@ -194,21 +219,18 @@ def cmd_loop(args: argparse.Namespace) -> int:
         goal = (getattr(args, "goal", "") or "").strip()
         if not goal:
             db.close()
-            print_error("--goal TEXT is required")
-            return 1
-        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+            return _emit_error(args, "--goal TEXT is required")
+        profile = getattr(args, "profile", None) or _master_profile(cfg)
         max_iters = getattr(args, "max_iters", 10)
         if max_iters is None:
             max_iters = 10
         if max_iters < 1:
             db.close()
-            print_error("--max-iters must be >= 1")
-            return 1
+            return _emit_error(args, "--max-iters must be >= 1")
         approval = getattr(args, "approval", "auto") or "auto"
         if approval not in ("auto", "human"):
             db.close()
-            print_error("--approval must be 'auto' or 'human'")
-            return 1
+            return _emit_error(args, "--approval must be 'auto' or 'human'")
 
         loop_id = uuid.uuid4().hex[:12]
         now = utc_now()
@@ -255,13 +277,11 @@ def cmd_loop(args: argparse.Namespace) -> int:
         loop_id = getattr(args, "loop_id", None)
         if not loop_id:
             db.close()
-            print_error("LOOP_ID required")
-            return 1
+            return _emit_error(args, "LOOP_ID required")
         run = db.execute("SELECT * FROM loop_runs WHERE id=?", (loop_id,)).fetchone()
         if not run:
             db.close()
-            print_error(f"Loop '{loop_id}' not found")
-            return 1
+            return _emit_error(args, f"Loop '{loop_id}' not found")
         iters = db.execute(
             "SELECT iteration, decision, output FROM loop_iterations WHERE loop_id=? ORDER BY iteration",
             (loop_id,),
@@ -284,8 +304,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
         loop_id = getattr(args, "loop_id", None)
         if not loop_id:
             db.close()
-            print_error("LOOP_ID required")
-            return 1
+            return _emit_error(args, "LOOP_ID required")
         cur = db.execute(
             "UPDATE loop_runs SET status='aborted', updated_at=? WHERE id=? AND status='running'",
             (utc_now(), loop_id),
@@ -294,9 +313,38 @@ def cmd_loop(args: argparse.Namespace) -> int:
         affected = cur.rowcount
         db.close()
         if affected == 0:
-            print_error(f"No running loop found: {loop_id}")
-            return 1
+            return _emit_error(args, f"No running loop found: {loop_id}")
         print(f"abort requested: {loop_id}")
+        return 0
+
+    if sub in ("approve", "deny"):
+        loop_id = getattr(args, "loop_id", None)
+        db.close()
+        if not loop_id:
+            return _emit_error(args, "LOOP_ID required")
+        # Producer for the human-approval gate that loop_agent._request_approval
+        # polls: write the decision into loop-approvals/<id>.json next to the DB.
+        # The worker reads data["decision"] and treats "continue" as approve and
+        # "abort" as deny — match that exact contract (B021).
+        decision = "continue" if sub == "approve" else "abort"
+        approval_file = runtime_db_path(cfg).parent / "loop-approvals" / f"{loop_id}.json"
+        if not approval_file.exists():
+            return _emit_error(
+                args,
+                f"No pending approval request for loop '{loop_id}'. The loop must be "
+                "running with --approval human and waiting at a checkpoint.",
+            )
+        try:
+            data = json.loads(approval_file.read_text())
+        except (OSError, ValueError):
+            data = {"loop_id": loop_id}
+        data["decision"] = decision
+        approval_file.write_text(json.dumps(data))
+        if getattr(args, "json", False):
+            print(json.dumps({"loop_id": loop_id, "decision": decision}))
+        else:
+            verb = "approved (continue)" if sub == "approve" else "denied (abort)"
+            print(f"loop {loop_id} {verb}")
         return 0
 
     db.close()
@@ -318,23 +366,20 @@ def cmd_cron(args: argparse.Namespace) -> int:
         from tag.cron_scheduler import validate_cron_expression
         name = (getattr(args, "name", "") or "").strip()
         schedule = (getattr(args, "schedule", "") or "").strip()
-        profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        profile = getattr(args, "profile", None) or _master_profile(cfg)
         task = (getattr(args, "task", "") or "").strip()
         if not name or not schedule or not task:
             db.close()
-            print_error("--name, --schedule and TASK are required")
-            return 1
+            return _emit_error(args, "--name, --schedule and TASK are required")
         try:
             validate_cron_expression(schedule)
         except ValueError as exc:
             db.close()
-            print_error(str(exc))
-            return 1
+            return _emit_error(args, str(exc))
         existing = db.execute("SELECT id FROM cron_jobs WHERE name=?", (name,)).fetchone()
         if existing:
             db.close()
-            print_error(f"A cron job named '{name}' already exists (names must be unique)")
-            return 1
+            return _emit_error(args, f"A cron job named '{name}' already exists (names must be unique)")
         job_id = uuid.uuid4().hex[:8]
         now = utc_now()
         db.execute(
@@ -374,14 +419,12 @@ def cmd_cron(args: argparse.Namespace) -> int:
         job_id = getattr(args, "job_id", None)
         if not job_id:
             db.close()
-            print_error("JOB_ID required")
-            return 1
+            return _emit_error(args, "JOB_ID required")
         cur = db.execute("DELETE FROM cron_jobs WHERE id=?", (job_id,))
         db.commit()
         db.close()
         if cur.rowcount == 0:
-            print_error(f"Job '{job_id}' not found")
-            return 1
+            return _emit_error(args, f"Job '{job_id}' not found")
         print(f"removed: {job_id}")
         return 0
 
@@ -389,8 +432,7 @@ def cmd_cron(args: argparse.Namespace) -> int:
         job_id = getattr(args, "job_id", None)
         if not job_id:
             db.close()
-            print_error("JOB_ID required")
-            return 1
+            return _emit_error(args, "JOB_ID required")
         enabled = 1 if sub == "enable" else 0
         cur = db.execute(
             "UPDATE cron_jobs SET enabled=?, updated_at=? WHERE id=?",
@@ -399,8 +441,7 @@ def cmd_cron(args: argparse.Namespace) -> int:
         db.commit()
         db.close()
         if cur.rowcount == 0:
-            print_error(f"Job '{job_id}' not found")
-            return 1
+            return _emit_error(args, f"Job '{job_id}' not found")
         print(f"{sub}d: {job_id}")
         return 0
 
@@ -409,13 +450,11 @@ def cmd_cron(args: argparse.Namespace) -> int:
         job_id = getattr(args, "job_id", None)
         if not job_id:
             db.close()
-            print_error("JOB_ID required")
-            return 1
+            return _emit_error(args, "JOB_ID required")
         job = db.execute("SELECT * FROM cron_jobs WHERE id=?", (job_id,)).fetchone()
         if not job:
             db.close()
-            print_error(f"Job '{job_id}' not found")
-            return 1
+            return _emit_error(args, f"Job '{job_id}' not found")
         q_id = uuid.uuid4().hex[:8]
         now = utc_now()
         db.execute(
@@ -475,12 +514,17 @@ def cmd_workspace(args: argparse.Namespace) -> int:
     if sub == "index":
         if not root.is_dir():
             db.close()
-            print_error(f"Not a directory: {root}")
-            return 1
+            return _emit_error(args, f"Not a directory: {root}")
         max_files = getattr(args, "max_files", None)
         if max_files is None:
             max_files = 500
-        result = index_workspace(db, root, max_files=max_files)
+        try:
+            result = index_workspace(db, root, max_files=max_files)
+        except ValueError as exc:
+            # e.g. --max-files 0: close the connection on this error path too
+            # (previously the raise skipped db.close(), leaking the connection).
+            db.close()
+            return _emit_error(args, str(exc))
         db.close()
         if getattr(args, "json", False):
             print(json.dumps(result))
@@ -491,7 +535,9 @@ def cmd_workspace(args: argparse.Namespace) -> int:
         return 0
 
     if sub == "map":
-        budget = getattr(args, "budget", 4000) or 4000
+        budget = getattr(args, "budget", 4000)
+        if budget is None:
+            budget = 4000
         ws_map = build_workspace_map(db, root, budget_tokens=budget)
         db.close()
         if getattr(args, "json", False):
@@ -569,7 +615,13 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     loop_status_p.add_argument("--json", action="store_true")
     loop_abort = loop_sub.add_parser("abort", help="Abort a running loop")
     loop_abort.add_argument("loop_id", metavar="LOOP_ID")
-    for lp in [loop_cmd, loop_start, loop_list, loop_status_p, loop_abort]:
+    loop_approve = loop_sub.add_parser("approve", help="Approve a loop waiting for human approval (continue)")
+    loop_approve.add_argument("loop_id", metavar="LOOP_ID")
+    loop_approve.add_argument("--json", action="store_true")
+    loop_deny = loop_sub.add_parser("deny", help="Deny a loop waiting for human approval (abort)")
+    loop_deny.add_argument("loop_id", metavar="LOOP_ID")
+    loop_deny.add_argument("--json", action="store_true")
+    for lp in [loop_cmd, loop_start, loop_list, loop_status_p, loop_abort, loop_approve, loop_deny]:
         lp.set_defaults(func=cmd_loop)
 
     # ---- PRD-022: cron ----
