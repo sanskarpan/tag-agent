@@ -112,7 +112,10 @@ def cmd_costs(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(getattr(args, "config", None)))
     db_path = runtime_db_path(cfg)
     if not db_path.exists():
-        print("No runs database found.")
+        if getattr(args, "json", False):
+            print(json.dumps({"runs": [], "totals": {}}))
+        else:
+            print("No runs database found.")
         return 0
     conn = sqlite3.connect(str(db_path))
     try:
@@ -176,7 +179,10 @@ def cmd_trace(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(getattr(args, "config", None)))
     db_path = runtime_db_path(cfg)
     if not db_path.exists():
-        print("No spans database found.")
+        if getattr(args, "json", False):
+            print(json.dumps([]))
+        else:
+            print("No spans database found.")
         return 0
 
     conn = sqlite3.connect(str(db_path))
@@ -279,7 +285,10 @@ def cmd_trace_extended(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(getattr(args, "config", None)))
     db_path = runtime_db_path(cfg)
     if not db_path.exists():
-        print("No spans database found.")
+        if getattr(args, "json", False):
+            print(json.dumps([]))
+        else:
+            print("No spans database found.")
         return 0
 
     conn = sqlite3.connect(str(db_path))
