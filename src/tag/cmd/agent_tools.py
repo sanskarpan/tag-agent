@@ -44,7 +44,14 @@ def cmd_security(args: argparse.Namespace) -> int:
     sec_ensure(db)
     sub = getattr(args, "security_subcommand", None)
 
-    if sub == "scan" or sub is None:
+    if sub is None:
+        # Bare `tag security` must not silently recursively scan the current
+        # directory (slow / surprising, and a test hang). Print usage instead.
+        db.close()
+        print("Usage: tag security {scan,list}. Try `tag security scan .` or `tag security list`.")
+        return 1
+
+    if sub == "scan":
         path_str = getattr(args, "path", ".") or "."
         scan_path = Path(path_str).resolve()
         max_files = getattr(args, "max_files", 2000) or 2000

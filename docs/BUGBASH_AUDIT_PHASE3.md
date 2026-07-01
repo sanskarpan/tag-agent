@@ -1,0 +1,615 @@
+# TAG CLI — Full Bug-Bash Audit (Phase 3)
+
+Method: 14 domain auditors (read full modules + ran commands in isolated sandboxes) → adversarial verification of every finding → deduped synthesis. **149 confirmed bugs** (4 critical, 30 high, 42 medium, 73 low).
+
+Legend: ☐ open · ☑ fixed
+
+Kinds: consistency=16, crash=13, cross-platform=2, data-integrity=18, dead-code=10, doc-mismatch=6, exit-code=5, json-contract=7, resource-leak=8, security=14, validation=19, wrong-behavior=31
+
+## CRITICAL (4)
+
+- ☐ **B001** [crash] Custom source-path import flags (--aws-dir/--zed-config/--cursor-dir/--gh-config/--aider-home/--opencode-data-dir) crash with TypeError
+  - area: `import-* (generic dispatch)`
+  - root_cause: src/tag/cmd/import_.py:271-277 builds kwargs using argparse dest names (aws_dir/zed_config/...) but controller fns take source_-prefixed params (controller.py:1243 source_aws_dir=, :995 source_zed_config=, :925 source_data_dir=, etc.). Only supermemory/honcho happen to match.
+  - repro: tag import-aws --profile coder --aws-dir /tmp/awsalt -> 'error: import_aws_into_profile() got an unexpected keyword argument aws_dir', exit 1. Same for import-zed --zed-config, import-opencode --opencode-data-dir, etc.
+- ☐ **B002** [security] AppleScript/shell injection in desktop notifications (macOS local code execution)
+  - area: `tui_output.send_desktop_notification / notifications.py`
+  - root_cause: src/tag/tui_output.py:241 and mirrored src/tag/notifications.py:209 — f-string interpolates untrusted message/title into 'display notification "{message}" with title "{title}"' passed to osascript -e with no escaping; a double-quote breaks out and `do shell script` runs arbitrary shell.
+  - repro: send_desktop_notification('TAG', 'x" & (do shell script "touch /tmp/PWNED") & "') on Darwin creates the marker file; reachable from queue_worker.py:110-113,155-156 with job['task'] (webhook payloads).
+- ☐ **B003** [security] Webhook HMAC signature verified but never enforced — unauthenticated task injection
+  - area: `webhook_server.do_POST`
+  - root_cause: src/tag/webhook_server.py:318 computes `valid` but never gates do_POST; lines 326-364 parse payload, match rules, insert event, and enqueue unconditionally. No `if not valid: return 401/403`. Default host='0.0.0.0' (line 374).
+  - repro: Start WebhookServer(secret='mysecret'), POST /webhook/github with X-Hub-Signature-256: sha256=BADBAD -> HTTP 200 {rules_matched:1,signature_valid:false}; event stored and matched rules enqueue queue_worker tasks. Default bind is 0.0.0.0.
+- ☐ **B004** [crash] `tag webhook listen` crashes on startup — wrong constructor kwargs and nonexistent method
+  - area: `cmd_webhook_server (prd_clusters) vs webhook_server.WebhookServer`
+  - root_cause: src/tag/cmd/prd_clusters.py:425 calls WebhookServer(conn=..., host=..., port=..., cfg=...) but __init__ is (db_path, cfg, host, port, secret) (webhook_server.py:369-383); also prd_clusters.py:427 calls server.serve_forever() which does not exist (only start()/start_background()/stop()).
+  - repro: tag webhook listen -> 'error: WebhookServer.__init__() got an unexpected keyword argument conn'.
+
+## HIGH (30)
+
+- ☐ **B005** [data-integrity] Concurrent set-model on different profiles silently loses updates (read-modify-write race)
+  - area: `set-model / core.config.save_config`
+  - root_cause: src/tag/cmd/routing.py:164-181 does load_config -> mutate -> save_config with no lock spanning the read; the flock in src/tag/core/config.py:56-80 only serializes the write+os.replace, preventing torn files but not lost updates.
+  - repro: 12 parallel pairs of `tag set-model --profile researcher` / `--profile reviewer` -> ~12 of 24 updates LOST; config never corrupts but one write is dropped almost every iteration.
+- ☐ **B006** [crash] `mem2 extract` crashes with TypeError on every valid run (len() on an int)
+  - area: `cmd/memory.py cmd_mem_ext extract`
+  - root_cause: src/tag/cmd/memory.py:296-297 — auto_extract_post_run returns an int (memory_extractor.py:246 -> int save count) but line 297 does len(memories).
+  - repro: Insert a step row for run_id fakerun1 with output, then `tag mem2 extract fakerun1` -> 'error: object of type int has no len()', exit 1.
+- ☐ **B007** [wrong-behavior] `mem2 tier` core/recall tiers permanently empty; every memory stuck in archival
+  - area: `semantic_memory tier classification`
+  - root_cause: src/tag/semantic_memory.py:462 ADD COLUMN tier DEFAULT 'archival'; add_memory (77-110) and update_fact never set tier, and list_memories_by_tier (505-514) trusts the stored literal, so get_memory_tier confidence classification (466-485) is dead for the CLI.
+  - repro: tag mem add "always use tabs" --type convention; mem2 tier --tier core -> CORE (0); --tier archival lists it.
+- ☐ **B008** [wrong-behavior] Legacy `tag swarm <task>` unreachable and bare `tag swarm` crashes (subparser + positional conflict)
+  - area: `cmd/swarm.py register()/cmd_swarm`
+  - root_cause: src/tag/cmd/swarm.py:533-543 mixes add_subparsers(dest=swarm_subcommand) with a shadowed positional `task`; argparse consumes the first token as a subcommand. cmd_swarm (line 141) assumes args.task is str and never guards None.
+  - repro: tag swarm "build me a website" -> rc=2 'invalid choice'. tag swarm (bare) -> rc=1 'NoneType object has no attribute replace'.
+- ☐ **B009** [crash] Swarm sub-agent entrypoint imports nonexistent `_load_cfg`; every sub-agent fails to locate the runtime binary
+  - area: `swarm_agent_entry.py + swarm.SwarmRunner._build_agent_env`
+  - root_cause: src/tag/swarm_agent_entry.py:83 does `from tag.controller import hermes_bin, _load_cfg` but _load_cfg never existed, so the whole import fails and hermes_bin is unbound; fallback reads TAG_HERMES_BIN which swarm.py:585-588 never sets (nor TAG_SWARM_PROFILE/TAG_SWARM_TIMEOUT).
+  - repro: python -c 'from tag.controller import _load_cfg' -> ImportError; running swarm_agent_entry with SwarmRunner's env -> {status:failure,'Cannot locate TAG runtime binary'} rc=1.
+- ☐ **B010** [exit-code] cache stats exits 1 by default whenever any cache hit rate is below 50%
+  - area: `cmd/observability.py _cmd_cache_stats`
+  - root_cause: src/tag/cmd/observability.py:891 --warn-threshold default=0.5 is always active; lines 531-534 (json) and 543-555 (table) do `return 1 if warned else 0`, turning a data condition into a failure exit.
+  - repro: Seed run prompt_tokens=1000, cache_read_tokens=100 (10%); tag cache stats (and --json) -> exit 1.
+- ☐ **B011** [crash] `prompt list` (default non-JSON) crashes: dicts treated as objects
+  - area: `prompt (cmd/prd_clusters.py)`
+  - root_cause: src/tag/cmd/prd_clusters.py:345-346 iterates list_prompts() as objects (p.name/p.version) but prompt_hub.list_prompts (prompt_hub.py:260-294) returns dicts with keys name/latest_version/versions_count.
+  - repro: tag prompt save greet ./p.txt; tag prompt list -> 'error: dict object has no attribute name', exit 1; --json works.
+- ☐ **B012** [crash] `alert check` (default non-JSON) crashes whenever an alert fires; firing already committed
+  - area: `alert (cmd/prd_clusters.py)`
+  - root_cause: src/tag/cmd/prd_clusters.py:239 references f.condition, but alerts.AlertFiring (alerts.py:57-68) has no condition field; check_alerts commits the INSERT (alerts.py:351) before the crash so the firing persists.
+  - repro: alert create r --metric eval_pass_rate --condition gte --threshold 0; alert check -> 'error: AlertFiring object has no attribute condition', exit 1; --json works.
+- ☐ **B013** [crash] `annotate next` crashes whenever a task exists; task silently claimed/lost
+  - area: `annotate (cmd/prd_clusters.py)`
+  - root_cause: src/tag/cmd/prd_clusters.py:284 uses t.task_type but AnnotationTask field is source_type (annotation_queue.py:44-58); dequeue() (213-225) sets IN_PROGRESS and commits before the handler prints.
+  - repro: Enqueue a task then tag annotate next -> 'error: AnnotationTask object has no attribute task_type', exit 1; DB shows status='in_progress'.
+- ☐ **B014** [data-integrity] import_from_eval_runs silently returns empty dataset (wrong columns, swallowed error)
+  - area: `eval-dataset (eval_datasets.py)`
+  - root_cause: src/tag/eval_datasets.py:159-167 joins eval_cases on c.run_id (actual eval_run_id), filters c.status='pass' (actual passed 0/1), selects c.metadata_json (no such column); every run raises OperationalError swallowed by bare `except Exception: pass` at 173-174.
+  - repro: After an eval run with a passing case, import_from_eval_runs(conn,'x') returns case_count=0.
+- ☐ **B015** [wrong-behavior] Entropy-based secret detection is mathematically dead — threshold 4.5 unreachable for 20-char window
+  - area: `security.py scan`
+  - root_cause: src/tag/security.py:61-66 — window=20 with threshold=4.5, but max entropy of a length-20 string is log2(20)=4.3219 < 4.5, so `entropy > threshold` is unsatisfiable.
+  - repro: _shannon_entropy('abcdefghijklmnopqrst')==4.3219 (<4.5); _high_entropy_windows on base64 of urandom(5000) returns 0 windows.
+- ☐ **B016** [security] 'restricted' sandbox backend provides no isolation on macOS/non-Linux (FS + network open)
+  - area: `sandbox.py / tag sandbox run`
+  - root_cause: src/tag/sandbox.py:60-68 applies RLIMIT_CPU/RLIMIT_AS only under `if sys.platform.startswith('linux')`; no chroot/namespace/seccomp, cwd is caller's, no network block.
+  - repro: tag sandbox run "cat /etc/passwd" -> prints host passwd, exit 0; socket.create_connection(('1.1.1.1',53)) succeeds.
+- ☐ **B017** [security] verify_signature returns True for empty secret and CLI never wires a secret
+  - area: `webhook_server.verify_signature / cmd_webhook_server`
+  - root_cause: src/tag/webhook_server.py:92-93 `if not secret: return True`; prd_clusters.py:425 and parser (882-894) never supply/accept a secret, so _secret is always None.
+  - repro: verify_signature('github', b'{}', 'sha256=deadbeef', '') -> True; cmd_webhook_server (prd_clusters.py:425) builds WebhookServer with no secret= and no --secret flag.
+- ☐ **B018** [wrong-behavior] Cron day-of-week is off by one — jobs fire on the wrong day; Sunday-as-7 never fires
+  - area: `cron_scheduler.cron_matches`
+  - root_cause: src/tag/cron_scheduler.py:57 passes Python dt.weekday() (0=Mon..6=Sun) straight to the cron dow field (0/7=Sun,1=Mon) with no shift; dow=7 is unmatchable.
+  - repro: cron_matches('* * * * 0', Sunday)=False, ('* * * * 0', Monday)=True, ('* * * * 7', Sunday)=False; so `0 9 * * 1-5` fires Tue-Sat.
+- ☐ **B019** [wrong-behavior] Cron aliases (@daily, @hourly, ...) validate but never fire
+  - area: `cron_scheduler validate_cron_expression vs cron_matches`
+  - root_cause: src/tag/cron_scheduler.py:67-71 accepts 8 aliases while cron_matches:48-50 hard-requires 5 fields; daemon swallows the ValueError at 178-179.
+  - repro: validate_cron_expression('@daily') passes (add succeeds) but cron_matches('@daily', now) raises ValueError('need 5 fields'); run_daemon catches and continues, so the job never runs.
+- ☐ **B020** [wrong-behavior] `tag loop abort` does not stop the running worker (status clobbered)
+  - area: `loop_agent.main vs cmd_loop abort`
+  - root_cause: src/tag/loop_agent.py:201-241 — only reads status once at startup (line 180); line 202 sets status back to 'running' each iteration, and terminal statuses (221/226/239) overwrite 'aborted'; no per-iteration abort check.
+  - repro: loop abort sets loop_runs.status='aborted' (ci_loop.py:289-294) but the worker keeps running and overwrites it.
+- ☐ **B021** [wrong-behavior] Loop `--approval human` is non-functional — always times out and aborts
+  - area: `loop_agent._request_approval`
+  - root_cause: src/tag/loop_agent.py:147-167 writes the approval file but there is no producer for the decision and no companion loop approve/deny command (ci_loop.py:554-573 loop has only start/list/status/abort).
+  - repro: Human mode writes loop-approvals/<id>.json decision='pending' and polls 5 min; no command anywhere writes the decision, so it always times out and aborts after iteration 1.
+- ☐ **B022** [crash] `tag agentic-ci test-gen` crashes — generate_tests called with unknown kwarg `out`
+  - area: `cmd_ci_ext test-gen (prd_clusters) vs ci.generate_tests`
+  - root_cause: src/tag/cmd/prd_clusters.py:472 passes out= while ci.py:490-497 defines the param as output_path.
+  - repro: tag agentic-ci test-gen --diff '...' -> 'error: generate_tests() got an unexpected keyword argument out'.
+- ☐ **B023** [security] SWEHarness path sandbox escapable via sibling-directory prefix
+  - area: `swe_harness.SWEHarness._is_safe_path`
+  - root_cause: src/tag/swe_harness.py:76-83 uses `str(resolved).startswith(str(self.working_dir))` instead of Path.is_relative_to; sibling dirs sharing a string prefix pass.
+  - repro: working_dir=/tmp/work; _is_safe_path(Path('/tmp/work-evil/secret')) -> True.
+- ☐ **B024** [security] marketplace pull --name allows path traversal / absolute path -> arbitrary file write
+  - area: `marketplace pull`
+  - root_cause: src/tag/cmd/marketplace.py:139,162-163 — name from --name is unvalidated then `local_path = profiles_dir / f"{name}.yaml"; write_bytes`, unlike cmd_template import which validates (workflow_mgmt.py:243).
+  - repro: tag marketplace pull file:///tmp/x.yaml --name ../PWNED -> writes runtime/home/PWNED.yaml (above profiles/); --name /tmp/ABSPWN -> writes /tmp/ABSPWN.yaml. Both exit 0.
+- ☐ **B025** [security] SSRF / local file disclosure: marketplace pull and template fetch accept file:// and any URL scheme
+  - area: `marketplace pull / template fetch`
+  - root_cause: src/tag/cmd/marketplace.py:142 (urlopen(url) # noqa S310) and src/tag/cmd/workflow_mgmt.py:276 (urlopen(url)) — no scheme/host allowlist before the request.
+  - repro: tag template fetch file:///tmp/secret.txt -> prints file contents; tag marketplace pull file:///tmp/prof.yaml -> reads/caches local file. http:// to 169.254.169.254 reachable.
+- ☐ **B026** [wrong-behavior] template import writes profile to wrong directory — imported profile invisible to the agent
+  - area: `template import`
+  - root_cause: src/tag/cmd/workflow_mgmt.py:249 — profile_dir = tag_home()/'profiles'/profile, but the runtime reads runtime_home/.hermes/profiles (paths.py:203,224).
+  - repro: template with name: myimport; tag template import /tmp/tmpl.yaml -> success, but runtime/home/.hermes/profiles lists only the bootstrapped profiles; files landed in taghome/profiles/myimport.
+- ☐ **B027** [wrong-behavior] mcp-registry enable/disable write to a phantom directory — no effect on the agent
+  - area: `mcp-registry enable/disable`
+  - root_cause: src/tag/cmd/workflow_mgmt.py:137,158 — reads/writes tag_home()/profiles/<profile>/lab-config.yaml which the runtime never loads.
+  - repro: tag mcp-registry enable mcp-sqlite --profile orchestrator -> success; writes taghome/profiles/orchestrator/lab-config.yaml, but runtime/home/.hermes/profiles/orchestrator/config.yaml is unmodified.
+- ☐ **B028** [wrong-behavior] context show/compress/trim always fail against the hermes CLI (unsupported args/subcommands)
+  - area: `context`
+  - root_cause: src/tag/cmd/workflow_mgmt.py:551-552 (sessions list --json), 583 (sessions compress), 600-601 (sessions trim --keep-last) call flags/subcommands hermes does not implement (sessions supports only list/export/delete/prune/optimize/stats/rename/browse; list has only --source/--limit).
+  - repro: tag context show -> 'unrecognized arguments: --json'; context compress/trim -> 'invalid choice', exit 1 each.
+- ☐ **B029** [exit-code] npm launcher reports exit 0 when the underlying tag process is killed by a signal
+  - area: `bin/tag.js`
+  - root_cause: bin/tag.js:144 — `process.exit(result.status || 0)`; status=null (signal death) coerced to 0, result.signal ignored (should be 128+signo).
+  - repro: Child killed by SIGTERM -> spawnSync returns {status:null,signal:'SIGTERM'}; `result.status || 0` = 0, so the launcher exits 0.
+- ☐ **B030** [dead-code] Broken phantom console scripts hermes/hermes-agent/hermes-acp installed into PATH (crash + branding leak)
+  - area: `pyproject.toml [project.scripts]`
+  - root_cause: pyproject.toml:261-263 — hermes/hermes-agent/hermes-acp point at modules absent from the repo; only `tag = tag.cli:main` (line 260) is valid.
+  - repro: venv/bin/hermes --help -> ModuleNotFoundError 'hermes_cli'; hermes-agent -> 'run_agent'; hermes-acp -> 'acp_adapter'; each exit 1. Created by pip install on every npm install (bin/tag.js:128).
+- ☐ **B031** [resource-leak] `tag web` dashboard permanently wedged by its own SSE stream (single-threaded HTTPServer)
+  - area: `api.py DashboardServer`
+  - root_cause: src/tag/api.py:294 uses plain http.server.HTTPServer (not ThreadingHTTPServer); _sse_loop (260-277) runs an unbounded blocking while True with sleep(2), monopolizing the single thread. Same pattern in marketplace.py:491,501.
+  - repro: With one SSE client held on /api/stream, /api/runs times out (curl RC=28); the dashboard HTML auto-opens EventSource so the first browser tab freezes the server.
+- ☐ **B032** [crash] print_warning passes unsupported stderr= kwarg to Rich Console.print — TypeError on every TTY warning
+  - area: `tui_output.print_warning`
+  - root_cause: src/tag/tui_output.py:172 — invalid/redundant stderr=True on Console.print (the console is already stderr-bound at line 51). Only the TTY branch hits it; non-TTY/NO_COLOR runs take the plain-text branch.
+  - repro: On a color TTY, print_warning runs console.print(..., stderr=True); Console(stderr=True).print('x', stderr=True) -> TypeError 'unexpected keyword argument stderr'.
+- ☐ **B033** [security] Imported secrets written to .env world-readable (mode 0644)
+  - area: `all import-* (via _upsert_env_line)`
+  - root_cause: src/tag/core/utils.py:69 _upsert_env_line — env_file.write_text(...) with no chmod(0o600); all import_*_into_profile helpers funnel secrets through it.
+  - repro: import-supermemory --api-key sk-...; ls -l <profile>/.env -> -rw-r--r-- containing the key in cleartext.
+- ☐ **B034** [exit-code] import-nous-portal --json returns exit 0 when nothing was imported (no-auth)
+  - area: `import-nous-portal`
+  - root_cause: src/tag/cmd/import_.py:612-614 — `if args.json: print(json.dumps(results)); return 0` runs before the any_ok/return-1 logic.
+  - repro: import-nous-portal --profile coder --json (no creds) -> [{status:skipped-no-auth}] exit 0; without --json the same case exits 1.
+
+## MEDIUM (42)
+
+- ☐ **B035** [data-integrity] Non-atomic write_yaml() causes torn reads of profile config.yaml under concurrency
+  - area: `core.utils.write_yaml (render/bootstrap)`
+  - root_cause: src/tag/core/utils.py:99-104 — write_yaml does path.open('w') truncate then yaml.safe_dump directly into target with no lock and no atomic os.replace, unlike config.py:47-80 save_config (flock+tempfile+os.replace). render_profiles (profile.py:296) calls it force=True on every render.
+  - repro: 8 writers write_yaml(target, ~24KB, force=True) + 8 readers yaml.safe_load(target) -> readers deterministically hit yaml.reader.ReaderError (truncated mid-write).
+- ☐ **B036** [validation] Null (or wrong-typed) top-level config sections crash with cryptic 'NoneType has no attribute get/items/keys'
+  - area: `global --config / env / render / doctor`
+  - root_cause: src/tag/core/paths.py:154-182 and profile.py:231, cmd/system.py:245,265 chain .get/.items/.keys on a present-but-null section (returns None, not the {} default); surfaced opaquely via controller.py:1698-1704. env_examples/skins are guarded (utils.py:272-293) but path/profile helpers are not.
+  - repro: printf 'runtime: null' -> env exit1 'NoneType object has no attribute get'; 'profiles: null' -> render/doctor 'NoneType items/keys'; 'runtime: astring' -> 'str object has no attribute get'.
+- ☐ **B037** [wrong-behavior] Empty-string runtime paths silently redirect HOME/CODEX_HOME/db to TAG_HOME root
+  - area: `env / runtime path resolution`
+  - root_cause: src/tag/core/paths.py:154-169 — cfg.get('runtime',{}).get('home_dir','runtime/home') returns '' when the key exists empty; resolve_home_relative('') (92-96) yields Path('.')==tag_home(). Empty strings never validated.
+  - repro: printf 'runtime:\n  home_dir: ""' -> HOME=<TAG_HOME>, HERMES_HOME=<TAG_HOME>/.hermes (expected <TAG_HOME>/runtime/home); codex_home:"" -> CODEX_HOME=<TAG_HOME>. Both exit 0.
+- ☐ **B038** [crash] benchmark with unknown --profile and no --model-ref crashes with an empty 'error:' message
+  - area: `benchmark`
+  - root_cause: src/tag/cmd/routing.py:435-442 — default model_refs uses next(row... if row['profile']==args.profile) with no default, so an unknown profile raises StopIteration (str is empty); cmd_benchmark never calls ensure_profile_exists.
+  - repro: tag benchmark --profile ghostprofile -> 'error: ' (empty), exit 1; TAG_DEBUG shows StopIteration at routing.py:437.
+- ☐ **B039** [wrong-behavior] route non-JSON output prints raw Python dicts instead of provider/model refs
+  - area: `route`
+  - root_cause: src/tag/cmd/routing.py:95-99 interpolates route[...]['model'] (dicts) directly instead of format_model_ref (imported at :27, used at :267).
+  - repro: tag route --task-type implementation -> "master: orchestrator -> {'provider':'openai-codex','default':'gpt-5.4',...}" (dict repr) for master/workers/verifier.
+- ☐ **B040** [exit-code] route-fallback resolve returns exit code 1 for a legitimate 'no fallback' answer
+  - area: `route-fallback resolve`
+  - root_cause: src/tag/cmd/workflow_mgmt.py:728-733 — the 'not row' branch returns 1 for both text and --json, conflating 'query error' with 'no fallback configured'.
+  - repro: route-fallback resolve --primary ZZZ --json -> valid JSON {fallback:null} but exit 1; a matching resolve exits 0; list on empty profile exits 0.
+- ☐ **B041** [wrong-behavior] `graph build` labels every entity entity_type='unknown' (wrong dict key)
+  - area: `graph build (cmd/prd_clusters.py)`
+  - root_cause: src/tag/cmd/prd_clusters.py:731 — add_entity(..., ent.get('type','unknown'), ...) reads key 'type' but extract_entities_from_memory (entity_graph.py:141-162) emits 'entity_type'.
+  - repro: mem add "Use Python and Docker with Redis at Acme Corp"; graph build; graph show --json -> every entity entity_type='unknown'.
+- ☐ **B042** [wrong-behavior] `graph build` never creates relations and never persists communities
+  - area: `graph build (cmd/prd_clusters.py)`
+  - root_cause: src/tag/cmd/prd_clusters.py:724-735 — loops only add_entity; never calls extract_and_store_from_memory (entity_graph.py:255-279) and discards detect_communities (line 733) instead of writing entity_communities.
+  - repro: graph build; graph show -> '5 entities, 0 relations, 5 communities'; relations table and entity_communities empty.
+- ☐ **B043** [wrong-behavior] `mem2 episode end` reports success and exits 0 for a nonexistent episode
+  - area: `cmd/memory.py episode end`
+  - root_cause: src/tag/cmd/memory.py:378-383 ignores end_episode's bool return (rowcount>0 at semantic_memory.py:911).
+  - repro: mem2 episode end --id NOPE -> 'Episode ended' exit 0; episode get --id NOPE -> error exit 1.
+- ☐ **B044** [data-integrity] `mem2 fact update` with whitespace content creates an empty-content memory
+  - area: `semantic_memory.update_fact`
+  - root_cause: src/tag/semantic_memory.py:697-708 — inserts new_content.strip() with no non-empty guard, unlike add_memory:88-90 which raises on empty; the temporal-versioning path bypasses add_memory.
+  - repro: fact update --id $ID --content '   ' -> success; mem list --json shows content ''.
+- ☐ **B045** [wrong-behavior] `dag run`/`queue-dep add` create jobs that never execute — false-success message
+  - area: `queue_dag / dag.py`
+  - root_cause: src/tag/dag.py:109 sets status='ready' with no dispatcher; launch_queue_worker is only called by queue add (queue_dag.py:81) and ci_loop.py:431; nothing consumes 'ready'/'pending' rows from add_job/run_dag; promote_ready_jobs only flips pending->ready.
+  - repro: dag save d --steps '[...]'; dag run d -> 'DAG d submitted: 2 jobs'; queue-dep list shows them stuck ready/pending forever.
+- ☐ **B046** [data-integrity] Job depending on a cancelled/timed-out job is stranded in 'pending' forever
+  - area: `dag.py promote_ready_jobs/all_deps_satisfied/has_failed_dep`
+  - root_cause: src/tag/dag.py:64,77 — status checks cover only 'done'/'failed'; cancelled/timed_out are neither promoted nor cascade-failed.
+  - repro: add A; add B depends_on=[A]; set A cancelled -> promote_ready_jobs()=[], B stays pending; same for timed_out; a 'failed' dep correctly cascade-fails B.
+- ☐ **B047** [wrong-behavior] `queue list --limit 0` shows all jobs; `--limit -1` shows none
+  - area: `cmd/queue_dag.py cmd_queue(list)`
+  - root_cause: src/tag/cmd/queue_dag.py:92-93 — `limit = getattr(args,'limit',50) or 50` turns 0 into 50; `limit+1=0` -> SQLite LIMIT 0 -> zero rows; no lower-bound validation.
+  - repro: With 5 jobs: queue list --limit 0 -> all 5; --limit -1 -> 'No jobs in queue.' rc=0.
+- ☐ **B048** [json-contract] swarm status/results/abort emit plain-text error when swarm not found despite --json/--format json
+  - area: `cmd/swarm.py status/results/abort`
+  - root_cause: src/tag/cmd/swarm.py:417-420,484-487,445-448 — early error returns don't branch on the json/format flag.
+  - repro: swarm status nope --json -> 'error: swarm nope not found' plain text rc=1; swarm list --json (empty) -> [] rc=0.
+- ☐ **B049** [data-integrity] SwarmRunner silently drops tasks whose depends_on references an unknown task_id
+  - area: `swarm.SwarmRunner.run / _validate_manifest`
+  - root_cause: src/tag/swarm.py:76-97 validate acyclicity but not referential integrity; run() (467-486) breaks out of the wave loop leaving orphans; n_total excludes t2 so final_status can be 'completed'.
+  - repro: Manifest task t2 depends_on=['does_not_exist'] -> _validate_manifest passes; run() -> status 'completed' with only t1; t2 left status='pending'.
+- ☐ **B050** [dead-code] cache trend advertises --json/--since/--buckets but ignores all three (hardcoded 30 days)
+  - area: `cmd/observability.py _cmd_cache_trend`
+  - root_cause: src/tag/cmd/observability.py:563 `days = int(getattr(args,'days',30) or 30)` reads a non-existent arg; register() (895-899) adds --since/--buckets/--json the handler never consults.
+  - repro: cache trend --json --since 7d --buckets 5 -> ASCII chart over 30 days, not JSON; all three flags no-op.
+- ☐ **B051** [validation] cache stats --since with non-numeric/unit-less value crashes with leaked Python internals
+  - area: `cmd/observability.py _parse_since`
+  - root_cause: src/tag/cmd/observability.py:62-67 — unit=since[-1]; n=int(since[:-1]) with no try/except or format validation.
+  - repro: cache stats --since abc -> 'invalid literal for int() with base 10: ab'; --since 7 -> 'invalid literal for int(): '' ', exit 1.
+- ☐ **B052** [json-contract] trace show / agentops show / compare show ignore --json and emit plain text on not-found
+  - area: `cmd/observability.py + cmd/workflow_mgmt.py`
+  - root_cause: src/tag/cmd/observability.py:215-217 (trace show) and 822-824 (agentops show); src/tag/cmd/workflow_mgmt.py:448-451 (compare show) — plain-text return precedes the getattr(args,'json') check.
+  - repro: trace show DOESNOTEXIST --json -> 'No spans found...' rc=1 (missing-DB path returns [] rc=0); agentops show nope --json -> plain error; compare show NOPE --json -> plain error.
+- ☐ **B053** [wrong-behavior] OTel gen_ai.system is 'unknown' for provider-namespaced model IDs used throughout TAG
+  - area: `otel_semconv.detect_provider`
+  - root_cause: src/tag/otel_semconv.py:51-57 — startswith(prefix) against bare prefixes never accounts for a 'provider/' namespace; _COST_TABLE uses namespaced ids exclusively.
+  - repro: detect_provider('anthropic/claude-sonnet-4-6')='unknown', ('openai/gpt-4o')='unknown', ('gpt-4o')='openai'.
+- ☐ **B054** [json-contract] pricing --json (no subcommand) errors with exit 2 while bare `pricing` lists successfully
+  - area: `cmd/prd_clusters.py pricing`
+  - root_cause: src/tag/cmd/prd_clusters.py:748 — --json added only to pr_list, not pricing_cmd, yet cmd_pricing (line 48) aliases sub=None to list.
+  - repro: pricing -> table exit 0; pricing --json -> 'unrecognized arguments: --json' exit 2; pricing list --json -> valid JSON.
+- ☐ **B055** [data-integrity] tracing.save_spans_to_db/Tracer crash against the real spans table (schema drift); migrate_spans_table never called
+  - area: `tracing.py vs core/db.py`
+  - root_cause: src/tag/tracing.py:238-245 _INSERT_SPAN inserts 16 cols vs the 14-col runtime spans table (core/db.py:131-146); migrate_spans_table (tracing.py:298) has zero callers, as do save_spans_to_db/open_span/close_span/Tracer.
+  - repro: save_spans_to_db(runtime_db, [Span(...)]) -> OperationalError: table spans has no column named kind.
+- ☐ **B056** [data-integrity] Installing a persona with a builtin's name permanently shadows the builtin with no restore/delete
+  - area: `persona.py install|remove`
+  - root_cause: src/tag/persona.py:152-168 unconditional ON CONFLICT(name) upsert overwrites builtins; _seed_builtins uses INSERT OR IGNORE so it never re-seeds; agent_tools.py:171-180 maps 'remove' to remove_active_persona (deactivate only); remove_persona (row delete) is never wired.
+  - repro: Install YAML name terse-engineer with EVIL OVERRIDE; persona show terse-engineer -> Source: user, EVIL content. No CLI path deletes the shadow row.
+- ☐ **B057** [validation] split plan --spec-json with a non-dict item leaks raw internal error and orphans a DB run
+  - area: `split_agent.py / tag split plan`
+  - root_cause: src/tag/split_agent.py:50-59 from_dict calls d.get/d['file'] with no type check; agent_tools.py:588 catches only (JSONDecodeError, KeyError); create_split_run (agent_tools.py:580) runs before validation.
+  - repro: split plan 'x' --spec-json '{"items":[123]}' -> 'error: int object has no attribute get' rc=1; split list shows an orphan pending run.
+- ☐ **B058** [doc-mismatch] `annotate export --format csv` advertised as valid but always errors
+  - area: `annotate export`
+  - root_cause: src/tag/cmd/prd_clusters.py:839 declares choices ['jsonl','csv'] but annotation_queue.export_labeled (annotation_queue.py:372-373) raises for anything except jsonl.
+  - repro: annotate export --format csv -> 'Unsupported export format: csv. Only jsonl is supported.' exit 1.
+- ☐ **B059** [wrong-behavior] `prompt diff` output is mangled into a single unreadable line
+  - area: `prompt`
+  - root_cause: src/tag/prompt_hub.py:324-331 — difflib.unified_diff with lineterm='' then ''.join(diff); single-line prompts collapse to one line. Should join with '\n'.
+  - repro: prompt diff greet 1 2 -> '--- greet v1+++ greet v2@@ -1 +1 @@-Hello {{name}}+v2 content' (all glued).
+- ☐ **B060** [data-integrity] export_to_yaml produces invalid/corrupt YAML for special characters
+  - area: `eval-dataset`
+  - root_cause: src/tag/eval_datasets.py:195-207 hand-builds strings ('description: {ds.description}' unquoted, 'input: "{inp}"' escaping only double-quotes); should use yaml.safe_dump.
+  - repro: description with ':' -> ScannerError on reparse; backslash/newline corrupts content; empty dataset -> 'cases:' (null), rejected by load_suite.
+- ☐ **B061** [validation] score_case crashes on malformed suite field types
+  - area: `eval`
+  - root_cause: src/tag/eval_framework.py:93 (keyword.lower()) and :118/:127 (len>=min_len) assume str/int; load_suite (65-78) only checks cases is a non-empty list, never per-field types. Reachable via eval / eval-ci run.
+  - repro: score_case({'expect_contains':[123]}, 'x 123') -> AttributeError 'int has no lower'; {'min_length':'10'} -> TypeError '>=' int vs str.
+- ☐ **B062** [data-integrity] py-modules lists 14 deleted top-level modules; wheel ships a false top_level.txt
+  - area: `pyproject.toml [tool.setuptools] py-modules`
+  - root_cause: pyproject.toml:266 — py-modules still targets the pre-refactor flat layout; setuptools only warns and bakes a bogus top_level.txt (incl. generic 'cli'/'utils' that could shadow in a shared env).
+  - repro: python -m build --wheel warns 'file <mod>.py not found' for all 14 (run_agent, cli, utils, hermes_*, ...); wheel top_level.txt lists all 14 phantom modules plus tag.
+- ☐ **B063** [data-integrity] Runtime venv provisioning has no lock — concurrent first-run tag invocations corrupt the shared venv
+  - area: `bin/tag.js ensureRuntime`
+  - root_cause: bin/tag.js:122-129 — venv creation/pip install run unguarded; the guard is a plain existsSync+stamp check (107-131) with no mutex or temp-dir-then-rename.
+  - repro: On a cold cache, two concurrent `tag <cmd>` both run python -m venv + pip install into the same RUNTIME_HOME/venv with no lock or atomic swap.
+- ☐ **B064** [consistency] Branding leak: standalone lowercase 'hermes' in prose is not rewritten
+  - area: `core.utils.rewrite_cli_hints`
+  - root_cause: src/tag/core/utils.py:209 — the final sweep `re.sub(r'(?<![/.])\bHermes\b(?![-/.])','TAG',...)` is case-sensitive; a bare lowercase 'hermes' not followed by a known subcommand and not in back-ticks matches no rule.
+  - repro: rewrite_cli_hints('Run hermes to start.') -> 'Run hermes to start.'; 'hermes is great' -> 'hermes is great' (both leak).
+- ☐ **B065** [data-integrity] read_dotenv is a naive parser: keeps surrounding quotes, drops 'export KEY=', keeps inline comments
+  - area: `core.utils.read_dotenv`
+  - root_cause: src/tag/core/utils.py:34-37 — only line.startswith('#') and value.strip(); no dequoting, no export-prefix stripping, no inline-comment handling.
+  - repro: GEMINI_API_KEY="abc" -> value '"abc"'; export OPENAI_API_KEY=abc -> key 'export OPENAI_API_KEY'; ANTHROPIC_API_KEY=plain # note -> value 'plain # note'.
+- ☐ **B066** [crash] DevUI HTTP endpoints crash (uncaught ValueError) on non-integer `limit`, returning an empty reply
+  - area: `devui.py do_GET`
+  - root_cause: src/tag/devui.py:441 (and 458,467,476,493) — limit=int(qp('limit','50')) with no try/except; negatives pass through (SQLite treats LIMIT -1 as unbounded).
+  - repro: curl 'http://127.0.0.1:PORT/api/spans?limit=abc' -> curl RC=52, server log ValueError at devui.py:441; ?limit=-1 returns unbounded rows.
+- ☐ **B067** [security] DevUI and Web dashboards send Access-Control-Allow-Origin: * on local data endpoints
+  - area: `devui.py / api.py JSON handlers`
+  - root_cause: src/tag/devui.py:391 and src/tag/api.py:255 (JSON) + 264 (SSE) unconditionally set wildcard CORS, letting any visited web page fetch() localhost endpoints and read spans/costs/memories/DB path.
+  - repro: curl -i http://127.0.0.1:PORT/api/stats -> Access-Control-Allow-Origin: *.
+- ☐ **B068** [data-integrity] LSP sessions are never marked stopped — `tag lsp status` reports dead processes as running forever
+  - area: `lsp_server / cmd_lsp`
+  - root_cause: src/tag/lsp_server.py:199-205 (run_stdio) and 230-236 (run_tcp) INSERT status='running' but no exit path/finally ever UPDATEs status/stopped_at; get_lsp_status (257-268) trusts the stored value.
+  - repro: lsp start --stdio </dev/null (twice); lsp status --json -> both sessions status='running' with dead PIDs.
+- ☐ **B069** [json-contract] hooks list --json emits non-JSON when no hooks are configured
+  - area: `hooks list`
+  - root_cause: src/tag/cmd/workflow_mgmt.py:357-360 — `if not hooks_cfg: print(...); return 0` precedes the `if args.json` check at 361.
+  - repro: hooks list --json (fresh config) -> 'No hooks configured.'; json.load raises JSONDecodeError.
+- ☐ **B070** [wrong-behavior] template export always produces empty env/config for bootstrapped profiles
+  - area: `template export`
+  - root_cause: src/tag/cmd/workflow_mgmt.py:197-199 — profile_dir = tag_home()/'profiles'/profile (wrong base); the real config lives under runtime_home/.hermes/profiles.
+  - repro: template export --profile coder -> env: {}, config: {} despite a rendered config at runtime/home/.hermes/profiles/coder/config.yaml.
+- ☐ **B071** [json-contract] --json requested but error/skip paths emit plain text across all import commands
+  - area: `all import-* commands`
+  - root_cause: src/tag/cmd/import_.py — unknown-profile/status checks raise SystemExit(text) before the json branch: 262-264/281-284 (generic) plus per-command variants (56-58,124-130,165-172,236-242).
+  - repro: import-aws --profile nope --json -> plain 'Unknown profile' exit 1; import-mistral --profile coder --json (no creds) -> plain 'No Mistral credentials found' exit 1.
+- ☐ **B072** [wrong-behavior] Zed import parses settings.json as strict JSON; real Zed config is JSONC -> silent no-op
+  - area: `import-zed`
+  - root_cause: src/tag/controller.py:976 _detect_zed_credentials uses stdlib json.loads on a JSONC file, catches JSONDecodeError -> {} (no comment stripping).
+  - repro: ~/.config/zed/settings.json with a // comment + api_key -> import-zed 'No API keys found' exit 1; removing the comment imports successfully.
+- ☐ **B073** [wrong-behavior] Webhook event pattern matching is over-broad (unanchored prefix; empty pattern matches all)
+  - area: `webhook_server._event_matches`
+  - root_cause: src/tag/webhook_server.py:237-239 — `fnmatch(...) or event_type.startswith(pattern.rstrip('*'))`; the startswith fallback is unanchored and empty pattern makes startswith('') always True.
+  - repro: _event_matches('issue','issues.opened')=True; _event_matches('','whatever.event')=True; _event_matches('pull','pull_request.opened')=True.
+- ☐ **B074** [wrong-behavior] cron_matches ANDs day-of-month and day-of-week (POSIX specifies OR when both restricted)
+  - area: `cron_scheduler.cron_matches`
+  - root_cause: src/tag/cron_scheduler.py:52-58 — unconditional `and` across all five fields including dom and dow.
+  - repro: cron_matches('0 0 1 * 1', 2026-07-01 00:00)=False even though it is the 1st (dom matches).
+- ☐ **B075** [security] parse_sarif mangles file:// URIs and preserves ../ traversal; fix_sarif_vulns writes to the raw path
+  - area: `ci.parse_sarif / ci.fix_sarif_vulns`
+  - root_cause: src/tag/ci.py:878-882 strips 'file:///' with path[8:] (drops leading slash, no normalization); fix_sarif_vulns writes to the unvalidated path at ci.py:1042.
+  - repro: parse_sarif('file:///etc/passwd') -> 'etc/passwd'; '../../../../etc/cron.d/evil' and '/absolute/evil' kept verbatim; fix_sarif_vulns then write_text to any such existing path.
+- ☐ **B076** [consistency] Configured default master_profile is ignored — several commands always fall back to 'orchestrator'
+  - area: `template / mcp-registry / context / compare`
+  - root_cause: src/tag/cmd/workflow_mgmt.py:135,157,196,479,547 read cfg.get('master_profile','orchestrator') while eval (marketplace.py:266) and route-fallback (workflow_mgmt.py:640) correctly use cfg['defaults']['master_profile'].
+  - repro: cfg.get('master_profile') is None (real key is cfg['defaults']['master_profile']); handlers use cfg.get('master_profile','orchestrator') so a user-set default is ignored.
+
+## LOW (73)
+
+- ☐ **B077** [validation] load_config leaks raw OSError (e.g. 'Is a directory') instead of a clean config error
+  - area: `global --config`
+  - root_cause: src/tag/core/config.py:34-44 — load_config only catches FileNotFoundError and yaml.YAMLError; IsADirectoryError/PermissionError propagate to controller.py:1698-1704.
+  - repro: mkdir adir; tag --config adir env -> 'error: [Errno 21] Is a directory: .../adir'; missing -> 'Config file not found'; bad YAML -> 'Config at ... is not valid YAML'.
+- ☐ **B078** [wrong-behavior] doctor --profile <undefined> reports 'missing — run tag bootstrap' for a profile not in config
+  - area: `doctor`
+  - root_cause: src/tag/cmd/system.py:263-268 (and JSON 243-248) build profiles_to_check=[target_profile] without validating against cfg['profiles']; ensure_profile_exists (profile.py:505-509) has the correct 'Unknown profile' pattern that is not used.
+  - repro: tag doctor --profile ghost -> status fail 'home ✗ missing — run tag bootstrap'; 'ghost' is not in cfg['profiles'] so bootstrap can never create it.
+- ☐ **B079** [wrong-behavior] render/bootstrap on a profile-less config exit 0 silently with no output or warning
+  - area: `render / bootstrap`
+  - root_cause: src/tag/core/profile.py:228-231 render_profiles returns [] for empty cfg.get('profiles',{}); cmd_render (system.py:300-311) prints nothing with no guard.
+  - repro: printf '' > empty.yaml; tag --config empty.yaml render -> exit 0, 0 bytes.
+- ☐ **B080** [data-integrity] _upsert_env_line un-comments commented lines and rewrites all matches, producing duplicate keys
+  - area: `core.utils._upsert_env_line (credential import)`
+  - root_cause: src/tag/core/utils.py:60-68 (mirrored profile.py:94) — match `stripped.startswith(prefix) or stripped.lstrip('# ').startswith(prefix)` treats commented lines as replaceable and the `replaced` flag never short-circuits. Reachable from all credential import paths.
+  - repro: '# OPENAI_API_KEY=old' upsert -> 'OPENAI_API_KEY=new' (re-activated in place); '# KEY=placeholder' + 'KEY=old' upsert -> two identical 'KEY=new' lines.
+- ☐ **B081** [dead-code] Dead/always-true guard in _estimate_cost (hasattr(str,'removeprefix'))
+  - area: `controller._estimate_cost`
+  - root_cause: src/tag/controller.py:1553-1555 — vestigial 3.8-compat guard; the manual-slice else branch can never execute.
+  - repro: Static: str.removeprefix exists since 3.9 and MIN_PYTHON=(3,11) (paths.py:14), so the ternary else is unreachable.
+- ☐ **B082** [data-integrity] route-fallback allows cycles (A->B and B->A) with no detection
+  - area: `route-fallback add`
+  - root_cause: src/tag/cmd/workflow_mgmt.py:642-674 validates only primary!=fallback and condition membership; never walks existing rows to detect a cycle before INSERT. resolve is single-hop (LIMIT 1) so runtime-loop impact is theoretical.
+  - repro: route-fallback add --primary A --fallback B; then --primary B --fallback A -> both exit 0, forming a cycle.
+- ☐ **B083** [validation] route-fallback add allows unlimited duplicate chains, unvalidated model-refs, and negative priority
+  - area: `route-fallback add`
+  - root_cause: src/tag/cmd/workflow_mgmt.py:659-666 unconditionally INSERTs a fresh uuid with no uniqueness check and no parse_model_ref; --priority is type=int (parser :842) with no lower bound. set-model (routing.py:167) validates via parse_model_ref.
+  - repro: route-fallback add --primary A --fallback B twice -> two identical rows; --priority -5 stored; bare tokens (no provider/model slash) accepted.
+- ☐ **B084** [wrong-behavior] route --worker-model-override for a non-worker profile is silently ignored
+  - area: `route / apply_route_model_overrides`
+  - root_cause: src/tag/core/profile.py:537-541 — the override loop iterates route['workers'] and skips overrides whose worker name is absent; unmatched keys never reported.
+  - repro: route --task-type implementation --worker-model-override ghostworker=openai/gpt-4 -> exit 0, unchanged, no warning.
+- ☐ **B085** [validation] route accepts duplicate --worker-profile without dedup
+  - area: `route / resolve_route`
+  - root_cause: src/tag/core/profile.py:359-370 — the workers list is iterated as-is with no de-duplication; in submit --execution direct this spawns the same worker twice and double-inserts DB steps.
+  - repro: route --task-type implementation --worker-profile coder --worker-profile coder --json -> workers contains 'coder' twice.
+- ☐ **B086** [validation] set-model --openai-runtime silently ignored when --target delegation
+  - area: `set-model`
+  - root_cause: src/tag/cmd/routing.py:170-179 — args.openai_runtime is consulted only inside the target=='primary' branch (174); the delegation branch (176-179) ignores it.
+  - repro: set-model --profile coder --ref openai/x --target delegation --openai-runtime codex_app_server --json -> exit 0, no runtime in JSON.
+- ☐ **B087** [validation] `x or default` clobbers explicit 0 on numeric flags (--limit/--max-files/--context-lines/--budget/--top-k/--since)
+  - area: `cmd/agent_tools.py, observability.py, queue_dag.py, memory.py, ci_loop.py`
+  - root_cause: Pervasive `getattr(args,X,default) or default` idiom: agent_tools.py:50,233-234,654; observability.py:805,463; queue_dag.py:92; memory.py:181,197; ci_loop.py:494 (and swarm.py:296, marketplace.py:396 in their combined findings).
+  - repro: security scan <dir> --max-files 0 --json -> scans anyway and reports a finding; mem list --limit 0 -> all rows; cache stats --since '' -> treated as 7d; workspace map --budget 0 -> 4000.
+- ☐ **B088** [wrong-behavior] `mem list --limit -1` drops the last row (negative-limit off-by-one)
+  - area: `semantic_memory.list_memories`
+  - root_cause: src/tag/semantic_memory.py:209 (LIMIT bound to limit*3=-3 -> unlimited) and :229 (results[:limit]=results[:-1] drops the last element); no negative-limit validation.
+  - repro: With 5 memories: --limit 100 -> 5, --limit -1 -> 4 (last row dropped).
+- ☐ **B089** [validation] `mem2 fact list-at` accepts an unvalidated/malformed timestamp and returns everything
+  - area: `semantic_memory.list_facts_at`
+  - root_cause: src/tag/semantic_memory.py:789-797 — lexical `COALESCE(valid_at,created_at) <= ?` with no format validation; 'not-a-date' sorts after any ISO timestamp; cmd path memory.py:347-353 also does not validate.
+  - repro: mem2 fact list-at --at not-a-date -> returns all live memories, exit 0.
+- ☐ **B090** [crash] `mem2`/`graph` crash with 'unable to open database file' if run before runtime dirs exist
+  - area: `cmd/memory.py cmd_mem_ext & cmd/prd_clusters.py cmd_entity_graph`
+  - root_cause: src/tag/cmd/memory.py:256-257 and prd_clusters.py:707-708 call raw sqlite3.connect(db_path) without ensure_runtime_dirs, unlike cmd_memory_semantic (memory.py:129) and cmd_memory_journal (68).
+  - repro: Fresh TAG_HOME, no bootstrap: tag mem2 gc / tag graph show -> 'error: unable to open database file' exit 1; tag mem list works and creates runtime/.
+- ☐ **B091** [wrong-behavior] `mem2 store rebuild` prints 'Embeddings rebuilt' (exit 0) even when nothing was embedded
+  - area: `cmd/memory.py store rebuild`
+  - root_cause: src/tag/cmd/memory.py:445-447 ignores rebuild_embeddings return (semantic_memory.py:1155-1182 returns 0 on the first None from embed_text).
+  - repro: Without sentence-transformers: mem2 store rebuild -> 'Embeddings rebuilt' exit 0; store store -> 'Embedding backend unavailable' exit 1.
+- ☐ **B092** [doc-mismatch] `graph query --depth` flag is advertised but silently ignored
+  - area: `cmd/prd_clusters.py graph query`
+  - root_cause: src/tag/cmd/prd_clusters.py:958 defines --depth (default 2); handler (718-723) calls query_graph and never reads args.depth; get_entity_neighbors (supports max_depth) is imported but unused.
+  - repro: graph query Redis --depth 5 -> same single-level result as default, exit 0.
+- ☐ **B093** [consistency] Inconsistent no-subcommand behavior across mem/mem2/graph
+  - area: `cmd/memory.py & cmd/prd_clusters.py`
+  - root_cause: src/tag/cmd/memory.py:236 (falls through return 0), :453 (error exit 1), prd_clusters.py:710 (sub is None treated as implicit 'show').
+  - repro: tag mem -> nothing exit 0; tag mem2 -> 'Unknown mem subcommand: None' exit 1; tag graph -> summary exit 0.
+- ☐ **B094** [validation] `mem2 fact update --content ''` gives misleading 'required' error
+  - area: `cmd/memory.py fact update`
+  - root_cause: src/tag/cmd/memory.py:339 — `if not args.fact_id or not args.content` treats '' as absent; inconsistent with whitespace content (B044) which is accepted.
+  - repro: fact update --id <id> --content '' -> 'error: --id and --content required' exit 1, even though --content was supplied.
+- ☐ **B095** [consistency] `queue-dep add` (add_job) does not strip null bytes, unlike `queue add` and kanban
+  - area: `dag.add_job vs queue_dag cmd_queue(add) vs kanban._clean_text`
+  - root_cause: src/tag/dag.py:132-153 — add_job omits the .replace('\x00','') sanitization applied elsewhere.
+  - repro: add_job(db,'a\x00b') stores 'a\x00b' verbatim; queue add strips \x00 (queue_dag.py:65) and kanban._clean_text strips it.
+- ☐ **B096** [resource-leak] queue_worker: uncaught traceback when queue_jobs table missing; DB connection leaked on job-not-found
+  - area: `queue_worker.py main/_open_db`
+  - root_cause: src/tag/queue_worker.py:27-32 (no ensure_schema) and 130-132 (early return leaks conn).
+  - repro: python -m tag.queue_worker --job-id ghost --db /tmp/fresh.db -> OperationalError 'no such table: queue_jobs' (uncaught); with a valid db but unknown id, returns 1 without conn.close().
+- ☐ **B097** [consistency] queue vs DAG subsystems share queue_jobs but use divergent status vocabularies (filters, icons, missing --json)
+  - area: `cmd/queue_dag.py / dag.py show_dag`
+  - root_cause: src/tag/cmd/queue_dag.py:324 (status choices queued/running/done/failed/cancelled), 328-329 (result no --json); dag.py:199-202 (_STATUS_ICON missing 'queued'). DAG uses pending/ready/done/failed.
+  - repro: queue list --status pending -> 'invalid choice' rc=2; dag show of a 'queued' job renders '?'; queue result --json -> 'unrecognized arguments: --json'.
+- ☐ **B098** [validation] `dag save` accepts empty name and never validates step structure (deferred to run)
+  - area: `cmd/queue_dag.py cmd_dag(save) / dag.save_dag`
+  - root_cause: src/tag/dag.py:251-261 save_dag performs no name/step validation; cmd_dag save (queue_dag.py:191-204) doesn't either.
+  - repro: dag save "" --steps '[]' -> 'DAG saved:  (id)'; dag save objdag --steps '{"a":1}' -> saved, listed as '1 steps'; only dag run errors 'malformed steps'.
+- ☐ **B099** [doc-mismatch] swarm run --dry-run invokes the coordinator before the dry-run check; --max-agents 0->4; dead post-min guard
+  - area: `cmd/swarm.py _cmd_swarm_run`
+  - root_cause: src/tag/cmd/swarm.py:318-340 coordinator call precedes the dry-run branch; :296 falsy clobber; :304 dead guard.
+  - repro: Static: coordinator.produce_manifest (line 320) runs before `if dry_run:` (327); --max-agents 0 -> min(int(0 or 4),10)=4 (line 296); `if max_agents > SWARM_MAX_AGENTS` (304) is unreachable after min(...,10).
+- ☐ **B100** [consistency] `eval-dataset create` duplicate name leaks raw SQL error
+  - area: `eval-dataset`
+  - root_cause: src/tag/cmd/prd_clusters.py:130-132 calls create_dataset with no duplicate pre-check; create_dataset (eval_datasets.py:103-108) relies on the UNIQUE constraint and the IntegrityError propagates to the generic handler.
+  - repro: eval-dataset create ds1 twice -> 'error: UNIQUE constraint failed: eval_datasets.name' exit 1.
+- ☐ **B101** [data-integrity] `alert check` re-fires with no cooldown; duplicate firings accumulate unboundedly
+  - area: `alert`
+  - root_cause: src/tag/alerts.py:295-353 check_alerts unconditionally INSERTs a firing for every enabled rule whose condition holds; last_triggered_at is written (331-334) but never consulted to suppress repeats.
+  - repro: alert check --json thrice on a still-true rule -> 3 distinct firing ids for the same rule.
+- ☐ **B102** [data-integrity] annotation dequeue is non-atomic (race: double task assignment)
+  - area: `annotate`
+  - root_cause: src/tag/annotation_queue.py:196-226 — dequeue() SELECTs pending rows (197-205) then loops per-row UPDATE (215-222) with a single commit (225), outside any explicit write transaction / row lock.
+  - repro: Two concurrent annotate next / dequeue can SELECT the same PENDING row before either UPDATEs, both claiming it.
+- ☐ **B103** [validation] prompt save accepts empty/blank name
+  - area: `prompt`
+  - root_cause: src/tag/cmd/prd_clusters.py:324-331 and prompt_hub.save_prompt (prompt_hub.py:168-213) perform no name validation.
+  - repro: prompt save "" ./file.txt -> 'Saved '' v1' exit 0.
+- ☐ **B104** [dead-code] persona.remove_persona is dead code — no subcommand ever calls it (can't delete an installed persona)
+  - area: `persona.py / tag persona`
+  - root_cause: src/tag/agent_tools.py:745-747 wires 'remove' to remove_active_persona only; remove_persona (DELETE FROM personas WHERE source!='builtin') is never invoked.
+  - repro: grep remove_persona -> only the def (persona.py:200) and the import (agent_tools.py:118); no call site.
+- ☐ **B105** [validation] sandbox --timeout 0 silently becomes 60s; negative timeout accepted and always times out
+  - area: `marketplace.py cmd_sandbox / sandbox.py`
+  - root_cause: src/tag/marketplace.py:396 `getattr(args,'timeout',60) or 60` clobbers 0; sandbox.py:70-82 has no timeout>0 guard so negatives flow to subprocess.run.
+  - repro: sandbox run 'echo hi' --timeout 0 -> runs (60s default); --timeout -5 -> 'Timed out after -5 seconds', exit 124.
+- ☐ **B106** [security] notify webhook/slack channels allow SSRF — arbitrary/internal URLs posted with no validation
+  - area: `notifications.py (webhook, slack)`
+  - root_cause: src/tag/notifications.py:156-170 and 224-236 — urlopen on an unvalidated user/config URL (no scheme/host allow-list, no loopback/link-local block).
+  - repro: notify add --channel webhook --config-json '{"url":"http://127.0.0.1:1/x"}'; notify test <id> -> request attempted against loopback.
+- ☐ **B107** [json-contract] diff-context error path embeds the entire `git diff` usage/help text into the message and JSON error field
+  - area: `diff_context.py / tag diff-context`
+  - root_cause: src/tag/diff_context.py:63-64 — raises RuntimeError(f'git diff failed: {result.stderr.strip()}') with git's full --no-index usage as stderr, echoed verbatim.
+  - repro: In a non-git dir: diff-context --workdir <dir> prints ~128 lines of git usage; --json is valid JSON but its 'error' contains the whole dump.
+- ☐ **B108** [data-integrity] Notification delivery log always records http_status=NULL and attempt=1
+  - area: `notifications.py fire_event_notifications`
+  - root_cause: src/tag/notifications.py:298 deliver() drops the http_status/attempt it computes; :315-320 INSERTs http_status=None, attempt=1.
+  - repro: Static: deliver() returns only (ok, err); the INSERT hardcodes None/1.
+- ☐ **B109** [consistency] Token budget counts only status='completed' runs — in-flight/failed consumption not gated
+  - area: `budget.py used_tokens / check_budget`
+  - root_cause: src/tag/budget.py:128-133 — WHERE ... AND status='completed' excludes running/failed token usage.
+  - repro: Static: used_tokens SUMs tokens WHERE status='completed'.
+- ☐ **B110** [security] security scan follows file symlinks, reading files outside the scanned tree
+  - area: `security.py scan_file / scan_directory`
+  - root_cause: src/tag/security.py:114-128 scan_file uses path.read_text with no realpath containment check; os.walk doesn't follow dir symlinks but file symlinks are still read.
+  - repro: ln -s /etc/passwd <dir>/link_passwd; scan_file reads /etc/passwd (9344 bytes).
+- ☐ **B111** [validation] Malformed persona YAML surfaces raw yaml parser error instead of a friendly validation message
+  - area: `persona.py load_persona_file / tag persona install`
+  - root_cause: src/tag/persona.py:141-142 yaml.safe_load not wrapped; agent_tools.py:199 catches only (FileNotFoundError, ValueError), so yaml.YAMLError escapes to the global net.
+  - repro: printf ':\n:\nbad' > bad.yaml; persona install bad.yaml -> raw 'while parsing a block mapping / expected <block end>...' exit 1.
+- ☐ **B112** [doc-mismatch] otel-export --semconv override is ignored in the actual payload
+  - area: `cmd/observability.py cmd_otel_export / otel_semconv.py`
+  - root_cause: src/tag/otel_semconv.py:23,31-38,82 hardcode SEMCONV_VERSION via INSTRUMENTATION_SCOPE; cmd_otel_export (observability.py:704,750) only prints the override after a live POST, never threading it into the payload builder.
+  - repro: otel-export --trace-id trace-abc --semconv 99.99.99 | grep -c 99.99.99 -> 0; output still contains 1.28.0.
+- ☐ **B113** [dead-code] otel-export --json flag is a no-op
+  - area: `cmd/observability.py cmd_otel_export`
+  - root_cause: src/tag/cmd/observability.py:914 registers otel_cmd --json but cmd_otel_export (693-764) never reads args.json; output depends solely on --endpoint.
+  - repro: diff <(otel-export --trace-id trace-abc --json) <(otel-export --trace-id trace-abc) -> identical.
+- ☐ **B114** [validation] pricing get and cache/cost paths accept negative token counts and emit negative costs with exit 0
+  - area: `cost_table.compute_cost / cmd/observability.py`
+  - root_cause: src/tag/cost_table.py:367-383 — no validation of token counts; observability.py:539-553 similarly unvalidated, propagating negative tokens into displayed percentages/savings.
+  - repro: pricing get claude-opus-4-8 --input-tokens -1000 --output-tokens -500 -> '$-0.05250000', exit 0.
+- ☐ **B115** [resource-leak] trace diff/replay write snapshot rows as a side effect of read commands; repeated snapshot grows unbounded
+  - area: `cmd/observability.py _snapshot_trace / cmd_trace_extended`
+  - root_cause: src/tag/cmd/observability.py:82,98-103 (random snap_id + INSERT OR REPLACE that never collides) and 317-322/363-373 (read commands trigger writes).
+  - repro: trace snapshot trace-abc 4x -> 4 rows (one new random-PK row per call); diff/replay auto-create a snapshot when none exists.
+- ☐ **B116** [dead-code] Dead code: _monotonic_to_wall and unused profile var in trace export
+  - area: `tracing.py / cmd/observability.py`
+  - root_cause: src/tag/tracing.py:43-48 unused; src/tag/cmd/observability.py:244 assigned-but-unused.
+  - repro: grep _monotonic_to_wall -> only the def (tracing.py:43); observability.py:244 profile is assigned but never used in the export branch.
+- ☐ **B117** [wrong-behavior] import-honcho reports success when only --base-url given (no actual credential)
+  - area: `import-honcho`
+  - root_cause: src/tag/cmd/import_.py:474-481 — `if base_url: creds['HONCHO_BASE_URL']=base_url` makes creds non-empty, bypassing skipped-no-auth even with no api key.
+  - repro: import-honcho --base-url http://x:8080 --json -> {status:ok, providers_imported:[HONCHO_BASE_URL]}; .env has only HONCHO_BASE_URL, no api key.
+- ☐ **B118** [validation] Supermemory/Honcho --api-key value not validated: whitespace-only key written as success
+  - area: `import-supermemory / import-honcho`
+  - root_cause: src/tag/cmd/import_.py:415 uses `{...: api_key} if api_key` (truthiness only, no .strip()); newline handling at core/utils.py:48 replaces \n with space rather than rejecting. Inconsistent with modal/daytona/nous.
+  - repro: import-supermemory --api-key '   ' --json -> status ok exit 0; .env gets 'SUPERMEMORY_API_KEY=   '.
+- ☐ **B119** [consistency] import-ssh silently drops key-file-not-found warning in non-JSON mode
+  - area: `import-ssh vs import-docker`
+  - root_cause: src/tag/cmd/import_.py:813-817 — success branch prints a fixed line and never checks result.get('warning'), unlike cmd_import_docker at 785-786.
+  - repro: import-ssh --host h.com --key-file /nope/key -> only '✓ SSH backend configured'; the 'Key file not found' warning appears only with --json.
+- ☐ **B120** [consistency] Nous Portal key length validation applied only to --api-key, not to env/config-detected keys
+  - area: `import-nous-portal`
+  - root_cause: src/tag/cmd/import_.py:596-599 — length check is on the --api-key value; _detect_nous_portal_credentials results are never length-checked.
+  - repro: import-nous-portal --api-key short -> 'API key too short (5 chars)' exit 1; NOUS_PORTAL_API_KEY=short in env -> status ok exit 0.
+- ☐ **B121** [dead-code] Dead code: cmd_import_docker '✗' failure branch is unreachable but still returns 0
+  - area: `import-docker`
+  - root_cause: src/tag/cmd/import_.py:783-789 — status is always 'ok' (import path 644-678); the `else: print('✗...')` block is dead and the function unconditionally returns 0.
+  - repro: Static: import_docker_into_profile only returns status 'ok' (or raises SystemExit); the else branch never runs and the function returns 0 regardless.
+- ☐ **B122** [validation] SWE view/edit accept start<=0, producing negative-index slices
+  - area: `swe_harness._exec_view/_exec_edit`
+  - root_cause: src/tag/swe_harness.py:143-148 and 162-167 — int(args.get('start',1)) used directly in slice math with no start>=1 check.
+  - repro: view start=0 on a 5-line file -> only the last line numbered '0'; edit start=0 end=0 content='HACK' inserts before the last line.
+- ☐ **B123** [security] Linear issue id interpolated into GraphQL query string (injection/breakage)
+  - area: `issue_solver._fetch_linear_issue`
+  - root_cause: src/tag/issue_solver.py:131 — unescaped `% issue_ref` string interpolation instead of GraphQL variables.
+  - repro: An issue_ref with a double-quote breaks the JSON/GraphQL body (json.loads fails) or injects a GraphQL field.
+- ☐ **B124** [dead-code] Dead code: _EXTERNAL_CURL compiled but never used — bash sandbox does not block network egress
+  - area: `swe_harness`
+  - root_cause: src/tag/swe_harness.py:29 defines _EXTERNAL_CURL; _is_safe_bash never references it.
+  - repro: grep _EXTERNAL_CURL -> only the def (line 29); _is_safe_bash (85-89) checks only _BLOCKED_PATTERNS, so curl runs freely.
+- ☐ **B125** [resource-leak] workspace index leaks DB connection on invalid --max-files
+  - area: `cmd_workspace index`
+  - root_cause: src/tag/cmd/ci_loop.py:483 — index_workspace(...) not wrapped; db.close() (484) skipped when it raises (workspace.py:80-81).
+  - repro: workspace index --max-files 0 -> index_workspace raises ValueError past the un-guarded db.close(); connection not closed.
+- ☐ **B126** [consistency] Inconsistent master-profile config lookup across sibling commands (loop/cron can KeyError)
+  - area: `cmd_review_pr/cmd_ci vs cmd_loop/cmd_cron`
+  - root_cause: src/tag/cmd/ci_loop.py:41,102 use cfg.get('master_profile','orchestrator') vs 199,321 unguarded cfg['defaults']['master_profile']; the two paths also read different keys.
+  - repro: With a config lacking 'defaults', loop start/cron add raise KeyError('defaults') while review-pr/ci fall back to 'orchestrator'.
+- ☐ **B127** [json-contract] --json error/not-found paths emit plain text in loop/cron/workspace commands
+  - area: `loop/cron/workspace commands`
+  - root_cause: src/tag/cmd/ci_loop.py:263 (and siblings) call print_error and return before the json branch; no {"error":...} emitted.
+  - repro: loop status doesnotexist --json -> 'error: Loop doesnotexist not found' plain text, exit 1.
+- ☐ **B128** [consistency] marketplace pull stores profiles in a location the agent cannot use
+  - area: `marketplace pull`
+  - root_cause: src/tag/cmd/marketplace.py:160 — profiles_dir = runtime_home(cfg)/'profiles' (flat), inconsistent with import/enable (tag_home/profiles) and the runtime (runtime_home/.hermes/profiles).
+  - repro: marketplace pull file:///tmp/prof.yaml -> 'Saved to: runtime/home/profiles/prof.yaml' (a third distinct, unused profile location).
+- ☐ **B129** [exit-code] marketplace with no subcommand exits 0 and prints nothing
+  - area: `marketplace`
+  - root_cause: src/tag/cmd/marketplace.py:231-232 — bare invocation runs cmd_profile_marketplace with marketplace_subcommand=None and returns 0 silently.
+  - repro: tag marketplace -> no output, exit 0.
+- ☐ **B130** [wrong-behavior] hooks test always reports success and never logs fired hooks
+  - area: `hooks test`
+  - root_cause: src/tag/cmd/workflow_mgmt.py:398-400 — _fire_hooks called without db_path (so hook_log write at 336-348 is skipped) then unconditional print_success/return 0.
+  - repro: hooks test somevent -> 'Fired 0 hook(s)' exit 0; hooks log shows no rows.
+- ☐ **B131** [consistency] Every invocation (including --version/--help) forces full venv build + 55MB pip install on first run
+  - area: `bin/tag.js main`
+  - root_cause: bin/tag.js:133-136 — no pre-dispatch fast path for --version/--help.
+  - repro: Static: main() calls ensureRuntime() unconditionally before inspecting argv; first `tag --help`/`--version` triggers python -m venv + pip install of the 54.7MB tarball.
+- ☐ **B132** [validation] --reinstall-runtime is matched anywhere in argv and stripped from forwarded args
+  - area: `bin/tag.js`
+  - root_cause: bin/tag.js:18,136 — whole-argv includes() and unconditional filter conflate a launcher directive with user data.
+  - repro: Static: FORCE_REINSTALL = process.argv.includes('--reinstall-runtime') (line 18) tests all argv; forwardedArgs filter (136) removes every occurrence.
+- ☐ **B133** [doc-mismatch] MANIFEST.in references nonexistent TODO.md
+  - area: `MANIFEST.in`
+  - root_cause: MANIFEST.in:3 — `include TODO.md` left over from the pre-refactor tree.
+  - repro: Build emits 'warning: no files found matching TODO.md'; ls TODO.md -> not found.
+- ☐ **B134** [dead-code] setuptools data-files/package-data/packages.find reference nonexistent packages and dirs
+  - area: `pyproject.toml setuptools config`
+  - root_cause: pyproject.toml:266-297 — packaging config still describes the flat Hermes tree replaced by src/tag.
+  - repro: None of agent/tools/hermes_cli/gateway/tui_gateway/cron/acp_adapter/plugins/providers/locales exist, yet packages.find (297), package-data (277-293), and data-files (275) reference them.
+- ☐ **B135** [cross-platform] npm files whitelist enumerates src/tag subpackages by hand — diverges from wheel packages.find on any new subpackage
+  - area: `package.json files vs pyproject packages.find`
+  - root_cause: package.json:19-22 — hardcoded per-directory globs vs pyproject's recursive tag.*; a future src/tag/<newpkg>/ ships in the wheel but is dropped from the npm tarball.
+  - repro: Static: package.json files (19-22) lists src/tag/*.py, src/tag/core/*.py, cmd/*.py, integrations/*.py; pyproject uses recursive tag/tag.*.
+- ☐ **B136** [doc-mismatch] package.json keywords leak 'hermes' branding in published npm metadata
+  - area: `package.json`
+  - root_cause: package.json:43 — leftover 'hermes' keyword.
+  - repro: grep '"hermes"' package.json -> line 43 within the keywords array of tag-agent.
+- ☐ **B137** [resource-leak] 54.7MB vendored tarball shipped in both the npm tarball and the wheel
+  - area: `packaging bloat`
+  - root_cause: package.json:27 (files: src/tag/vendor) + MANIFEST.in:9 (recursive-include src/tag/vendor *.tar.gz) — vendor tarball included in both artifacts.
+  - repro: npm pack --dry-run reports 54.7MB src/tag/vendor/hermes-agent-upstream.tar.gz; the built wheel also contains it (54739008 bytes); pip install re-embeds it.
+- ☐ **B138** [cross-platform] Box-title re-centering miscounts double-width/emoji characters (wide-unicode misalignment)
+  - area: `core.utils._fix_box_title_alignment`
+  - root_cause: src/tag/core/utils.py:234-236 — width math uses len()/str.center() (code points) instead of East-Asian-wide display columns.
+  - repro: _fix_box_title_alignment of a box with a CJK title recentres to a middle line whose display width (~16) exceeds the 10-column border.
+- ☐ **B139** [resource-leak] _prune_old_spans issues a DELETE+commit on every open_db() call
+  - area: `core.db.open_db`
+  - root_cause: src/tag/core/db.py:200 (unconditional call) + 568-576 (DELETE+commit body) — pruning wired into every connection open with no throttle.
+  - repro: Every open_db (including read-only commands) runs DELETE FROM spans WHERE started_at < ? + commit, taking a write lock on the read path.
+- ☐ **B140** [consistency] open_db raises raw sqlite3.OperationalError on persistent lock, inconsistent with SystemExit convention
+  - area: `core.db.open_db`
+  - root_cause: src/tag/core/db.py:67-68 — retry-exhaustion re-raises the raw error, bypassing the print_error+SystemExit(1) convention used at 51-53 and 62-64.
+  - repro: If the WAL PRAGMA stays locked for all 20 retries, open_db does `raise last_error` (bare OperationalError).
+- ☐ **B141** [crash] Web dashboard _fetch_runs/_fetch_cost_summary lack error handling; missing `runs` table crashes the request
+  - area: `api.py`
+  - root_cause: src/tag/api.py:31-45 (_fetch_runs) and 85-98 (_fetch_cost_summary) have no try/except OperationalError, unlike _fetch_queue (65-82) which returns [] .
+  - repro: tag web against a DB lacking `runs`; GET /api/runs -> OperationalError at api.py:32, curl RC=52.
+- ☐ **B142** [security] DevUI leaks absolute local filesystem DB path; dead __DB_PATH__ template substitution
+  - area: `devui.py`
+  - root_cause: src/tag/devui.py:437 (/api/stats) and :422 (/health) return the absolute db path; do_GET (:418) does _DASHBOARD_HTML.replace('__DB_PATH__', db) but the template has no such token (dead substitution).
+  - repro: curl /api/stats returns "db": "/private/tmp/.../runtime/tag.sqlite3".
+- ☐ **B143** [wrong-behavior] DevUIServer.start_background daemon thread dies with the process — background mode is a false-success no-op
+  - area: `devui.py DevUIServer / cmd_devui`
+  - root_cause: src/tag/devui.py:548-553 (serve_forever in a daemon thread) + 583-585 (cmd_devui returns 0 immediately). LATENT: the wired handler is prd_clusters.cmd_devui which always calls blocking start().
+  - repro: Static: devui.py cmd_devui background branch calls start_background() then returns 0; on interpreter exit the daemon is killed.
+- ☐ **B144** [resource-leak] Server stop() methods call shutdown() but not server_close() — socket/fd leak on restart
+  - area: `api.py / webhook_server.py`
+  - root_cause: src/tag/api.py:305-307 and src/tag/webhook_server.py:398-400 call only shutdown(); neither calls server_close(), unlike DevUIServer.stop() (devui.py:558-559) which does both.
+  - repro: Static: DashboardServer.stop() and WebhookServer.stop() only shut down the serve loop.
+- ☐ **B145** [consistency] Deprecated datetime.utcnow() yields tz-naive timestamps and inconsistent formats within a row
+  - area: `cmd/queue_dag.py _queue_update_status, prompt_hub.py`
+  - root_cause: src/tag/cmd/queue_dag.py:36 and prompt_hub.py:116 use datetime.utcnow().strftime('...Z'); contrast core/utils.py:21 utc_now() (aware, +00:00 isoformat).
+  - repro: queue cancel writes finished_at via utcnow().strftime('...Z') while created_at is utc_now() isoformat with +00:00; under 3.12 utcnow() is deprecated.
+- ☐ **B146** [consistency] Inconsistent exit codes for not-found across sibling delete/get subcommands
+  - area: `cross-command (budget/persona/notify vs cron/alert/journal/loop)`
+  - root_cause: src/tag/cmd/agent_tools.py:355-363 (budget remove returns 0 regardless of bool) vs 481-490 (notify remove returns 1) vs cron/alert/journal/loop handlers returning 1; no shared convention.
+  - repro: budget remove --profile nope rc=0; persona remove nope rc=0; notify list rc=0; but notify remove NOPE rc=1, cron remove nope rc=1, alert delete nope rc=1, memory-journal forget nope rc=1, loop status nope rc=1.
+- ☐ **B147** [resource-leak] SQLite connections opened outside try/finally leak on error (hooks log / compare)
+  - area: `cmd/workflow_mgmt.py cmd_hooks(log), cmd_compare(list/show)`
+  - root_cause: src/tag/cmd/workflow_mgmt.py:375,419,443 — bare connect with manual close (381/425/450); an exception in between skips close, unlike observability.py:120-142 which uses try/finally.
+  - repro: Static: sqlite3.connect() at workflow_mgmt.py:375/419/443 followed by execute/json.dumps, with manual conn.close() and no try/finally.
+- ☐ **B148** [dead-code] cmd/__init__ silently drops any command module that fails to import
+  - area: `cmd/__init__.py _load_module`
+  - root_cause: src/tag/cmd/__init__.py:25-29 — bare `except ImportError: return None` with no logging; only ImportError is caught (SyntaxError etc. would propagate).
+  - repro: Static: _load_module catches ImportError and returns None; get_command_modules skips it, so a broken module's whole command group vanishes from `tag --help` with no diagnostic.
+- ☐ **B149** [consistency] queue result subcommand lacks --json while every sibling queue subcommand has it
+  - area: `cmd/queue_dag.py register() queue subcommands`
+  - root_cause: src/tag/cmd/queue_dag.py:328-329 — q_result parser only adds job_id; cmd_queue result branch (113-124) has no json handling.
+  - repro: queue result somejob --json -> rc=2 'unrecognized arguments: --json'; add/list/cancel/clear all accept --json.
