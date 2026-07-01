@@ -126,37 +126,45 @@ def main() -> int:
     results_dir = db_path.parent / "queue-results"
 
     conn = _open_db(db_path)
-    job = _get_job(conn, args.job_id)
-    if not job:
-        print(f"queue_worker: job {args.job_id} not found", file=sys.stderr)
-        return 1
-
-    # Ignore SIGHUP so the process stays alive after terminal close
     try:
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
-    except (AttributeError, OSError):
-        pass
+        try:
+            job = _get_job(conn, args.job_id)
+        except sqlite3.OperationalError as exc:
+            # e.g. "no such table: queue_jobs" on a fresh/foreign DB — fail
+            # cleanly instead of crashing with an uncaught traceback (B096).
+            print(f"queue_worker: cannot read queue_jobs ({exc})", file=sys.stderr)
+            return 1
+        if not job:
+            print(f"queue_worker: job {args.job_id} not found", file=sys.stderr)
+            return 1
 
-    _mark_running(conn, args.job_id)
+        # Ignore SIGHUP so the process stays alive after terminal close
+        try:
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        except (AttributeError, OSError):
+            pass
 
-    exit_code, result_path, error = _run_job(job, args.config, results_dir)
+        _mark_running(conn, args.job_id)
 
-    _mark_done(
-        conn,
-        args.job_id,
-        exit_code=exit_code,
-        result_path=str(result_path),
-        error=error or None,
-    )
+        exit_code, result_path, error = _run_job(job, args.config, results_dir)
 
-    # Desktop notification
-    if job.get("notify", 1):
-        status_word = "completed" if exit_code == 0 else "failed"
-        task_short = (job["task"] or "")[:60]
-        _send_notification("TAG Queue", f"{job.get('profile','agent')} {status_word}: {task_short}")
+        _mark_done(
+            conn,
+            args.job_id,
+            exit_code=exit_code,
+            result_path=str(result_path),
+            error=error or None,
+        )
 
-    conn.close()
-    return exit_code
+        # Desktop notification
+        if job.get("notify", 1):
+            status_word = "completed" if exit_code == 0 else "failed"
+            task_short = (job["task"] or "")[:60]
+            _send_notification("TAG Queue", f"{job.get('profile','agent')} {status_word}: {task_short}")
+
+        return exit_code
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
