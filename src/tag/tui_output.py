@@ -169,7 +169,9 @@ def print_warning(msg: str) -> None:
     if console is None:
         print(f"warning: {msg}", file=sys.stderr)
         return
-    console.print(f"[bold yellow]⚠[/bold yellow] {msg}", stderr=True)
+    # The console returned by get_console() is already stderr-bound (line 51);
+    # Console.print() has no `stderr=` kwarg, so passing it raises TypeError.
+    console.print(f"[bold yellow]⚠[/bold yellow] {msg}")
 
 
 # ---------------------------------------------------------------------------
