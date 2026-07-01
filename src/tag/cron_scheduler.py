@@ -19,28 +19,52 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------
 
 def _field_matches(field: str, value: int, lo: int, hi: int) -> bool:
-    """Return True if *value* matches a single cron field token."""
+    """Return True if *value* matches a cron field, which may be a comma-list.
+
+    The grammar mirrors :func:`_validate_cron_field`: split on ``,`` FIRST, then
+    interpret each element as ``*``, a literal, a range, or any of those with a
+    ``/step`` suffix. Doing the comma split first is essential — otherwise a
+    mixed element like ``1,2-4`` or ``*/15,45`` takes the range/step branch and
+    ``int()`` chokes on a fragment that still contains a comma (C003).
+    """
     if field == "*":
         return True
-    # Step: */N or lo-hi/N
-    if "/" in field:
-        base, step_str = field.rsplit("/", 1)
-        step = int(step_str)
+    return any(_element_matches(el, value, lo, hi) for el in field.split(","))
+
+
+def _element_matches(element: str, value: int, lo: int, hi: int) -> bool:
+    """Match a single comma-free cron element.
+
+    Handles ``*``, literals, ``a-b`` ranges, and ``*/N`` / ``a/N`` / ``a-b/N``
+    steps. Defensively rejects a zero or non-numeric step (C030) so a row that
+    bypassed validation (e.g. a direct DB insert) cannot crash the daemon.
+    """
+    if element == "*":
+        return True
+    # Step: base/step
+    if "/" in element:
+        base, step_str = element.rsplit("/", 1)
+        try:
+            step = int(step_str)
+        except ValueError:
+            return False
+        if step <= 0:
+            return False
         if base == "*":
             return (value - lo) % step == 0
         if "-" in base:
             start, end = (int(x) for x in base.split("-", 1))
             return start <= value <= end and (value - start) % step == 0
-        return value == int(base)
-    # Range: lo-hi
-    if "-" in field:
-        start, end = (int(x) for x in field.split("-", 1))
+        # Numeric base with step, e.g. '5/10' == 5,15,25,... up to the field max
+        # (crontab semantics). Previously the step was silently dropped (C019).
+        start = int(base)
+        return start <= value <= hi and (value - start) % step == 0
+    # Range: a-b
+    if "-" in element:
+        start, end = (int(x) for x in element.split("-", 1))
         return start <= value <= end
-    # List: a,b,c
-    if "," in field:
-        return value in {int(x) for x in field.split(",")}
     # Literal
-    return value == int(field)
+    return value == int(element)
 
 
 # Schedulable cron aliases → their 5-field equivalents. ``@reboot`` is
@@ -209,8 +233,14 @@ def run_daemon(db_path: str, config_path: str) -> None:
                 last = job["last_run_at"]
                 if last:
                     last_dt = datetime.fromisoformat(last)
-                    # Prevent firing twice in the same minute
-                    if (now - last_dt).total_seconds() < 55:
+                    # Prevent firing twice in the same calendar minute. Key on the
+                    # minute (the schedule's resolution) rather than a fixed 55s
+                    # window: under poll drift a fixed window can suppress the only
+                    # poll that lands in a fresh minute, dropping that minute's fire
+                    # for an every-minute job (C031).
+                    if last_dt.replace(second=0, microsecond=0) == now.replace(
+                        second=0, microsecond=0
+                    ):
                         continue
             except Exception:
                 continue
