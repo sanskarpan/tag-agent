@@ -278,16 +278,53 @@ class TagLspServer:
             self._mark_stopped()
 
 
+def _pid_alive(pid: int | None) -> bool:
+    """Return True if *pid* refers to a live process."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but owned by another user — still alive.
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def get_lsp_status(conn: sqlite3.Connection) -> list[dict]:
-    """Return running LSP sessions."""
+    """Return running LSP sessions.
+
+    A session's stored status is only flipped to 'stopped' in the graceful
+    finally block of run_stdio/run_tcp, so SIGKILL/OOM/crash leave the row as
+    'running' forever (C023). Probe PID liveness here: any 'running' row whose
+    PID is dead is reaped (marked stopped) and excluded from the result.
+    """
     ensure_schema(conn)
     rows = conn.execute(
         "SELECT id, transport, port, pid, status, created_at FROM lsp_sessions "
         "WHERE status='running' ORDER BY created_at DESC"
     ).fetchall()
-    return [
-        {"id": r[0], "transport": r[1], "port": r[2], "pid": r[3],
-         "status": r[4], "created_at": r[5]}
-        for r in rows
-    ]
+    alive: list[dict] = []
+    dead_ids: list[str] = []
+    for r in rows:
+        if _pid_alive(r[3]):
+            alive.append(
+                {"id": r[0], "transport": r[1], "port": r[2], "pid": r[3],
+                 "status": r[4], "created_at": r[5]}
+            )
+        else:
+            dead_ids.append(r[0])
+    if dead_ids:
+        try:
+            conn.executemany(
+                "UPDATE lsp_sessions SET status='stopped', stopped_at=? WHERE id=?",
+                [(_utc_now(), sid) for sid in dead_ids],
+            )
+            conn.commit()
+        except Exception:
+            pass
+    return alive
 
