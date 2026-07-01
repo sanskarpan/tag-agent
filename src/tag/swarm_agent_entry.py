@@ -78,15 +78,19 @@ def main() -> None:
 
     prompt = _build_prompt(task)
 
-    # Resolve the TAG runtime binary
-    try:
-        from tag.controller import hermes_bin, _load_cfg  # noqa: PLC0415
-        cfg = _load_cfg()
-        binary = str(hermes_bin(cfg))
-    except Exception:
-        binary = os.environ.get("TAG_HERMES_BIN", "")
-        if not binary:
-            _fail_exit("Cannot locate TAG runtime binary")
+    # Resolve the TAG runtime binary. Prefer the path handed down by
+    # SwarmRunner via TAG_HERMES_BIN; fall back to loading config ourselves.
+    binary = os.environ.get("TAG_HERMES_BIN", "")
+    if not binary:
+        try:
+            from tag.core.config import load_config, config_path  # noqa: PLC0415
+            from tag.core.paths import hermes_bin  # noqa: PLC0415
+            cfg = load_config(config_path(os.environ.get("TAG_CONFIG") or None))
+            binary = str(hermes_bin(cfg))
+        except Exception:
+            binary = ""
+    if not binary:
+        _fail_exit("Cannot locate TAG runtime binary")
 
     profile = os.environ.get("TAG_SWARM_PROFILE", "")
     start = time.monotonic()
