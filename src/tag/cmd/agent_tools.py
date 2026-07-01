@@ -49,6 +49,11 @@ def cmd_security(args: argparse.Namespace) -> int:
         scan_path = Path(path_str).resolve()
         max_files = getattr(args, "max_files", 2000) or 2000
 
+        if not scan_path.exists():
+            db.close()
+            print_error(f"Path not found: {path_str}")
+            return 1
+
         if scan_path.is_file():
             from tag.security import scan_file as sf
             findings = sf(scan_path)
@@ -318,7 +323,10 @@ def cmd_budget(args: argparse.Namespace) -> int:
         budget = get_budget(db, profile)
         db.close()
         if not budget:
-            print(f"No budget set for profile '{profile}'.")
+            if getattr(args, "json", False):
+                print(json.dumps({"profile": profile, "budget": None}))
+            else:
+                print(f"No budget set for profile '{profile}'.")
             return 0
         if getattr(args, "json", False):
             print(json.dumps(budget, indent=2))
@@ -483,15 +491,21 @@ def cmd_notify(args: argparse.Namespace) -> int:
 
     if sub == "enable":
         hook_id = getattr(args, "hook_id", "")
-        set_hook_enabled(db, hook_id, True)
+        ok = set_hook_enabled(db, hook_id, True)
         db.close()
+        if not ok:
+            print_error(f"Hook not found: {hook_id}")
+            return 1
         print(f"Hook {hook_id} enabled.")
         return 0
 
     if sub == "disable":
         hook_id = getattr(args, "hook_id", "")
-        set_hook_enabled(db, hook_id, False)
+        ok = set_hook_enabled(db, hook_id, False)
         db.close()
+        if not ok:
+            print_error(f"Hook not found: {hook_id}")
+            return 1
         print(f"Hook {hook_id} disabled.")
         return 0
 
@@ -663,7 +677,10 @@ def cmd_tool_retrieval(args: argparse.Namespace) -> int:
         db.close()
 
         if not results:
-            print(f"No tools found for query: {query!r}")
+            if getattr(args, "json", False):
+                print(json.dumps([]))
+            else:
+                print(f"No tools found for query: {query!r}")
             return 0
 
         if getattr(args, "json", False):
