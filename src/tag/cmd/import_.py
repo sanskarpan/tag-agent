@@ -652,23 +652,12 @@ def import_nous_portal_into_profile(
 
 def cmd_import_nous_portal(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
-    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
-    profiles_cfg = cfg.get("profiles", {})
 
-    if getattr(args, "all_profiles", False):
-        profiles_to_update = list(profiles_cfg.keys())
-    else:
-        p = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
-        if p not in profiles_cfg:
-            available = ", ".join(sorted(profiles_cfg))
-            _import_fail(args, f"Unknown profile '{p}'. Available: {available}")
-        profiles_to_update = [p]
-
+    # Validate the API key BEFORE provisioning the managed runtime — fail fast on
+    # bad input, and so a validation-only rejection never triggers heavy setup.
+    # Covers both --api-key AND env/config-detected keys (B120/C014). The library
+    # import fn does not validate, so direct callers keep control.
     api_key_arg = getattr(args, "api_key", None) or None
-
-    # Validate the effective key length at the CLI layer — covering both
-    # --api-key AND env/config-detected keys (B120). The library import fn does
-    # not validate, so direct callers keep control.
     effective_key = api_key_arg
     if effective_key is None:
         detected = _detect_nous_portal_credentials()
@@ -686,6 +675,18 @@ def cmd_import_nous_portal(args: argparse.Namespace) -> int:
                 f"API key too short ({len(effective_key.strip())} chars); "
                 "Nous Portal keys are at least 20 characters"
             )
+
+    ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    profiles_cfg = cfg.get("profiles", {})
+
+    if getattr(args, "all_profiles", False):
+        profiles_to_update = list(profiles_cfg.keys())
+    else:
+        p = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+        if p not in profiles_cfg:
+            available = ", ".join(sorted(profiles_cfg))
+            _import_fail(args, f"Unknown profile '{p}'. Available: {available}")
+        profiles_to_update = [p]
 
     results = []
     for p in profiles_to_update:
