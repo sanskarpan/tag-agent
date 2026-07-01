@@ -181,11 +181,18 @@ def cmd_set_model(args: argparse.Namespace) -> int:
             delegation_cfg["model"] = model
             if args.openai_runtime:
                 delegation_cfg["openai_runtime"] = args.openai_runtime
+        # Render under the SAME lock as the write. If render runs after the lock
+        # is released, a racing set-model can commit in between and then this
+        # call's stale cfg snapshot renders last, leaving per-profile config.yaml
+        # inconsistent with the persisted tag.yaml (C017). update_config re-reads
+        # config under the lock, so `cfg` here already includes any prior writer's
+        # changes, and the last committer renders last.
+        render_profiles(cfg, force=True)
 
-    # Hold the lock across the whole read-modify-write so two set-model calls on
-    # different profiles don't clobber each other (lost-update race, B005).
+    # Hold the lock across the whole read-modify-write (and the render) so two
+    # set-model calls on different profiles don't clobber each other
+    # (lost-update race, B005) or render a stale snapshot last (C017).
     cfg = update_config(path, _mutate)
-    render_profiles(cfg, force=True)
 
     result = {
         "profile": args.profile,
