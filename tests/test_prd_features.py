@@ -1245,9 +1245,13 @@ class TestParserRegistrations:
         assert "clear" in q_sub._name_parser_map
 
     def test_swarm_has_task_positional(self):
-        swarm_parser = self.sub._name_parser_map["swarm"]
-        positionals = [a.dest for a in swarm_parser._actions if a.option_strings == []]
-        assert "task" in positionals
+        # B008: legacy `tag swarm <task>` is routed via a subparser fallback
+        # (not a raw positional). Verify both a legacy task and a subcommand parse.
+        parser = TAG.build_parser()
+        legacy = parser.parse_args(["swarm", "build a thing"])
+        assert getattr(legacy, "task", None) == "build a thing"
+        subc = parser.parse_args(["swarm", "list"])
+        assert getattr(subc, "swarm_subcommand", None) == "list"
 
     def test_swarm_has_no_wait_flag(self):
         swarm_parser = self.sub._name_parser_map["swarm"]
@@ -1920,12 +1924,13 @@ class TestMcpRegistry:
         with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
             rc = TAG.cmd_mcp_registry(args)
         assert rc == 0
-        cfg_path = tmp_path / "taghome" / "profiles" / "orchestrator" / "lab-config.yaml"
+        cfg_path = (tmp_path / "taghome" / "runtime" / "home" / ".hermes" /
+                    "profiles" / "orchestrator" / "config.yaml")
         assert cfg_path.exists()
         import yaml
         data = yaml.safe_load(cfg_path.read_text())
-        names = [e["name"] for e in data.get("mcp_servers", [])]
-        assert "mcp-filesystem" in names
+        servers = data.get("mcp_servers") or {}
+        assert "mcp-filesystem" in servers
 
 
 # ===========================================================================
@@ -1983,7 +1988,8 @@ class TestProfileTemplates:
         with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
             rc = TAG.cmd_template(args)
         assert rc == 0
-        env_file = tmp_path / "taghome" / "profiles" / "test-imported" / ".env"
+        env_file = (tmp_path / "taghome" / "runtime" / "home" / ".hermes" /
+                    "profiles" / "test-imported" / ".env")
         assert env_file.exists()
         assert "MODEL_ID=gpt-4o" in env_file.read_text()
 
@@ -2002,7 +2008,8 @@ class TestProfileTemplates:
         )
         with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
             TAG.cmd_template(args)
-        env_file = tmp_path / "taghome" / "profiles" / "secure-profile" / ".env"
+        env_file = (tmp_path / "taghome" / "runtime" / "home" / ".hermes" /
+                    "profiles" / "secure-profile" / ".env")
         content = env_file.read_text()
         assert "# OPENAI_API_KEY=<fill in>" in content
         assert "MODEL_ID=gpt-4o" in content
@@ -2535,7 +2542,11 @@ class TestPRD011ThroughPRD020Regressions:
             status TEXT, prompt_tokens INTEGER, completion_tokens INTEGER,
             attributes TEXT, error_msg TEXT
         )""")
-        db.execute("""INSERT INTO spans VALUES (
+        db.execute("""INSERT INTO spans
+            (id, trace_id, parent_id, name, profile, model_id, started_at,
+             finished_at, duration_ms, status, prompt_tokens, completion_tokens,
+             attributes, error_msg)
+            VALUES (
             'span-001', 'trace-001', NULL, 'test_op', 'orchestrator', 'gpt-4o',
             '2026-01-01T00:00:00', NULL, NULL, 'ok', 100, 50, '{}', NULL
         )""")
@@ -2559,7 +2570,11 @@ class TestPRD011ThroughPRD020Regressions:
             status TEXT, prompt_tokens INTEGER, completion_tokens INTEGER,
             attributes TEXT, error_msg TEXT
         )""")
-        db.execute("""INSERT INTO spans VALUES (
+        db.execute("""INSERT INTO spans
+            (id, trace_id, parent_id, name, profile, model_id, started_at,
+             finished_at, duration_ms, status, prompt_tokens, completion_tokens,
+             attributes, error_msg)
+            VALUES (
             'span-002', 'trace-002', NULL, 'fetch', NULL, NULL,
             '2026-01-01T00:00:00', NULL, NULL, 'ok', 0, 0, '{}', NULL
         )""")
@@ -2584,10 +2599,13 @@ class TestPRD011ThroughPRD020Regressions:
             )
             with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
                 TAG.cmd_mcp_registry(args)
-        cfg_path = tmp_path / "taghome" / "profiles" / "orchestrator" / "lab-config.yaml"
+        cfg_path = (tmp_path / "taghome" / "runtime" / "home" / ".hermes" /
+                    "profiles" / "orchestrator" / "config.yaml")
         data = yaml.safe_load(cfg_path.read_text())
-        count = sum(1 for e in data.get("mcp_servers", []) if e.get("name") == "mcp-filesystem")
-        assert count == 1, f"Expected 1 entry, got {count} (duplicate bug)"
+        servers = data.get("mcp_servers") or {}
+        # mcp_servers is a dict keyed by server name -> inherently de-duplicated.
+        assert "mcp-filesystem" in servers
+        assert isinstance(servers, dict)
 
     def test_cmd_template_import_config_null_ok(self, tmp_path):
         """template import with config: null must not crash (treat as empty config)."""
@@ -2617,7 +2635,8 @@ class TestPRD011ThroughPRD020Regressions:
             rc = TAG.cmd_template(args)
         assert rc == 0
         # Falls back to 'imported' as profile name
-        assert (tmp_path / "taghome" / "profiles" / "imported" / ".env").exists()
+        assert (tmp_path / "taghome" / "runtime" / "home" / ".hermes" /
+                "profiles" / "imported" / ".env").exists()
 
     def test_hooks_test_no_hooks_configured_fires_zero(self, tmp_path, capsys):
         """hooks test with an event that has no hooks must print 'Fired 0 hooks' cleanly."""
