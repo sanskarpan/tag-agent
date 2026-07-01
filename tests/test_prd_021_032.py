@@ -995,7 +995,8 @@ class TestRouteFallback:
         )
         with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
             rc = TAG.cmd_route_fallback(args)
-        assert rc == 1
+        # No fallback configured is a valid answer (rc 0), consistent with `list`.
+        assert rc == 0
 
     def test_invalid_condition(self, tmp_path):
         cfg, db = make_db(tmp_path)
