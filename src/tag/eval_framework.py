@@ -75,6 +75,27 @@ def load_suite(suite_path: Path) -> dict[str, Any]:
     cases = data["cases"]
     if not isinstance(cases, list) or len(cases) == 0:
         raise ValueError("Suite must have at least one case")
+    for i, case in enumerate(cases):
+        if not isinstance(case, dict):
+            raise ValueError(f"Case {i} must be a mapping, got: {type(case).__name__}")
+        label = case.get("id", i)
+        for key in ("expect_contains", "expect_not_contains", "expect_regex"):
+            val = case.get(key)
+            if val is None:
+                continue
+            if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+                raise ValueError(
+                    f"Case {label!r} field {key!r} must be a list of strings"
+                )
+        for key in ("min_length", "max_length"):
+            val = case.get(key)
+            if val is None:
+                continue
+            # bool is a subclass of int; reject it explicitly.
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ValueError(
+                    f"Case {label!r} field {key!r} must be an integer"
+                )
     return data
 
 
