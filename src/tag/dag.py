@@ -275,11 +275,28 @@ def validate_dag_spec(spec: DagSpec) -> None:
             f"DAG steps must be a JSON array of step objects, got "
             f"{type(steps).__name__}."
         )
+    # Keys the engine actually reads (see run_dag). Unknown keys — especially
+    # dependency aliases like 'deps'/'needs' — would be silently ignored,
+    # producing an edge-free DAG with wrong ordering, so reject them (C032).
+    _RECOGNIZED_STEP_KEYS = {"name", "task", "depends_on", "profile"}
+    _DEP_ALIASES = {"deps", "depends", "needs", "dependencies", "requires", "after"}
     for i, step in enumerate(steps):
         if not isinstance(step, dict):
             raise ValueError(f"DAG step {i} must be an object, got {type(step).__name__}.")
         if not str(step.get("task", "")).strip():
             raise ValueError(f"DAG step {i} is missing required non-empty 'task'.")
+        unknown = set(step) - _RECOGNIZED_STEP_KEYS
+        if unknown:
+            alias = sorted(unknown & _DEP_ALIASES)
+            if alias:
+                raise ValueError(
+                    f"DAG step {i} uses unrecognized dependency key(s) "
+                    f"{alias}; use 'depends_on' instead."
+                )
+            raise ValueError(
+                f"DAG step {i} has unrecognized key(s) {sorted(unknown)}; "
+                f"allowed keys are {sorted(_RECOGNIZED_STEP_KEYS)}."
+            )
 
 
 def save_dag(conn: sqlite3.Connection, spec: DagSpec) -> str:
