@@ -77,6 +77,8 @@ def index_workspace(conn: sqlite3.Connection, root: Path, *, max_files: int = 50
     Returns a summary dict with counts.
     """
     import datetime
+    if max_files <= 0:
+        raise ValueError("max_files must be > 0")
     _ensure_schema(conn)
 
     all_files = _files_from_git(root)
@@ -106,6 +108,7 @@ def index_workspace(conn: sqlite3.Connection, root: Path, *, max_files: int = 50
 
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
     indexed = 0
+    run_tokens = 0
     for fp, size, rank in selected:
         try:
             content = fp.read_bytes()
@@ -121,15 +124,17 @@ def index_workspace(conn: sqlite3.Connection, root: Path, *, max_files: int = 50
                 (rel_path, h, size, tokens, rank, now_iso),
             )
             indexed += 1
+            run_tokens += tokens
         except Exception:
             continue
 
     conn.commit()
-    total_tokens = conn.execute("SELECT SUM(token_count) FROM workspace_files").fetchone()[0] or 0
+    # Report tokens for the files indexed in THIS run — not SUM() over the whole
+    # table, which conflated prior runs and made a capped index report millions.
     return {
         "files_indexed": indexed,
         "total_files": len(all_files),
-        "total_tokens": total_tokens,
+        "total_tokens": run_tokens,
         "max_rank_file": selected[0][0].name if selected else None,
     }
 
