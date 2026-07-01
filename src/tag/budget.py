@@ -62,6 +62,8 @@ def set_budget(
     ensure_schema(conn)
     if max_tokens <= 0:
         raise ValueError("max_tokens must be > 0")
+    if max_tokens > 2**63 - 1:
+        raise ValueError("max_tokens is too large (must fit in a 64-bit integer)")
     if period not in _PERIOD_DAYS:
         raise ValueError(f"period must be one of {list(_PERIOD_DAYS)}, got {period!r}")
     if not (0.0 < warn_pct < 1.0):
@@ -170,6 +172,7 @@ def check_budget(conn: sqlite3.Connection, profile: str) -> dict:
 
     result = {
         "allowed": True,
+        "budget": budget,
         "profile": profile,
         "used": used,
         "limit": limit,
