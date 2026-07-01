@@ -333,6 +333,19 @@ def run_judge_on_eval(
     """
     ensure_schema(conn)
 
+    # Fail loudly if the eval run doesn't exist. Previously an unknown run id
+    # produced an empty JudgeRunResult with exit 0 (a silent false success).
+    if not conn.execute(
+        "SELECT 1 FROM eval_cases WHERE eval_run_id = ? LIMIT 1", (eval_run_id,)
+    ).fetchone():
+        raise ValueError(f"Eval run not found or has no cases: {eval_run_id!r}")
+
+    # Default to the core quality criteria when none are supplied (the CLI
+    # passes None when --criteria is omitted).
+    criteria = list(criteria) if criteria else [
+        JudgeCriteria.FACTUALITY, JudgeCriteria.RELEVANCE, JudgeCriteria.SAFETY
+    ]
+
     judge_run_id = uuid.uuid4().hex[:16]
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
