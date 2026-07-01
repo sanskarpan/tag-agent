@@ -74,18 +74,29 @@ class SWEHarness:
         )
 
     def _is_safe_path(self, path: Path) -> bool:
-        resolved = path.resolve()
-        if str(resolved).startswith(str(self.working_dir)):
-            return True
-        for allowed in self.allowed_dirs:
-            if str(resolved).startswith(str(allowed)):
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        # Use true path containment, NOT string-prefix matching: the latter let a
+        # sibling directory sharing a name prefix (e.g. /tmp/work-evil vs the
+        # working dir /tmp/work) escape the sandbox.
+        for base in [self.working_dir, *self.allowed_dirs]:
+            try:
+                resolved.relative_to(base)
                 return True
+            except ValueError:
+                continue
         return False
 
     def _is_safe_bash(self, cmd: str) -> bool:
         for pat in _BLOCKED_PATTERNS:
             if pat.search(cmd):
                 return False
+        # Block outbound network egress via curl/wget (defense against
+        # exfiltration / fetching untrusted payloads).
+        if _EXTERNAL_CURL.search(cmd):
+            return False
         return True
 
     def execute_action(self, action_name: str, args: dict) -> HarnessAction:
@@ -141,6 +152,10 @@ class SWEHarness:
             act.exit_code = 1
             return act
         start = int(args.get("start", 1))
+        if start < 1:
+            act.error = f"start must be >= 1 (got {start})"
+            act.exit_code = 1
+            return act
         end = int(args.get("end", start + 99))
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -160,6 +175,10 @@ class SWEHarness:
             act.exit_code = 1
             return act
         start = int(args.get("start", 1))
+        if start < 1:
+            act.error = f"start must be >= 1 (got {start})"
+            act.exit_code = 1
+            return act
         end = int(args.get("end", start))
         new_content = args.get("content", "")
         try:
