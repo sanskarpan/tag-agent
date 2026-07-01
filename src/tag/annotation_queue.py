@@ -194,36 +194,30 @@ def dequeue(
     Optionally assigns them to *assigned_to*. Returns the claimed tasks.
     """
     conn.row_factory = sqlite3.Row
+    # Claim atomically: a single UPDATE...RETURNING runs under SQLite's write
+    # lock, so two concurrent workers cannot SELECT-then-UPDATE the same PENDING
+    # row (no lost-update window). The subquery selects the highest-priority
+    # pending rows; RETURNING yields the post-update (IN_PROGRESS) rows.
     rows = conn.execute(
         """
-        SELECT * FROM annotation_tasks
-        WHERE status = ?
-        ORDER BY priority DESC, created_at ASC
-        LIMIT ?
+        UPDATE annotation_tasks
+        SET status = ?, assigned_to = ?
+        WHERE id IN (
+            SELECT id FROM annotation_tasks
+            WHERE status = ?
+            ORDER BY priority DESC, created_at ASC
+            LIMIT ?
+        )
+        RETURNING *
         """,
-        (AnnotationStatus.PENDING, limit),
+        (AnnotationStatus.IN_PROGRESS, assigned_to, AnnotationStatus.PENDING, limit),
     ).fetchall()
+    conn.commit()
 
     if not rows:
         return []
 
-    tasks: list[AnnotationTask] = []
-    for row in rows:
-        task = _row_to_task(row)
-        task.status = AnnotationStatus.IN_PROGRESS
-        task.assigned_to = assigned_to
-        conn.execute(
-            """
-            UPDATE annotation_tasks
-            SET status = ?, assigned_to = ?
-            WHERE id = ?
-            """,
-            (AnnotationStatus.IN_PROGRESS, assigned_to, task.id),
-        )
-        tasks.append(task)
-
-    conn.commit()
-    return tasks
+    return [_row_to_task(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -364,13 +358,15 @@ def queue_stats(conn: sqlite3.Connection) -> dict:
 # ---------------------------------------------------------------------------
 
 def export_labeled(conn: sqlite3.Connection, *, format: str = "jsonl") -> str:
-    """Return all COMPLETED tasks with their labels as a JSONL string.
+    """Return all COMPLETED tasks with their labels serialized for export.
 
-    Each line is a JSON object suitable for fine-tuning dataset creation.
-    Only *format="jsonl"* is currently supported.
+    Each record is suitable for fine-tuning dataset creation. Supported
+    *format* values are ``"jsonl"`` (one JSON object per line) and ``"csv"``.
     """
-    if format != "jsonl":
-        raise ValueError(f"Unsupported export format: {format!r}. Only 'jsonl' is supported.")
+    if format not in ("jsonl", "csv"):
+        raise ValueError(
+            f"Unsupported export format: {format!r}. Supported: 'jsonl', 'csv'."
+        )
 
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -382,10 +378,10 @@ def export_labeled(conn: sqlite3.Connection, *, format: str = "jsonl") -> str:
         (AnnotationStatus.COMPLETED,),
     ).fetchall()
 
-    lines: list[str] = []
+    records: list[dict] = []
     for row in rows:
         task = _row_to_task(row)
-        record = {
+        records.append({
             "id": task.id,
             "source_type": task.source_type,
             "source_id": task.source_id,
@@ -399,10 +395,29 @@ def export_labeled(conn: sqlite3.Connection, *, format: str = "jsonl") -> str:
             "completed_at": task.completed_at,
             "priority": task.priority,
             "tags": task.tags,
-        }
-        lines.append(json.dumps(record, ensure_ascii=False))
+        })
 
-    return "\n".join(lines)
+    if format == "csv":
+        import csv
+        import io
+
+        fieldnames = [
+            "id", "source_type", "source_id", "content", "question",
+            "label_schema", "label", "notes", "assigned_to",
+            "created_at", "completed_at", "priority", "tags",
+        ]
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            row_out = dict(record)
+            # Serialize nested structures so the CSV cells stay well-formed.
+            row_out["label_schema"] = json.dumps(record["label_schema"], ensure_ascii=False)
+            row_out["tags"] = json.dumps(record["tags"], ensure_ascii=False)
+            writer.writerow(row_out)
+        return buf.getvalue()
+
+    return "\n".join(json.dumps(r, ensure_ascii=False) for r in records)
 
 
 # ---------------------------------------------------------------------------
