@@ -226,16 +226,26 @@ def solve_issue(
         "Respond with the plan and then implement the fix.\n"
     )
 
-    tag_bin = _find_tag_bin()
-    try:
-        cmd = [tag_bin, "-q", prompt, "-p", profile]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        output = r.stdout
-    except Exception as e:
-        output = f"Error invoking TAG: {e}"
+    if dry_run:
+        # A dry run previews intent only — it must NOT invoke the (billable)
+        # agent subprocess or produce side effects.
+        result.plan = "(dry run — agent not invoked)"
+        result.changes_summary = "dry run: agent invocation skipped"
+    else:
+        tag_bin = _find_tag_bin()
+        try:
+            # Invoke the real TAG chat command form. The top-level wrapper takes
+            # `chat --profile <p> -q <prompt> -Q` (see cmd/session.py chat parser
+            # + _cmd_hermes_passthrough); the old `-q <prompt> -p <profile>` form
+            # is not a valid top-level CLI and always exited argparse with rc=2.
+            cmd = [tag_bin, "chat", "--profile", profile, "-q", prompt, "-Q"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            output = r.stdout
+        except Exception as e:
+            output = f"Error invoking TAG: {e}"
 
-    result.plan = output[:1000]
-    result.changes_summary = f"TAG output: {len(output)} chars"
+        result.plan = output[:1000]
+        result.changes_summary = f"TAG output: {len(output)} chars"
 
     # Run tests if not dry_run
     if not dry_run:
