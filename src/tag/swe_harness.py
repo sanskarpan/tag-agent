@@ -28,6 +28,24 @@ _BLOCKED_PATTERNS = [
 
 _EXTERNAL_CURL = re.compile(r'(curl|wget)\s+.*https?://')
 
+# Real egress control: any common network tool / URL scheme / raw-socket path,
+# not just a two-token curl|wget regex that a python one-liner trivially bypasses.
+_EXTERNAL_NET = re.compile(
+    r'\b(curl|wget|nc|ncat|netcat|telnet|ssh|scp|sftp|ftp|rsync|socat)\b'
+    r'|https?://|ftp://'
+    r'|/dev/(tcp|udp)/'
+    r'|\b(urllib|urllib2|requests|httpx|http\.client|httplib|socket|smtplib|'
+    r'ftplib|aiohttp|websocket|urlopen)\b'
+)
+
+# Absolute paths that are safe to reference (interpreters, libraries, system
+# binaries) even though they sit outside the working dir. User data locations
+# like /etc, /tmp, /var and $HOME are deliberately excluded.
+_SAFE_EXEC_PREFIXES = (
+    "/usr/bin", "/usr/local/bin", "/usr/sbin", "/bin", "/sbin",
+    "/usr/lib", "/usr/libexec", "/System", "/Library", "/opt",
+)
+
 
 @dataclass
 class HarnessAction:
@@ -93,9 +111,44 @@ class SWEHarness:
         for pat in _BLOCKED_PATTERNS:
             if pat.search(cmd):
                 return False
-        # Block outbound network egress via curl/wget (defense against
-        # exfiltration / fetching untrusted payloads).
-        if _EXTERNAL_CURL.search(cmd):
+        # Block outbound network egress via any common tool/library or raw
+        # socket path (defense against exfiltration / fetching untrusted
+        # payloads) — not just literal `curl http://…`.
+        if _EXTERNAL_NET.search(cmd):
+            return False
+        # Path containment, mirroring view/edit/create: any absolute path or
+        # parent-traversal token must resolve inside the working dir (or a
+        # known system binary/library location). This rejects reads like
+        # `cat /etc/passwd` or `cat /tmp/outside/secret`.
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:
+            return False
+        for tok in tokens:
+            cand = tok.lstrip('0123456789<>|&')
+            if not cand:
+                continue
+            looks_pathy = (
+                cand.startswith('/')
+                or cand.startswith('~')
+                or '..' in cand.split('/')
+            )
+            if not looks_pathy:
+                continue
+            expanded = Path(cand).expanduser()
+            if not expanded.is_absolute():
+                expanded = self.working_dir / expanded
+            if self._is_safe_path(expanded):
+                continue
+            try:
+                resolved = str(expanded.resolve())
+            except OSError:
+                return False
+            if any(
+                resolved == p or resolved.startswith(p + "/")
+                for p in _SAFE_EXEC_PREFIXES
+            ):
+                continue
             return False
         return True
 
