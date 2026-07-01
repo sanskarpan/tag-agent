@@ -368,6 +368,10 @@ def compute_cost(
     if entry is None:
         return None
 
+    # Clamp negative token counts so cost is never negative (PRD-046 hardening).
+    input_tokens = max(0, input_tokens)
+    output_tokens = max(0, output_tokens)
+
     input_rate = entry.input_usd_per_1m
     output_rate = entry.output_usd_per_1m
 
