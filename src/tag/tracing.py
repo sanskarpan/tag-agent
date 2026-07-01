@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -38,14 +37,6 @@ from typing import Any, Generator, Protocol
 def _utc_now() -> str:
     """Return the current UTC time as an ISO-8601 string."""
     return datetime.now(timezone.utc).isoformat()
-
-
-def _monotonic_to_wall(mono: float) -> str:
-    """Convert a monotonic timestamp to an ISO wall-clock string."""
-    wall = datetime.fromtimestamp(
-        mono - time.monotonic() + time.time(), tz=timezone.utc
-    )
-    return wall.isoformat()
 
 
 # ---------------------------------------------------------------------------
