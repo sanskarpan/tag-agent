@@ -101,6 +101,52 @@ def _now_utc() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+class _AnyChoices:
+    """Choices container that accepts any value.
+
+    Used so the swarm subparser does not reject a legacy free-text task
+    (``tag swarm "build a website"``) as an 'invalid choice'. Unknown tokens are
+    routed to the legacy positional by :class:`_LegacyFallbackSubParsers`.
+    """
+
+    def __init__(self, mapping):
+        self._mapping = mapping
+
+    def __contains__(self, key):
+        return True
+
+    def __iter__(self):
+        return iter(self._mapping)
+
+    def __getitem__(self, key):
+        return self._mapping[key]
+
+
+class _LegacyFallbackSubParsers(argparse._SubParsersAction):  # type: ignore[name-defined]
+    """Subparsers action that falls back to a legacy positional task.
+
+    ``tag swarm run|list|status|abort|results`` dispatch to the PRD-023
+    subcommands. Any other first token is treated as the legacy PRD-004 kanban
+    task string, so ``tag swarm "build a website"`` keeps working instead of
+    raising 'invalid choice'. Options that follow the task are still parsed.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.choices = _AnyChoices(self._name_parser_map)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        name = values[0] if values else None
+        if name is not None and name not in self._name_parser_map:
+            setattr(namespace, "task", name)
+            setattr(namespace, self.dest, None)
+            rest = list(values[1:])
+            if rest:
+                parser.parse_args(rest, namespace)
+            return
+        super().__call__(parser, namespace, values, option_string)
+
+
 # ---------------------------------------------------------------------------
 # PRD-004: kanban-based swarm (legacy)
 # ---------------------------------------------------------------------------
@@ -114,6 +160,13 @@ def cmd_swarm(args: argparse.Namespace) -> int:
     expected: you need AI credentials to run AI.
     """
     import tag.kanban as _kanban  # noqa: PLC0415
+
+    # Bare `tag swarm` (no task, no subcommand) — print usage instead of crashing
+    # on a None task (B008).
+    if getattr(args, "task", None) is None:
+        print('usage: tag swarm "<task>" [--profile P] [--type T] [--board B] [--no-wait] [--json]')
+        print("       tag swarm run|list|status|abort|results [options]")
+        return 0
 
     cfg = load_config(config_path(args.config))
 
@@ -293,7 +346,8 @@ def _cmd_swarm_run(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
     coordinator_profile = getattr(args, "coordinator_profile", None) or cfg["defaults"].get("master_profile", "orchestrator")
     goal = getattr(args, "goal", "")
-    max_agents = min(int(getattr(args, "max_agents", 4) or 4), SWARM_MAX_AGENTS)
+    max_agents_raw = getattr(args, "max_agents", 4)
+    max_agents = 4 if max_agents_raw is None else int(max_agents_raw)
     failure_policy = getattr(args, "failure_policy", "best_effort") or "best_effort"
     timeout = int(getattr(args, "timeout_per_agent", 300) or 300)
     dry_run = getattr(args, "dry_run", False)
@@ -301,8 +355,13 @@ def _cmd_swarm_run(args: argparse.Namespace) -> int:
     approve = getattr(args, "approve", False)
     parallel = not getattr(args, "sequential", False)
 
+    # Validate BEFORE clamping so an explicit 0/negative/over-cap is rejected
+    # rather than silently normalised (B087/B099).
+    if max_agents < 1:
+        print("error: --max-agents must be >= 1", file=sys.stderr)
+        return 1
     if max_agents > SWARM_MAX_AGENTS:
-        print(f"error: --max-agents must be ≤ {SWARM_MAX_AGENTS}", file=sys.stderr)
+        print(f"error: --max-agents must be <= {SWARM_MAX_AGENTS}", file=sys.stderr)
         return 1
     if not goal:
         print("error: --goal is required", file=sys.stderr)
@@ -311,33 +370,46 @@ def _cmd_swarm_run(args: argparse.Namespace) -> int:
         print("error: invalid --failure-policy value", file=sys.stderr)
         return 1
 
-    db = open_db(cfg)
     swarm_id = uuid.uuid4().hex[:12]
+
+    # --dry-run is offline: describe what would run without invoking the
+    # coordinator model or touching the database (B099).
+    if dry_run:
+        plan = {
+            "swarm_id": swarm_id,
+            "goal": goal,
+            "coordinator_profile": coordinator_profile,
+            "max_agents": max_agents,
+            "failure_policy": failure_policy,
+            "timeout_per_agent": timeout,
+            "parallel": parallel,
+            "dry_run": True,
+        }
+        if as_json:
+            print(json.dumps(plan, indent=2))
+            return 0
+        print(f"Swarm ID:     {swarm_id}")
+        print(f"Goal:         {goal}")
+        print(f"Coordinator:  {coordinator_profile}")
+        print(f"Max agents:   {max_agents}")
+        print(f"Policy:       {failure_policy}")
+        print(f"Dispatch:     {'parallel' if parallel else 'sequential'}")
+        print("\n(dry run — the coordinator would decompose the goal into up to "
+              f"{max_agents} tasks; re-run without --dry-run to execute.)")
+        return 0
+
+    db = open_db(cfg)
 
     # Step 1: Run coordinator to produce task manifest
     coordinator = SwarmCoordinator(cfg, coordinator_profile)
     try:
         manifest = coordinator.produce_manifest(goal, swarm_id, max_agents)
     except SwarmManifestError as exc:
+        db.close()
         print(f"error: coordinator failed: {exc}", file=sys.stderr)
         return 2
 
     manifest["coordinator_profile"] = coordinator_profile
-
-    if dry_run:
-        print(f"Swarm ID: {swarm_id}")
-        print(f"Goal:     {goal}")
-        print(f"\n{'Task ID':<20} {'Profile':<18} {'Context Type':<14} Context Selector")
-        print("-" * 80)
-        for t in manifest["tasks"]:
-            cs = t.get("context_slice", {})
-            sel = cs.get("selector", "")
-            if isinstance(sel, list):
-                sel = ", ".join(str(s) for s in sel[:3])
-            print(f"{t['task_id']:<20} {t['profile']:<18} {cs.get('type', ''):<14} {str(sel)[:40]}")
-        if as_json:
-            print(json.dumps(manifest, indent=2))
-        return 0
 
     # Step 2: Persist run + tasks
     create_swarm_run(db, swarm_id, goal, coordinator_profile, failure_policy, max_agents)
@@ -415,8 +487,11 @@ def _cmd_swarm_status(args: argparse.Namespace) -> int:
         (swarm_id,),
     ).fetchone()
     if not run:
-        print(f"error: swarm {swarm_id!r} not found", file=sys.stderr)
         db.close()
+        if getattr(args, "json", False):
+            print(json.dumps({"error": f"swarm {swarm_id} not found", "swarm_id": swarm_id}))
+        else:
+            print(f"error: swarm {swarm_id!r} not found", file=sys.stderr)
         return 1
     tasks = db.execute(
         "SELECT task_id, profile, status, started_at, completed_at, cost_usd, error_message FROM swarm_tasks WHERE swarm_id=? ORDER BY id",
@@ -444,7 +519,10 @@ def _cmd_swarm_abort(args: argparse.Namespace) -> int:
     db = open_db(cfg)
     if not db.execute("SELECT 1 FROM swarm_runs WHERE swarm_id=? LIMIT 1", (swarm_id,)).fetchone():
         db.close()
-        print(f"error: swarm {swarm_id!r} not found", file=sys.stderr)
+        if getattr(args, "json", False):
+            print(json.dumps({"error": f"swarm {swarm_id} not found", "swarm_id": swarm_id}))
+        else:
+            print(f"error: swarm {swarm_id!r} not found", file=sys.stderr)
         return 1
     pids = db.execute(
         "SELECT pid FROM swarm_tasks WHERE swarm_id=? AND status='running' AND pid IS NOT NULL",
@@ -469,7 +547,10 @@ def _cmd_swarm_abort(args: argparse.Namespace) -> int:
     )
     db.commit()
     db.close()
-    print(f"Swarm {swarm_id} aborted — {killed} process(es) signalled.")
+    if getattr(args, "json", False):
+        print(json.dumps({"swarm_id": swarm_id, "status": "aborted", "signalled": killed}))
+    else:
+        print(f"Swarm {swarm_id} aborted — {killed} process(es) signalled.")
     return 0
 
 
@@ -482,8 +563,11 @@ def _cmd_swarm_results(args: argparse.Namespace) -> int:
         (swarm_id,),
     ).fetchone()
     if not run:
-        print(f"error: swarm {swarm_id!r} not found", file=sys.stderr)
         db.close()
+        if getattr(args, "format", "table") == "json" or getattr(args, "json", False):
+            print(json.dumps({"error": f"swarm {swarm_id} not found", "swarm_id": swarm_id}))
+        else:
+            print(f"error: swarm {swarm_id!r} not found", file=sys.stderr)
         return 1
     tasks = db.execute(
         "SELECT task_id, profile, status, cost_usd, tokens_prompt, tokens_completion, output, error_message FROM swarm_tasks WHERE swarm_id=? ORDER BY id",
@@ -529,18 +613,24 @@ def _cmd_swarm_results(args: argparse.Namespace) -> int:
 def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[name-defined]
     """Register the swarm command and its subcommands onto *sub*."""
     # ---- PRD-004: swarm ----
-    swarm = sub.add_parser("swarm", help="Multi-agent swarm orchestration")
-    swarm_sub = swarm.add_subparsers(dest="swarm_subcommand")
+    swarm = sub.add_parser(
+        "swarm", help="Multi-agent swarm orchestration",
+        description='Legacy: tag swarm "<task>" [options]. '
+                    'PRD-023: tag swarm run|list|status|abort|results.',
+    )
+    swarm.register("action", "swarm_legacy_parsers", _LegacyFallbackSubParsers)
+    swarm_sub = swarm.add_subparsers(dest="swarm_subcommand", action="swarm_legacy_parsers")
 
-    # Legacy kanban-based swarm (PRD-004) — keep as default positional
-    swarm.add_argument("task", nargs="?", help="Task description (kanban swarm — legacy)")
+    # Legacy kanban-based swarm (PRD-004): `tag swarm "<task>" [--profile ...]`.
+    # The free-text task is captured by _LegacyFallbackSubParsers (any token that
+    # is not a known subcommand), so we only register its options here.
     swarm.add_argument("--profile", help="Orchestrator profile (default: orchestrator)")
     swarm.add_argument("--type", dest="task_type", default="mixed",
                        choices=("research", "implementation", "review", "mixed"))
     swarm.add_argument("--board", help="Kanban board name (default: from config)")
     swarm.add_argument("--no-wait", action="store_true", dest="no_wait")
     swarm.add_argument("--json", action="store_true")
-    swarm.set_defaults(func=cmd_swarm)
+    swarm.set_defaults(func=cmd_swarm, task=None)
 
     # PRD-023: context-centric swarm subcommands
     sw_run = swarm_sub.add_parser("run", help="Launch a context-centric multi-agent swarm")
@@ -575,6 +665,7 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[name-defi
 
     sw_abort = swarm_sub.add_parser("abort", help="Abort a running swarm")
     sw_abort.add_argument("swarm_id", metavar="SWARM_ID")
+    sw_abort.add_argument("--json", action="store_true")
     sw_abort.set_defaults(func=cmd_swarm_context)
 
     sw_results = swarm_sub.add_parser("results", help="Show results and final output for a swarm")
