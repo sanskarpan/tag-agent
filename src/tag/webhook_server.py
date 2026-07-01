@@ -316,6 +316,12 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
             or self.headers.get("X-Slack-Signature", "")
         )
         valid = verify_signature(platform, body_bytes, sig_header, secret)
+        # Enforce the signature: when a secret is configured, reject a request
+        # that fails HMAC verification BEFORE parsing/matching/enqueuing.
+        # Without this gate a forged request could enqueue arbitrary agent work.
+        if secret and not valid:
+            self._send_json(401, {"error": "invalid signature"})
+            return
 
         try:
             payload = json.loads(body_bytes.decode("utf-8"))
@@ -371,7 +377,7 @@ class WebhookServer:
         self,
         db_path: str | Path,
         cfg: dict,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 8080,
         secret: str | None = None,
     ) -> None:
