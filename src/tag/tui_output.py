@@ -238,9 +238,17 @@ def send_desktop_notification(title: str, message: str) -> None:
     system = platform.system()
     try:
         if system == "Darwin":
-            script = f'display notification "{message}" with title "{title}"'
+            # Pass message/title as osascript arguments (argv), never
+            # interpolated into the script text — otherwise a double-quote in
+            # the message escapes the string and `do shell script` runs
+            # arbitrary shell (local code execution).
+            script = (
+                "on run {msg, ttl}\n"
+                "display notification msg with title ttl\n"
+                "end run"
+            )
             subprocess.run(
-                ["osascript", "-e", script],
+                ["osascript", "-e", script, message, title],
                 check=False,
                 capture_output=True,
                 timeout=5,
