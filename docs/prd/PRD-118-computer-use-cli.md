@@ -1,10 +1,12 @@
 # PRD-118: Computer Use CLI (`tag computer-use`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Computer Use
-**Affects:** `computer_use.py + controller.py`
+**Affects:** `internal/agent (computer-use loop) + internal/llm (vision) + internal/sandbox + internal/cli`
 **Depends on:** PRD-119 (Claude computer-use screenshot loop), PRD-028 (sandbox execution), PRD-089 (sandbox streaming stdout/stderr)
 **Inspired by:** Anthropic Claude computer use, OpenAI computer use preview, Playwright CUA, SWE-agent bash harness
 
@@ -115,16 +117,16 @@ Options:
 
 | ID | Requirement |
 |----|------------|
-| FR-01 | `tag computer-use run` creates a `computer_use_sessions` SQLite row and launches the PRD-119 screenshot-action loop. |
-| FR-02 | Action allow-list: before dispatching any model-requested action, check action type against allow-list; reject with error response if not allowed. |
-| FR-03 | Each screenshot is base64-encoded and passed to the Claude API as an `image` content block with `type: base64`. |
-| FR-04 | Each action dispatched is recorded in `computer_use_actions` SQLite table with type, coordinates, text, and timestamp. |
-| FR-05 | `--sandbox` flag: start a PRD-120 VNC sandbox desktop before the loop; all actions dispatched to the VNC display. |
+| FR-01 | `tag computer-use run` creates a `computer_use_sessions` SQLite row (`internal/store`) and launches the PRD-119 screenshot→vision→action loop in `internal/agent`. |
+| FR-02 | Action allow-list: before dispatching any model-requested action, check the action type against the allow-list; reject with a tool error result returned to the model if not allowed. |
+| FR-03 | Each screenshot is passed to the vision provider (`internal/llm`) as an image content block; the `internal/llm/anthropic` adapter over `anthropics/anthropic-sdk-go` v1.55.x sends it as a base64 image source alongside the `computer_use` tool result. |
+| FR-04 | Each action dispatched is recorded in the `computer_use_actions` SQLite table with type, coordinates (JSON), text, and timestamp. |
+| FR-05 | `--sandbox` flag: bring up a PRD-120 VNC sandbox desktop via the `internal/sandbox` ladder before the loop; all actions are dispatched to the VNC display through the desktop driver (`chromedp`/`playwright-go` for browser targets). |
 | FR-06 | `--max-actions` hard stop: after N actions, stop the loop and report the current state. |
-| FR-07 | `--timeout` hard stop: if the session runs longer than N seconds, stop and report. |
+| FR-07 | `--timeout` hard stop: enforced with `context.WithTimeout`; if the session ctx expires, stop and report. |
 | FR-08 | `tag computer-use replay <id>` queries `computer_use_screenshots` for the session and displays them in sequence with `--delay` between frames. |
 | FR-09 | `tag computer-use show <id>` renders session metadata + action log (type, coordinates, text, timestamp). |
-| FR-10 | Screenshots are also attached to the current OTel span (PRD-041) as binary blob attachments. |
+| FR-10 | Screenshots are also attached to the current OTel span (`go.opentelemetry.io/otel`, PRD-041) as binary blob attachments. |
 
 ---
 
@@ -141,7 +143,18 @@ Options:
 
 ## 9. Technical Design
 
-### 9.1 SQLite DDL
+### 9.1 Architecture
+
+The session is a **screenshot → vision → action loop** driven by `internal/agent`, calling the Claude *computer use* tool through the provider-neutral vision interface in `internal/llm` (`internal/llm/anthropic` over `anthropics/anthropic-sdk-go` v1.55.x, using the `computer_use` tool + image content blocks). Each turn:
+
+1. Capture a screenshot from the target display (VNC sandbox via `internal/sandbox`; browser targets driven by `github.com/chromedp/chromedp` or `github.com/playwright-community/playwright-go`).
+2. Send the screenshot as an image block + prior tool results to the model; the model responds with a `computer_use` tool call (action + coordinates/text).
+3. Gate the action through the allow-list and the `internal/tool` permission engine, then dispatch it to the driver.
+4. Persist the action + screenshot to `internal/store` and attach the screenshot to the OTel span.
+
+Loop control (`--max-actions`, `--timeout`, doom-loop/interrupt) reuses the bounded-loop primitives in `internal/agent`; `--timeout` is a `context.WithTimeout` on the loop ctx. Untrusted actions are gated through the `internal/sandbox` ladder (landlock+seccomp+nftables → docker → gVisor → firecracker on Linux; degrade off-Linux) plus the permission gate.
+
+### 9.2 SQLite DDL (`internal/store`, modernc.org/sqlite)
 
 ```sql
 CREATE TABLE IF NOT EXISTS computer_use_sessions (
@@ -178,20 +191,66 @@ CREATE TABLE IF NOT EXISTS computer_use_screenshots (
 );
 ```
 
-### 9.2 Action allow-list enforcement
+### 9.3 Action allow-list enforcement
 
-```python
-VALID_ACTIONS = frozenset({
-    "screenshot", "key", "type", "left_click", "right_click",
-    "double_click", "scroll", "move", "drag", "cursor_position"
-})
+```go
+package computeruse // internal/agent/computeruse
 
-def check_allow_list(action_type: str, allow_list: Optional[set]) -> bool:
-    if action_type not in VALID_ACTIONS:
-        return False
-    if allow_list is None:
-        return True
-    return action_type in allow_list
+// validActions is the set of computer_use tool action types TAG understands.
+var validActions = map[string]struct{}{
+	"screenshot": {}, "key": {}, "type": {}, "left_click": {}, "right_click": {},
+	"double_click": {}, "scroll": {}, "move": {}, "drag": {}, "cursor_position": {},
+}
+
+// checkAllowList reports whether an action type may be dispatched.
+// A nil allow set means "all valid actions are allowed".
+func checkAllowList(actionType string, allow map[string]struct{}) bool {
+	if _, ok := validActions[actionType]; !ok {
+		return false
+	}
+	if allow == nil {
+		return true
+	}
+	_, ok := allow[actionType]
+	return ok
+}
+```
+
+### 9.4 Loop skeleton
+
+```go
+// Run drives one computer-use session until goal completion, max-actions,
+// timeout, or interrupt. vision is the internal/llm provider; drv is the
+// display/browser driver; store persists actions + screenshots.
+func (s *Session) Run(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, s.timeout) // FR-07
+	defer cancel()
+
+	for n := 0; n < s.maxActions; n++ { // FR-06
+		shot, err := s.drv.Screenshot(ctx)
+		if err != nil {
+			return err
+		}
+		s.store.SaveScreenshot(ctx, s.id, n, shot) // FR-04/FR-10 (+ OTel span attach)
+
+		call, err := s.vision.NextAction(ctx, s.goal, shot) // anthropic-sdk-go computer_use tool
+		if err != nil {
+			return err
+		}
+		if call.Stop {
+			return nil
+		}
+		if !checkAllowList(call.Action, s.allow) { // FR-02
+			s.vision.RejectAction(call, "action not permitted")
+			continue
+		}
+		if err := s.drv.Dispatch(ctx, call); err != nil {
+			return err
+		}
+		s.store.SaveAction(ctx, s.id, n, call)
+	}
+	return errMaxActions
+}
 ```
 
 ---
@@ -211,9 +270,10 @@ def check_allow_list(action_type: str, allow_list: Optional[set]) -> bool:
 
 | Layer | Tests |
 |-------|-------|
-| Unit | Allow-list enforcement; action recording; session state persistence |
-| Integration | Mock computer-use loop: screenshot → model mock → action dispatch → assert recording |
-| Security | Rejected action type never dispatched; `--max-actions` stops loop |
+| Unit | Table-driven `go test` for `checkAllowList`; action recording; session state persistence across a simulated crash |
+| Integration | Loop against a fake `internal/llm` vision provider + fake driver: screenshot → mocked tool call → action dispatch → assert recording |
+| Benchmark | `testing.B` for loop-iteration and screenshot-capture latency (Success Metrics: cycle < 3s, capture < 500ms) |
+| Security | Rejected action type never dispatched; `--max-actions` and `context` `--timeout` stop the loop |
 
 ---
 
@@ -233,8 +293,12 @@ def check_allow_list(action_type: str, allow_list: Optional[set]) -> bool:
 
 | Dependency | Reason |
 |-----------|--------|
-| PRD-119 screenshot-action loop | Core execution loop |
-| PRD-120 VNC sandbox | Isolated desktop environment |
+| `github.com/anthropics/anthropic-sdk-go` v1.55.x (via `internal/llm/anthropic`) | Claude `computer_use` tool + image content blocks |
+| `github.com/chromedp/chromedp` **or** `github.com/playwright-community/playwright-go` | Display/browser action driver |
+| `modernc.org/sqlite` (via `internal/store`) | Session/action/screenshot persistence (pure-Go) |
+| `github.com/google/uuid` | Session/action IDs |
+| PRD-119 screenshot-action loop | Core execution loop (`internal/agent`) |
+| PRD-120 VNC sandbox | Isolated desktop environment (`internal/sandbox`) |
 | PRD-041 OTel span system | Screenshot attachment |
 | Claude claude-sonnet-4-6 | Computer-use capable model |
 

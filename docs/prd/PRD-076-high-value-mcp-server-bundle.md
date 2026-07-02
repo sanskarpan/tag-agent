@@ -1,5 +1,7 @@
 # PRD-076: High-Value MCP Server Bundle (`tag mcp registry add-curated`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P2
 **Estimated Effort:** XS (1-2 days)
@@ -17,7 +19,7 @@ MCP (Model Context Protocol) has become the de facto integration standard for ag
 
 This PRD introduces `tag mcp registry add-curated`: a single command that installs a carefully selected bundle of the 20 highest-value MCP servers, sourced by cross-referencing Composio's top-integration metrics, Smithery's community download rankings, and the MCP community's most-starred GitHub repositories. The bundle covers every major workflow category a professional engineering team or knowledge worker is likely to need: productivity (Notion, Google Workspace), developer infrastructure (GitHub, Docker, Vercel, Cloudflare, AWS), databases (PostgreSQL, MongoDB, Redis), CRM and payments (HubSpot, Stripe), communication (Slack, Twilio), project management (Jira, Linear), design (Figma), browser automation (Playwright), observability (Sentry), SEO analytics (Ahrefs), and design collaboration.
 
-The feature extends the existing `mcp-registry.yaml` bundle format defined in PRD-014, adds four category groupings to enable selective installs (`--category productivity | devops | database | comms`), and enriches the registry YAML schema with a `curated_bundle` top-level key that carries ranking metadata, install-method type, tool count estimates, and required environment variables for pre-flight credential checks. No new Python source files are required for the XS scope of this PRD; the primary deliverable is the enriched `mcp-registry.yaml` and the `cmd_mcp_registry_add_curated` handler in `controller.py`. A thin SQLite table (`mcp_curated_installs`) records which servers were installed and when, enabling `tag mcp list --json` to surface curated-install provenance.
+The feature extends the existing `mcp-registry.yaml` bundle format defined in PRD-014, adds four category groupings to enable selective installs (`--category productivity | devops | database | comms`), and enriches the registry YAML schema with a `curated_bundle` top-level key that carries ranking metadata, install-method type, tool count estimates, and required environment variables for pre-flight credential checks. No Python source files are involved. The primary deliverables are the enriched `internal/mcp/registry/registry.yaml` (compiled into the binary via `//go:embed`) and the handlers in `internal/mcp/curated/curated.go` and `internal/cli/mcp_registry.go`. A thin SQLite table (`mcp_curated_installs`) records which servers were installed and when, enabling `tag mcp list --json` to surface curated-install provenance.
 
 The feature also addresses a real constraint in the Cursor/Claude agent tool budget: a single context window supports at most 40 simultaneous MCP tools before the model begins to drop or misroute calls. Playwright alone exposes 25 tools. The curated installer therefore enforces a pre-flight tool-budget check, warns when the selection would exceed the 40-tool soft ceiling, and recommends disabling Playwright from the active context by default (it remains installed and available, but not auto-enabled). This tool-budget awareness makes `add-curated` safe to run in a single command without blowing up an existing agent configuration.
 
@@ -316,9 +318,9 @@ Pending Credentials — researcher profile (17 servers)
 | FR-01 | **`mcp-registry.yaml` curated_bundle section:** The registry YAML must include a top-level `curated_bundle` key containing a list of 20 server references, each with: `server_key` (matching a key in `servers:`), `rank` (int 1–20), `category` (one of `productivity`, `devops`, `database`, `comms`), `ranking_sources` (list of strings), `tool_count_estimate` (int), and `default_disabled` (bool, true for Playwright). |
 | FR-02 | **Idempotent install:** Re-running `tag mcp registry add-curated` on a profile that already has some curated servers must skip those servers silently and install only missing ones. The exit code must be 0; the output must clearly indicate which were skipped. |
 | FR-03 | **Category filter:** `--category` must restrict the install to servers in that category group only. Running `add-curated --category devops` must not modify, remove, or re-register servers in other categories already installed on the profile. |
-| FR-04 | **Pre-flight env-var check:** Before any writes, the command must iterate over each selected server's `requires_env` list and check `os.environ` for each variable. Missing variables are collected and displayed in the pre-flight summary. Missing variables do not block the install. |
+| FR-04 | **Pre-flight env-var check:** Before any writes, the command must iterate over each selected server's `requires_env` list and call `os.Getenv` for each variable. Missing variables are collected and displayed in the pre-flight summary. Missing variables do not block the install. |
 | FR-05 | **`pending_credentials` status:** Servers installed with one or more missing env-vars must be written to `mcp_curated_installs` with `status = 'pending_credentials'` and must not be written to the profile's active MCP server config until all required env-vars are present. |
-| FR-06 | **`mcp_curated_installs` SQLite table:** The installation record table must be created with WAL mode on first use via `open_db()`. Schema is defined in Section 9.2. Every `add-curated` invocation writes one row per server to this table (INSERT OR REPLACE). |
+| FR-06 | **`mcp_curated_installs` SQLite table:** The installation record table must be created via `internal/store.Migrate(db)` (WAL mode already set by `internal/store.OpenDB()`). Schema is defined in Section 10.2. Every `add-curated` invocation writes one row per server to this table (`INSERT OR REPLACE`), wrapped in a single transaction. |
 | FR-07 | **Tool-budget pre-flight:** Before displaying the confirmation prompt, the command must sum `tool_count_estimate` for all selected servers with `status != 'disabled'` and add the count of already-active tools for the profile. If the sum exceeds 40, a WARNING block is printed listing which servers to disable to reach a safe count. This check is skipped when `--no-budget-check` is set. |
 | FR-08 | **`--disable-playwright` flag:** When set, Playwright is registered in `mcp_curated_installs` with `status = 'disabled'` and its tool count is excluded from the budget calculation. The user must explicitly run `tag mcp enable mcp-playwright --profile <name>` to activate it. |
 | FR-09 | **Dry-run mode:** `--dry-run` must not write any rows to `mcp_curated_installs`, must not modify any profile config, and must print the full install plan table, tool-budget impact, and missing env-vars. Exit code is 0 if `mcp-registry.yaml` parses cleanly, 1 otherwise. |
@@ -327,7 +329,7 @@ Pending Credentials — researcher profile (17 servers)
 | FR-12 | **Install method fidelity:** Each server in the curated bundle must use exactly one of: `npx` (Node.js stdio), `uvx` (Python stdio), `docker` (container stdio), or `remote` (streamable-HTTP or remote URL). SSE transport must never be used. The `config` block in `mcp-registry.yaml` must include a transport-appropriate `command` and `args` for each server. |
 | FR-13 | **Google Workspace as five distinct servers:** Gmail, Drive, Calendar, Sheets, and Chat must be registered as five separate server keys in `mcp-registry.yaml` (e.g., `mcp-google-drive`, `mcp-google-calendar`, `mcp-google-gmail`). Each has its own `requires_env` entry for the shared OAuth client credentials. The curated bundle counts them as separate entries toward the 20 total but notes they share one OAuth client. |
 | FR-14 | **`tag mcp creds` output:** The `tag mcp creds` command must read `mcp_curated_installs` for the given profile, collect all servers with `status = 'pending_credentials'`, and for each server print the required env-var name, a one-sentence setup URL, and the `export VAR=...` command. When `--server` is provided, output only that server's credential guide. |
-| FR-15 | **`tag mcp activate`:** When a user sets a missing env-var and runs `tag mcp activate <server> --profile <name>`, the command must re-check all `requires_env` for that server, confirm all are present in `os.environ`, and update the `mcp_curated_installs` row to `status = 'active'` and write the server to the profile's MCP config. |
+| FR-15 | **`tag mcp activate`:** When a user sets a missing env-var and runs `tag mcp activate <server> --profile <name>`, the command must re-check all `requires_env` for that server, confirm all are present via `os.Getenv`, and update the `mcp_curated_installs` row to `status = 'active'` and write the server to the profile's MCP config via `knadh/koanf/v2`. |
 | FR-16 | **Confirmation prompt:** Unless `--yes` or `CI=true`, the command must display a summary line ("Install N servers for profile X? [y/N]") and await user input before making any writes. |
 | FR-17 | **`--json` output:** In `--json` mode, all human-readable output is suppressed. The final JSON object (schema in Section 9.3) is written to stdout. Progress and errors go to stderr. |
 | FR-18 | **Ranking sources:** Each server's `curated_bundle` entry in `mcp-registry.yaml` must list at least one of: `composio_top_integrations`, `smithery_downloads`, `github_stars`, `mcp_community_vote`. This is editorial metadata; it is included in `--json` output for transparency but not validated against live APIs. |
@@ -342,9 +344,9 @@ Pending Credentials — researcher profile (17 servers)
 | NFR-01 | **Command latency:** `tag mcp registry add-curated --dry-run` must complete in under 200 ms on a warm machine (YAML already parsed). No network calls are made during dry-run. Actual install (YAML writes + SQLite) must complete in under 500 ms for all 20 servers. |
 | NFR-02 | **Idempotency:** Running `add-curated` N times on the same profile must produce the same final state as running it once. SQLite writes use `INSERT OR REPLACE` keyed on `(profile, server_key)`. Profile config writes check for existing server entry before appending. |
 | NFR-03 | **Zero network requirement:** The curated bundle is defined entirely in the bundled `mcp-registry.yaml`. No network calls to `registry.modelcontextprotocol.io` or any other endpoint are made by `add-curated`. Network calls happen only at agent runtime when the MCP servers themselves are invoked. |
-| NFR-04 | **YAML round-trip safety:** The `mcp-registry.yaml` file is read using `ruamel.yaml` to preserve comments and indentation. No existing entry comments are dropped. The new `curated_bundle` section is appended after the existing `servers:` block. |
-| NFR-05 | **SQLite WAL mode:** All writes to `mcp_curated_installs` use the existing `open_db()` helper (WAL mode, `journal_mode=WAL`, `synchronous=NORMAL`). Concurrent reads from `tag mcp list --json` are never blocked. |
-| NFR-06 | **Secret hygiene:** No secret values are ever written to `mcp-registry.yaml`, `mcp_curated_installs`, or any log output. The `requires_env` list contains only variable names (strings). The pre-flight check uses `os.environ.get(name) is not None` — no value logging. |
+| NFR-04 | **YAML parse safety:** `internal/mcp/registry/registry.yaml` is embedded at compile time via `//go:embed` and parsed once at startup with `gopkg.in/yaml.v3` (`yaml.Unmarshal`). The file is read-only at runtime; no round-trip writes occur. The `curated_bundle` section is appended as a top-level key after `servers:` in the source file; YAML comments are preserved in version control but are not required to survive parse/marshal cycles. |
+| NFR-05 | **SQLite WAL mode:** All writes to `mcp_curated_installs` go through `internal/store.OpenDB()` (`modernc.org/sqlite`, WAL mode, `journal_mode=WAL`, `synchronous=NORMAL`). Single-writer isolation is enforced by `gofrs/flock`. Concurrent reads from `tag mcp list --json` are never blocked. |
+| NFR-06 | **Secret hygiene:** No secret values are ever written to `mcp-registry.yaml`, `mcp_curated_installs`, or any log output. The `requires_env` list contains only variable names (strings). The pre-flight check uses `os.Getenv(name) != ""` — no value logging. |
 | NFR-07 | **`--json` machine-readability:** The JSON schema for `tag mcp list --json` output must be stable across minor TAG releases (additive changes only). Breaking schema changes require a new `--json-version` flag. |
 | NFR-08 | **Graceful missing YAML keys:** If a server referenced in `curated_bundle` does not have a corresponding entry in `servers:`, the command must emit a WARNING (not an ERROR) for that server, skip it, and continue. This handles the case where a server is removed from the registry. |
 | NFR-09 | **TTY vs. pipe output:** Progress output (spinner, per-server status lines) is only emitted when stdout is a TTY. When piped, only the final summary line is written to stdout; `--json` overrides both. |
@@ -357,21 +359,27 @@ Pending Credentials — researcher profile (17 servers)
 
 | File | Change Type | Description |
 |------|-------------|-------------|
-| `src/tag/config/mcp-registry.yaml` | Modified | Add 11 new server entries + `curated_bundle` top-level key |
-| `src/tag/controller.py` | Modified | Add `cmd_mcp_registry_add_curated`, `cmd_mcp_registry_list_curated`, `cmd_mcp_creds`, `cmd_mcp_activate`; extend `cmd_mcp_list` to join `mcp_curated_installs` |
+| `internal/mcp/registry/registry.yaml` | Modified | Add 11 new server entries + `curated_bundle` top-level key (go:embed'd into the binary at compile time) |
+| `internal/mcp/registry/embed.go` | New | `//go:embed registry.yaml` directive; exports `LoadRegistry() (*Registry, error)` parsing the embedded YAML via `gopkg.in/yaml.v3` |
+| `internal/mcp/curated/curated.go` | New | `ComputeInstallPlan`, `ExecuteInstallPlan`; Go structs `CuratedServerDef`, `MCPServerConfig`, `CuratedInstallPlan`, `CuratedInstallResult` |
+| `internal/cli/mcp_registry.go` | Modified | Add `CmdMCPRegistryAddCurated`, `CmdMCPRegistryListCurated`, `CmdMCPCreds`, `CmdMCPActivate`; extend `CmdMCPList` to LEFT JOIN `mcp_curated_installs` when `--json` is requested |
+| `internal/store/migrations/0NNN_mcp_curated_installs.sql` | New | DDL migration for the `mcp_curated_installs` table (Section 10.2) |
 
-No new Python source files are required. The SQLite DDL is applied inline in `controller.py` using the existing `open_db()` pattern.
+No Python source files are involved. The registry YAML is read-only at runtime (go:embed'd at compile time). Profile config writes use `knadh/koanf/v2` (existing pattern). SQLite access goes through `internal/store` with `modernc.org/sqlite` (CGO_ENABLED=0, pure-Go).
+
+> **Runtime dependency flag:** All 20 curated servers in this bundle launch via `npx` (Node.js stdio) or connect over `streamable-http`. The Go binary orchestrates these external processes via `CommandTransport`/`StdioTransport` from `github.com/modelcontextprotocol/go-sdk v1.6.1`; it does **not** embed Node.js. `node` (≥18) must be present on the host PATH for npx-launched servers to function. This was also true under the Python implementation; the Go move does not change this runtime constraint. Users must understand the binary orchestrates external MCP server processes — it does not eliminate their runtime dependencies.
 
 ### 10.2 SQLite DDL — `mcp_curated_installs` Table
 
+Delivered as a numbered migration in `internal/store/migrations/`. Applied by `internal/store.Migrate(db)` on first use. The underlying driver is `modernc.org/sqlite` (pure-Go, FTS5 built-in, CGO_ENABLED=0). Single-writer access is enforced by `gofrs/flock` on the database file; concurrent reads from `tag mcp list --json` use WAL mode without blocking.
+
 ```sql
--- Applied via open_db() on first use of any add-curated command.
--- WAL mode is already set by open_db(); no additional PRAGMA needed here.
+-- Applied via internal/store.Migrate(db); WAL mode already set by store.OpenDB().
 
 CREATE TABLE IF NOT EXISTS mcp_curated_installs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     profile         TEXT    NOT NULL,            -- profile name, e.g. "researcher"
-    server_key      TEXT    NOT NULL,            -- matches mcp-registry.yaml servers key, e.g. "mcp-notion"
+    server_key      TEXT    NOT NULL,            -- matches registry.yaml servers key, e.g. "mcp-notion"
     status          TEXT    NOT NULL             -- 'active' | 'pending_credentials' | 'disabled'
                     CHECK (status IN ('active', 'pending_credentials', 'disabled')),
     curated_rank    INTEGER,                     -- rank within the curated bundle (1–20)
@@ -395,72 +403,103 @@ CREATE INDEX IF NOT EXISTS idx_mcp_curated_status
     ON mcp_curated_installs (profile, status);
 ```
 
-### 10.3 Python Dataclasses
+### 10.3 Go Structs (replaces Python dataclasses)
 
-```python
-# All dataclasses defined inline in controller.py, near cmd_mcp_* handlers.
-# Import: from dataclasses import dataclass, field; from typing import Optional, List
+```go
+// internal/mcp/curated/curated.go
+// Package curated implements the curated-bundle install planner for TAG.
 
-@dataclass
-class CuratedServerDef:
-    """Parsed from mcp-registry.yaml curated_bundle entry."""
-    server_key: str
-    rank: int
-    category: str                          # 'productivity' | 'devops' | 'database' | 'comms'
-    ranking_sources: List[str]
-    tool_count_estimate: int
-    default_disabled: bool = False
+package curated
 
-@dataclass
-class MCPServerConfig:
-    """Parsed from mcp-registry.yaml servers entry."""
-    key: str
-    description: str
-    category: str
-    install_type: str                      # 'npx' | 'uvx' | 'docker' | 'remote'
-    package: Optional[str]                 # npm package name or PyPI package name
-    command: str                           # e.g. 'npx'
-    args: List[str]
-    transport_type: str                    # 'stdio' | 'streamable-http'
-    transport_url: Optional[str]           # for 'remote' type only
-    requires_env: List[str]
-    tool_count_estimate: int = 0
-    docker_image: Optional[str] = None    # for 'docker' type only
+import "database/sql"
 
-@dataclass
-class CuratedInstallPlan:
-    """Computed before writes; used for dry-run and confirmation."""
-    selected_servers: List[CuratedServerDef]
-    server_configs: dict                   # server_key -> MCPServerConfig
-    already_installed: List[str]           # server_keys already in mcp_curated_installs
-    to_install: List[str]                  # server_keys that will be newly written
-    to_disable: List[str]                  # server_keys with default_disabled=True
-    missing_env: dict                      # server_key -> List[str] of missing var names
-    present_env: dict                      # server_key -> List[str] of present var names
-    current_active_tools: int              # from existing profile MCP config
-    added_active_tools: int                # sum of tool_count_estimate for non-pending, non-disabled
-    budget_exceeded: bool
-    budget_overage: int                    # how many tools over the 40-tool limit
+// CuratedServerDef is parsed from the go:embed'd registry.yaml curated_bundle entry.
+type CuratedServerDef struct {
+    ServerKey         string   `yaml:"server_key"          json:"server_key"`
+    Rank              int      `yaml:"rank"                json:"rank"`
+    Category          string   `yaml:"category"            json:"category"` // "productivity"|"devops"|"database"|"comms"
+    RankingSources    []string `yaml:"ranking_sources"     json:"ranking_sources"`
+    ToolCountEstimate int      `yaml:"tool_count_estimate" json:"tool_count_estimate"`
+    DefaultDisabled   bool     `yaml:"default_disabled"    json:"default_disabled"`
+}
 
-@dataclass
-class CuratedInstallResult:
-    """Written to stdout / --json after install completes."""
-    profile: str
-    installed: List[str]
-    skipped_existing: List[str]
-    disabled: List[str]
-    pending_credentials: List[str]
-    total_active_tools: int
-    warnings: List[str]
-    errors: List[str]
+// MCPServerConfig is parsed from the registry.yaml servers entry.
+type MCPServerConfig struct {
+    Key               string   `yaml:"key"                 json:"key"`
+    Description       string   `yaml:"description"         json:"description"`
+    Category          string   `yaml:"category"            json:"category"`
+    InstallType       string   `yaml:"install_type"        json:"install_type"` // "npx"|"uvx"|"docker"|"remote"
+    Package           string   `yaml:"package"             json:"package,omitempty"`
+    Command           string   `yaml:"command"             json:"command"`
+    Args              []string `yaml:"args"                json:"args"`
+    TransportType     string   `yaml:"transport_type"      json:"transport_type"` // "stdio"|"streamable-http"
+    TransportURL      string   `yaml:"transport_url"       json:"transport_url,omitempty"`
+    RequiresEnv       []string `yaml:"requires_env"        json:"requires_env"`
+    ToolCountEstimate int      `yaml:"tool_count_estimate" json:"tool_count_estimate"`
+    DockerImage       string   `yaml:"docker_image"        json:"docker_image,omitempty"`
+}
+
+// CuratedInstallPlan is computed before writes; used for dry-run and confirmation.
+type CuratedInstallPlan struct {
+    SelectedServers    []CuratedServerDef
+    ServerConfigs      map[string]MCPServerConfig
+    AlreadyInstalled   []string
+    ToInstall          []string
+    ToDisable          []string
+    MissingEnv         map[string][]string // server_key -> missing var names
+    PresentEnv         map[string][]string // server_key -> present var names
+    CurrentActiveTools int
+    AddedActiveTools   int
+    BudgetExceeded     bool
+    BudgetOverage      int // tools over the 40-tool soft limit
+}
+
+// CuratedInstallResult is returned after install completes; serialised to stdout in --json mode.
+type CuratedInstallResult struct {
+    Profile            string   `json:"profile"`
+    Installed          []string `json:"installed"`
+    SkippedExisting    []string `json:"skipped_existing"`
+    Disabled           []string `json:"disabled"`
+    PendingCredentials []string `json:"pending_credentials"`
+    TotalActiveTools   int      `json:"total_active_tools"`
+    Warnings           []string `json:"warnings"`
+    Errors             []string `json:"errors"`
+}
 ```
 
-### 10.4 `mcp-registry.yaml` — New Curated Server Entries
+JSON schema annotations are generated via `invopop/jsonschema` for use in `--json` output validation and CI schema-stability tests (NFR-07).
 
-The following 11 server keys are new additions to the `servers:` block. (9 already exist: `mcp-github`, `mcp-postgresql`, `mcp-slack`, `mcp-puppeteer` → replaced by `mcp-playwright`, `mcp-brave-search`, `mcp-filesystem`, `mcp-sqlite`, `mcp-fetch`, `mcp-memory`). The table below shows all 20 curated servers with their YAML keys:
+### 10.4 `internal/mcp/registry/registry.yaml` — New Curated Server Entries
+
+This file lives at `internal/mcp/registry/registry.yaml` and is compiled into the binary via `//go:embed registry.yaml` in `internal/mcp/registry/embed.go`:
+
+```go
+// internal/mcp/registry/embed.go
+package registry
+
+import (
+    _ "embed"
+    "gopkg.in/yaml.v3"
+)
+
+//go:embed registry.yaml
+var registryYAML []byte
+
+// LoadRegistry parses the embedded registry.yaml and returns a Registry value.
+// Called once at startup; result is safe for concurrent reads (no writes at runtime).
+func LoadRegistry() (*Registry, error) {
+    var r Registry
+    if err := yaml.Unmarshal(registryYAML, &r); err != nil {
+        return nil, err
+    }
+    return &r, nil
+}
+```
+
+The following 11 server keys are new additions to the `servers:` block. (9 already exist: `mcp-github`, `mcp-postgresql`, `mcp-slack`, `mcp-puppeteer` → replaced by `mcp-playwright`, `mcp-brave-search`, `mcp-filesystem`, `mcp-sqlite`, `mcp-fetch`, `mcp-memory`). The table below shows all 20 curated servers with their YAML keys. The YAML content itself is transport-level data and is language-agnostic:
 
 ```yaml
-# --- NEW ENTRIES to append to servers: block in mcp-registry.yaml ---
+# --- NEW ENTRIES to append to servers: block in registry.yaml ---
 
   mcp-notion:
     description: "Notion workspace: create/read pages, query databases, search content"
@@ -904,210 +943,268 @@ curated_bundle:
       default_disabled: false
 ```
 
-### 10.5 Core Algorithm: `compute_install_plan`
+### 10.5 Core Algorithm: `ComputeInstallPlan`
 
-```python
-import json
-import os
-from pathlib import Path
-from typing import Optional
+```go
+// internal/mcp/curated/curated.go
 
-def compute_install_plan(
-    registry: dict,
-    profile: str,
-    category: Optional[str],
-    disable_playwright: bool,
-    conn,          # sqlite3.Connection from open_db()
-) -> CuratedInstallPlan:
-    """
-    Computes which servers to install, their env-var status,
-    and the tool-budget impact. Makes no writes.
-    """
-    # 1. Load curated_bundle from registry YAML
-    bundle_entries: list[dict] = registry.get("curated_bundle", {}).get("servers", [])
-    servers_cfg: dict = registry.get("servers", {})
+import (
+    "database/sql"
+    "encoding/json"
+    "fmt"
+    "os"
+    "time"
 
-    # 2. Filter by category if specified
-    if category:
-        bundle_entries = [e for e in bundle_entries if e.get("category") == category]
+    "github.com/tag-ai/tag/internal/mcp/registry"
+)
 
-    # 3. Load already-installed server_keys for this profile
-    rows = conn.execute(
-        "SELECT server_key FROM mcp_curated_installs WHERE profile = ?", (profile,)
-    ).fetchall()
-    already_installed = {r[0] for r in rows}
+// ComputeInstallPlan computes which servers to install, their env-var status,
+// and the tool-budget impact. Makes no writes to SQLite or disk.
+func ComputeInstallPlan(
+    reg *registry.Registry,
+    profile string,
+    category string,       // "" = all categories
+    disablePlaywright bool,
+    db *sql.DB,
+) (*CuratedInstallPlan, error) {
+    // 1. Filter bundle entries by category if specified.
+    entries := reg.CuratedBundle.Servers
+    if category != "" {
+        var filtered []registry.CuratedEntry
+        for _, e := range entries {
+            if e.Category == category {
+                filtered = append(filtered, e)
+            }
+        }
+        entries = filtered
+    }
 
-    # 4. Build CuratedServerDef list
-    selected: list[CuratedServerDef] = []
-    for entry in bundle_entries:
-        key = entry["server_key"]
-        cfg = servers_cfg.get(key)
-        if cfg is None:
-            # FR-08: warn and skip
-            continue
-        selected.append(CuratedServerDef(
-            server_key=key,
-            rank=entry.get("rank", 99),
-            category=entry.get("category", "unknown"),
-            ranking_sources=entry.get("ranking_sources", []),
-            tool_count_estimate=entry.get("tool_count_estimate", 0),
-            default_disabled=entry.get("default_disabled", False) or
-                             (disable_playwright and key == "mcp-playwright"),
-        ))
-
-    # 5. Compute env-var status per server
-    missing_env: dict[str, list[str]] = {}
-    present_env: dict[str, list[str]] = {}
-    for s in selected:
-        cfg = servers_cfg[s.server_key]
-        required = cfg.get("requires_env", [])
-        missing = [v for v in required if not os.environ.get(v)]
-        present = [v for v in required if os.environ.get(v)]
-        missing_env[s.server_key] = missing
-        present_env[s.server_key] = present
-
-    # 6. Count currently active tools from profile's MCP config
-    current_active_tools = _count_active_tools_for_profile(conn, profile)
-
-    # 7. Compute new tool additions (exclude disabled, exclude pending_creds from budget)
-    to_install = [s.server_key for s in selected if s.server_key not in already_installed]
-    to_disable = [s.server_key for s in selected if s.default_disabled]
-
-    added_active = sum(
-        s.tool_count_estimate
-        for s in selected
-        if s.server_key in to_install
-        and not s.default_disabled
-        and not missing_env.get(s.server_key)  # fully credentialed → active
+    // 2. Load already-installed server_keys for this profile.
+    rows, err := db.Query(
+        `SELECT server_key FROM mcp_curated_installs WHERE profile = ?`, profile,
     )
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    alreadyInstalled := map[string]bool{}
+    for rows.Next() {
+        var key string
+        if err := rows.Scan(&key); err != nil {
+            return nil, err
+        }
+        alreadyInstalled[key] = true
+    }
 
-    projected_total = current_active_tools + added_active
-    budget_exceeded = projected_total > 40
-
-    return CuratedInstallPlan(
-        selected_servers=selected,
-        server_configs=servers_cfg,
-        already_installed=list(already_installed),
-        to_install=to_install,
-        to_disable=to_disable,
-        missing_env=missing_env,
-        present_env=present_env,
-        current_active_tools=current_active_tools,
-        added_active_tools=added_active,
-        budget_exceeded=budget_exceeded,
-        budget_overage=max(0, projected_total - 40),
-    )
-
-
-def execute_install_plan(plan: CuratedInstallPlan, profile: str, conn) -> CuratedInstallResult:
-    """
-    Writes mcp_curated_installs rows. Does NOT modify profile config files —
-    that is deferred to cmd_mcp_activate for pending_credentials servers,
-    and done immediately for fully-credentialed servers.
-    """
-    import json
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    installed, skipped, disabled, pending = [], [], [], []
-
-    for s in plan.selected_servers:
-        if s.server_key in plan.already_installed:
-            skipped.append(s.server_key)
+    // 3. Build selected defs; apply disable-playwright override.
+    // Servers absent from reg.Servers are skipped with a warning (FR-08 — caller logs).
+    var selected []CuratedServerDef
+    for _, entry := range entries {
+        if _, ok := reg.Servers[entry.ServerKey]; !ok {
             continue
+        }
+        def := CuratedServerDef{
+            ServerKey:         entry.ServerKey,
+            Rank:              entry.Rank,
+            Category:          entry.Category,
+            RankingSources:    entry.RankingSources,
+            ToolCountEstimate: entry.ToolCountEstimate,
+            DefaultDisabled:   entry.DefaultDisabled || (disablePlaywright && entry.ServerKey == "mcp-playwright"),
+        }
+        selected = append(selected, def)
+    }
 
-        missing = plan.missing_env.get(s.server_key, [])
+    // 4. Compute env-var status per server.
+    missingEnv := map[string][]string{}
+    presentEnv := map[string][]string{}
+    for _, s := range selected {
+        cfg := reg.Servers[s.ServerKey]
+        for _, v := range cfg.RequiresEnv {
+            if os.Getenv(v) == "" {
+                missingEnv[s.ServerKey] = append(missingEnv[s.ServerKey], v)
+            } else {
+                presentEnv[s.ServerKey] = append(presentEnv[s.ServerKey], v)
+            }
+        }
+    }
 
-        if s.default_disabled:
+    // 5. Count currently active tools for the profile.
+    currentActive, err := countActiveToolsForProfile(db, profile)
+    if err != nil {
+        return nil, err
+    }
+
+    // 6. Compute additions (exclude disabled and pending_credentials from budget).
+    var toInstall, toDisable []string
+    addedActive := 0
+    for _, s := range selected {
+        if !alreadyInstalled[s.ServerKey] {
+            toInstall = append(toInstall, s.ServerKey)
+        }
+        if s.DefaultDisabled {
+            toDisable = append(toDisable, s.ServerKey)
+            continue
+        }
+        if !alreadyInstalled[s.ServerKey] && len(missingEnv[s.ServerKey]) == 0 {
+            addedActive += s.ToolCountEstimate
+        }
+    }
+
+    projected := currentActive + addedActive
+    overage := projected - 40
+    if overage < 0 {
+        overage = 0
+    }
+    return &CuratedInstallPlan{
+        SelectedServers:    selected,
+        ServerConfigs:      reg.Servers,
+        AlreadyInstalled:   mapKeys(alreadyInstalled),
+        ToInstall:          toInstall,
+        ToDisable:          toDisable,
+        MissingEnv:         missingEnv,
+        PresentEnv:         presentEnv,
+        CurrentActiveTools: currentActive,
+        AddedActiveTools:   addedActive,
+        BudgetExceeded:     projected > 40,
+        BudgetOverage:      overage,
+    }, nil
+}
+
+// ExecuteInstallPlan writes mcp_curated_installs rows inside a single transaction.
+// Does NOT modify profile config files — that is deferred to CmdMCPActivate for
+// pending_credentials servers, and done immediately for fully-credentialed servers.
+func ExecuteInstallPlan(plan *CuratedInstallPlan, profile string, db *sql.DB) (*CuratedInstallResult, error) {
+    now := time.Now().UTC().Format(time.RFC3339)
+    var installed, skipped, disabled, pending []string
+
+    tx, err := db.Begin()
+    if err != nil {
+        return nil, err
+    }
+    defer tx.Rollback() //nolint:errcheck
+
+    alreadySet := map[string]bool{}
+    for _, k := range plan.AlreadyInstalled {
+        alreadySet[k] = true
+    }
+
+    for _, s := range plan.SelectedServers {
+        if alreadySet[s.ServerKey] {
+            skipped = append(skipped, s.ServerKey)
+            continue
+        }
+        missing := plan.MissingEnv[s.ServerKey]
+        var status string
+        switch {
+        case s.DefaultDisabled:
             status = "disabled"
-            disabled.append(s.server_key)
-        elif missing:
+            disabled = append(disabled, s.ServerKey)
+        case len(missing) > 0:
             status = "pending_credentials"
-            pending.append(s.server_key)
-        else:
+            pending = append(pending, s.ServerKey)
+        default:
             status = "active"
-            installed.append(s.server_key)
-
-        conn.execute(
-            """
+            installed = append(installed, s.ServerKey)
+        }
+        missingJSON, _ := json.Marshal(missing)
+        sourcesJSON, _ := json.Marshal(s.RankingSources)
+        if _, err := tx.Exec(`
             INSERT OR REPLACE INTO mcp_curated_installs
                 (profile, server_key, status, curated_rank, category,
                  ranking_sources, tool_count_est, missing_env, installed_at, installed_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'add-curated')
-            """,
-            (
-                profile,
-                s.server_key,
-                status,
-                s.rank,
-                s.category,
-                json.dumps(s.ranking_sources),
-                s.tool_count_estimate,
-                json.dumps(missing),
-                now,
-            ),
-        )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'add-curated')`,
+            profile, s.ServerKey, status, s.Rank, s.Category,
+            string(sourcesJSON), s.ToolCountEstimate, string(missingJSON), now,
+        ); err != nil {
+            return nil, err
+        }
+    }
+    if err := tx.Commit(); err != nil {
+        return nil, err
+    }
 
-    conn.commit()
-
-    warnings = []
-    if plan.budget_exceeded:
-        warnings.append(
-            f"Tool budget exceeded: {plan.current_active_tools + plan.added_active_tools} active tools "
-            f"(soft limit: 40). Disable {plan.budget_overage} tools or use --category to install a subset."
-        )
-
-    return CuratedInstallResult(
-        profile=profile,
-        installed=installed,
-        skipped_existing=skipped,
-        disabled=disabled,
-        pending_credentials=pending,
-        total_active_tools=plan.current_active_tools + plan.added_active_tools,
-        warnings=warnings,
-        errors=[],
-    )
+    var warnings []string
+    if plan.BudgetExceeded {
+        warnings = append(warnings, fmt.Sprintf(
+            "Tool budget exceeded: %d active tools (soft limit: 40). Disable %d tools or use --category.",
+            plan.CurrentActiveTools+plan.AddedActiveTools, plan.BudgetOverage,
+        ))
+    }
+    return &CuratedInstallResult{
+        Profile:            profile,
+        Installed:          installed,
+        SkippedExisting:    skipped,
+        Disabled:           disabled,
+        PendingCredentials: pending,
+        TotalActiveTools:   plan.CurrentActiveTools + plan.AddedActiveTools,
+        Warnings:           warnings,
+        Errors:             nil,
+    }, nil
+}
 ```
 
-### 10.6 Integration with `cmd_mcp_list`
+### 10.6 Integration with `CmdMCPList`
 
-The existing `cmd_mcp_list` handler (in `controller.py`) must be extended to LEFT JOIN `mcp_curated_installs` when `--json` is requested:
+The existing `CmdMCPList` handler in `internal/cli/mcp_registry.go` is extended to LEFT JOIN `mcp_curated_installs` when `--json` is requested:
 
-```python
-def _enrich_mcp_list_with_curated(rows: list[dict], conn, profile: str) -> list[dict]:
-    """Add curated_bundle metadata to each server dict that has a mcp_curated_installs row."""
-    curated_rows = conn.execute(
-        """
+```go
+// internal/cli/mcp_registry.go
+
+// enrichMCPListWithCurated adds curated_bundle metadata to each server that
+// has a mcp_curated_installs row. Non-curated servers are left unchanged.
+func enrichMCPListWithCurated(servers []MCPServerJSON, db *sql.DB, profile string) ([]MCPServerJSON, error) {
+    rows, err := db.Query(`
         SELECT server_key, status, curated_rank, category, ranking_sources,
-               tool_count_est, missing_env, installed_at, installed_by, activated_at
-        FROM mcp_curated_installs
-        WHERE profile = ?
-        """,
-        (profile,),
-    ).fetchall()
+               installed_at, installed_by, activated_at
+        FROM mcp_curated_installs WHERE profile = ?`, profile)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
 
-    curated_map = {r["server_key"]: dict(r) for r in curated_rows}
+    type curatedRow struct {
+        Status      string
+        Rank        int
+        Category    string
+        Sources     string // JSON array
+        InstalledAt string
+        InstalledBy string
+        ActivatedAt sql.NullString
+    }
+    curatedMap := map[string]curatedRow{}
+    for rows.Next() {
+        var key string
+        var r curatedRow
+        if err := rows.Scan(&key, &r.Status, &r.Rank, &r.Category,
+            &r.Sources, &r.InstalledAt, &r.InstalledBy, &r.ActivatedAt); err != nil {
+            return nil, err
+        }
+        curatedMap[key] = r
+    }
 
-    for row in rows:
-        key = row.get("name")
-        if key in curated_map:
-            c = curated_map[key]
-            row["curated_bundle"] = {
-                "rank": c["curated_rank"],
-                "category": c["category"],
-                "ranking_sources": json.loads(c["ranking_sources"] or "[]"),
-                "installed_at": c["installed_at"],
-                "installed_by": c["installed_by"],
-                "activated_at": c["activated_at"],
+    for i, s := range servers {
+        if c, ok := curatedMap[s.Name]; ok {
+            var sources []string
+            _ = json.Unmarshal([]byte(c.Sources), &sources)
+            servers[i].CuratedBundle = &CuratedBundleMeta{
+                Rank:           c.Rank,
+                Category:       c.Category,
+                RankingSources: sources,
+                InstalledAt:    c.InstalledAt,
+                InstalledBy:    c.InstalledBy,
+                ActivatedAt:    c.ActivatedAt.String,
             }
-    return rows
+        }
+    }
+    return servers, nil
+}
 ```
 
 ---
 
 ## 11. Security Considerations
 
-1. **No secrets in YAML or SQLite:** `requires_env` stores only variable names, never values. `missing_env` column in `mcp_curated_installs` stores only the names of missing variables. Any debug logging must explicitly exclude `os.environ` dumps. The existing `security.py` module's `redact_secrets()` function must be applied to any structured log output from `cmd_mcp_registry_add_curated`.
+1. **No secrets in YAML or SQLite:** `requires_env` stores only variable names, never values. `missing_env` column in `mcp_curated_installs` stores only the names of missing variables. Any debug logging must explicitly exclude environment variable values (`os.Environ()` dumps are forbidden in structured logs). The `internal/obs` secret-redaction helper must be applied to any structured log output from `CmdMCPRegistryAddCurated`.
 
 2. **Supply chain risk for curated npm packages:** Each of the 20 curated servers is a third-party npm package. A compromised package could exfiltrate environment variables, filesystem contents, or API keys accessible to the agent. Mitigation: the `mcp-registry.yaml` `curated_bundle` entries should include a `pinned_version` field (future PRD) with a SHA-256 content hash of the npm package `.mcpc.json` contract snapshot. Until version pinning is implemented, users should be aware that `npx -y` always pulls the latest version.
 
@@ -1127,44 +1224,47 @@ def _enrich_mcp_list_with_curated(rows: list[dict], conn, profile: str) -> list[
 
 ### 12.1 Unit Tests
 
-All unit tests go in `tests/test_mcp_curated.py`.
+All unit tests live in `internal/mcp/curated/curated_test.go`, using `go test` with `github.com/stretchr/testify/assert`. SQLite is `modernc.org/sqlite` opened as `sql.Open("sqlite", ":memory:")`.
 
 | Test | What it validates |
 |------|------------------|
-| `test_compute_install_plan_full` | All 20 servers in plan when no `--category` flag |
-| `test_compute_install_plan_category_devops` | Only 7 devops servers in plan with `--category devops` |
-| `test_compute_install_plan_idempotent` | Already-installed servers appear in `already_installed`, not `to_install` |
-| `test_env_var_check_missing` | `missing_env` populated when env-vars absent from `os.environ` |
-| `test_env_var_check_present` | `present_env` populated when env-vars are set in `os.environ` |
-| `test_budget_check_exceeds` | `budget_exceeded=True` when projected total > 40 |
-| `test_budget_check_within` | `budget_exceeded=False` for category subset under 40 tools |
-| `test_disable_playwright` | Playwright has `status='disabled'` in result when `--disable-playwright` set |
-| `test_execute_install_plan_writes_sqlite` | `mcp_curated_installs` has correct rows after `execute_install_plan` |
-| `test_execute_install_plan_idempotent` | Running `execute_install_plan` twice produces same SQLite state (INSERT OR REPLACE) |
-| `test_missing_server_key_warns` | Server key in `curated_bundle` but absent from `servers:` emits WARNING, does not raise |
-| `test_mcp_list_json_curated_field` | `tag mcp list --json` output includes `curated_bundle` for installed servers |
-| `test_mcp_list_json_no_curated_field` | Non-curated servers omit `curated_bundle` key from JSON |
-| `test_pending_credentials_status` | Server with missing env-var gets `status='pending_credentials'` |
-| `test_activate_transitions_status` | `cmd_mcp_activate` updates row to `status='active'` when all env-vars present |
+| `TestComputeInstallPlanFull` | All 20 servers in plan when no `--category` flag |
+| `TestComputeInstallPlanCategoryDevops` | Only 7 devops servers in plan with `--category devops` |
+| `TestComputeInstallPlanIdempotent` | Already-installed servers appear in `AlreadyInstalled`, not `ToInstall` |
+| `TestEnvVarCheckMissing` | `MissingEnv` populated when env-vars absent (via `t.Setenv` to isolate) |
+| `TestEnvVarCheckPresent` | `PresentEnv` populated when env-vars are set |
+| `TestBudgetCheckExceeds` | `BudgetExceeded=true` when projected total > 40 |
+| `TestBudgetCheckWithin` | `BudgetExceeded=false` for category subset under 40 tools |
+| `TestDisablePlaywright` | Playwright has `status="disabled"` in result when `disablePlaywright=true` |
+| `TestExecuteInstallPlanWritesSQLite` | `mcp_curated_installs` has correct rows after `ExecuteInstallPlan` |
+| `TestExecuteInstallPlanIdempotent` | Running `ExecuteInstallPlan` twice produces same SQLite state (INSERT OR REPLACE) |
+| `TestMissingServerKeyWarns` | Server key in `curated_bundle` but absent from `servers:` does not panic; plan excludes it |
+| `TestMCPListJSONCuratedField` | `CmdMCPList --json` output includes `curated_bundle` for installed servers |
+| `TestMCPListJSONNoCuratedField` | Non-curated servers omit `curated_bundle` key from JSON |
+| `TestPendingCredentialsStatus` | Server with missing env-var gets `status="pending_credentials"` |
+| `TestActivateTransitionsStatus` | `CmdMCPActivate` updates row to `status="active"` when all env-vars present |
 
 ### 12.2 Integration Tests
 
-Located in `tests/integration/test_mcp_curated_integration.py`. These tests use a real SQLite in-memory DB via `open_db(":memory:")` and a temporary `mcp-registry.yaml` fixture.
+Located in `internal/mcp/curated/integration_test.go`. These tests use a real SQLite in-memory DB via `sql.Open("sqlite", ":memory:")` with `modernc.org/sqlite` and a minimal `registry.yaml` fixture embedded via `//go:embed testdata/minimal_registry.yaml`.
 
 | Test | What it validates |
 |------|------------------|
-| `test_add_curated_e2e_dry_run` | `cmd_mcp_registry_add_curated(dry_run=True)` returns 0 and makes no SQLite writes |
-| `test_add_curated_e2e_full_install` | All 20 servers written to `mcp_curated_installs` after full install |
-| `test_add_curated_e2e_category_only` | Only category-filtered servers written to `mcp_curated_installs` |
-| `test_add_curated_yaml_round_trip` | `mcp-registry.yaml` can be read with `ruamel.yaml` and re-serialized without data loss |
-| `test_mcp_creds_output_completeness` | `tag mcp creds` output lists all servers with `status='pending_credentials'` |
-| `test_mcp_activate_live` | After setting a required env-var, `cmd_mcp_activate` flips status and writes profile config |
+| `TestAddCuratedE2EDryRun` | `CmdMCPRegistryAddCurated(dryRun=true)` returns nil error and makes no SQLite writes |
+| `TestAddCuratedE2EFullInstall` | All 20 servers written to `mcp_curated_installs` after full install |
+| `TestAddCuratedE2ECategoryOnly` | Only category-filtered servers written to `mcp_curated_installs` |
+| `TestAddCuratedYAMLRoundTrip` | `registry.yaml` round-trips cleanly through `gopkg.in/yaml.v3` `Unmarshal`/`Marshal` without data loss |
+| `TestMCPCredsOutputCompleteness` | `CmdMCPCreds` lists all servers with `status="pending_credentials"` |
+| `TestMCPActivateLive` | After `t.Setenv` for a required var, `CmdMCPActivate` flips status and writes profile config |
 
-### 12.3 Fixture: Minimal `mcp-registry.yaml` for Tests
+### 12.3 Fixture: Minimal `registry.yaml` for Tests
 
-```python
-# conftest.py or test file
-MINIMAL_REGISTRY_YAML = """
+```go
+// internal/mcp/curated/testdata/minimal_registry.yaml
+// Loaded in tests via //go:embed testdata/minimal_registry.yaml in a test helper.
+```
+
+```yaml
 servers:
   mcp-notion:
     description: "Notion"
@@ -1191,14 +1291,13 @@ curated_bundle:
       ranking_sources: [composio_top_integrations]
       tool_count_estimate: 8
       default_disabled: false
-"""
 ```
 
 ### 12.4 Performance Tests
 
-- `test_add_curated_dry_run_latency`: Assert `add-curated --dry-run` completes in < 200 ms via `time.perf_counter()`.
-- `test_add_curated_full_install_latency`: Assert full 20-server install (SQLite writes only, no subprocess) completes in < 500 ms.
-- `test_mcp_list_json_latency`: Assert `tag mcp list --json` with 20 curated rows completes in < 100 ms (SQLite read only).
+- `BenchmarkComputeInstallPlanDryRun`: Assert `ComputeInstallPlan` (registry pre-loaded, in-memory SQLite) completes in < 200 ms using `testing.B`.
+- `BenchmarkExecuteInstallPlanFull`: Assert 20-server SQLite write via `ExecuteInstallPlan` completes in < 500 ms.
+- `BenchmarkMCPListJSONLatency`: Assert `CmdMCPList --json` with 20 curated rows completes in < 100 ms (SQLite read only).
 
 ---
 
@@ -1223,7 +1322,7 @@ curated_bundle:
 | AC-15 | `add-curated --dry-run` makes zero writes to `mcp_curated_installs` | Run dry-run; query row count = 0 |
 | AC-16 | No secret values appear in any log output or SQLite column | Run with real env-var; grep logs and SQLite for value |
 | AC-17 | `add-curated --json` outputs valid JSON to stdout; no human-readable text on stdout | Parse stdout as JSON; verify stderr has progress |
-| AC-18 | `mcp-registry.yaml` parses cleanly with `ruamel.yaml` and all 20+ server keys are present | Load YAML in test; assert key set |
+| AC-18 | `internal/mcp/registry/registry.yaml` parses cleanly via `gopkg.in/yaml.v3` and all 20+ server keys are present | `go test ./internal/mcp/registry/...`; assert key set |
 | AC-19 | All 20 curated servers use transport type `stdio` (npx/uvx/docker) or `streamable-http` (remote); none use `sse` | Assert `transport != 'sse'` for all entries |
 | AC-20 | `add-curated --category database` does not modify or re-register any `productivity`, `devops`, or `comms` servers already installed | Install `devops`; then install `database`; verify `devops` rows unchanged |
 
@@ -1238,9 +1337,11 @@ curated_bundle:
 | D3 | PRD-034 — Secret Scanning | Soft | `security.py` `redact_secrets()` must be applied to all structured log output. |
 | D4 | PRD-013 — Tracing | Soft | `add-curated` emits an OTel span (`mcp.curated.install`) with attributes: `profile`, `category`, `servers_installed_count`, `servers_pending_count`. |
 | D5 | PRD-028 — Sandbox Code Execution | Informational | Playwright and Docker MCP servers should be enabled only in sandbox-aware profiles. No hard code dependency. |
-| D6 | `ruamel.yaml` (Python package) | External | Required for round-trip YAML parsing of `mcp-registry.yaml`. Already a dependency of TAG (used in profile YAML handling). |
-| D7 | `@notionhq/notion-mcp-server` npm package | External runtime | Not a Python dependency; installed at agent runtime via `npx`. |
-| D8 | `@atlassian/jira-mcp` npm package | External runtime | Same pattern — runtime only. |
+| D6 | `gopkg.in/yaml.v3` (Go module) | External | Required for `registry.yaml` parsing in `internal/mcp/registry`. Already a transitive dependency of `knadh/koanf/v2`. Replaces `ruamel.yaml`. Note: `gopkg.in/yaml.v3` does not preserve YAML comments on round-trip; `registry.yaml` is treated as read-only at runtime so this is not a concern. |
+| D7 | `@notionhq/notion-mcp-server` npm package | External runtime | Not a Go dependency; launched at agent runtime via `npx` over stdio (`CommandTransport` from go-sdk). `node` ≥18 must be on the host PATH. |
+| D8 | `@atlassian/jira-mcp` npm package | External runtime | Same pattern — runtime only, node required on host. |
+| D11 | `github.com/modelcontextprotocol/go-sdk v1.6.1` | External | MCP protocol 2025-11-25. Used in `internal/mcp` to connect to `npx`-launched servers (CommandTransport/Stdio) and to remote HTTP endpoints (StreamableHTTP). Pin `MCPVersion = "2025-11-25"` as a single const in `internal/mcp`. |
+| D12 | `modernc.org/sqlite` | External | Pure-Go SQLite driver (CGO_ENABLED=0, FTS5 built-in) used by `internal/store` for `mcp_curated_installs`. Replaces `aiosqlite`/`sqlite3`. Single-writer isolation via `gofrs/flock`. |
 | D9 | Google Cloud OAuth 2.0 Client | External service | Required by `mcp-google-*` servers. Users must create credentials at console.cloud.google.com. |
 | D10 | MCP OAuth Integration PRD (unscheduled) | Future | Full OAuth 2.1 PKCE flow for Google Workspace and other OAuth-gated servers. This PRD records `pending_credentials` state and defers OAuth to that future PRD. |
 
@@ -1266,16 +1367,16 @@ curated_bundle:
 
 | Phase | Tasks | Estimate |
 |-------|-------|----------|
-| Phase 1 — YAML authoring (0.5 day) | Write 11 new server entries in `mcp-registry.yaml`; write the `curated_bundle` top-level key with all 20 ranked entries; verify YAML parses cleanly with `ruamel.yaml` | 0.5 day |
-| Phase 2 — Controller handlers (0.5 day) | Add `cmd_mcp_registry_add_curated`, `cmd_mcp_registry_list_curated`, `cmd_mcp_creds`, `cmd_mcp_activate` in `controller.py`; apply DDL for `mcp_curated_installs`; extend `cmd_mcp_list` JSON output | 0.5 day |
-| Phase 3 — Tests (0.5 day) | Write `tests/test_mcp_curated.py` with all 15 unit tests and 6 integration tests; assert latency bounds; add CI step | 0.5 day |
+| Phase 1 — YAML authoring (0.5 day) | Write 11 new server entries in `internal/mcp/registry/registry.yaml`; write the `curated_bundle` top-level key with all 20 ranked entries; verify the file parses cleanly via `gopkg.in/yaml.v3` (`go test ./internal/mcp/registry/...`) | 0.5 day |
+| Phase 2 — Go handlers (0.5 day) | Implement `CuratedServerDef`, `ComputeInstallPlan`, `ExecuteInstallPlan` in `internal/mcp/curated/curated.go`; add `internal/mcp/registry/embed.go`; add CLI handlers `CmdMCPRegistryAddCurated`, `CmdMCPRegistryListCurated`, `CmdMCPCreds`, `CmdMCPActivate` in `internal/cli/mcp_registry.go`; add `internal/store` migration for `mcp_curated_installs`; extend `CmdMCPList` JSON output | 0.5 day |
+| Phase 3 — Tests (0.5 day) | Write `internal/mcp/curated/curated_test.go` and `internal/mcp/curated/integration_test.go` with all 15 unit tests and 6 integration tests using `go test` + `testify`; add benchmark functions for latency assertions; add CI step | 0.5 day |
 
 **Parallel work:** YAML authoring (Phase 1) and DDL design can be done concurrently with no dependency.
 
-**Risk:** Low. The primary risk is that one or more npm package names differ from what is documented here (e.g., if `@atlassian/jira-mcp` is the wrong package name). This is resolved by spot-checking each package on npmjs.com during Phase 1 YAML authoring — a 30-minute task. No architectural risk.
+**Risk:** Low. The primary risk is that one or more npm package names differ from what is documented here (e.g., if `@atlassian/jira-mcp` is the wrong package name). This is resolved by spot-checking each package on npmjs.com during Phase 1 YAML authoring — a 30-minute task. The Go refactor itself is low risk because the registry YAML is language-agnostic data and the Go packages (`internal/mcp`, `internal/store`, `internal/cli`) already provide the patterns needed. No architectural risk.
 
 **Definition of Done:**
-- `mcp-registry.yaml` passes `ruamel.yaml` load + schema assertion in CI.
+- `internal/mcp/registry/registry.yaml` passes `gopkg.in/yaml.v3` unmarshal + schema assertion in CI (`go test ./internal/mcp/registry/...`).
 - All 20 AC items pass in CI on macOS and Linux runners.
 - `tag mcp registry add-curated --dry-run` output reviewed and approved by a second team member.
 - Security review of Section 11 items OQ7 and the Playwright/Docker warnings completed.

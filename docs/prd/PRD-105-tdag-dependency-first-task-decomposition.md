@@ -1,10 +1,12 @@
 # PRD-105: Dependency-First Hierarchical Task Decomposition (TDAG) (`tag plan decompose`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P2
 **Estimated Effort:** L (2-4 weeks)
 **Category:** Advanced Reasoning & Planning
-**Affects:** `dag.py + loop_agent.py`
+**Affects:** `internal/queue + internal/agent`
 **Depends on:** PRD-027 (eval framework), PRD-028 (sandbox), PRD-013 (agent tracing/observability), PRD-034 (security), PRD-033 (dependency-aware task queue), PRD-043 (vector-based tool retrieval), PRD-025 (semantic memory), PRD-021 (agent loop/autonomous mode), PRD-012 (cost tracking/budget)
 **Inspired by:** TDAG paper (2024), HuggingGPT, LLM Compiler, Plan-and-Execute
 **GitHub issue:** #349
@@ -13,13 +15,13 @@
 
 ## 1. Overview
 
-Complex agentic goals — "Build and deploy a REST API", "Refactor the authentication module and update all tests", "Research competitors and produce a slide deck" — cannot be reliably achieved in a single LLM call or even in a flat sequence of tool calls. They require decomposition into subtasks with explicit dependency relationships, parallel execution where the dependency graph permits, and dynamic adaptation when individual subtasks fail. The TAG agent loop (`loop_agent.py`) currently operates as a flat iteration: a single goal is pursued iteration-by-iteration with no structural awareness of sub-goals, their ordering constraints, or opportunities for concurrency. When a subtask fails, the loop retries the full goal with no surgical intervention.
+Complex agentic goals — "Build and deploy a REST API", "Refactor the authentication module and update all tests", "Research competitors and produce a slide deck" — cannot be reliably achieved in a single LLM call or even in a flat sequence of tool calls. They require decomposition into subtasks with explicit dependency relationships, parallel execution where the dependency graph permits, and dynamic adaptation when individual subtasks fail. The TAG agent loop (`internal/agent`) currently operates as a flat iteration: a single goal is pursued iteration-by-iteration with no structural awareness of sub-goals, their ordering constraints, or opportunities for concurrency. When a subtask fails, the loop retries the full goal with no surgical intervention.
 
-TDAG (Task DAG) introduces `tag plan decompose`, a planning command that takes a high-level goal and emits a directed acyclic graph (DAG) of typed subtasks with explicit dependency edges. The decomposition is performed by an LLM acting as a planner, guided by a structured output schema that enforces node typing (compute, research, review, write, deploy), skill-to-tool assignment via SentenceTransformer similarity matching (threshold θ=0.7), and a topological sort validation pass before the plan is persisted. The resulting plan is a JSON artifact — a `plan.json` — that can be inspected, edited, re-validated, and then executed via `tag plan run`. Execution honors the partial order defined by the DAG: nodes with no unresolved dependencies enter a ready queue immediately, while nodes with unsatisfied dependencies remain pending. Ready nodes can be dispatched concurrently, with a configurable parallelism cap.
+TDAG (Task DAG) introduces `tag plan decompose`, a planning command that takes a high-level goal and emits a directed acyclic graph (DAG) of typed subtasks with explicit dependency edges. The decomposition is performed by an LLM acting as a planner, guided by a structured output schema (Go structs + `invopop/jsonschema`) that enforces node typing (compute, research, review, write, deploy), skill-to-tool assignment via embedding cosine similarity (threshold θ=0.7), and a topological sort validation pass before the plan is persisted. The resulting plan is a JSON artifact — a `plan.json` — that can be inspected, edited, re-validated, and then executed via `tag plan run`. Execution honors the partial order defined by the DAG: nodes with no unresolved dependencies enter a ready queue immediately, while nodes with unsatisfied dependencies remain pending. Ready nodes can be dispatched concurrently by a bounded goroutine worker pool, with a configurable parallelism cap.
 
-The execution engine builds on the MagenticOne Dual-Ledger pattern: a Task Ledger (the DAG itself, with per-node status and outputs) is the outer strategic record, while a Progress Ledger (a structured JSON self-reflection updated after every node completion) tracks tactical state. A stall counter monitors for repeated identical states; when the stall counter exceeds a configurable threshold (default 2), the engine triggers a re-plan call that splices replacement nodes into the live DAG without restarting already-completed work. This dynamic replanning differentiates TDAG from simpler Plan-and-Execute architectures that must restart from scratch on failure.
+Execution is driven by the bespoke SQLite-backed goroutine DAG scheduler in `internal/queue` (see GO_MIGRATION_PLAN.md decision (5)) — a worker pool over `golang.org/x/sync/errgroup` and channels, not an external queue such as River (Postgres) or asynq (Redis), both of which would break the single-binary mandate. There is no drop-in pure-Go embedded durable DAG queue, so this scheduler is genuine engineering rather than a library drop-in. The engine builds on the MagenticOne Dual-Ledger pattern: a Task Ledger (the DAG itself, with per-node status and outputs) is the outer strategic record, while a Progress Ledger (a structured JSON self-reflection updated after every node completion) tracks tactical state. A stall counter monitors for repeated identical states; when the stall counter exceeds a configurable threshold (default 2), the engine triggers a re-plan call that splices replacement nodes into the live DAG without restarting already-completed work. This dynamic replanning differentiates TDAG from simpler Plan-and-Execute architectures that must restart from scratch on failure.
 
-The feature integrates with TAG's existing infrastructure at every layer: the DAG spec and all execution state live in SQLite (WAL mode, using `open_db()`) under the `plan_graphs` and `plan_nodes` tables. Per-node span traces are emitted to the `traces` table via the existing `tracing.py` module. Tool retrieval for subtask-to-skill assignment reuses `tool_retrieval.py` (SentenceTransformer + ChromaDB). Budget enforcement per-plan uses `budget.py`. Sandbox isolation for code-execution subtasks uses `sandbox.py`. The `--json` flag on every subcommand makes all outputs machine-readable for CI pipelines and the upcoming web dashboard.
+The feature integrates with TAG's existing infrastructure at every layer: the DAG spec and all execution state live in the single `modernc.org/sqlite` store (pure-Go, WAL mode, `CGO_ENABLED=0`, accessed through `internal/store`) under the `plan_graphs` and `plan_nodes` tables. State transitions are event-sourced to SQLite for durability, crash recovery, and time-travel replay. Per-node span traces are emitted through `internal/obs` (`go.opentelemetry.io/otel`) to the `traces` table. Tool retrieval for subtask-to-skill assignment reuses `internal/toolindex` (an `Embedder` interface + in-Go cosine over a float32 BLOB column, replacing the Python SentenceTransformer + ChromaDB path). Budget enforcement per-plan uses `internal/obs` cost tracking. Sandbox isolation for code-execution subtasks uses `internal/sandbox`. The `--json` flag on every subcommand makes all outputs machine-readable for CI pipelines and the upcoming web dashboard.
 
 The inspiration sources each contribute a specific mechanism: TDAG (2024) contributes the skill-retrieval loop and ordered dependency list with dynamic updates; HuggingGPT contributes the typed node taxonomy and model-to-task assignment pattern; LLM Compiler contributes the parallel dispatch pattern and the `$node_id` variable substitution syntax for passing outputs between nodes; Plan-and-Execute contributes the two-phase planner/executor separation and the re-plan trigger on executor failure.
 
@@ -29,11 +31,11 @@ The inspiration sources each contribute a specific mechanism: TDAG (2024) contri
 
 ### 2.1 The agent loop has no structural understanding of subtask dependencies
 
-`loop_agent.py` runs a single goal through repeated agent invocations. There is no mechanism to express that "writing unit tests" must follow "implementing the function", or that "deploying to staging" must follow both "building the Docker image" and "passing the test suite". When the LLM produces a plan implicitly in its chain-of-thought, that plan is ephemeral — it is not persisted, not validated for cycles or missing dependencies, not tracked per-subtask, and not available for inspection or reuse. If the agent fails mid-way, the operator has no visibility into which subtasks completed and which did not. The only recovery path is a full restart.
+The `internal/agent` loop runs a single goal through repeated agent invocations. There is no mechanism to express that "writing unit tests" must follow "implementing the function", or that "deploying to staging" must follow both "building the Docker image" and "passing the test suite". When the LLM produces a plan implicitly in its chain-of-thought, that plan is ephemeral — it is not persisted, not validated for cycles or missing dependencies, not tracked per-subtask, and not available for inspection or reuse. If the agent fails mid-way, the operator has no visibility into which subtasks completed and which did not. The only recovery path is a full restart.
 
 ### 2.2 Parallelism opportunities are left on the table
 
-Many real-world goals decompose into subtasks that are structurally independent and could execute concurrently. Research subtasks, documentation generation, and test writing for different modules are often fully parallel. The current loop_agent serializes all work into a single sequential thread. On goals with natural parallelism, this means the wall-clock time scales linearly with subtask count rather than with the critical path length. For a 10-subtask goal where 5 subtasks are independent, this is a 2-5x wall-clock penalty.
+Many real-world goals decompose into subtasks that are structurally independent and could execute concurrently. Research subtasks, documentation generation, and test writing for different modules are often fully parallel. The current agent loop serializes all work into a single sequential goroutine. On goals with natural parallelism, this means the wall-clock time scales linearly with subtask count rather than with the critical path length. For a 10-subtask goal where 5 subtasks are independent, this is a 2-5x wall-clock penalty.
 
 ### 2.3 Failure recovery is coarse-grained and stateless
 
@@ -52,9 +54,9 @@ When the current loop agent encounters a subtask failure (e.g., a build fails, a
 | G3 | `tag plan show --plan plan.json` renders the DAG as a rich ASCII graph or JSON, showing node status, type, assigned tools, and dependency edges. |
 | G4 | Per-node execution state is persisted to SQLite after every node transition, enabling crash recovery by re-running `tag plan run` on a previously started plan. |
 | G5 | When a node fails, the engine triggers structured re-plan: the planner LLM receives the failed node's output and error, the completed-nodes context, and the remaining DAG, and returns replacement node(s) to splice in. |
-| G6 | Tool-to-subtask assignment uses SentenceTransformer cosine similarity (threshold θ=0.7) against the indexed tool registry, reusing `tool_retrieval.py` — so subtasks automatically get the right tools without manual specification. |
+| G6 | Tool-to-subtask assignment uses embedding cosine similarity (threshold θ=0.7) against the indexed tool registry, reusing `internal/toolindex` (Embedder interface + in-Go cosine) — so subtasks automatically get the right tools without manual specification. |
 | G7 | All plan operations (`decompose`, `run`, `show`, `list`, `export`) support `--json` output for CI/pipeline integration. |
-| G8 | Per-plan budget caps (token and USD) are enforced via `budget.py`; the plan engine checks remaining budget before dispatching each node. |
+| G8 | Per-plan budget caps (token and USD) are enforced via `internal/obs` cost tracking; the plan engine checks remaining budget before dispatching each node. |
 | G9 | Stall detection: a stall counter per plan increments when no node changes status between dispatch cycles; at threshold 2 (configurable), re-plan is triggered even without an explicit failure. |
 | G10 | A `$node_id.output` variable substitution syntax allows downstream node prompts to reference the literal output of upstream nodes, enabling data flow across the DAG. |
 | G11 | Plan files are signed (HMAC-SHA256) on write and verified on load, so tampered plan files are rejected before execution. See Security Considerations. |
@@ -82,7 +84,7 @@ When the current loop agent encounters a subtask failure (e.g., a build fails, a
 | Parallelism speedup | Wall-clock time for a 6-node plan with 3 independent root nodes is ≤ 55% of sequential wall-clock time | Benchmark test with mock agent that sleeps 1s per node |
 | Re-plan success rate | Re-plan splices correct replacement nodes (no cycle introduction, valid topological order) in ≥ 95% of triggered cases | Property test with random DAG + random failure injection |
 | Plan persistence | After `SIGKILL` of `tag plan run`, re-running the same command resumes from the last completed node with 0 re-executed completed nodes | Integration test |
-| Tool assignment accuracy | SentenceTransformer skill retrieval assigns ≥ 1 relevant tool for ≥ 90% of non-trivial subtask descriptions | Eval against 50 manually labeled subtask→tool pairs |
+| Tool assignment accuracy | Embedding skill retrieval (`internal/toolindex`) assigns ≥ 1 relevant tool for ≥ 90% of non-trivial subtask descriptions | Eval against 50 manually labeled subtask→tool pairs |
 | Budget enforcement | Plan engine never dispatches a node when accumulated cost exceeds plan budget cap | Unit test with mock cost accumulator |
 | Cycle rejection | 100% of plans containing cycles are rejected at validation time with a clear error identifying the cycle | Fuzz test with randomly generated graphs |
 | Variable substitution | `$node_id.output` resolves correctly in 100% of tested downstream prompts | Unit test with synthetic plan fixtures |
@@ -361,7 +363,7 @@ Checks: JSON schema conformance, no cycles (topological sort), all `depends_on` 
 |----|------------|-----------------|
 | FR-01 | `tag plan decompose` calls the planner LLM with a structured output schema enforcing `PlanNode` fields: `id`, `label`, `type`, `prompt`, `depends_on`. | Unit test: mock LLM returns malformed JSON; command exits 1 with schema error. |
 | FR-02 | Decomposition validates the graph for cycles using Kahn's algorithm before persisting. Any cycle causes an immediate error with the cycle path. | Unit test: inject a plan with A→B→A; expect `CycleError` with path `['A','B','A']`. |
-| FR-03 | Tool-to-subtask assignment is performed by computing cosine similarity between each node's `prompt` embedding and indexed tool descriptions via `tool_retrieval.py`. Only tools with similarity ≥ `--skill-threshold` are assigned. | Integration test: subtask "write Python code" assigns `bash`/`write_file`; subtask "search the web" assigns `web_search`. |
+| FR-03 | Tool-to-subtask assignment is performed by computing cosine similarity between each node's `prompt` embedding and indexed tool descriptions via `internal/toolindex` (Embedder interface + in-Go cosine over the float32 BLOB index). Only tools with similarity ≥ `--skill-threshold` are assigned. | Integration test: subtask "write Python code" assigns `bash`/`write_file`; subtask "search the web" assigns `web_search`. |
 | FR-04 | All plans are persisted to `plan_graphs` and `plan_nodes` tables via `open_db()` before `decompose` returns. | Integration test: `tag plan list` shows the plan after `decompose`; kill process before output; `tag plan list` still shows it. |
 | FR-05 | `tag plan run` reads the plan from SQLite (using `plan_id` from the JSON file) and dispatches nodes whose `depends_on` set is fully in `{done}` state. | Unit test: plan with nodes A (no deps), B (depends A), C (depends A). At t=0, only A dispatched. |
 | FR-06 | `tag plan run` maintains a `ready_queue` and an `in_flight` set; at each dispatch cycle it promotes all nodes with all deps `done` into `ready_queue` and dispatches up to `--parallel` from `ready_queue`. | Integration test: mock executor sleeps 0.1s; verify 3 concurrent dispatches when `--parallel 3` and 3 independent root nodes. |
@@ -372,13 +374,13 @@ Checks: JSON schema conformance, no cycles (topological sort), all `depends_on` 
 | FR-11 | Per-node execution state (status, output, error, start_time, end_time, tokens, cost_usd) is written to `plan_nodes` after every transition. | Integration test: `SIGKILL` mid-run; verify `plan_nodes` shows correct `done`/`running` state for completed/active nodes. |
 | FR-12 | `tag plan run --resume` skips nodes with `status='done'` in `plan_nodes` and re-queues nodes with `status='running'` (crashed in-flight) as `pending`. | Integration test: pre-seed `plan_nodes` with 3 done + 1 running; verify only non-done nodes are executed. |
 | FR-13 | Budget caps (USD and tokens) are checked before dispatching each node. If `accumulated_cost_usd + estimated_node_cost > budget_usd`, dispatch is blocked and the engine emits a `budget_exceeded` event and aborts. | Unit test: set budget=$0.01; mock executor accumulates cost; verify abort before third node. |
-| FR-14 | Per-node spans are emitted to `traces` table via `tracing.py`, tagged with `plan_id`, `node_id`, `node_type`, and `depends_on` attributes. | Integration test: verify `SELECT * FROM traces WHERE attributes LIKE '%plan_id%'` returns one span per executed node. |
+| FR-14 | Per-node spans are emitted to the `traces` table via `internal/obs` (`otel` custom SpanProcessor), tagged with `plan_id`, `node_id`, `node_type`, and `depends_on` attributes. | Integration test: verify `SELECT * FROM traces WHERE attributes LIKE '%plan_id%'` returns one span per executed node. |
 | FR-15 | Plan files are HMAC-SHA256 signed using the TAG instance key on write. `tag plan validate` and `tag plan run` verify the signature before trusting the file. | Unit test: modify one byte of plan.json; verify rejection with `SignatureError`. |
-| FR-16 | `tag plan show --dot` emits a valid Graphviz DOT file representing the DAG, with node shapes colored by type and edge labels showing dependency direction. | Unit test: parse DOT output with `pydot`; verify node count and edge count match plan spec. |
+| FR-16 | `tag plan show --dot` emits a valid Graphviz DOT file representing the DAG, with node shapes colored by type and edge labels showing dependency direction. | Unit test: parse DOT output with `gonum.org/v1/gonum/graph/encoding/dot`; verify node count and edge count match plan spec. |
 | FR-17 | `tag plan export --include-outputs` produces a JSON archive containing the full plan spec plus the `output` field of every completed node. | Integration test: run a plan to completion; export; verify all node outputs present. |
 | FR-18 | `tag plan list` reads from `plan_graphs` and emits one row per plan with `id`, `goal` (truncated to 60 chars), `status`, total node count, done count, failed count, and `created_at`. | Unit test with seeded SQLite; verify output row count and field values. |
 | FR-19 | Node types are constrained to the enum `{research, compute, write, review, deploy}`. The planner prompt includes the enum definition and the schema validator rejects unknown types. | Unit test: inject node with `type: "unknown"`; verify `SchemaValidationError`. |
-| FR-20 | `tag plan decompose --dry-run` constructs the planner prompt, validates profile existence, and prints the estimated prompt token count and cost without making any LLM API call. | Unit test: verify no HTTP calls made (mock httpx); verify cost estimate printed. |
+| FR-20 | `tag plan decompose --dry-run` constructs the planner prompt, validates profile existence, and prints the estimated prompt token count and cost without making any LLM API call. | Unit test: verify no HTTP calls made (`net/http/httptest` round-tripper asserting zero requests); verify cost estimate printed. |
 
 ---
 
@@ -394,28 +396,30 @@ Checks: JSON schema conformance, no cycles (topological sort), all `depends_on` 
 | NFR-06 | `tag plan run` with `--json` emits newline-delimited JSON (NDJSON), one JSON object per event, so pipelines can process events incrementally with `while read line`. | Shell integration test |
 | NFR-07 | The re-plan LLM call must complete within 30 seconds; if it times out, the engine falls back to abort behavior. | Unit test with mock timeout |
 | NFR-08 | Memory usage of the dispatch engine must not grow with plan size beyond O(N) where N is node count (no full output materialization in memory for non-referenced outputs). | Memory profiling test with 50-node plan |
-| NFR-09 | Skill retrieval via `tool_retrieval.py` (SentenceTransformer embed + ChromaDB query) must complete within 2 seconds per node at decomposition time. | Benchmark test |
-| NFR-10 | All new modules must pass `ruff check` and `mypy --strict` with zero errors. | CI gate |
-| NFR-11 | The feature must not introduce new dependencies beyond what is already required by `tool_retrieval.py` (sentence-transformers, chromadb) and the existing TAG stack. | `pip install tag` must not pull new packages not already optional. |
-| NFR-12 | `tag plan decompose` and `tag plan run` must be idempotent with respect to SQLite state: running `decompose` twice for the same goal and plan ID is a no-op (returns existing plan). | Integration test: run decompose twice; verify single row in `plan_graphs`. |
+| NFR-09 | Skill retrieval via `internal/toolindex` (Embedder call + in-Go cosine over the BLOB index) must complete within 2 seconds per node at decomposition time. | Benchmark test (`testing.B`) |
+| NFR-10 | All new packages must pass `go vet`, `golangci-lint`, and `staticcheck` with zero findings, and be `gofmt`-clean. | CI gate |
+| NFR-11 | The feature must not introduce new modules beyond what is already required by `internal/toolindex` (the `Embedder` interface + provider embedding client, `gonum`) and the existing TAG Go stack. The default build stays `CGO_ENABLED=0`. | `go build ./...` must not pull new direct modules outside the pinned `go.mod` set. |
+| NFR-12 | `tag plan decompose` and `tag plan run` must be idempotent with respect to SQLite state: running `decompose` twice for the same goal and plan ID is a no-op (returns existing plan). Idempotency is enforced by the single-writer + `flock`/`os.Rename` atomic RMW contract in `internal/store`. | Integration test: run decompose twice; verify single row in `plan_graphs`. |
 
 ---
 
 ## 9. Technical Design
 
-### 9.1 New and Modified Files
+### 9.1 New and Modified Packages
 
-| File | Change Type | Description |
+| Package / file | Change Type | Description |
 |------|-------------|-------------|
-| `src/tag/dag.py` | **Extend** | Add `PlanGraph`, `PlanNode` dataclasses; `decompose()`, `run_plan()`, `replan()`, `validate_dag()` functions; new SQLite schema (`plan_graphs`, `plan_nodes`). |
-| `src/tag/loop_agent.py` | **Extend** | Add `DualLedger` (TaskLedger + ProgressLedger) dataclasses; `run_with_ledger()` function; stall detection logic. |
-| `src/tag/controller.py` | **Extend** | Add `cmd_plan_decompose`, `cmd_plan_run`, `cmd_plan_show`, `cmd_plan_list`, `cmd_plan_export`, `cmd_plan_validate` command handlers under `tag plan` subparser. |
-| `tests/test_tdag.py` | **New** | Unit and integration tests for all FR items. |
-| `tests/test_tdag_properties.py` | **New** | Property-based tests (Hypothesis) for DAG validation, cycle detection, re-plan splice correctness. |
+| `internal/queue/plan.go` | **New** | `PlanGraph`, `PlanNode` structs; `Decompose()`, `RunPlan()`, `Replan()`, `ValidateDAG()`; Kahn topological sort + cycle detection. Reuses the existing `internal/queue` errgroup worker pool + scheduler goroutine (the bespoke SQLite-backed DAG engine). |
+| `internal/queue/scheduler.go` | **Extend** | The pending→ready promotion loop and bounded goroutine dispatch already used for `queue_jobs`/`queue_dags` is generalized to schedule `plan_nodes`. |
+| `internal/store/plan_schema.go` | **New** | `EnsurePlanSchema(ctx, db)` migration creating `plan_graphs`, `plan_nodes`, `plan_progress_ledger` on the single `modernc.org/sqlite` store. |
+| `internal/agent/ledger.go` | **New** | `TaskLedger` + `ProgressLedger` + `ProgressReflection` structs; `RunWithLedger()`; stall detection. Wraps the hand-rolled inner agent loop. |
+| `internal/cli/plan.go` | **New** | Cobra command group `tag plan` with `decompose`, `run`, `show`, `list`, `export`, `validate` subcommands. |
+| `internal/queue/plan_test.go` | **New** | Table-driven unit + integration tests for all FR items. |
+| `internal/queue/plan_prop_test.go` | **New** | Property-based tests (`testing/quick`, optionally `pgregory.net/rapid`) for DAG validation, cycle detection, re-plan splice correctness. |
 
 ### 9.2 SQLite DDL
 
-These tables are created by `ensure_plan_schema(conn)` in `dag.py`, called on first access via `open_db()`.
+These tables are created by `EnsurePlanSchema(ctx, db)` in `internal/store`, invoked once at migration time against the single pure-Go `modernc.org/sqlite` connection (WAL, `CGO_ENABLED=0`, FTS5 compiled in). All writes go through the single-writer + `flock` atomic RMW contract.
 
 ```sql
 -- Plan graph: one row per decompose call
@@ -485,206 +489,285 @@ CREATE TABLE IF NOT EXISTS plan_progress_ledger (
 CREATE INDEX IF NOT EXISTS idx_ppl_plan ON plan_progress_ledger(plan_id, cycle);
 ```
 
-### 9.3 Core Dataclasses
+### 9.3 Core Structs
 
-```python
-# src/tag/dag.py  (additions)
-from __future__ import annotations
+```go
+// internal/queue/plan.go
+package queue
 
-import hashlib
-import hmac
-import json
-import uuid
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Literal
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"sort"
+)
 
+type NodeType string
 
-class NodeType(str, Enum):
-    RESEARCH = "research"
-    COMPUTE  = "compute"
-    WRITE    = "write"
-    REVIEW   = "review"
-    DEPLOY   = "deploy"
+const (
+	NodeResearch NodeType = "research"
+	NodeCompute  NodeType = "compute"
+	NodeWrite    NodeType = "write"
+	NodeReview   NodeType = "review"
+	NodeDeploy   NodeType = "deploy"
+)
 
+type NodeStatus string
 
-class NodeStatus(str, Enum):
-    PENDING  = "pending"
-    READY    = "ready"
-    RUNNING  = "running"
-    DONE     = "done"
-    FAILED   = "failed"
-    SKIPPED  = "skipped"
+const (
+	StatusPending NodeStatus = "pending"
+	StatusReady   NodeStatus = "ready"
+	StatusRunning NodeStatus = "running"
+	StatusDone    NodeStatus = "done"
+	StatusFailed  NodeStatus = "failed"
+	StatusSkipped NodeStatus = "skipped"
+)
 
+// ErrCycle is returned by TopologicalOrder when the graph is not acyclic.
+var ErrCycle = errors.New("cycle detected in plan DAG")
 
-@dataclass
-class PlanNode:
-    id: str
-    label: str
-    node_type: NodeType
-    prompt_template: str          # may contain $node_id.output variable refs
-    depends_on: list[str] = field(default_factory=list)
-    tools: list[str] = field(default_factory=list)
-    status: NodeStatus = NodeStatus.PENDING
-    output: str | None = None
-    error: str | None = None
-    replaced_by: str | None = None
-    tokens_used: int = 0
-    cost_usd: float = 0.0
-    started_at: str | None = None
-    completed_at: str | None = None
+type PlanNode struct {
+	ID             string     `json:"id"`
+	Label          string     `json:"label"`
+	NodeType       NodeType   `json:"type"`
+	PromptTemplate string     `json:"prompt"` // may contain $node_id.output refs
+	DependsOn      []string   `json:"depends_on"`
+	Tools          []string   `json:"tools"`
+	Status         NodeStatus `json:"status"`
+	Output         string     `json:"output,omitempty"`
+	Error          string     `json:"error,omitempty"`
+	ReplacedBy     string     `json:"replaced_by,omitempty"`
+	TokensUsed     int        `json:"tokens_used"`
+	CostUSD        float64    `json:"cost_usd"`
+	StartedAt      string     `json:"started_at,omitempty"`
+	CompletedAt    string     `json:"completed_at,omitempty"`
+}
 
-    def resolve_prompt(self, outputs: dict[str, str]) -> str:
-        """Substitute $node_id.output references with actual outputs."""
-        import re
-        def _sub(m: re.Match) -> str:
-            ref_id = m.group(1)
-            if ref_id not in outputs:
-                raise ValueError(f"Output reference ${ref_id}.output not yet available")
-            return outputs[ref_id]
-        return re.sub(r'\$([a-zA-Z_][a-zA-Z0-9_]*)\.output', _sub, self.prompt_template)
+var outputRef = regexp.MustCompile(`\$([a-zA-Z_][a-zA-Z0-9_]*)\.output`)
 
+// ResolvePrompt substitutes $node_id.output references with actual outputs.
+func (n *PlanNode) ResolvePrompt(outputs map[string]string) (string, error) {
+	var missing string
+	res := outputRef.ReplaceAllStringFunc(n.PromptTemplate, func(m string) string {
+		ref := outputRef.FindStringSubmatch(m)[1]
+		v, ok := outputs[ref]
+		if !ok {
+			missing = ref
+			return m
+		}
+		return v
+	})
+	if missing != "" {
+		return "", fmt.Errorf("output reference $%s.output not yet available", missing)
+	}
+	return res, nil
+}
 
-@dataclass
-class PlanGraph:
-    id: str
-    goal: str
-    profile: str
-    nodes: dict[str, PlanNode]    # keyed by node ID
-    planner_model: str
-    decompose_tokens: int = 0
-    decompose_cost_usd: float = 0.0
-    skill_threshold: float = 0.7
-    budget_usd: float | None = None
-    budget_tokens: int | None = None
-    accumulated_cost_usd: float = 0.0
-    accumulated_tokens: int = 0
-    stall_count: int = 0
-    replan_count: int = 0
-    status: str = "ready"
-    hmac_sha256: str = ""
+type PlanGraph struct {
+	ID                 string               `json:"plan_id"`
+	Goal               string               `json:"goal"`
+	Profile            string               `json:"profile"`
+	Nodes              map[string]*PlanNode `json:"-"` // keyed by node ID; serialized as an ordered slice
+	PlannerModel       string               `json:"planner_model"`
+	DecomposeTokens    int                  `json:"decompose_tokens"`
+	DecomposeCostUSD   float64              `json:"decompose_cost_usd"`
+	SkillThreshold     float64              `json:"skill_threshold"`
+	BudgetUSD          *float64             `json:"budget_usd"`     // nil means no cap
+	BudgetTokens       *int                 `json:"budget_tokens"`  // nil means no cap
+	AccumulatedCostUSD float64              `json:"accumulated_cost_usd"`
+	AccumulatedTokens  int                  `json:"accumulated_tokens"`
+	StallCount         int                  `json:"stall_count"`
+	ReplanCount        int                  `json:"replan_count"`
+	Status             string               `json:"status"`
+	HMACSHA256         string               `json:"hmac_sha256"`
+}
 
-    def topological_order(self) -> list[str]:
-        """Kahn's algorithm. Raises CycleError if a cycle is detected."""
-        in_degree: dict[str, int] = {nid: 0 for nid in self.nodes}
-        adj: dict[str, list[str]] = {nid: [] for nid in self.nodes}
-        for nid, node in self.nodes.items():
-            for dep in node.depends_on:
-                if dep not in self.nodes:
-                    raise ValueError(f"Node {nid!r} depends on unknown node {dep!r}")
-                adj[dep].append(nid)
-                in_degree[nid] += 1
-        queue = [nid for nid, deg in in_degree.items() if deg == 0]
-        order: list[str] = []
-        while queue:
-            nid = queue.pop(0)
-            order.append(nid)
-            for succ in adj[nid]:
-                in_degree[succ] -= 1
-                if in_degree[succ] == 0:
-                    queue.append(succ)
-        if len(order) != len(self.nodes):
-            # Find cycle members for error reporting
-            cycle_members = [nid for nid in self.nodes if nid not in order]
-            raise CycleError(f"Cycle detected involving nodes: {cycle_members}")
-        return order
+// TopologicalOrder implements Kahn's algorithm; wraps ErrCycle if a cycle exists.
+func (g *PlanGraph) TopologicalOrder() ([]string, error) {
+	inDeg := make(map[string]int, len(g.Nodes))
+	adj := make(map[string][]string, len(g.Nodes))
+	for id := range g.Nodes {
+		inDeg[id] = 0
+	}
+	for id, node := range g.Nodes {
+		for _, dep := range node.DependsOn {
+			if _, ok := g.Nodes[dep]; !ok {
+				return nil, fmt.Errorf("node %q depends on unknown node %q", id, dep)
+			}
+			adj[dep] = append(adj[dep], id)
+			inDeg[id]++
+		}
+	}
+	queue := make([]string, 0)
+	for id, d := range inDeg {
+		if d == 0 {
+			queue = append(queue, id)
+		}
+	}
+	sort.Strings(queue) // deterministic ordering
+	order := make([]string, 0, len(g.Nodes))
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		order = append(order, id)
+		for _, succ := range adj[id] {
+			inDeg[succ]--
+			if inDeg[succ] == 0 {
+				queue = append(queue, succ)
+			}
+		}
+	}
+	if len(order) != len(g.Nodes) {
+		var members []string
+		seen := make(map[string]bool, len(order))
+		for _, id := range order {
+			seen[id] = true
+		}
+		for id := range g.Nodes {
+			if !seen[id] {
+				members = append(members, id)
+			}
+		}
+		sort.Strings(members)
+		return nil, fmt.Errorf("%w involving nodes: %v", ErrCycle, members)
+	}
+	return order, nil
+}
 
-    def ready_nodes(self) -> list[str]:
-        """Return node IDs whose deps are all done and whose status is pending."""
-        done_ids = {nid for nid, n in self.nodes.items() if n.status == NodeStatus.DONE}
-        return [
-            nid for nid, node in self.nodes.items()
-            if node.status == NodeStatus.PENDING
-            and all(dep in done_ids for dep in node.depends_on)
-        ]
+// ReadyNodes returns node IDs whose deps are all done and whose status is pending.
+func (g *PlanGraph) ReadyNodes() []string {
+	done := make(map[string]bool)
+	for id, n := range g.Nodes {
+		if n.Status == StatusDone {
+			done[id] = true
+		}
+	}
+	var ready []string
+	for id, node := range g.Nodes {
+		if node.Status != StatusPending {
+			continue
+		}
+		ok := true
+		for _, dep := range node.DependsOn {
+			if !done[dep] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			ready = append(ready, id)
+		}
+	}
+	sort.Strings(ready)
+	return ready
+}
 
-    def sign(self, key: bytes) -> str:
-        """Compute HMAC-SHA256 over canonical JSON representation (nodes only)."""
-        canonical = json.dumps(
-            {nid: {"prompt_template": n.prompt_template, "depends_on": sorted(n.depends_on)}
-             for nid, n in sorted(self.nodes.items())},
-            sort_keys=True,
-        ).encode()
-        return hmac.new(key, canonical, hashlib.sha256).hexdigest()
-
-
-class CycleError(ValueError):
-    pass
+// Sign computes HMAC-SHA256 over a canonical JSON of the nodes (prompt + deps only).
+func (g *PlanGraph) Sign(key []byte) string {
+	type canon struct {
+		Prompt    string   `json:"prompt_template"`
+		DependsOn []string `json:"depends_on"`
+	}
+	ids := make([]string, 0, len(g.Nodes))
+	for id := range g.Nodes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	m := make(map[string]canon, len(ids))
+	for _, id := range ids {
+		n := g.Nodes[id]
+		deps := append([]string(nil), n.DependsOn...)
+		sort.Strings(deps)
+		m[id] = canon{Prompt: n.PromptTemplate, DependsOn: deps}
+	}
+	buf, _ := json.Marshal(m) // map keys are marshaled in sorted order by encoding/json
+	mac := hmac.New(sha256.New, key)
+	mac.Write(buf)
+	return hex.EncodeToString(mac.Sum(nil))
+}
 ```
 
-### 9.4 Dual-Ledger Dataclasses (loop_agent.py additions)
+`Nodes` is held as a map for O(1) lookup during scheduling but is (de)serialized to/from an ordered `[]PlanNode` slice via custom `MarshalJSON`/`UnmarshalJSON` so `plan.json` stays stable and diff-friendly.
 
-```python
-# src/tag/loop_agent.py  (additions)
-from __future__ import annotations
+### 9.4 Dual-Ledger Structs (`internal/agent/ledger.go`)
 
-from dataclasses import dataclass, field
+```go
+// internal/agent/ledger.go
+package agent
 
+// TaskLedger is the outer strategic record: the plan DAG reference + high-level goal.
+type TaskLedger struct {
+	PlanID           string   `json:"plan_id"`
+	Goal             string   `json:"goal"`
+	Profile          string   `json:"profile"`
+	TotalNodes       int      `json:"total_nodes"`
+	CompletedNodeIDs []string `json:"completed_node_ids"`
+	FailedNodeIDs    []string `json:"failed_node_ids"`
+}
 
-@dataclass
-class TaskLedger:
-    """Outer strategic record: the plan DAG reference + high-level goal."""
-    plan_id: str
-    goal: str
-    profile: str
-    total_nodes: int
-    completed_node_ids: list[str] = field(default_factory=list)
-    failed_node_ids: list[str] = field(default_factory=list)
+// ProgressLedger is the inner tactical record: a per-cycle state snapshot plus a
+// 5-question self-reflection.
+type ProgressLedger struct {
+	PlanID        string              `json:"plan_id"`
+	Cycle         int                 `json:"cycle"`
+	NodesDone     []string            `json:"nodes_done"`
+	NodesFailed   []string            `json:"nodes_failed"`
+	NodesInFlight []string            `json:"nodes_in_flight"`
+	StallCount    int                 `json:"stall_count"`
+	Reflection    *ProgressReflection `json:"reflection,omitempty"` // populated by the LLM self-reflection call
+}
 
-
-@dataclass
-class ProgressLedger:
-    """Inner tactical record: per-cycle state snapshot + 5-question self-reflection."""
-    plan_id: str
-    cycle: int
-    nodes_done: list[str] = field(default_factory=list)
-    nodes_failed: list[str] = field(default_factory=list)
-    nodes_in_flight: list[str] = field(default_factory=list)
-    stall_count: int = 0
-    # Structured 5-question reflection (populated by LLM self-reflection call):
-    reflection: ProgressReflection | None = None
-
-
-@dataclass
-class ProgressReflection:
-    """5-question MagenticOne-style self-reflection, parsed from structured LLM output."""
-    is_goal_achieved: bool
-    what_has_been_done: str         # 1-2 sentences
-    what_remains: str               # 1-2 sentences
-    are_there_blockers: bool
-    blocker_description: str | None # None if no blockers
-    recommended_action: str         # "continue" | "replan" | "abort"
+// ProgressReflection is the 5-question MagenticOne-style self-reflection, decoded
+// from structured LLM output (schema generated via invopop/jsonschema).
+type ProgressReflection struct {
+	IsGoalAchieved     bool   `json:"is_goal_achieved"`
+	WhatHasBeenDone    string `json:"what_has_been_done"`  // 1-2 sentences
+	WhatRemains        string `json:"what_remains"`        // 1-2 sentences
+	AreThereBlockers   bool   `json:"are_there_blockers"`
+	BlockerDescription string `json:"blocker_description"` // empty if no blockers
+	RecommendedAction  string `json:"recommended_action"`  // "continue" | "replan" | "abort"
+}
 ```
 
 ### 9.5 Core Algorithms
 
 #### 9.5.1 Decomposition Algorithm
 
-```python
-def decompose(
-    goal: str,
-    profile: str,
-    *,
-    planner_model: str,
-    skill_threshold: float = 0.7,
-    max_nodes: int = 20,
-    budget_usd: float | None = None,
-    budget_tokens: int | None = None,
-    db_path: Path,
-    hmac_key: bytes,
-) -> PlanGraph:
-    """
-    1. Build planner prompt with goal, node schema, tool list, and constraints.
-    2. Call planner_model with structured output (JSON mode).
-    3. Parse PlanNode list from response.
-    4. For each node, run SentenceTransformer similarity against tool registry
-       (tool_retrieval.py) and assign tools with score >= skill_threshold.
-    5. Validate: topological sort (CycleError), all depends_on IDs exist,
-       node types valid, count <= max_nodes.
-    6. Assign plan_id, sign with HMAC, persist to plan_graphs + plan_nodes.
-    7. Return PlanGraph.
-    """
+```go
+// Decompose builds a validated, signed PlanGraph and persists it.
+func Decompose(ctx context.Context, opts DecomposeOpts) (*PlanGraph, error)
+
+type DecomposeOpts struct {
+	Goal           string
+	Profile        string
+	PlannerModel   string
+	SkillThreshold float64 // default 0.7
+	MaxNodes       int     // default 20
+	BudgetUSD      *float64
+	BudgetTokens   *int
+	Store          *store.DB
+	HMACKey        []byte
+}
+
+// Steps:
+//  1. Build the planner prompt with goal, node schema, tool list, and constraints.
+//  2. Call the planner model through the internal/llm provider interface with a
+//     JSON-schema-constrained response (schema from invopop/jsonschema over PlanNode).
+//  3. Decode the []PlanNode from the response (encoding/json).
+//  4. For each node, call internal/toolindex to embed the prompt and assign tools
+//     whose cosine similarity >= SkillThreshold.
+//  5. Validate: TopologicalOrder (ErrCycle), all DependsOn IDs exist, node types
+//     valid, len(nodes) <= MaxNodes.
+//  6. Assign plan ID, Sign with HMAC, persist plan_graphs + plan_nodes inside a
+//     single write transaction (single-writer contract).
+//  7. Return the PlanGraph.
 ```
+
+The planner call uses the provider-neutral `Stream(ctx, Request) -> <-chan Event` interface from `internal/llm`; the decomposition consumes the accumulated `Finish` event and its `Usage` for token/cost accounting.
 
 The planner prompt instructs the LLM to return a JSON object with a `nodes` array. Each element must match the `PlanNode` schema. The prompt includes:
 - The full node type enum with descriptions
@@ -693,135 +776,164 @@ The planner prompt instructs the LLM to return a JSON object with a `nodes` arra
 - A node count constraint (`max_nodes`)
 - A prohibition on cycles ("do not create circular dependencies")
 
-#### 9.5.2 Dispatch Loop
+#### 9.5.2 Dispatch Loop (the bespoke `internal/queue` scheduler)
 
-```python
-import asyncio
-import concurrent.futures
+Execution runs on the SQLite-backed goroutine DAG scheduler (GO_MIGRATION_PLAN.md decision (5)) — **not** an external durable queue. A single scheduler goroutine owns the promotion loop (`pending → ready` when all `deps_json` predecessors are `done`); a bounded worker pool driven by `golang.org/x/sync/errgroup` executes ready nodes over channels, capped at `parallel`. `context.Context` propagates cancellation (interrupt, budget abort, `fail_fast`). Every state transition is written to SQLite before the next transition, giving durability + replay.
 
-def run_plan(
-    plan: PlanGraph,
-    profile: str,
-    *,
-    parallel: int = 4,
-    stall_threshold: int = 2,
-    no_replan: bool = False,
-    db_path: Path,
-    config_path: str,
-    event_callback: Callable[[dict], None] | None = None,
-) -> PlanGraph:
-    """
-    Dispatch loop (synchronous wrapper over async inner loop):
+```go
+type RunOpts struct {
+	Profile        string
+	Parallel       int  // default 4
+	StallThreshold int  // default 2
+	NoReplan       bool
+	Store          *store.DB
+	Events         chan<- Event // nil-safe; buffered NDJSON/stream sink
+}
 
-    while not all nodes done/failed/skipped:
-        ready = plan.ready_nodes()
-        if not ready and not in_flight:
-            stall_count += 1
-            if stall_count >= stall_threshold:
-                trigger replan(reason="stall")
-            else:
-                sleep(1.0)
-            continue
-        stall_count = 0
+// RunPlan schedules the DAG to completion and returns the final PlanGraph.
+func RunPlan(ctx context.Context, plan *PlanGraph, opts RunOpts) (*PlanGraph, error) {
+	sem := make(chan struct{}, opts.Parallel) // bounded concurrency
+	g, ctx := errgroup.WithContext(ctx)
+	results := make(chan nodeResult)          // workers -> scheduler
+	inFlight := 0
+	stall := 0
+	doneOutputs := map[string]string{}
 
-        # Dispatch up to (parallel - len(in_flight)) ready nodes
-        to_dispatch = ready[:parallel - len(in_flight)]
-        for node_id in to_dispatch:
-            resolved_prompt = plan.nodes[node_id].resolve_prompt(done_outputs)
-            future = executor.submit(_execute_node, node_id, resolved_prompt, ...)
-            in_flight[node_id] = future
-            mark_node_running(node_id, db)
-            emit_event("dispatch", node_id)
+	for !plan.allTerminal() {
+		ready := plan.ReadyNodes()
+		if len(ready) == 0 && inFlight == 0 {
+			stall++
+			if stall >= opts.StallThreshold {
+				if err := Replan(ctx, plan, ReplanReq{Reason: "stall", Store: opts.Store}); err != nil {
+					return plan, err
+				}
+			}
+			continue
+		}
+		stall = 0
 
-        # Poll for completed futures (non-blocking)
-        for node_id, fut in list(in_flight.items()):
-            if fut.done():
-                result = fut.result()
-                if result.success:
-                    mark_node_done(node_id, result, db)
-                    done_outputs[node_id] = result.output
-                    emit_event("done", node_id, result)
-                else:
-                    mark_node_failed(node_id, result.error, db)
-                    if no_replan:
-                        abort_plan(plan)
-                        return plan
-                    trigger_replan(plan, failed_node=node_id, db=db, ...)
-                in_flight.pop(node_id)
+		// Dispatch up to (parallel - inFlight) ready nodes.
+		for _, id := range ready[:min(len(ready), opts.Parallel-inFlight)] {
+			node := plan.Nodes[id]
+			prompt, err := node.ResolvePrompt(doneOutputs) // blocks dispatch on missing refs
+			if err != nil {
+				continue
+			}
+			plan.mark(ctx, opts.Store, id, StatusRunning)
+			opts.emit(Event{Kind: "dispatch", NodeID: id})
+			inFlight++
+			g.Go(func() error {
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				res := executeNode(ctx, id, prompt, opts.Profile) // runs the agent inner loop
+				select {
+				case results <- res:
+				case <-ctx.Done():
+				}
+				return nil
+			})
+		}
 
-        sleep(1.0)  # poll interval
-
-    finalize_plan(plan, db)
-    return plan
+		// Await one completion (channel receive; no busy-wait poll).
+		res := <-results
+		inFlight--
+		if res.Success {
+			plan.markDone(ctx, opts.Store, res)
+			doneOutputs[res.NodeID] = res.Output
+			opts.emit(Event{Kind: "done", NodeID: res.NodeID})
+		} else {
+			plan.markFailed(ctx, opts.Store, res)
+			if opts.NoReplan {
+				plan.abort(ctx, opts.Store)
+				return plan, nil
+			}
+			if err := Replan(ctx, plan, ReplanReq{FailedNode: res.NodeID, Reason: "failure", Store: opts.Store}); err != nil {
+				return plan, err
+			}
+		}
+	}
+	if err := g.Wait(); err != nil {
+		return plan, err
+	}
+	plan.finalize(ctx, opts.Store)
+	return plan, nil
+}
 ```
 
-The `_execute_node` function submits a `tag submit` subprocess call (same pattern as `loop_agent.py`'s `_run_iteration`), capturing stdout/stderr and exit code.
+`executeNode` invokes the agent inner loop in `internal/agent` for that node (mirroring the single-iteration path), for `compute`/`deploy` types wrapped by `internal/sandbox`. Because completions are delivered over a channel rather than a polled future set, the scheduler is event-driven and consumes no CPU while waiting (satisfies NFR-04). All node executions share the same `errgroup`, so a `fail_fast` cancellation propagates through `ctx` to every in-flight worker.
 
 #### 9.5.3 Re-plan Splice Algorithm
 
-```python
-def replan(
-    plan: PlanGraph,
-    *,
-    failed_node_id: str | None,
-    reason: str,
-    replan_model: str,
-    db_path: Path,
-    hmac_key: bytes,
-) -> PlanGraph:
-    """
-    1. Build re-plan prompt:
-       - Original goal
-       - Completed nodes + their outputs (truncated to 500 chars each)
-       - Failed node spec + error (if reason="failure")
-       - Remaining (not-yet-started) node IDs and their prompts
-       - Stall description (if reason="stall")
-       - Instruction: return replacement_nodes[] and updated depends_on for each
+```go
+type ReplanReq struct {
+	FailedNode  string // "" when Reason == "stall"
+	Reason      string // "failure" | "stall"
+	ReplanModel string
+	Store       *store.DB
+	HMACKey     []byte
+}
 
-    2. Call replan_model with structured output.
-    3. Parse replacement PlanNode list.
-    4. Validate replacement nodes:
-       a. No new cycles when spliced into existing (done + replacement + remaining) graph
-       b. All depends_on IDs reference either done nodes or other replacement nodes
-       c. Node IDs do not collide with existing non-failed node IDs
-    5. Mark failed_node (if any) as status='replaced', set replaced_by=first replacement ID
-    6. Insert replacement nodes into plan.nodes dict
-    7. Remove failed_node from ready/pending queue consideration
-    8. Re-sign plan HMAC
-    9. Persist updated nodes to plan_nodes table
-    10. Update plan_graphs.replan_count += 1
-    11. Return updated PlanGraph
-    """
+// Replan splices LLM-proposed replacement nodes into the live DAG.
+func Replan(ctx context.Context, plan *PlanGraph, req ReplanReq) error
+
+// Steps:
+//  1. Build the re-plan prompt:
+//       - original goal
+//       - completed nodes + outputs (truncated to 500 chars each)
+//       - failed node spec + error (Reason == "failure")
+//       - remaining (not-yet-started) node IDs and their prompts
+//       - stall description (Reason == "stall")
+//       - instruction: return replacement_nodes[] with updated depends_on
+//  2. Call the re-plan model via internal/llm with a JSON-schema-constrained response.
+//  3. Decode the []PlanNode replacement list.
+//  4. Validate replacements against a trial-spliced copy of the graph:
+//       a. TopologicalOrder returns no ErrCycle over (done + replacement + remaining)
+//       b. every DependsOn references a done node or another replacement node
+//       c. IDs do not collide with existing non-failed node IDs
+//     On any validation failure, fall back to NoReplan (abort) — never splice.
+//  5. Mark the failed node (if any) Status="skipped", ReplacedBy=first replacement ID.
+//  6. Insert replacement nodes into plan.Nodes.
+//  7. Drop the failed node from ready/pending consideration.
+//  8. Re-sign the plan HMAC.
+//  9. Persist updated rows to plan_nodes in one write txn.
+// 10. plan_graphs.replan_count++.
 ```
 
-#### 9.5.4 SentenceTransformer Skill Assignment
+The whole splice runs inside a single SQLite write transaction so a crash mid-re-plan leaves the DAG in its pre-splice state (replayable from the event log).
 
-This reuses `tool_retrieval.py`'s existing `get_embed_model()` and ChromaDB query pattern:
+#### 9.5.4 Embedding-Based Skill Assignment
 
-```python
-def assign_tools(
-    node: PlanNode,
-    *,
-    embed_model,           # SentenceTransformer instance
-    chroma_collection,     # ChromaDB collection of indexed tools
-    threshold: float = 0.7,
-    top_k: int = 8,
-) -> list[str]:
-    """
-    1. Embed node.prompt_template using embed_model.encode()
-    2. Query chroma_collection.query(query_embeddings=[emb], n_results=top_k)
-    3. Filter results where distance <= (1 - threshold)  # cosine: distance = 1 - similarity
-    4. Return list of tool names from filtered results
-    """
-    if not tool_retrieval.is_available():
-        return []  # Degrade gracefully; human can specify tools manually
-    emb = embed_model.encode([node.prompt_template])[0].tolist()
-    results = chroma_collection.query(query_embeddings=[emb], n_results=top_k)
-    assigned = []
-    for tool_name, distance in zip(results["ids"][0], results["distances"][0]):
-        if distance <= (1.0 - threshold):
-            assigned.append(tool_name)
-    return assigned
+This reuses `internal/toolindex` — an `Embedder` interface plus brute-force in-Go cosine over a float32 BLOB index (replacing the Python SentenceTransformer + ChromaDB path; the same substitution the memory subsystem makes per GO_MIGRATION_RESEARCH.md):
+
+```go
+// internal/toolindex/assign.go
+
+type Embedder interface {
+	Embed(ctx context.Context, texts []string) ([][]float32, error)
+}
+
+// AssignTools returns tool names whose cosine similarity to the node prompt
+// meets threshold, degrading to nil (manual assignment) if no index is available.
+func AssignTools(ctx context.Context, idx *Index, emb Embedder, node *queue.PlanNode, threshold float64, topK int) ([]string, error) {
+	if idx == nil || !idx.Available() {
+		return nil, nil // degrade gracefully; operator can specify tools manually
+	}
+	vecs, err := emb.Embed(ctx, []string{node.PromptTemplate})
+	if err != nil {
+		return nil, err
+	}
+	q := vecs[0]
+	// idx.TopK does a brute-force cosine scan over the BLOB-stored tool vectors
+	// (≤500 tools => no ANN engine needed).
+	hits := idx.TopK(q, topK)
+	var assigned []string
+	for _, h := range hits {
+		if h.Similarity >= threshold { // cosine similarity, not distance
+			assigned = append(assigned, h.ToolName)
+		}
+	}
+	return assigned, nil
+}
 ```
 
 ### 9.6 Progress Self-Reflection Prompt
@@ -850,39 +962,49 @@ The response is parsed as `ProgressReflection` and stored in `plan_progress_ledg
 
 ### 9.7 Plan File Format and HMAC Signing
 
-The plan file written by `tag plan decompose` is a JSON object with a top-level `hmac_sha256` field. The HMAC is computed over the canonical serialization of the `nodes` dict (alphabetically sorted node IDs, prompt and depends_on fields only). The signing key is derived from the TAG instance key stored in `~/.tag/instance.key` (32 random bytes, created on first run, stored with mode 0600).
+The plan file written by `tag plan decompose` is a JSON object with a top-level `hmac_sha256` field. The HMAC is computed over the canonical serialization of the node map (alphabetically sorted node IDs, prompt and depends_on fields only — see `PlanGraph.Sign`). The signing key is derived from the TAG instance key stored in `~/.tag/instance.key` (32 random bytes from `crypto/rand`, created on first run, written with mode 0600).
 
-```python
-def _instance_key(config_dir: Path) -> bytes:
-    key_path = config_dir / "instance.key"
-    if key_path.exists():
-        return key_path.read_bytes()
-    key = os.urandom(32)
-    key_path.write_bytes(key)
-    key_path.chmod(0o600)
-    return key
+```go
+// internal/credentials/instance_key.go
+func InstanceKey(configDir string) ([]byte, error) {
+	path := filepath.Join(configDir, "instance.key")
+	if b, err := os.ReadFile(path); err == nil {
+		return b, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil { // crypto/rand
+		return nil, err
+	}
+	if err := os.WriteFile(path, key, 0o600); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
 ```
 
-This prevents untrusted plan files from being executed without explicit operator opt-in (via `tag plan validate --allow-unsigned`).
+Verification uses `hmac.Equal` (constant-time) against the recomputed signature. This prevents untrusted plan files from being executed without explicit operator opt-in (via `tag plan validate --allow-unsigned`).
 
 ### 9.8 Integration Points
 
-| Existing Module | Integration |
+| Package | Integration |
 |----------------|-------------|
-| `dag.py` | Extended with `PlanGraph`, `PlanNode`, `decompose()`, `run_plan()`, `replan()`, `ensure_plan_schema()`. The existing `queue_dags` / dependency promotion logic is complementary and reused for queue-based dispatch fallback. |
-| `loop_agent.py` | Extended with `DualLedger`, `ProgressLedger`, `ProgressReflection`, `run_with_ledger()`. The new ledger pattern wraps the existing `_run_iteration` function. |
-| `tool_retrieval.py` | `assign_tools()` calls `get_embed_model()` and queries the existing ChromaDB collection. No modification needed. |
-| `budget.py` | `check_budget(plan_id, estimated_cost)` called before each node dispatch. Plan accumulated cost updated after each node. |
-| `tracing.py` | `emit_span(plan_id=..., node_id=..., node_type=..., ...)` called at node start and end using existing span helpers. |
-| `security.py` | HMAC key derivation, plan file signature verification. |
-| `sandbox.py` | Nodes of type `compute` and `deploy` run inside the existing sandbox when `sandbox.enabled=true` in config. |
-| `controller.py` | New `cmd_plan_*` handlers registered under `tag plan` subparser using the existing argparse pattern. |
+| `internal/queue` | The bespoke SQLite-backed DAG scheduler. Gains `PlanGraph`, `PlanNode`, `Decompose()`, `RunPlan()`, `Replan()`. The existing `queue_jobs`/`queue_dags` promotion loop (pending→ready on `deps_json`) and errgroup worker pool are reused to schedule `plan_nodes`. |
+| `internal/agent` | Gains `TaskLedger`, `ProgressLedger`, `ProgressReflection`, `RunWithLedger()`. The ledger pattern wraps the hand-rolled inner agent loop invoked per node. |
+| `internal/toolindex` | `AssignTools()` calls the `Embedder` and runs in-Go cosine over the float32 BLOB tool index (replaces SentenceTransformer + ChromaDB). No schema change to the memory store. |
+| `internal/obs` | Cost/budget tracking: `CheckBudget(planID, estimated)` before each dispatch; accumulated cost updated after each node. Also hosts token/cost accounting off `Usage` events. |
+| `internal/obs` (tracing) | `otel` spans emitted at node start/end via the custom `SpanProcessor`, tagged `plan_id`/`node_id`/`node_type`/`depends_on`, persisted to the `traces` table. |
+| `internal/credentials` | Instance-key derivation (`crypto/rand`); plan file HMAC signature verification (`hmac.Equal`). |
+| `internal/sandbox` | Nodes of type `compute` and `deploy` run inside the isolation ladder (landlock+seccomp → docker → gVisor) when `sandbox.enabled=true` in config. |
+| `internal/cli` | New `tag plan` cobra command group registered on the root command. |
+| `internal/store` | `EnsurePlanSchema` migration; single-writer + `flock` atomic RMW for all plan writes. |
 
 ---
 
 ## 10. Security Considerations
 
-1. **Plan file tampering (pickle deserialization is not used).** Plan files are plain JSON. There is no `pickle` or `eval` in the plan serialization path. This avoids the RCE vector present in LangGraph's `_freeze()` pickle-based cache keys (GHSA-mhr3-j7m5-c7c9). The HMAC-SHA256 signature provides integrity without deserialization risk.
+1. **Plan file tampering (no unsafe deserialization).** Plan files are plain JSON decoded with `encoding/json` into typed structs. There is no `encoding/gob`, reflection-based code loading, or `eval`-equivalent in the plan serialization path. This avoids the RCE vector present in LangGraph's `_freeze()` pickle-based cache keys (GHSA-mhr3-j7m5-c7c9). The HMAC-SHA256 signature (verified with constant-time `hmac.Equal`) provides integrity without deserialization risk.
 
 2. **Prompt injection via goal input.** The `--goal` argument is included verbatim in the planner prompt. A malicious goal string could attempt to override the system prompt or inject additional instructions. Mitigation: the planner prompt wraps the goal in a clearly delimited XML-style tag (`<user_goal>...</user_goal>`) and the system prompt explicitly instructs the model to treat content inside this tag as untrusted user input, not instructions.
 
@@ -890,58 +1012,63 @@ This prevents untrusted plan files from being executed without explicit operator
 
 4. **HMAC key exposure.** The instance key is stored at `~/.tag/instance.key` with mode `0600`. It must not be logged, included in plan exports, or transmitted over the network. The `tag plan export` command explicitly excludes the HMAC key from the export. The `--allow-unsigned` flag logs a warning that the plan's integrity cannot be verified.
 
-5. **Subprocess injection via node prompts.** `_execute_node` invokes `tag submit` as a subprocess with `--prompt` passed as a command-line argument. If the resolved prompt contains shell metacharacters, this could be exploited. Mitigation: the prompt is always passed via `subprocess.run(..., args=[..., "--prompt", resolved_prompt])` as a list (not a shell string), so no shell interpretation occurs.
+5. **Command injection via node prompts.** When `executeNode` shells out to tools it uses `os/exec.CommandContext` with an explicit argument slice (`exec.CommandContext(ctx, "tag", "submit", "--prompt", resolvedPrompt)`) — never a shell string. Go's `os/exec` does not invoke a shell, so metacharacters in a resolved prompt are passed as inert argv and cannot be interpreted. Child processes are started with `Setpgid` so a cancelled/timed-out node's whole process group is killed.
 
 6. **Budget bypass via re-plan node insertion.** Re-plan inserts new nodes, which increases the total planned spend. The budget check must run against the accumulated total (already-spent + in-flight estimated cost + new node estimated cost) not just the next single node. The `_check_budget_for_replan` function sums all outstanding node estimated costs before approving the splice.
 
 7. **Cycle injection via re-plan response.** A compromised planner LLM (or a prompt-injected goal) could attempt to introduce cycles in re-plan responses. Mitigation: `validate_dag()` is always run on the post-splice graph before nodes are promoted to `ready`. Any cycle causes the re-plan to be rejected and the engine to abort safely.
 
-8. **SQLite concurrent write safety.** Multiple `tag plan run` invocations against the same plan ID would corrupt state. The engine acquires an application-level lock (SQLite `BEGIN EXCLUSIVE`) before marking a plan `running`. A second invocation detecting `status='running'` emits an error and exits 1. The `--resume` flag bypasses this check (operator intent).
+8. **SQLite concurrent write safety.** Multiple `tag plan run` invocations against the same plan ID would corrupt state. The engine takes the process-level `gofrs/flock` file lock plus a SQLite `BEGIN EXCLUSIVE` transaction before marking a plan `running` (the single-writer contract from `internal/store`). A second invocation detecting `status='running'` emits an error and exits 1. The `--resume` flag bypasses this check (operator intent). `flock` closes the Windows `fcntl` no-op gap present in the Python implementation.
 
 ---
 
 ## 11. Testing Strategy
 
-### 11.1 Unit Tests (`tests/test_tdag.py`)
+### 11.1 Unit Tests (`internal/queue/plan_test.go`, table-driven)
 
-- `test_topological_order_simple`: 3-node linear chain, verify order.
-- `test_topological_order_parallel`: diamond graph (A→B, A→C, B→D, C→D), verify A first, D last, B/C in between.
-- `test_cycle_detection`: A depends on B, B depends on A; verify `CycleError` with both IDs.
-- `test_ready_nodes`: diamond graph with A done; verify B and C are ready, D is not.
-- `test_prompt_variable_substitution`: node with `$upstream.output`; verify correct substitution.
-- `test_prompt_variable_missing`: reference to not-yet-done node; verify `ValueError`.
-- `test_hmac_sign_verify`: sign a plan, verify signature; flip one byte, verify rejection.
-- `test_schema_validation_unknown_type`: inject node with `type="hack"`; verify `SchemaValidationError`.
-- `test_tool_assignment_threshold`: mock ChromaDB returns distances [0.2, 0.35, 0.4]; with threshold 0.7, only tools with distance ≤ 0.3 assigned.
-- `test_budget_check_blocks_dispatch`: accumulate cost to 99% of budget; verify next dispatch blocked.
-- `test_replan_splice_no_cycle`: re-plan injects 2 replacement nodes; verify final graph has valid topo order.
-- `test_replan_splice_cycle_rejected`: re-plan injects nodes that create cycle; verify rejection.
-- `test_stall_counter_triggers_replan`: mock dispatch cycle with no transitions 3 times; verify re-plan called at stall_threshold=2.
-- `test_progress_reflection_parsing`: mock LLM returns 5-question JSON; verify `ProgressReflection` fields.
+- `TestTopologicalOrderSimple`: 3-node linear chain, verify order.
+- `TestTopologicalOrderParallel`: diamond graph (A→B, A→C, B→D, C→D), verify A first, D last, B/C in between.
+- `TestCycleDetection`: A depends on B, B depends on A; verify `errors.Is(err, ErrCycle)` with both IDs in the message.
+- `TestReadyNodes`: diamond graph with A done; verify B and C are ready, D is not.
+- `TestPromptVariableSubstitution`: node with `$upstream.output`; verify correct substitution.
+- `TestPromptVariableMissing`: reference to not-yet-done node; verify a non-nil error.
+- `TestHMACSignVerify`: sign a plan, verify with `hmac.Equal`; flip one byte, verify rejection.
+- `TestSchemaValidationUnknownType`: decode a node with `type="hack"`; verify a validation error.
+- `TestToolAssignmentThreshold`: fake `Embedder` yielding cosine similarities [0.8, 0.65, 0.6]; with threshold 0.7, only the first tool is assigned.
+- `TestBudgetCheckBlocksDispatch`: accumulate cost to 99% of budget; verify next dispatch blocked.
+- `TestReplanSpliceNoCycle`: re-plan injects 2 replacement nodes; verify final graph has valid topo order.
+- `TestReplanSpliceCycleRejected`: re-plan injects nodes that create a cycle; verify rejection + abort.
+- `TestStallCounterTriggersReplan`: fake worker returns no transition 3 times; verify re-plan called at `stallThreshold=2`.
+- `TestProgressReflectionParsing`: fake LLM returns 5-question JSON; verify `ProgressReflection` fields decode.
 
-### 11.2 Integration Tests (`tests/test_tdag_integration.py`)
+Table-driven cases share a `t.Run(tc.name, ...)` harness; the LLM provider and `Embedder` are stubbed via interfaces (no network).
 
-- `test_decompose_persists_to_sqlite`: run `decompose()` with mock LLM; verify rows in `plan_graphs` and `plan_nodes`.
-- `test_run_resume_after_crash`: pre-seed plan with 2 done nodes; verify `run_plan(resume=True)` only executes remaining nodes.
-- `test_parallel_dispatch`: 3 independent root nodes with `parallel=3`; verify all 3 dispatched within 2 seconds.
-- `test_failed_node_triggers_replan`: mock executor fails node 3; verify re-plan call, splice, and continuation.
-- `test_full_plan_lifecycle`: end-to-end with mock LLM and mock executor; verify all events emitted in order.
-- `test_plan_show_output`: verify ASCII DAG render contains all node IDs and correct dependency arrows.
-- `test_budget_abort`: set budget=$0.005; mock nodes cost $0.003 each; verify abort after node 2.
-- `test_node_trace_emission`: verify `SELECT * FROM traces WHERE attributes LIKE '%plan_id%'` returns one span per node.
+### 11.2 Integration Tests (`internal/queue/plan_integration_test.go`)
 
-### 11.3 Property-Based Tests (`tests/test_tdag_properties.py`)
+Each test opens a temp `modernc.org/sqlite` DB (`t.TempDir()`), so the real store path is exercised with `CGO_ENABLED=0`.
 
-Using `hypothesis`:
-- `@given(dag_strategy())` — generate random DAGs (up to 15 nodes, random edges); verify `topological_order()` either succeeds with a valid order or raises `CycleError` (never produces wrong order).
-- `@given(dag_strategy(), node_strategy())` — generate valid DAG + random replacement node list from re-plan; verify post-splice graph either has valid topo order or is rejected.
-- `@given(st.text())` — fuzz goal strings through the HMAC sign/verify cycle; verify round-trip integrity.
+- `TestDecomposePersistsToSQLite`: run `Decompose()` with a stub provider; verify rows in `plan_graphs` and `plan_nodes`.
+- `TestRunResumeAfterCrash`: pre-seed a plan with 2 done nodes; verify `RunPlan` with `--resume` only executes remaining nodes.
+- `TestParallelDispatch`: 3 independent root nodes with `parallel=3`; a fake node fn sleeps 0.1s; assert overlapping `started_at` timestamps.
+- `TestFailedNodeTriggersReplan`: fake worker fails node 3; verify re-plan call, splice, and continuation.
+- `TestFullPlanLifecycle`: end-to-end with stub provider + fake worker; verify all events emitted in order over the channel.
+- `TestPlanShowOutput`: verify the ASCII DAG render contains all node IDs and correct dependency arrows.
+- `TestBudgetAbort`: set budget=$0.005; fake nodes cost $0.003 each; verify abort after node 2 and a cancelled `errgroup`.
+- `TestNodeTraceEmission`: verify `SELECT * FROM traces WHERE attributes LIKE '%plan_id%'` returns one span per node.
 
-### 11.4 Performance Benchmarks (`tests/test_tdag_perf.py`)
+### 11.3 Property-Based Tests (`internal/queue/plan_prop_test.go`)
 
-- `bench_topological_sort_100_nodes`: 100-node linear chain, verify <10ms.
-- `bench_parallel_speedup`: 6-node plan with 3 independent roots, mock executor sleeps 0.5s; verify wall time < 2.0s with `parallel=3` vs 3.5s with `parallel=1`.
-- `bench_skill_retrieval_10_nodes`: 10-node plan, real SentenceTransformer embed; verify total assign_tools time < 5s.
+Using `pgregory.net/rapid` (or stdlib `testing/quick`):
+
+- Generate random DAGs (up to 15 nodes, random edges); assert `TopologicalOrder()` either returns a valid order or `ErrCycle` — never a wrong order.
+- Generate a valid DAG + a random replacement node list; assert the post-splice graph either has a valid topo order or is rejected (`Replan` returns an error and does not mutate the graph).
+- Fuzz goal strings through the HMAC sign/verify cycle; assert round-trip integrity via `go test -fuzz`.
+
+### 11.4 Performance Benchmarks (`internal/queue/plan_bench_test.go`, `testing.B`)
+
+- `BenchmarkTopologicalSort100Nodes`: 100-node linear chain, verify <10ms/op via `b.ReportMetric`.
+- `BenchmarkParallelSpeedup`: 6-node plan with 3 independent roots, fake worker sleeps 0.5s; verify wall time < 2.0s with `parallel=3` vs 3.5s with `parallel=1`.
+- `BenchmarkSkillRetrieval10Nodes`: 10-node plan, real provider `Embedder` + in-Go cosine; verify total `AssignTools` time < 5s.
 
 ---
 
@@ -971,17 +1098,20 @@ Using `hypothesis`:
 
 | Dependency | Version | Type | Justification |
 |-----------|---------|------|---------------|
-| `sentence-transformers` | ≥ 2.2.0 | Optional (already required by PRD-043) | Skill-to-tool SentenceTransformer embedding for node tool assignment |
-| `chromadb` | ≥ 0.4.0 | Optional (already required by PRD-043) | Vector store for tool registry queries during decomposition |
-| `hypothesis` | ≥ 6.0 | Test-only | Property-based testing for DAG validation and re-plan splice correctness |
-| `pydot` | ≥ 1.4 | Optional | Parsing DOT output in `--dot` tests; not required for production |
-| PRD-013 (tracing) | — | Internal | Per-node span emission to `traces` table |
-| PRD-028 (sandbox) | — | Internal | Sandboxed execution for `compute` and `deploy` node types |
-| PRD-034 (security) | — | Internal | HMAC key management, `security.py` instance key derivation |
-| PRD-033 (dag.py base) | — | Internal | Existing `ensure_schema`, `add_job`, `promote_ready_jobs` functions extended |
-| PRD-043 (tool_retrieval) | — | Internal | `get_embed_model()`, ChromaDB collection access for skill assignment |
-| PRD-012 (budget) | — | Internal | `check_budget()`, cost accumulation per plan |
-| PRD-021 (loop_agent) | — | Internal | `_run_iteration()` reused for per-node execution; ledger pattern extends this module |
+| `modernc.org/sqlite` | pinned GA | Core (project-wide driver) | Pure-Go store for `plan_graphs`/`plan_nodes`/`plan_progress_ledger`; WAL, FTS5, `CGO_ENABLED=0` |
+| `golang.org/x/sync/errgroup` | latest | Core | Bounded goroutine worker pool for the DAG scheduler |
+| `github.com/invopop/jsonschema` | latest | Core | JSON-schema generation for the structured planner/re-plan/reflection responses |
+| Embedding provider client (behind `internal/toolindex` `Embedder`) | — | Core (already required by PRD-043) | Skill-to-tool embedding for node tool assignment; in-Go cosine over BLOB index |
+| `gonum.org/v1/gonum/graph/encoding/dot` | latest | Optional | Emitting/parsing Graphviz DOT for `tag plan show --dot` and its tests |
+| `pgregory.net/rapid` | latest | Test-only | Property-based testing for DAG validation and re-plan splice correctness (stdlib `testing/quick` fallback) |
+| `github.com/spf13/cobra` | latest | Core | `tag plan` command group |
+| PRD-013 (tracing) | — | Internal | Per-node `otel` span emission to `traces` table via `internal/obs` |
+| PRD-028 (sandbox) | — | Internal | Sandboxed execution for `compute` and `deploy` node types (`internal/sandbox`) |
+| PRD-034 (security) | — | Internal | HMAC key management, `internal/credentials` instance-key derivation |
+| PRD-033 (queue base) | — | Internal | Existing `internal/queue` schema, `AddJob`, `PromoteReady` scheduler reused/extended |
+| PRD-043 (toolindex) | — | Internal | `Embedder` + in-Go cosine index for skill assignment |
+| PRD-012 (budget) | — | Internal | `CheckBudget()`, cost accumulation per plan via `internal/obs` |
+| PRD-021 (agent loop) | — | Internal | Inner agent loop reused for per-node execution; ledger pattern extends `internal/agent` |
 
 ---
 
@@ -996,7 +1126,7 @@ Using `hypothesis`:
 | OQ-5 | Should `tag plan decompose` optionally run multiple decomposition calls and pick the best plan via self-consistency (PRD-101)? The tradeoff is 3-10x decomposition cost for potentially higher-quality plans. | Arch team | Defer to PRD-101 integration |
 | OQ-6 | What is the right stall threshold default? MagenticOne uses 2. A threshold too low triggers unnecessary re-plans; too high wastes time on stuck loops. Should this be auto-calibrated per goal complexity? | Engineering | Empirical testing during alpha |
 | OQ-7 | Should `tag plan export` include per-node outputs by default (for auditability) or exclude them by default (for privacy/size)? The `--include-outputs` flag makes it opt-in currently. | Product | Before v1 release |
-| OQ-8 | The SentenceTransformer model `all-MiniLM-L6-v2` is used in `tool_retrieval.py`. For skill assignment in decomposition, is a domain-specific model (e.g., `paraphrase-mpnet-base-v2`) worth the size tradeoff? | ML team | During implementation |
+| OQ-8 | The default embedding model (`all-MiniLM-L6-v2`) is used by `internal/toolindex` via the `Embedder` interface. For skill assignment in decomposition, is a domain-specific model (e.g., `paraphrase-mpnet-base-v2`) worth the size/latency tradeoff? | ML team | During implementation |
 
 ---
 
@@ -1006,41 +1136,41 @@ Using `hypothesis`:
 
 ### Phase 1 — Schema and Data Model (Days 1-3)
 
-- Add `ensure_plan_schema()` to `dag.py` with DDL for `plan_graphs`, `plan_nodes`, `plan_progress_ledger`
-- Implement `PlanGraph`, `PlanNode`, `CycleError` dataclasses
-- Implement `topological_order()`, `ready_nodes()`, `sign()` methods
-- Implement `DualLedger`, `ProgressLedger`, `ProgressReflection` in `loop_agent.py`
-- Write unit tests for all dataclass methods (FR-02, FR-10, FR-15 coverage)
+- Add `EnsurePlanSchema()` to `internal/store` with DDL for `plan_graphs`, `plan_nodes`, `plan_progress_ledger`
+- Implement `PlanGraph`, `PlanNode` structs and the `ErrCycle` sentinel in `internal/queue`
+- Implement `TopologicalOrder()`, `ReadyNodes()`, `Sign()` methods + custom map↔slice JSON
+- Implement `TaskLedger`, `ProgressLedger`, `ProgressReflection` in `internal/agent`
+- Write table-driven unit tests for all struct methods (FR-02, FR-10, FR-15 coverage)
 - Deliverable: passing unit tests for schema and data model; `tag plan validate` exits 0 for valid fixture
 
 ### Phase 2 — Decomposition Pipeline (Days 4-8)
 
-- Implement `decompose()` function: planner prompt construction, structured LLM call, PlanNode parsing, schema validation
-- Integrate `tool_retrieval.py` `assign_tools()` for skill-to-tool mapping
-- Implement `tag plan decompose` CLI handler in `controller.py`
-- Implement `tag plan validate` CLI handler
+- Implement `Decompose()`: planner prompt construction, JSON-schema-constrained LLM call, PlanNode decode, validation
+- Integrate `internal/toolindex` `AssignTools()` for skill-to-tool mapping
+- Implement `tag plan decompose` cobra handler in `internal/cli`
+- Implement `tag plan validate` cobra handler
 - Write integration tests for decompose + SQLite persistence (AC-01, AC-10, AC-15)
 - Deliverable: `tag plan decompose --goal "..." --profile orchestrator` produces a valid signed plan.json
 
 ### Phase 3 — Execution Engine (Days 9-16)
 
-- Implement `run_plan()` dispatch loop: ready queue, in-flight tracking, parallel dispatch via `ThreadPoolExecutor`
-- Implement `_execute_node()` subprocess wrapper (tag submit pattern from loop_agent)
+- Implement `RunPlan()` dispatch loop in `internal/queue`: scheduler goroutine + errgroup worker pool + channel completions, bounded by `--parallel`
+- Implement `executeNode()` wrapper over the `internal/agent` inner loop (`os/exec.CommandContext` with `Setpgid` where it shells out)
 - Implement `$node_id.output` variable substitution (FR-10)
 - Implement resume logic (FR-12)
-- Implement budget enforcement hooks (FR-13, budget.py integration)
-- Implement per-node tracing (FR-14, tracing.py integration)
+- Implement budget enforcement hooks (FR-13, `internal/obs` integration)
+- Implement per-node tracing (FR-14, `otel` via `internal/obs`)
 - Implement stall detection (FR-09, G9)
 - Write integration tests for parallel dispatch, resume, budget abort (AC-03, AC-04, AC-07, AC-08)
 - Deliverable: `tag plan run --plan plan.json --profile coder --parallel 3` runs to completion on a test plan
 
 ### Phase 4 — Re-plan and Dynamic Adaptation (Days 17-21)
 
-- Implement `replan()` function: failure context prompt, structured LLM call, splice validation, DAG update
+- Implement `Replan()`: failure context prompt, JSON-schema-constrained LLM call, splice validation, DAG update
 - Implement `ProgressReflection` 5-question self-reflection call
-- Integrate re-plan trigger into dispatch loop (failure path + stall path)
+- Integrate re-plan trigger into the scheduler (failure path + stall path)
 - Write integration tests for re-plan trigger, splice validation, cycle-in-replan rejection (AC-05, FR-07, FR-08)
-- Write property-based tests (hypothesis) for DAG and re-plan splice correctness
+- Write property-based tests (`pgregory.net/rapid`) for DAG and re-plan splice correctness
 - Deliverable: `tag plan run` survives a node failure, re-plans, and completes
 
 ### Phase 5 — Display, Export, and Polish (Days 22-26)

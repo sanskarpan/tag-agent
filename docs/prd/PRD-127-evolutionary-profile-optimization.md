@@ -1,11 +1,13 @@
 # PRD-127: Evolutionary Profile Configuration Optimization (`tag evolve`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P2
 **Estimated Effort:** L (2–3 sprints, ~5 weeks)
 **Category:** Advanced Reasoning & Planning (Cluster G extension)
-**Affects:** `src/tag/evolver.py` (new), `src/tag/controller.py` (`cmd_evolve`), `tag.sqlite3` (new `evolve_runs`, `evolve_generations`, `evolve_individuals` tables)
-**Depends on:** PRD-027 (eval framework — fitness scoring), PRD-013 (agent tracing), PRD-012 (budget enforcement), PRD-023 (swarm — subprocess runner for fitness evaluation), PRD-045 (LLM-as-judge — quality scoring as fitness), PRD-001 (structured memory — profile config persistence)
+**Affects:** `internal/runtime/evolve` (new package: `EvolveRunner`), `internal/cli` (`evolve` command tree), `internal/store` (new `evolve_runs`, `evolve_generations`, `evolve_individuals` tables + migration)
+**Depends on:** PRD-027 (eval framework — fitness scoring), PRD-013 (agent tracing), PRD-012 (budget enforcement), PRD-023 (swarm — goroutine task runner for fitness evaluation), PRD-045 (LLM-as-judge — quality scoring as fitness), PRD-001 (structured memory — profile config persistence)
 **Inspired by:** Sakana AI Evolutionary Model Merging (arXiv:2403.13187, Nature Machine Intelligence), CycleQD (arXiv:2410.14735, ICLR 2025), ShinkaEvolve (arXiv:2509.19349), LLM² / DiscoPOP (arXiv:2406.08414, NeurIPS 2024)
 
 ---
@@ -68,7 +70,7 @@ Two profiles may each have complementary strengths: one has a better system prom
 
 - Modifying model weights (inference-time config search only).
 - Automated prompt engineering or prompt mutation beyond configuration parameters.
-- Multi-machine distributed evolution (single-machine ThreadPoolExecutor for fitness parallel evaluation).
+- Multi-machine distributed evolution (single-machine bounded goroutine pool / `errgroup` for parallel fitness evaluation).
 - Replacing human profile authorship for non-evolutionary use cases.
 
 ---
@@ -78,7 +80,7 @@ Two profiles may each have complementary strengths: one has a better system prom
 | Gene | Type | Range / Options |
 |---|---|---|
 | `model.provider` | categorical | `openai-codex`, `openrouter`, `anthropic` |
-| `model.default` | categorical | all models registered in `_COST_TABLE` |
+| `model.default` | categorical | all models registered in the go:embed'd pricing table (`internal/obs`) |
 | `temperature` | float | [0.0, 1.5] |
 | `max_tokens` | int | [512, 32768] |
 | `context_budget_tokens` | int | [2048, 131072] |
@@ -92,7 +94,7 @@ Two profiles may each have complementary strengths: one has a better system prom
 | `tool_allowlist` | set | subset of all registered tools |
 | `tui_statusbar` | categorical | `top`, `bottom`, `off` |
 
-Genes are encoded as a flat dict; crossover is uniform (each gene inherited from parent A or B with probability 0.5); mutation perturbs one randomly chosen gene.
+Genes are encoded as a flat `map[string]any` (the genome); crossover is uniform (each gene inherited from parent A or B with probability 0.5); mutation perturbs one randomly chosen gene. Randomness comes from a per-run `*math/rand.Rand` seeded from a `--seed` flag (deterministic tests). The genome round-trips to a profile via `gopkg.in/yaml.v3` marshal.
 
 ---
 
@@ -172,44 +174,58 @@ tag evolve abort <run-id>
 
 ### 6.4 Crossover and Mutation
 
-```python
-def crossover(parent_a: dict, parent_b: dict) -> dict:
-    """Uniform crossover: each gene from parent A or B with p=0.5."""
-    child = {}
-    for gene in GENE_SPACE:
-        child[gene] = parent_a[gene] if random.random() < 0.5 else parent_b[gene]
-    return child
+```go
+type Genome map[string]any
 
-def mutate(individual: dict, mutation_rate: float = 0.15) -> dict:
-    """Perturb one randomly selected gene."""
-    genes_to_mutate = [g for g in GENE_SPACE if random.random() < mutation_rate]
-    for gene in genes_to_mutate:
-        individual[gene] = _random_gene_value(gene)
-    return individual
+// crossover: each gene from parent A or B with p=0.5 (uniform).
+func (r *EvolveRunner) crossover(a, b Genome) Genome {
+	child := make(Genome, len(GeneSpace))
+	for _, gene := range GeneSpace {
+		if r.rng.Float64() < 0.5 {
+			child[gene] = a[gene]
+		} else {
+			child[gene] = b[gene]
+		}
+	}
+	return child
+}
+
+// mutate perturbs each gene with probability mutationRate.
+func (r *EvolveRunner) mutate(ind Genome, mutationRate float64) Genome {
+	out := maps.Clone(ind)
+	for _, gene := range GeneSpace {
+		if r.rng.Float64() < mutationRate {
+			out[gene] = r.randomGeneValue(gene)
+		}
+	}
+	return out
+}
 ```
 
 ### 6.5 Novelty-Based Rejection Sampling (ShinkaEvolve Pattern)
 
 Before adding a mutant to the next-generation pool, compute its configuration distance from existing population members:
 
-```python
-def _is_novel_enough(candidate: dict, population: list[dict],
-                     threshold: float = 0.3) -> bool:
-    """Reject candidate if it is too similar to existing members."""
-    for existing in population:
-        if config_distance(candidate, existing) < threshold:
-            return False
-    return True
+```go
+// isNovelEnough rejects a candidate too similar to any existing member.
+func isNovelEnough(candidate Genome, population []Genome, threshold float64) bool {
+	for _, existing := range population {
+		if configDistance(candidate, existing) < threshold {
+			return false
+		}
+	}
+	return true
+}
 ```
 
-`config_distance` is a normalized Hamming distance over categorical genes + normalized Manhattan distance over numerical genes.
+`configDistance` is a normalized Hamming distance over categorical genes + normalized Manhattan distance over numerical genes (implemented with `math.Abs` over the gene ranges declared in the Gene Space table; the numeric aggregation reuses `gonum/floats` for vector norms).
 
 ### 6.6 Pareto Front (Multi-Objective)
 
-When `--objectives quality,cost` is specified, selection uses non-dominated sorting (NSGA-II simplified):
+When `--objectives quality,cost` is specified, selection uses hand-rolled non-dominated sorting (NSGA-II simplified) over `[]Individual`:
 1. For each individual, count how many others dominate it (better on ALL objectives).
-2. Rank by domination count.
-3. Within the same rank, use crowding distance to maintain diversity on the Pareto front.
+2. Rank by domination count (sort with `sort.Slice`).
+3. Within the same rank, use crowding distance (per-objective normalized spacing, `gonum/floats` for the numeric spans) to maintain diversity on the Pareto front.
 4. `tag evolve results <id> --pareto` shows the non-dominated set with per-objective scores.
 
 ### 6.7 Database Schema
@@ -303,22 +319,24 @@ evolved-coder:
 ## 7. Architecture
 
 ```
-cmd_evolve (controller.py)
+internal/cli  (evolve command tree: run/status/results/list/abort/resume/export)
     │
     ▼
-EvolveRunner (evolver.py)
-    ├── _initialize_population()     # seed + random perturbations
-    ├── _evaluate_generation()       # parallel fitness evals (ThreadPoolExecutor)
-    │       ├── _run_fitness_eval()  # invoke profile subprocess per task
-    │       └── _score_fitness()     # judge/shell/eval-suite dispatcher
-    ├── _select_parents()            # tournament / roulette / QD
-    ├── _crossover()                 # uniform crossover
-    ├── _mutate()                    # random gene perturbation
-    ├── _novelty_filter()            # reject too-similar candidates
-    ├── _pareto_sort()               # NSGA-II front (multi-objective)
-    ├── _export_profile()            # genome → YAML profile
-    └── _checkpoint()               # write generation summary to DB
+evolve.EvolveRunner  (internal/runtime/evolve)
+    ├── initializePopulation() # seed + random perturbations
+    ├── evaluateGeneration()   # parallel fitness evals (errgroup, SetLimit(N))
+    │       ├── runFitnessEval()   # run profile via internal/llm per task (no subprocess)
+    │       └── scoreFitness()     # judge/shell(os/exec)/eval-suite/test dispatcher
+    ├── selectParents()        # tournament / roulette / QD
+    ├── crossover()            # uniform crossover
+    ├── mutate()               # random gene perturbation (per-run *rand.Rand)
+    ├── noveltyFilter()        # reject too-similar candidates (configDistance)
+    ├── paretoSort()           # NSGA-II front (multi-objective)
+    ├── exportProfile()        # genome → YAML profile (yaml.v3)
+    └── checkpoint()           # persist generation summary to internal/store
 ```
+
+Concurrency: `evaluateGeneration` fans out one goroutine per individual through an `errgroup` with `SetLimit(--parallelism)`, each running the fitness task suite via the `internal/llm` provider interface; results are collected and the generation is scored before selection. The whole run is cancellable via `context.Context` (Ctrl+C/abort/budget). Fitness evaluation reuses the swarm goroutine-task pattern (PRD-023) rather than forking subprocesses — the Go binary owns the runtime.
 
 ---
 
@@ -326,18 +344,18 @@ EvolveRunner (evolver.py)
 
 | Step | Task | File | Est. |
 |---|---|---|---|
-| 1 | Schema: `evolve_runs`, `evolve_generations`, `evolve_individuals` | `controller.py` | 0.5d |
-| 2 | Gene space definition + genome encode/decode to YAML | `evolver.py` | 1d |
-| 3 | Fitness evaluators: judge, eval-suite, shell, test | `evolver.py` | 2d |
-| 4 | Crossover + mutation + novelty filter | `evolver.py` | 1d |
-| 5 | Selection strategies: tournament, elitism, roulette, QD | `evolver.py` | 1d |
-| 6 | Main evolution loop: generations × population | `evolver.py` | 1.5d |
-| 7 | Multi-objective Pareto front (NSGA-II simplified) | `evolver.py` | 1.5d |
-| 8 | Profile export to YAML with provenance metadata | `evolver.py` | 0.5d |
-| 9 | Resume protocol: checkpoint/restore generation state | `evolver.py` | 1d |
-| 10 | `cmd_evolve` + argparse: `run`, `status`, `results`, `list`, `abort`, `resume`, `export` | `controller.py` | 1.5d |
-| 11 | Tests: crossover, mutation, novelty filter, fitness modes, export | `tests/` | 2d |
-| 12 | Budget enforcement integration | `budget.py` | 0.5d |
+| 1 | Schema: `evolve_runs`, `evolve_generations`, `evolve_individuals` + migration | `internal/store/migrate` | 0.5d |
+| 2 | Gene space definition + genome encode/decode to YAML (yaml.v3) | `internal/runtime/evolve` | 1d |
+| 3 | Fitness evaluators: judge (`internal/llm`), eval-suite, shell (`os/exec`), test | `internal/runtime/evolve` | 2d |
+| 4 | Crossover + mutation + novelty filter (`configDistance`) | `internal/runtime/evolve` | 1d |
+| 5 | Selection strategies: tournament, elitism, roulette, QD | `internal/runtime/evolve` | 1d |
+| 6 | Main evolution loop: generations × population over `errgroup` pool | `internal/runtime/evolve` | 1.5d |
+| 7 | Multi-objective Pareto front (NSGA-II simplified, gonum/floats) | `internal/runtime/evolve` | 1.5d |
+| 8 | Profile export to YAML with provenance metadata | `internal/runtime/evolve` | 0.5d |
+| 9 | Resume protocol: checkpoint/restore generation state from `internal/store` | `internal/runtime/evolve` | 1d |
+| 10 | `evolve` cobra command tree: `run`, `status`, `results`, `list`, `abort`, `resume`, `export` (+ `--json`) | `internal/cli` | 1.5d |
+| 11 | Tests: crossover, mutation, novelty filter, fitness modes, export (fake `llm.Provider`) | `*_test.go` | 2d |
+| 12 | Budget enforcement integration (`internal/obs`) | `internal/obs` | 0.5d |
 
 **Total:** ~14 dev-days (~3 sprints)
 
@@ -368,7 +386,7 @@ EvolveRunner (evolver.py)
 |---|---|
 | Each fitness eval costs tokens; large populations are expensive | Default population=8, generations=10; `--budget-usd` hard cap; dry-run mode shows cost estimate |
 | Premature convergence to local optima | Elitism count ≤ 2; novelty filter prevents identical individuals; mutation rate 15% |
-| System prompt addendum gene produces harmful prompts | `security.scan_text()` gate on all generated system prompt addenda |
+| System prompt addendum gene produces harmful prompts | `internal/security` scanner (`ScanText`, PRD-034) gates all generated system-prompt addenda before evaluation |
 | Evolved profiles may be unpredictable in production | Exports include full provenance metadata; `--dry-run` test runs before export |
 | Gene space combinatorics may be too large to converge in budget | Restrict to highest-impact genes first; optional `--gene-subset model,temperature,context_budget` |
 

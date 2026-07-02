@@ -1,5 +1,7 @@
 # PRD-090: Sandbox Template/Snapshot System for <200ms Cold Start (`tag sandbox template`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P2
 **Estimated Effort:** M (1-2 weeks)
@@ -81,13 +83,13 @@ Each `pip install numpy` in a fresh container downloads ~16 MB from PyPI, extrac
 
 | Metric | Target | Measurement Method |
 |--------|--------|--------------------|
-| Cold start latency (Docker backend) | p50 <200ms, p95 <400ms from `sandbox run --template` to first byte of user code output | Integration test: 100 `sandbox run --template` invocations with `time.perf_counter()` wrapping subprocess spawn to first stdout byte |
+| Cold start latency (container tier) | p50 <200ms, p95 <400ms from `sandbox run --template` to first byte of user code output | Integration test: 100 `sandbox run --template` invocations timed with `time.Now()`/`time.Since` around `exec.CommandContext` spawn to first stdout byte |
 | Cold start latency (E2B backend) | p50 <500ms end-to-end (network included) | Same instrumentation against E2B API with `sandbox_cold_start_ms` span attribute |
 | Template build reliability | 99% of `template create` invocations complete without error given a valid base image and install command | CI test matrix: 5 base images × 3 install manifests |
 | Reproducibility | Given the same template, 100 consecutive `sandbox run --template` invocations produce identical `pip freeze` output | Automated test: compare sorted `pip freeze` output across 100 runs |
 | Latency vs. baseline | Template-backed runs are ≥30× faster than cold-install runs for environments with ≥3 packages | Benchmark: `docker run python:3.11 pip install numpy pandas scikit-learn` vs `docker run <template_image> true` |
 | SQLite catalog integrity | `sandbox_templates` table correctly reflects creation, update, and delete operations with no orphaned records | Unit tests with in-memory SQLite |
-| OTEL instrumentation | Every template lifecycle event (create, run, delete) produces a span with correct `sandbox.template_id` attribute | Test via `tracing.py` mock exporter |
+| OTEL instrumentation | Every template lifecycle event (create, run, delete) produces a span with correct `sandbox.template_id` attribute | Test via OTEL `tracetest.SpanRecorder` in-memory exporter |
 | Zero regression in base sandbox | `tag sandbox run` without `--template` exhibits no latency or behavior change | Run PRD-028 integration tests before and after; assert no diff |
 
 ---
@@ -348,15 +350,15 @@ $ tag sandbox run --template python-datascience --file analysis.py
 | FR-03 | After template creation, the `install_manifest` field in `sandbox_templates` stores the output of `pip freeze` run inside the committed image, capturing exact pinned versions of all installed packages including transitive dependencies. | Assert `install_manifest` contains `numpy==` with a version string after creating a template with `--install numpy`. |
 | FR-04 | `tag sandbox run --template <name>` resolves the template by name or ID, retrieves the `artifact_ref`, and runs `docker run --rm <artifact_ref> <cmd>` (Docker backend) or `Sandbox.create(template=e2b_template_id)` (E2B backend). | Sandbox run succeeds and produces correct output without any `pip install` step visible in logs. |
 | FR-05 | The wall-clock time from `tag sandbox run --template` CLI invocation to first stdout byte of user code is measured and stored as `cold_start_ms` in the `sandbox_runs` table and emitted as a span attribute `sandbox.cold_start_ms`. | `sandbox_runs` row contains `cold_start_ms` < 400 in integration test on local Docker daemon. |
-| FR-06 | `--template` and `--image` are mutually exclusive flags. Providing both raises a `UsageError` with message "Cannot specify both --template and --image; --template uses a pre-baked image, use one or the other." | CLI test: assert non-zero exit code and message when both flags provided. |
+| FR-06 | `--template` and `--image` are mutually exclusive flags. Providing both returns a usage error (`ErrConflictingFlags`) with message "Cannot specify both --template and --image; --template uses a pre-baked image, use one or the other." | CLI test: assert non-zero exit code and message when both flags provided. |
 | FR-07 | `tag sandbox template list` returns all rows from `sandbox_templates` ordered by `created_at DESC` by default, filterable by `--backend` and `--tag`. | Insert 3 templates with different backends; assert `--backend e2b` returns only the E2B template. |
 | FR-08 | `tag sandbox template delete <id>` removes the `sandbox_templates` row AND calls `docker image rm <artifact_ref>` (Docker backend) or the E2B template delete API (E2B backend). If the Docker image does not exist (already removed externally), the delete proceeds and logs a warning instead of failing. | After `delete`, `docker image ls` does not show the template image; SQLite row is gone. |
-| FR-09 | `--force` on `template create` deletes the existing artifact and SQLite row before rebuilding. Without `--force`, creating with a name that already exists raises a `UsageError`. | Assert error message when creating duplicate without `--force`; assert success with `--force`. |
+| FR-09 | `--force` on `template create` deletes the existing artifact and SQLite row before rebuilding. Without `--force`, creating with a name that already exists returns a usage error (`ErrTemplateExists`). | Assert error message when creating duplicate without `--force`; assert success with `--force`. |
 | FR-10 | `tag sandbox template inspect <name>` emits the `install_manifest` (full pip freeze output), `env_vars`, `workdir`, all `tags`, and the last 10 `sandbox_runs` that referenced this template's ID. | Verify all fields present in JSON output; verify run cross-reference after running with `--template`. |
-| FR-11 | Template names must match `[a-z0-9][a-z0-9_-]{0,63}` (lowercase slug, 1-64 chars). Invalid names raise a `UsageError` with a clear message describing the allowed format. | Assert `UsageError` for names with uppercase, spaces, and leading hyphens. |
+| FR-11 | Template names must match `[a-z0-9][a-z0-9_-]{0,63}` (lowercase slug, 1-64 chars). Invalid names return a usage error (`ErrInvalidName`) with a clear message describing the allowed format. | Assert `ErrInvalidName` for names with uppercase, spaces, and leading hyphens. |
 | FR-12 | All template lifecycle operations (create, delete, run-from-template) emit OTEL spans with attributes `sandbox.template_id`, `sandbox.template_name`, `sandbox.backend`, and (for runs) `sandbox.cold_start_ms`. | Mock OTEL exporter in test; assert span attributes after each operation. |
 | FR-13 | `tag sandbox template create` with `--timeout <N>` kills the build container and cleans up the partially committed image if the build exceeds N seconds. | Test with a `--setup "sleep 999"` command and a 2-second timeout; assert cleanup and non-zero exit. |
-| FR-14 | `tag sandbox template list --json` outputs a valid JSON array parseable by `json.loads()`. Each element contains all fields defined in `SandboxTemplate` dataclass. | Assert `json.loads(output)` succeeds and each item has the required keys. |
+| FR-14 | `tag sandbox template list --json` outputs a valid JSON array parseable by `json.Unmarshal`. Each element contains all fields defined in the `SandboxTemplate` struct (JSON schema generated via `invopop/jsonschema`). | Assert `json.Unmarshal(output, &[]SandboxTemplate{})` succeeds and each item has the required keys. |
 | FR-15 | `sandbox_runs` rows created from a template run include `template_id` foreign key referencing the used template. | Assert `template_id` column is set in `sandbox_runs` after `sandbox run --template`. |
 | FR-16 | Template build logs are streamed to stderr in real time during `template create`. Each phase (pull, install, commit, index) is prefixed with a step indicator and elapsed time. | Test with `--base python:3.11-slim --install numpy`; assert stderr output contains "[1/4]", "[2/4]", "[3/4]", "[4/4]". |
 | FR-17 | `tag sandbox template delete` prints a warning and requires `--force` or interactive confirmation when `last_used_at` is within the past 7 days. | Insert a template with `last_used_at = now() - 1 day`; assert confirmation prompt (or error without `--force`). |
@@ -379,7 +381,7 @@ $ tag sandbox run --template python-datascience --file analysis.py
 | NFR-09 | Concurrent runs | Multiple concurrent `sandbox run --template` invocations from the same template do not interfere; Docker's image layer cache makes this naturally safe |
 | NFR-10 | OTEL span overhead | Template-related OTEL span creation adds <1ms to run latency; spans are created asynchronously where possible |
 | NFR-11 | Test coverage | All FR-* requirements have corresponding unit or integration tests; overall coverage for new code ≥80% |
-| NFR-12 | Python version support | Compatible with Python 3.11+ (matching TAG's minimum supported version) |
+| NFR-12 | Go toolchain support | Built with Go 1.24+, `CGO_ENABLED=0`, single static binary (matching TAG's build baseline) |
 
 ---
 
@@ -387,18 +389,25 @@ $ tag sandbox run --template python-datascience --file analysis.py
 
 ### 10.1 New Files
 
+All template logic lives under the `internal/sandbox` package of module `github.com/tag-agent/tag` (Go 1.24+, `CGO_ENABLED=0`).
+
 | File | Purpose |
 |------|---------|
-| `src/tag/sandbox.py` | Extended with `SandboxTemplate` dataclass, `ensure_template_schema()`, `cmd_sandbox_template_create()`, `cmd_sandbox_template_list()`, `cmd_sandbox_template_inspect()`, `cmd_sandbox_template_delete()`, and `_run_from_template()` |
-| `src/tag/sandbox_templates_schema.sql` | Inline SQL string (no separate file needed; embedded in `ensure_template_schema()`) |
+| `internal/sandbox/template.go` | `SandboxTemplate` / `TemplateBuildResult` structs, `EnsureTemplateSchema()`, `ResolveTemplate()`, `ValidateTemplateName()` |
+| `internal/sandbox/template_docker.go` | Docker-backend build (`buildTemplateDocker`) via moby client image commit, and `runFromTemplateDocker` |
+| `internal/sandbox/template_firecracker.go` | Firecracker/microVM tier build + VM-snapshot restore (`firecracker-go-sdk`), Linux-only, build-tagged |
+| `internal/sandbox/catalog.go` | `modernc.org/sqlite` catalog access (single-writer, WAL); embedded DDL via `//go:embed schema.sql` |
+| `internal/cli/sandbox_template.go` | `go-chi/chi`-registered subcommands / cobra commands `create`, `list`, `inspect`, `delete`, and the `--template` extension to `run` |
 
-No new top-level modules are required. All template logic extends `sandbox.py` following the existing pattern.
+The embedded DDL is applied by `EnsureTemplateSchema()`. All exec of untrusted or long-running processes uses `os/exec.CommandContext` with `Setpgid` for process-group kill.
 
 ### 10.2 SQLite DDL
 
+Backed by `modernc.org/sqlite` (pure-Go, no CGO), opened in WAL mode with a single writer. The DDL is `//go:embed`-ed as `schema.sql` and applied by `EnsureTemplateSchema()` inside a transaction.
+
 ```sql
 -- Migration: add sandbox_templates table to ~/.tag/runtime/tag.sqlite3
--- Applied via ensure_template_schema() using executescript() in WAL mode
+-- Applied via EnsureTemplateSchema() (modernc.org/sqlite, WAL mode)
 
 CREATE TABLE IF NOT EXISTS sandbox_templates (
     id              TEXT PRIMARY KEY,           -- 'tmpl_' + 8 hex chars
@@ -432,419 +441,508 @@ ALTER TABLE sandbox_runs ADD COLUMN cold_start_ms INTEGER;
 CREATE INDEX IF NOT EXISTS idx_sr_template ON sandbox_runs(template_id, created_at DESC);
 ```
 
-Note: SQLite does not support `ADD COLUMN IF NOT EXISTS`. The `ensure_template_schema()` function checks `PRAGMA table_info(sandbox_runs)` before issuing `ALTER TABLE` to handle idempotent migration.
+Note: SQLite does not support `ADD COLUMN IF NOT EXISTS`. `EnsureTemplateSchema()` queries `PRAGMA table_info(sandbox_runs)` and only issues the `ALTER TABLE` statements when the columns are absent, keeping the migration idempotent.
 
-### 10.3 Core Dataclasses
+### 10.3 Core Structs
 
-```python
-from __future__ import annotations
+JSON schema for the `--json` surface is generated with `invopop/jsonschema`. `env_vars` and `tags` are persisted as JSON `TEXT` columns and (de)serialized with `encoding/json`.
 
-import json
-import time
-import uuid
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+```go
+package sandbox
 
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"time"
+)
 
-@dataclass
-class SandboxTemplate:
-    id: str                              # 'tmpl_' + 8 hex chars
-    name: str                            # human slug
-    backend: str                         # 'docker' | 'e2b'
-    base_image: str                      # base image reference
-    artifact_ref: str                    # docker image tag or e2b template id
-    install_cmd: Optional[str] = None    # original --install value
-    install_manifest: Optional[str] = None  # pip freeze output
-    setup_cmd: Optional[str] = None      # original --setup value
-    workdir: str = '/workspace'
-    env_vars: dict[str, str] = field(default_factory=dict)
-    tags: dict[str, str] = field(default_factory=dict)
-    size_bytes: Optional[int] = None
-    run_count: int = 0
-    last_used_at: Optional[str] = None
-    created_at: str = field(default_factory=lambda: _utc_now())
-    updated_at: str = field(default_factory=lambda: _utc_now())
+type Backend string
 
-    @classmethod
-    def new(cls, name: str, backend: str, base_image: str, **kwargs) -> "SandboxTemplate":
-        tmpl_id = "tmpl_" + uuid.uuid4().hex[:8]
-        artifact_ref = f"tag-template:{name}-{tmpl_id[5:]}"
-        if backend == "e2b":
-            artifact_ref = kwargs.pop("e2b_template_id", tmpl_id)
-        return cls(
-            id=tmpl_id,
-            name=name,
-            backend=backend,
-            base_image=base_image,
-            artifact_ref=artifact_ref,
-            **kwargs,
-        )
+const (
+	BackendDocker      Backend = "docker"
+	BackendFirecracker Backend = "firecracker"
+)
 
-    def to_row(self) -> dict:
-        d = asdict(self)
-        d["env_vars"] = json.dumps(d["env_vars"])
-        d["tags"] = json.dumps(d["tags"])
-        return d
+// SandboxTemplate is a pre-baked, snapshotted sandbox environment.
+type SandboxTemplate struct {
+	ID              string            `json:"id"`               // "tmpl_" + 8 hex chars
+	Name            string            `json:"name"`             // human slug
+	Backend         Backend           `json:"backend"`          // docker | firecracker
+	BaseImage       string            `json:"base_image"`       // base image / rootfs reference
+	ArtifactRef     string            `json:"artifact_ref"`     // committed image tag or VM-snapshot id
+	InstallCmd      string            `json:"install_cmd,omitempty"`
+	InstallManifest string            `json:"install_manifest,omitempty"` // resolved dependency lock captured post-build
+	SetupCmd        string            `json:"setup_cmd,omitempty"`
+	Workdir         string            `json:"workdir"`
+	EnvVars         map[string]string `json:"env_vars"`
+	Tags            map[string]string `json:"tags"`
+	SizeBytes       int64             `json:"size_bytes,omitempty"`
+	RunCount        int64             `json:"run_count"`
+	LastUsedAt      *time.Time        `json:"last_used_at,omitempty"`
+	CreatedAt       time.Time         `json:"created_at"`
+	UpdatedAt       time.Time         `json:"updated_at"`
+}
 
-    @classmethod
-    def from_row(cls, row: dict) -> "SandboxTemplate":
-        row = dict(row)
-        row["env_vars"] = json.loads(row.get("env_vars") or "{}")
-        row["tags"] = json.loads(row.get("tags") or "{}")
-        return cls(**row)
+// NewTemplate mints an ID and derives the backend-specific artifact reference.
+func NewTemplate(name string, backend Backend, baseImage string) (*SandboxTemplate, error) {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return nil, err
+	}
+	id := "tmpl_" + hex.EncodeToString(b[:])
+	now := time.Now().UTC()
+	t := &SandboxTemplate{
+		ID:        id,
+		Name:      name,
+		Backend:   backend,
+		BaseImage: baseImage,
+		Workdir:   "/workspace",
+		EnvVars:   map[string]string{},
+		Tags:      map[string]string{},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	// Firecracker artifact_ref is assigned after the VM snapshot is taken.
+	if backend == BackendDocker {
+		t.ArtifactRef = fmt.Sprintf("tag-template:%s-%s", name, id[len("tmpl_"):])
+	}
+	return t, nil
+}
 
+// marshalMaps returns the JSON encodings persisted to the env_vars / tags columns.
+func (t *SandboxTemplate) marshalMaps() (envJSON, tagsJSON string, err error) {
+	e, err := json.Marshal(t.EnvVars)
+	if err != nil {
+		return "", "", err
+	}
+	g, err := json.Marshal(t.Tags)
+	if err != nil {
+		return "", "", err
+	}
+	return string(e), string(g), nil
+}
 
-@dataclass
-class TemplateBuildResult:
-    template: SandboxTemplate
-    build_duration_s: float
-    install_duration_s: float
-    commit_duration_s: float
-    log_lines: list[str] = field(default_factory=list)
+// TemplateBuildResult summarizes a completed build for progress reporting.
+type TemplateBuildResult struct {
+	Template        *SandboxTemplate
+	BuildDuration   time.Duration
+	InstallDuration time.Duration
+	CommitDuration  time.Duration
+	LogLines        []string
+}
 ```
 
 ### 10.4 Core Algorithms
 
-#### 10.4.1 Template Create (Docker Backend)
+#### 10.4.1 Template Create (Docker/Container Tier)
 
-```python
-import subprocess
-import shlex
-import tempfile
-import time
-from pathlib import Path
+Uses the `docker/docker` (moby) client for `ImagePull` → `ContainerCreate`/`ContainerStart`/`ContainerWait` → `ContainerCommit`. The build container's lifetime is bounded by `context.WithTimeout` and always removed via `defer`. When the Docker runtime is configured for gVisor (`runsc`), the same code path yields a gVisor-isolated build with no changes.
 
+```go
+package sandbox
 
-def _docker_build_template(
-    template: SandboxTemplate,
-    install_spec: str | None,
-    setup_cmd: str | None,
-    timeout: int,
-    *,
-    stream_log,  # callable(str) for progress output
-) -> TemplateBuildResult:
-    """
-    Build a Docker-backed template via:
-      1. docker pull <base_image>
-      2. docker run --name <build_ctr> <base_image> pip install ...
-      3. docker commit <build_ctr> <artifact_ref>
-      4. docker rm <build_ctr>
-      5. docker run <artifact_ref> pip freeze  -> install_manifest
-    """
-    t0 = time.perf_counter()
-    build_ctr = f"tag-template-build-{template.id}"
-    log_lines = []
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
 
-    def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, **kwargs
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Command {cmd[0]} failed (exit {result.returncode}):\n{result.stderr}"
-            )
-        return result
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
+	dclient "github.com/docker/docker/client"
+)
 
-    try:
-        # Step 1: Pull base image
-        stream_log(f"  [1/4] Pulling base image {template.base_image}")
-        t_pull = time.perf_counter()
-        _run(["docker", "pull", template.base_image])
-        pull_dur = time.perf_counter() - t_pull
-        stream_log(f"        done in {pull_dur:.1f}s")
+// LogFunc streams a progress line to the terminal.
+type LogFunc func(string)
 
-        # Step 2: Install packages
-        stream_log(f"  [2/4] Installing packages")
-        t_install = time.perf_counter()
+// buildTemplateDocker builds a container-tier template:
+//  1. ImagePull(base)
+//  2. ContainerCreate + Start running the install/setup script
+//  3. ContainerWait for exit
+//  4. ContainerCommit -> artifact_ref
+//  5. run the committed image once to capture the dependency lock -> InstallManifest
+func buildTemplateDocker(
+	ctx context.Context,
+	cli dclient.APIClient,
+	t *SandboxTemplate,
+	installSpec, setupCmd string,
+	timeout time.Duration,
+	log LogFunc,
+) (*TemplateBuildResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-        install_cmds = []
-        if install_spec:
-            # Normalize: could be package list string or requirements.txt path
-            req_path = Path(install_spec)
-            if req_path.exists() and req_path.is_file():
-                # Copy requirements file into container via stdin pipe approach:
-                # docker run reads from volume; we use a temp file approach.
-                install_cmds.append(
-                    f"pip install --no-cache-dir $(cat /tmp/reqs.txt)"
-                )
-                # We write the requirements via docker cp after container creation
-            else:
-                packages = shlex.split(install_spec)
-                pkg_list = " ".join(shlex.quote(p) for p in packages)
-                install_cmds.append(f"pip install --no-cache-dir {pkg_list}")
-        if setup_cmd:
-            install_cmds.append(setup_cmd)
-        install_cmds.append(f"mkdir -p {shlex.quote(template.workdir)}")
+	start := time.Now()
+	buildCtr := "tag-template-build-" + t.ID
 
-        full_cmd = " && ".join(install_cmds) if install_cmds else "true"
-        _run([
-            "docker", "run",
-            "--name", build_ctr,
-            "--workdir", template.workdir,
-            template.base_image,
-            "/bin/sh", "-c", full_cmd,
-        ])
-        install_dur = time.perf_counter() - t_install
-        stream_log(f"        done in {install_dur:.1f}s")
+	// Step 1: pull base image.
+	log(fmt.Sprintf("  [1/4] Pulling base image %s", t.BaseImage))
+	tPull := time.Now()
+	rc, err := cli.ImagePull(ctx, t.BaseImage, image.PullOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("pull %s: %w", t.BaseImage, err)
+	}
+	_ = drain(rc) // surface layer progress to log; closes rc
+	log(fmt.Sprintf("        done in %.1fs", time.Since(tPull).Seconds()))
 
-        # Step 3: Commit container to image
-        stream_log(f"  [3/4] Committing snapshot")
-        t_commit = time.perf_counter()
-        _run(["docker", "commit", build_ctr, template.artifact_ref])
-        commit_dur = time.perf_counter() - t_commit
-        stream_log(f"        done in {commit_dur:.1f}s")
+	// Step 2: assemble and run the install/setup script.
+	log("  [2/4] Installing packages")
+	tInstall := time.Now()
+	script := buildInstallScript(installSpec, setupCmd, t.Workdir) // safe: no shell interpolation of user args
 
-        # Step 4: Capture pip freeze for manifest
-        freeze_result = subprocess.run(
-            ["docker", "run", "--rm", template.artifact_ref, "pip", "freeze"],
-            capture_output=True, text=True, timeout=30,
-        )
-        install_manifest = freeze_result.stdout.strip() if freeze_result.returncode == 0 else None
+	created, err := cli.ContainerCreate(ctx, &container.Config{
+		Image:      t.BaseImage,
+		WorkingDir: t.Workdir,
+		Cmd:        []string{"/bin/sh", "-c", script},
+	}, nil, nil, nil, buildCtr)
+	if err != nil {
+		return nil, fmt.Errorf("create build container: %w", err)
+	}
+	// Always clean up the build container (even on failure/timeout).
+	defer cli.ContainerRemove(context.Background(), created.ID,
+		container.RemoveOptions{Force: true})
 
-        # Step 5: Get image size
-        inspect = subprocess.run(
-            ["docker", "image", "inspect", template.artifact_ref,
-             "--format", "{{.Size}}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        size_bytes = int(inspect.stdout.strip()) if inspect.returncode == 0 else None
+	if err := cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		return nil, fmt.Errorf("start build container: %w", err)
+	}
+	if err := waitExitZero(ctx, cli, created.ID); err != nil {
+		return nil, err
+	}
+	installDur := time.Since(tInstall)
+	log(fmt.Sprintf("        done in %.1fs", installDur.Seconds()))
 
-        template.install_manifest = install_manifest
-        template.size_bytes = size_bytes
+	// Step 3: commit the stopped container as the template image.
+	log("  [3/4] Committing snapshot")
+	tCommit := time.Now()
+	commitResp, err := cli.ContainerCommit(ctx, created.ID, container.CommitOptions{
+		Reference: t.ArtifactRef,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("commit snapshot: %w", err)
+	}
+	commitDur := time.Since(tCommit)
+	log(fmt.Sprintf("        done in %.1fs (image %s)", commitDur.Seconds(), commitResp.ID))
 
-        return TemplateBuildResult(
-            template=template,
-            build_duration_s=time.perf_counter() - t0,
-            install_duration_s=install_dur,
-            commit_duration_s=commit_dur,
-            log_lines=log_lines,
-        )
+	// Step 4: capture the resolved dependency lock and image size.
+	log("  [4/4] Registering in catalog")
+	if manifest, err := captureManifest(ctx, cli, t.ArtifactRef); err == nil {
+		t.InstallManifest = strings.TrimSpace(manifest)
+	}
+	if insp, _, err := cli.ImageInspectWithRaw(ctx, t.ArtifactRef); err == nil {
+		t.SizeBytes = insp.Size
+	}
 
-    finally:
-        # Always clean up the build container
-        subprocess.run(
-            ["docker", "rm", "-f", build_ctr],
-            capture_output=True, timeout=10,
-        )
+	return &TemplateBuildResult{
+		Template:        t,
+		BuildDuration:   time.Since(start),
+		InstallDuration: installDur,
+		CommitDuration:  commitDur,
+	}, nil
+}
 ```
 
-#### 10.4.2 Run from Template (Docker Backend) with Cold-Start Measurement
+#### 10.4.2 Run from Template (Container Tier) with Cold-Start Measurement
 
-```python
-def _run_from_template_docker(
-    template: SandboxTemplate,
-    code: str | None,
-    file_path: Path | None,
-    timeout: int,
-    extra_env: dict[str, str],
-) -> tuple[int, str, str, int]:
-    """
-    Returns (exit_code, stdout, stderr, cold_start_ms).
-    cold_start_ms is measured from docker run invocation to first byte of output.
-    """
-    import io
-    import threading
+`docker run --rm <artifact_ref>` is driven with `os/exec.CommandContext` so the run is bounded by the caller's context. `Setpgid` lets us kill the whole process group on timeout. First-byte latency is captured by an `io.Writer` shim on stdout; the read pumps run as goroutines coordinated with `errgroup`.
 
-    env_args = []
-    merged_env = {**template.env_vars, **extra_env}
-    for k, v in merged_env.items():
-        env_args += ["--env", f"{k}={v}"]
+```go
+package sandbox
 
-    cmd_to_run: list[str]
-    if code:
-        cmd_to_run = ["python3", "-c", code]
-    elif file_path:
-        cmd_to_run = ["python3", "/workspace/script.py"]
-    else:
-        cmd_to_run = ["/bin/bash"]
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os/exec"
+	"sync"
+	"syscall"
+	"time"
 
-    docker_cmd = [
-        "docker", "run", "--rm",
-        "--workdir", template.workdir,
-        *env_args,
-        template.artifact_ref,
-        *cmd_to_run,
-    ]
+	"golang.org/x/sync/errgroup"
+)
 
-    t_start = time.perf_counter()
-    cold_start_ms: int = -1
-    first_byte_event = threading.Event()
+type RunResult struct {
+	ExitCode  int
+	Stdout    string
+	Stderr    string
+	ColdStart time.Duration // CLI invocation -> first stdout byte
+}
 
-    stdout_buf = io.StringIO()
-    stderr_buf = io.StringIO()
+// firstByteWriter records the elapsed time to the first byte written.
+type firstByteWriter struct {
+	start time.Time
+	once  sync.Once
+	at    time.Duration
+	buf   bytes.Buffer
+}
 
-    proc = subprocess.Popen(
-        docker_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+func (w *firstByteWriter) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		w.once.Do(func() { w.at = time.Since(w.start) })
+	}
+	return w.buf.Write(p)
+}
 
-    def _read_stream(stream, buf, is_stdout: bool):
-        nonlocal cold_start_ms
-        for line in iter(stream.readline, ""):
-            if is_stdout and not first_byte_event.is_set():
-                cold_start_ms = int((time.perf_counter() - t_start) * 1000)
-                first_byte_event.set()
-            buf.write(line)
-        stream.close()
+func runFromTemplateDocker(
+	ctx context.Context,
+	t *SandboxTemplate,
+	code, filePath string,
+	timeout time.Duration,
+	extraEnv map[string]string,
+) (*RunResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-    t_stdout = threading.Thread(target=_read_stream,
-                                args=(proc.stdout, stdout_buf, True), daemon=True)
-    t_stderr = threading.Thread(target=_read_stream,
-                                args=(proc.stderr, stderr_buf, False), daemon=True)
-    t_stdout.start()
-    t_stderr.start()
+	args := []string{"run", "--rm", "--workdir", t.Workdir}
+	for k, v := range mergeEnv(t.EnvVars, extraEnv) { // extraEnv wins; not persisted
+		args = append(args, "--env", fmt.Sprintf("%s=%s", k, v))
+	}
+	args = append(args, t.ArtifactRef)
+	switch {
+	case code != "":
+		args = append(args, "python3", "-c", code)
+	case filePath != "":
+		args = append(args, "python3", "/workspace/script.py")
+	default:
+		args = append(args, "/bin/bash")
+	}
 
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        raise
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // process-group kill on cancel
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 
-    t_stdout.join(timeout=5)
-    t_stderr.join(timeout=5)
+	out := &firstByteWriter{start: start}
+	var stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = out, &stderr
 
-    if cold_start_ms < 0:
-        cold_start_ms = int((time.perf_counter() - t_start) * 1000)
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	g, _ := errgroup.WithContext(ctx)
+	g.Go(cmd.Wait)
+	_ = g.Wait() // exit code captured via ProcessState below
 
-    return proc.returncode, stdout_buf.getvalue(), stderr_buf.getvalue(), cold_start_ms
+	cold := out.at
+	if cold == 0 { // no stdout produced
+		cold = time.Since(start)
+	}
+	return &RunResult{
+		ExitCode:  cmd.ProcessState.ExitCode(),
+		Stdout:    out.buf.String(),
+		Stderr:    stderr.String(),
+		ColdStart: cold,
+	}, nil
+}
+
+var _ = io.Discard // stdout/stderr wired above
 ```
 
 #### 10.4.3 Template Resolution
 
-```python
-def resolve_template(
-    conn: sqlite3.Connection,
-    name_or_id: str,
-) -> SandboxTemplate:
-    """Resolve a template by name or ID. Raises ValueError if not found."""
-    row = conn.execute(
-        "SELECT * FROM sandbox_templates WHERE id = ? OR name = ? LIMIT 1",
-        (name_or_id, name_or_id),
-    ).fetchone()
-    if row is None:
-        # Provide helpful error with fuzzy match suggestions
-        similar = conn.execute(
-            "SELECT name FROM sandbox_templates ORDER BY name LIMIT 5"
-        ).fetchall()
-        names = [r[0] for r in similar]
-        suggestion = f" Available templates: {', '.join(names)}" if names else ""
-        raise ValueError(
-            f"Template '{name_or_id}' not found.{suggestion}"
-        )
-    return SandboxTemplate.from_row(dict(row))
+```go
+package sandbox
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+var ErrTemplateNotFound = errors.New("template not found")
+
+// ResolveTemplate resolves a template by ID or name, returning a wrapped
+// ErrTemplateNotFound (with suggestions) when absent.
+func ResolveTemplate(ctx context.Context, db *sql.DB, nameOrID string) (*SandboxTemplate, error) {
+	row := db.QueryRowContext(ctx,
+		`SELECT id, name, backend, base_image, artifact_ref, install_cmd,
+		        install_manifest, setup_cmd, workdir, env_vars, tags,
+		        size_bytes, run_count, last_used_at, created_at, updated_at
+		 FROM sandbox_templates WHERE id = ? OR name = ? LIMIT 1`,
+		nameOrID, nameOrID)
+
+	t, err := scanTemplate(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("template %q: %w.%s", nameOrID, ErrTemplateNotFound, suggestNames(ctx, db))
+	}
+	if err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+func suggestNames(ctx context.Context, db *sql.DB) string {
+	rows, err := db.QueryContext(ctx,
+		`SELECT name FROM sandbox_templates ORDER BY name LIMIT 5`)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if rows.Scan(&n) == nil {
+			names = append(names, n)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	return " Available templates: " + strings.Join(names, ", ")
+}
 ```
 
 ### 10.5 Integration Points
 
 | Integration | How |
 |-------------|-----|
-| `sandbox.py` — existing `run_sandbox()` | Add `template_id: str | None = None` parameter. When set, delegate to `_run_from_template()` instead of cold-start path. |
-| `controller.py` — `cmd_sandbox_run()` | Parse `--template` flag; pass `template_id` to `run_sandbox()`. Add mutually-exclusive check with `--image`. |
-| `controller.py` — `cmd_sandbox_template_*()` | New command group registered under `sandbox template` subparser. |
-| `tracing.py` — `start_span()` | Wrap template create, run, and delete in spans; set `sandbox.template_id`, `sandbox.template_name`, `sandbox.cold_start_ms` attributes. |
-| `budget.py` — `record_cost()` | Record template build compute time as a cost event with `operation=sandbox_template_build`. |
-| `open_db()` — existing helper | Call `ensure_template_schema(conn)` at the start of each template command; idempotent migration. |
+| `internal/sandbox` — existing `RunSandbox()` | Add a `TemplateID string` field to the run options struct. When set, delegate to `runFromTemplate*` instead of the cold-start path. |
+| `internal/cli` — `sandbox run` command | Parse `--template` flag; pass `TemplateID` into the run options. Add mutually-exclusive check with `--image` (returns `ErrConflictingFlags`). |
+| `internal/cli` — `sandbox template` commands | New command group registered under the `sandbox template` cobra/chi subcommand tree. |
+| `internal/telemetry` — OTEL tracer (`otel-go`) | Wrap template create, run, and delete in spans; set `sandbox.template_id`, `sandbox.template_name`, `sandbox.cold_start_ms` attributes. |
+| `internal/budget` — `RecordCost()` | Record template build compute time as a cost event with `operation=sandbox_template_build`. |
+| `OpenDB()` — existing helper (`modernc.org/sqlite`) | Call `EnsureTemplateSchema(ctx, db)` at the start of each template command; idempotent migration. |
 
 ### 10.6 Name Validation
 
-```python
-import re
+```go
+package sandbox
 
-_TEMPLATE_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,63}$')
+import (
+	"errors"
+	"fmt"
+	"regexp"
+)
 
-def validate_template_name(name: str) -> None:
-    if not _TEMPLATE_NAME_RE.match(name):
-        raise UsageError(
-            f"Invalid template name '{name}'. "
-            "Names must start with a lowercase letter or digit, "
-            "contain only lowercase letters, digits, hyphens, and underscores, "
-            "and be 1-64 characters long."
-        )
+var (
+	templateNameRE  = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+	ErrInvalidName  = errors.New("invalid template name")
+)
+
+// ValidateTemplateName enforces the lowercase-slug naming rule.
+func ValidateTemplateName(name string) error {
+	if !templateNameRE.MatchString(name) {
+		return fmt.Errorf("%w %q: names must start with a lowercase letter or digit, "+
+			"contain only lowercase letters, digits, hyphens, and underscores, "+
+			"and be 1-64 characters long", ErrInvalidName, name)
+	}
+	return nil
+}
 ```
 
-### 10.7 E2B Backend Integration
+### 10.7 Firecracker microVM Tier (self-hosted; replaces managed E2B)
 
-```python
-def _e2b_build_template(
-    template: SandboxTemplate,
-    install_spec: str | None,
-    setup_cmd: str | None,
-    timeout: int,
-    *,
-    stream_log,
-) -> TemplateBuildResult:
-    """
-    Delegates to E2B's template build API.
-    Requires e2b>=1.0.0 installed and E2B_API_KEY env var set.
-    """
-    try:
-        from e2b import Sandbox
-    except ImportError:
-        raise RuntimeError(
-            "E2B backend requires 'e2b' package. Install with: pip install e2b"
-        )
+In the native single-binary model TAG owns the strongest isolation tier directly rather than delegating to a managed cloud (E2B). The microVM tier uses `firecracker-microvm/firecracker-go-sdk` to boot a VM from a base rootfs, run the install/setup steps over vsock, then take a **VM snapshot** (memory + device state) via the pause/snapshot/resume API. The snapshot plus a copy-on-write `overlayfs` diff over the base rootfs *is* the template artifact — resuming a snapshot yields E2B-comparable ~150ms restore, but on infrastructure TAG runs itself.
 
-    t0 = time.perf_counter()
-    stream_log(f"  [1/3] Provisioning E2B build sandbox from {template.base_image}")
-    sbx = Sandbox(template=template.base_image, timeout=timeout)
+> **Linux-only.** Firecracker (and KVM `/dev/kvm`, vsock, overlayfs) exist only on Linux. This tier is compiled behind a `//go:build linux` tag and feature-detected at runtime; on macOS/Windows the binary degrades to the container tier (Docker) automatically. See the isolation ladder in `docs/GO_MIGRATION_RESEARCH.md`.
 
-    try:
-        if install_spec and not Path(install_spec).exists():
-            stream_log(f"  [2/3] Installing packages via pip")
-            result = sbx.commands.run(
-                f"pip install --no-cache-dir {install_spec}", timeout=timeout
-            )
-            if result.exit_code != 0:
-                raise RuntimeError(f"pip install failed: {result.stderr}")
+```go
+//go:build linux
 
-        if setup_cmd:
-            sbx.commands.run(setup_cmd, timeout=timeout)
+package sandbox
 
-        stream_log(f"  [3/3] Creating E2B template snapshot")
-        # E2B snapshot API: persists filesystem state
-        snap = sbx.snapshot_filesystem()
-        e2b_template_id = snap.template_id
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
 
-        freeze_result = sbx.commands.run("pip freeze", timeout=30)
-        install_manifest = freeze_result.stdout.strip() if freeze_result.exit_code == 0 else None
+	fc "github.com/firecracker-microvm/firecracker-go-sdk"
+	models "github.com/firecracker-microvm/firecracker-go-sdk/client/models"
+)
 
-        template.artifact_ref = e2b_template_id
-        template.install_manifest = install_manifest
+// buildTemplateFirecracker boots a microVM from the base rootfs, provisions it,
+// then persists a VM snapshot + COW overlay as the template artifact.
+func buildTemplateFirecracker(
+	ctx context.Context,
+	t *SandboxTemplate,
+	installSpec, setupCmd string,
+	timeout time.Duration,
+	log LogFunc,
+) (*TemplateBuildResult, error) {
+	if err := requireKVM(); err != nil { // /dev/kvm present + accessible
+		return nil, fmt.Errorf("firecracker tier unavailable: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	start := time.Now()
 
-    finally:
-        sbx.kill()
+	log(fmt.Sprintf("  [1/3] Booting microVM from rootfs %s", t.BaseImage))
+	overlay, err := newOverlay(t.ID, t.BaseImage) // COW overlayfs over base rootfs
+	if err != nil {
+		return nil, err
+	}
+	cfg := fc.Config{
+		SocketPath:      overlay.apiSock,
+		KernelImagePath: overlay.kernel,
+		Drives: []models.Drive{{
+			DriveID:      strPtr("rootfs"),
+			PathOnHost:   strPtr(overlay.rootfs),
+			IsRootDevice: boolPtr(true),
+		}},
+		VsockDevices: []fc.VsockDevice{{CID: 3, Path: overlay.vsock}},
+	}
+	m, err := fc.NewMachine(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.Start(ctx); err != nil {
+		return nil, err
+	}
+	defer m.StopVMM() // always tear down the VMM
 
-    return TemplateBuildResult(
-        template=template,
-        build_duration_s=time.perf_counter() - t0,
-        install_duration_s=0,
-        commit_duration_s=0,
-    )
+	log("  [2/3] Installing packages over vsock")
+	if err := guestExec(ctx, overlay, installScript(installSpec, setupCmd, t.Workdir)); err != nil {
+		return nil, err
+	}
+	if manifest, err := guestCapture(ctx, overlay); err == nil {
+		t.InstallManifest = strings.TrimSpace(manifest)
+	}
+
+	log("  [3/3] Pausing VM and creating snapshot")
+	if err := m.PauseVM(ctx); err != nil {
+		return nil, err
+	}
+	snapID := "snap_" + t.ID
+	if err := m.CreateSnapshot(ctx, overlay.memFile(snapID), overlay.stateFile(snapID)); err != nil {
+		return nil, err
+	}
+	t.ArtifactRef = snapID // catalog stores the snapshot handle
+	t.SizeBytes = overlay.snapshotSize(snapID)
+
+	return &TemplateBuildResult{Template: t, BuildDuration: time.Since(start)}, nil
+}
 ```
+
+Running from a Firecracker template resumes the snapshot with `firecracker-go-sdk`'s `LoadSnapshot` + `ResumeVM` instead of a cold boot; `runFromTemplateFirecracker` measures cold-start identically to the container tier. The snapshot memory/state files and the COW overlay are content-addressed with `crypto/sha256` so identical template definitions can share base layers.
 
 ---
 
 ## 11. Security Considerations
 
-1. **No credential baking**: The `--env` flag at template create time does NOT accept values matching TAG's credential patterns (`*SECRET*`, `*KEY*`, `*TOKEN*`, `*PASSWORD*`, `AWS_*`, `ANTHROPIC_*`). Attempting to bake these into a template raises a `SecurityError`. Runtime `--env` on `sandbox run` accepts any key but does not persist to the template.
+1. **No credential baking**: The `--env` flag at template create time does NOT accept values matching TAG's credential patterns (`*SECRET*`, `*KEY*`, `*TOKEN*`, `*PASSWORD*`, `AWS_*`, `ANTHROPIC_*`). Attempting to bake these into a template returns a sentinel `ErrCredentialInEnv` (non-zero exit). Runtime `--env` on `sandbox run` accepts any key but does not persist to the template.
 
-2. **Artifact namespace isolation**: All Docker images created by the template system use the `tag-template:` prefix. The `template delete` command only removes images matching this prefix, preventing accidental deletion of user images. The `docker commit` command does not run any new processes; it snapshots the stopped container's filesystem.
+2. **Artifact namespace isolation**: All container-tier images created by the template system use the `tag-template:` prefix. The `template delete` command only removes images matching this prefix, preventing accidental deletion of user images. `ContainerCommit` does not run any new processes; it snapshots the stopped container's filesystem.
 
 3. **Build container cleanup**: The build container (`tag-template-build-<id>`) is always removed in a `finally` block, even on build failure or timeout. This prevents abandoned containers with potentially sensitive build contexts from persisting on the host.
 
-4. **Template name injection prevention**: Template names are strictly validated against `[a-z0-9][a-z0-9_-]{0,63}` before use in Docker image tags and E2B API calls. Shell quoting (`shlex.quote`) is applied to all values interpolated into subprocess arguments; no shell=True execution is used.
+4. **Template name injection prevention**: Template names are strictly validated against `[a-z0-9][a-z0-9_-]{0,63}` before use in image tags and VM snapshot handles. All process invocation goes through `os/exec.CommandContext` with an explicit argv slice (no shell string, no `sh -c` over user input), so shell metacharacter injection is structurally impossible.
 
 5. **Mount validation inheritance**: When running from a template, all mount validation rules from PRD-028 (blocking paths matching `*.env`, `*.key`, `~/.ssh/*`, `~/.aws/*`) remain in force. Templates do not bypass the existing sandbox mount security layer.
 
-6. **E2B API key handling**: The E2B API key is read exclusively from the `E2B_API_KEY` environment variable or TAG's secure config store (same pattern as other secrets in `controller.py`). It is never logged, never stored in `sandbox_templates`, and never included in OTEL span attributes.
+6. **microVM host privileges**: The Firecracker tier requires access to `/dev/kvm` and vsock. TAG runs the VMM as an unprivileged user via a jailer-style setup and reads no cloud credentials — there is no managed-service API key to leak. Host paths for rootfs/snapshot files are confined to `~/.tag/runtime/firecracker/` and never logged in OTEL span attributes.
 
-7. **Disk exhaustion guard**: Template creation checks available disk space before `docker commit`. If available space is less than 2× the base image size, the build aborts with a clear error. The `docker image inspect` size query runs before the commit step.
+7. **Disk exhaustion guard**: Template creation checks available disk space (`golang.org/x/sys/unix.Statfs`) before `ContainerCommit` / snapshot write. If available space is less than 2× the base image (or rootfs) size, the build aborts with a clear error. The image/rootfs size query runs before the commit step.
 
-8. **Concurrent create isolation**: Two concurrent `template create` calls with the same name race on the `UNIQUE` constraint on `sandbox_templates.name`. The second insert will fail with an `IntegrityError`, which is caught and surfaced as a `UsageError` suggesting `--force`.
+8. **Concurrent create isolation**: Two concurrent `template create` calls with the same name race on the `UNIQUE` constraint on `sandbox_templates.name`. The modernc.org/sqlite driver surfaces the second write as a `SQLITE_CONSTRAINT` error, which is wrapped as `ErrTemplateExists` suggesting `--force`. The catalog uses a single writer under WAL to avoid interleaved commits.
 
-9. **E2B template ID opacity**: E2B template IDs returned by `snapshot_filesystem()` are opaque UUIDs. They are stored as-is in `artifact_ref`. No user-controlled input is concatenated into E2B API URLs; all E2B SDK calls use typed parameters.
+9. **Snapshot handle opacity**: VM snapshot handles (`snap_<id>`) and container image digests are treated as opaque identifiers stored as-is in `artifact_ref`. No user-controlled input is concatenated into filesystem paths without validation; all moby / firecracker-go-sdk calls use typed parameters rather than shell strings.
 
 10. **Audit trail**: All template lifecycle events (create, delete, run-from-template) are appended to `~/.tag/runtime/sandbox-audit.jsonl` (same file as PRD-028), with `template_id`, `template_name`, `backend`, and `outcome` fields. This provides a complete record for post-incident forensics.
 
@@ -852,39 +950,41 @@ def _e2b_build_template(
 
 ## 12. Testing Strategy
 
-### 12.1 Unit Tests (`tests/test_sandbox_templates.py`)
+### 12.1 Unit Tests (`internal/sandbox/template_test.go`)
 
-- **Schema migration**: Create in-memory SQLite, run `ensure_template_schema()` twice, assert idempotency. Assert `sandbox_runs` gains `template_id` and `cold_start_ms` columns.
-- **Name validation**: Parametrize 20 valid and 15 invalid template names; assert `validate_template_name()` raises `UsageError` for all invalid inputs.
-- **Template resolution**: Insert 3 templates, assert `resolve_template()` finds by both `id` and `name`; assert `ValueError` with helpful message for unknown name.
-- **Row serialization**: Create `SandboxTemplate` instance, call `to_row()`, then `from_row()`, assert round-trip equality including nested dicts for `env_vars` and `tags`.
-- **Mutual exclusion**: Mock CLI parser; assert `UsageError` when both `--template` and `--image` are provided.
-- **Credential env guard**: Assert `SecurityError` when `--env AWS_SECRET_ACCESS_KEY=foo` is passed to `template create`.
-- **`--force` overwrite**: Mock Docker subprocess calls; assert existing template is deleted and new one inserted when `--force` provided.
-- **Timeout kill**: Use `unittest.mock.patch` on `subprocess.run` to simulate timeout; assert build container cleanup runs in `finally` block.
+Standard `testing` package with table-driven subtests (`t.Run`); assertions via `stretchr/testify`.
 
-### 12.2 Integration Tests (`tests/test_sandbox_templates_integration.py`)
+- **Schema migration**: Open an in-memory `modernc.org/sqlite` DB, call `EnsureTemplateSchema()` twice, assert idempotency. Assert `sandbox_runs` gains `template_id` and `cold_start_ms` columns via `PRAGMA table_info`.
+- **Name validation**: Table-driven cases — 20 valid and 15 invalid names; assert `ValidateTemplateName()` returns `ErrInvalidName` (`errors.Is`) for all invalid inputs.
+- **Template resolution**: Insert 3 templates, assert `ResolveTemplate()` finds by both `id` and `name`; assert wrapped `ErrTemplateNotFound` with suggestion string for unknown name.
+- **Row serialization**: Construct a `SandboxTemplate`, persist and re-scan via the catalog, assert round-trip equality (including `EnvVars` / `Tags` maps) with `reflect.DeepEqual` / `testify.Equal`.
+- **Mutual exclusion**: Invoke the cobra command with both `--template` and `--image`; assert `errors.Is(err, ErrConflictingFlags)`.
+- **Credential env guard**: Assert `errors.Is(err, ErrCredentialInEnv)` when `--env AWS_SECRET_ACCESS_KEY=foo` is passed to `template create`.
+- **`--force` overwrite**: Inject a fake moby `client.APIClient`; assert the existing template is deleted and a new one inserted when `--force` is set.
+- **Timeout kill**: Use a fake exec/runner whose command blocks; drive with a short `context.WithTimeout`; assert the `defer` cleanup (`ContainerRemove` / `StopVMM`) runs and the error is `context.DeadlineExceeded`.
 
-These tests are gated on `pytest.mark.docker` and skip if `docker info` fails.
+### 12.2 Integration Tests (`internal/sandbox/template_integration_test.go`)
 
-- **End-to-end create and run**: Create `python-minimal` template with `--install "uuid"` (fast install); run with `--code "import uuid; print(uuid.uuid4())"`. Assert exit 0, UUID-format output, `cold_start_ms < 500` in `sandbox_runs`.
-- **Pip freeze manifest**: After create, assert `install_manifest` in `sandbox_templates` contains `uuid==` with a version string.
-- **Reproducibility**: Run from template 5 times; assert identical stdout across all runs when code is `pip freeze | sort`.
-- **Template delete cleans Docker**: After `template create` + `template delete`, assert `docker image ls | grep tag-template` returns empty.
-- **`--env` override**: Create template, run with `--env MYVAR=hello`, assert `MYVAR` visible inside sandbox; assert `sandbox_templates` `env_vars` unchanged.
-- **`inspect` run cross-reference**: Create template, run 3 times, call `inspect`; assert `run_count == 3` and `last_used_at` is recent.
-- **Concurrent runs**: Launch 5 concurrent `subprocess.Popen` calls with `sandbox run --template`; assert all 5 complete with exit 0 and independent output.
+Gated behind `//go:build integration` and skipped via `t.Skip` when `docker info` (or `/dev/kvm`) is unavailable.
 
-### 12.3 Performance Tests (`tests/test_sandbox_template_perf.py`)
+- **End-to-end create and run**: Create `python-minimal` template with `--install "uuid"`; run with `--code "import uuid; print(uuid.uuid4())"`. Assert exit 0, UUID-format output, `ColdStart < 500ms` recorded in `sandbox_runs`.
+- **Dependency-lock manifest**: After create, assert `install_manifest` in `sandbox_templates` contains `uuid==` with a version string.
+- **Reproducibility**: Run from template 5 times; assert identical stdout across all runs (`pip freeze | sort`).
+- **Template delete cleans image**: After `create` + `delete`, assert no `tag-template:*` image remains (moby `ImageList` filter returns empty).
+- **`--env` override**: Create template, run with `--env MYVAR=hello`, assert `MYVAR` visible inside sandbox; assert `sandbox_templates.env_vars` unchanged.
+- **`inspect` run cross-reference**: Create template, run 3 times, call `inspect`; assert `run_count == 3` and `last_used_at` recent.
+- **Concurrent runs**: Launch 5 concurrent `sandbox run --template` goroutines (via `errgroup`); assert all 5 exit 0 with independent output.
 
-- **Latency benchmark** (marked `@pytest.mark.slow`): After creating a `python-datascience` template with numpy/pandas/sklearn, run 20 consecutive `sandbox run --template` invocations. Assert p50 `cold_start_ms < 200` and p95 `cold_start_ms < 400`.
-- **Baseline comparison**: Time 5 cold-start runs (no template, fresh `pip install numpy pandas scikit-learn`). Assert template p50 is at least 30× faster than cold-start p50.
-- **`list` with 100 templates**: Insert 100 rows into `sandbox_templates` in a test DB; assert `template list` completes in <100ms.
+### 12.3 Benchmarks (`internal/sandbox/template_bench_test.go`)
+
+- **Latency benchmark** (`func BenchmarkColdStart`, `-benchtime`): After creating a `python-datascience` template, run consecutive `sandbox run --template` invocations. Assert p50 `ColdStart < 200ms` and p95 `< 400ms` (percentiles computed over `b.N` samples).
+- **Baseline comparison**: Benchmark 5 cold-start runs (no template, fresh install). Assert template p50 is at least 30× faster than cold-start p50.
+- **`list` with 100 templates**: Seed 100 rows; assert `template list` completes in <100ms (`testing.B` with `b.ReportMetric`).
 
 ### 12.4 OTEL Span Tests
 
-- Mock `tracing.start_span()` via `unittest.mock.patch`; assert `template_create`, `template_delete`, and `sandbox_run_from_template` spans are emitted with correct attributes after each operation.
-- Assert `sandbox.cold_start_ms` attribute is set on `sandbox_run_from_template` spans after a Docker run.
+- Use the OTEL `tracetest.SpanRecorder` (in-memory `SpanExporter`); assert `template_create`, `template_delete`, and `sandbox_run_from_template` spans are emitted with correct attributes after each operation.
+- Assert the `sandbox.cold_start_ms` attribute is set on `sandbox_run_from_template` spans after a container-tier run.
 
 ---
 
@@ -901,9 +1001,9 @@ These tests are gated on `pytest.mark.docker` and skip if `docker info` fails.
 | AC-07 | `tag sandbox template delete python-datascience` removes the SQLite row and removes the Docker image. After deletion, `docker image ls | grep tag-template:python-datascience` returns empty. | Run delete; verify via `docker image ls` and `tag sandbox template list`. |
 | AC-08 | `tag sandbox template delete <recently-used-template>` prompts for confirmation when last use was within 7 days; proceeds with `--force` without prompt. | Test interactively and with `--force` flag. |
 | AC-09 | `tag sandbox run --template nonexistent` exits non-zero with a clear error message naming the missing template and listing available templates. | Run command; assert exit code 1 and error message format. |
-| AC-10 | `tag sandbox run --template foo --image python:3.11` exits with a `UsageError` and message containing "Cannot specify both --template and --image". | Run command; assert non-zero exit and message. |
-| AC-11 | `tag sandbox template create UPPERCASE` exits with `UsageError` describing valid name format. | Run command; assert exit code 1 and message. |
-| AC-12 | `tag sandbox template create` with `--env AWS_SECRET_ACCESS_KEY=test` exits with `SecurityError` before any Docker operations are initiated. | Run command; verify no Docker containers were created (via `docker ps -a`). |
+| AC-10 | `tag sandbox run --template foo --image python:3.11` exits non-zero (`ErrConflictingFlags`) with message containing "Cannot specify both --template and --image". | Run command; assert non-zero exit and message. |
+| AC-11 | `tag sandbox template create UPPERCASE` exits non-zero (`ErrInvalidName`) describing valid name format. | Run command; assert exit code 1 and message. |
+| AC-12 | `tag sandbox template create` with `--env AWS_SECRET_ACCESS_KEY=test` exits non-zero (`ErrCredentialInEnv`) before any container/VM operations are initiated. | Run command; verify no containers were created (via `docker ps -a`). |
 | AC-13 | After `tag sandbox template create`, the `install_manifest` column in `sandbox_templates` contains `numpy==` followed by a version string. | `SELECT install_manifest FROM sandbox_templates WHERE name='python-datascience'` and grep for `numpy==`. |
 | AC-14 | A template run emits a span with `sandbox.template_id`, `sandbox.template_name`, and `sandbox.cold_start_ms` attributes to the OTEL exporter. | Run with OTEL exporter configured to stdout; grep output for span attributes. |
 | AC-15 | All existing `tag sandbox run` commands (without `--template`) produce identical output and latency before and after this feature is deployed. | Run PRD-028 integration test suite; assert all tests pass. |
@@ -914,17 +1014,19 @@ These tests are gated on `pytest.mark.docker` and skip if `docker info` fails.
 
 | Dependency | Type | Required / Optional | Notes |
 |------------|------|---------------------|-------|
-| Docker Engine (v24+) | Runtime | Required for Docker backend | Detected via `docker info`; graceful error if absent |
-| `e2b>=1.0.0` | Python package | Optional (E2B backend) | Lazy-imported; `pip install tag[e2b]` extra |
-| `sqlite3` (stdlib) | Python stdlib | Required | Already used by TAG; no new installation |
-| PRD-028 (Sandbox Code Execution) | Feature | Required | Template system extends `sandbox.py`; base `sandbox_runs` table and `run_sandbox()` function must exist |
-| PRD-013 (Agent Tracing) | Feature | Required | `tracing.start_span()` used for lifecycle events |
+| Docker Engine (v24+) | Runtime | Required for container tier | Detected via moby client `Ping`; graceful degrade if absent |
+| `github.com/docker/docker` (moby client) | Go module | Required (container tier) | `ImagePull` / `ContainerCommit` / `ImageList`; optional gVisor `runsc` runtime |
+| `github.com/firecracker-microvm/firecracker-go-sdk` | Go module | Optional (microVM tier) | Linux-only, `//go:build linux`; needs `/dev/kvm`, vsock, overlayfs |
+| `github.com/landlock-lsm/go-landlock`, `github.com/elastic/go-seccomp-bpf`, `github.com/google/nftables` | Go module | Optional (restricted tier) | Lowest rung of the isolation ladder for lightweight runs; Linux-only |
+| `modernc.org/sqlite` | Go module | Required | Pure-Go (no CGO) template/snapshot catalog; single-writer, WAL |
+| PRD-028 (Sandbox Code Execution) | Feature | Required | Template system extends `internal/sandbox`; base `sandbox_runs` table and `RunSandbox()` must exist |
+| PRD-013 (Agent Tracing) | Feature | Required | OTEL tracer (`go.opentelemetry.io/otel`) used for lifecycle spans |
 | PRD-034 (Secret Scanning) | Feature | Recommended | Credential pattern matching for `--env` guard re-uses existing patterns |
-| PRD-012 (Cost Tracking) | Feature | Optional | Template build cost attribution via `budget.py` |
-| `subprocess` (stdlib) | Python stdlib | Required | Docker CLI invocation |
-| `shlex` (stdlib) | Python stdlib | Required | Safe argument construction for Docker commands |
-| `threading` (stdlib) | Python stdlib | Required | Cold-start measurement via first-byte detection |
-| `uuid` (stdlib) | Python stdlib | Required | Template ID generation |
+| PRD-012 (Cost Tracking) | Feature | Optional | Template build cost attribution via `internal/budget` |
+| `os/exec` (stdlib) | Go stdlib | Required | `CommandContext` + `Setpgid` for process-group kill |
+| `golang.org/x/sync/errgroup` | Go module | Required | Concurrent stream pumps and concurrent-run tests |
+| `github.com/invopop/jsonschema` | Go module | Required | JSON schema generation for `--json` surface |
+| `crypto/rand`, `crypto/sha256`, `encoding/json` (stdlib) | Go stdlib | Required | Template ID generation, content-addressed hashing, catalog (de)serialization |
 
 ---
 
@@ -933,9 +1035,9 @@ These tests are gated on `pytest.mark.docker` and skip if `docker info` fails.
 | # | Question | Owner | Target Resolution |
 |---|----------|-------|-------------------|
 | OQ-1 | Should `tag sandbox template create` support a `--from-running <sandbox_id>` flag that snapshots a currently-running sandbox (analogous to E2B's pause/snapshot workflow) rather than rebuilding from scratch? This would enable "install packages interactively, then freeze" workflows. | Engineering | Evaluate after v1 ships; tracked in #348 comments |
-| OQ-2 | Should the E2B backend use `sbx.snapshot_filesystem()` (Modal-style API) or the `e2b template build` CLI entrypoint? The SDK API is more programmatic but the CLI may handle more edge cases. | Engineering | Confirm with E2B SDK changelog for v1.0.0+ |
+| OQ-2 | Should the microVM tier snapshot full VM memory (`CreateSnapshot` diff snapshots via firecracker-go-sdk) or fall back to overlayfs-only filesystem snapshots when memory snapshotting is unavailable on the host kernel? Memory snapshots give the ~150ms resume but require a matching kernel/uffd configuration. | Engineering | Confirm minimum kernel + firecracker-go-sdk snapshot support on target hosts |
 | OQ-3 | Should template images use a content-addressable name (hash of base_image + install_cmd) to enable transparent deduplication when two templates have identical definitions? | Engineering | Deferred to v2 if disk usage becomes a concern |
-| OQ-4 | Should `tag sandbox template list` show templates from the E2B account (fetched via E2B API) merged with local Docker templates, or only show locally-registered templates from SQLite? | Product | Decision needed before E2B backend implementation |
+| OQ-4 | Since both tiers are now self-hosted, all templates live in the local SQLite catalog. Should `list` also reconcile against on-disk artifacts (dangling images / orphaned snapshot files) and flag drift, or trust the catalog as source of truth? | Product | Decide before GA; likely add a `template gc` reconcile command |
 | OQ-5 | What is the maximum allowed `size_bytes` for a Docker-backend template before `template create` warns the user? 2 GB is a reasonable default but may need to be configurable. | Engineering | Set default at 2 GB with `--max-size` flag for override |
 | OQ-6 | Should `tag sandbox run --template` support `--mount <host_path>:<container_path>` for injecting read-only data into a template-based run without modifying the template? This is a common pattern for data science (mount dataset directory). | Product | Likely yes; implement with same mount validation rules from PRD-028 |
 | OQ-7 | Is there a use case for sharing templates across a team via a shared SQLite database (e.g., on a network mount or synced via git-lfs)? Or is per-developer local storage sufficient? | Product | Survey users after v1 ships |
@@ -945,40 +1047,40 @@ These tests are gated on `pytest.mark.docker` and skip if `docker info` fails.
 
 ## 16. Complexity and Timeline
 
-### Phase 1 — Core Docker Backend (Days 1-4)
+### Phase 1 — Core Container Tier (Days 1-4)
 
-- `ensure_template_schema()` with idempotent migration for `sandbox_templates` and `ALTER TABLE sandbox_runs` (Day 1)
-- `SandboxTemplate` dataclass, `validate_template_name()`, `resolve_template()` (Day 1)
-- `_docker_build_template()`: pull → install → commit → freeze → size (Days 1-2)
-- `cmd_sandbox_template_create()` in `controller.py` with progress streaming (Day 2)
-- `cmd_sandbox_template_list()` with `--backend` and `--tag` filters, `--json` output (Day 2)
-- `cmd_sandbox_template_delete()` with recency guard and `--force` (Day 3)
-- `cmd_sandbox_template_inspect()` with run cross-reference (Day 3)
-- `_run_from_template_docker()` with cold-start measurement via first-byte threading (Day 3)
-- Extend `cmd_sandbox_run()` with `--template` flag and mutual-exclusion check (Day 4)
-- Unit tests for all above (Day 4)
+- `EnsureTemplateSchema()` with idempotent migration for `sandbox_templates` and `ALTER TABLE sandbox_runs` (Day 1)
+- `SandboxTemplate` struct, `ValidateTemplateName()`, `ResolveTemplate()` (Day 1)
+- `buildTemplateDocker()`: pull → install → commit → manifest → size via moby client (Days 1-2)
+- `sandbox template create` command in `internal/cli` with progress streaming (Day 2)
+- `sandbox template list` with `--backend` and `--tag` filters, `--json` output (Day 2)
+- `sandbox template delete` with recency guard and `--force` (Day 3)
+- `sandbox template inspect` with run cross-reference (Day 3)
+- `runFromTemplateDocker()` with cold-start measurement via first-byte writer + `errgroup` (Day 3)
+- Extend `sandbox run` with `--template` flag and mutual-exclusion check (Day 4)
+- Unit tests for all above (`go test ./internal/sandbox/...`) (Day 4)
 
 ### Phase 2 — OTEL, Security, and Integration (Days 5-7)
 
 - OTEL span instrumentation for all template lifecycle events (Day 5)
 - Credential pattern guard for `--env` in `template create` (Day 5)
-- Disk space pre-check before `docker commit` (Day 5)
-- Integration tests (`@pytest.mark.docker`) for end-to-end create/run/delete/inspect (Day 6)
-- Performance benchmark tests (latency vs. baseline) (Day 6)
+- Disk space pre-check (`unix.Statfs`) before `ContainerCommit` (Day 5)
+- Integration tests (`//go:build integration`) for end-to-end create/run/delete/inspect (Day 6)
+- Benchmarks (`testing.B`, latency vs. baseline) (Day 6)
 - Audit log appender to `sandbox-audit.jsonl` (Day 6)
 - Budget integration for template build cost attribution (Day 7)
-- CLI help text, error message polish, and `pyproject.toml` optional extras update (Day 7)
+- CLI help text, error message polish (Day 7)
 
-### Phase 3 — E2B Backend (Days 8-10)
+### Phase 3 — Firecracker microVM Tier (Days 8-10, Linux-only)
 
-- `_e2b_build_template()` using `Sandbox` + `snapshot_filesystem()` (Day 8)
-- `_run_from_template_e2b()` using `Sandbox.create(template=e2b_id)` (Day 8)
-- E2B-specific unit tests with mocked `e2b.Sandbox` (Day 9)
-- E2B integration tests (gated on `E2B_API_KEY` env var) (Day 9)
-- Documentation: update `docs/prd/INDEX.md`, add template examples to `README` (Day 10)
+- `buildTemplateFirecracker()` using firecracker-go-sdk boot + pause + `CreateSnapshot` over COW overlayfs (Day 8)
+- `runFromTemplateFirecracker()` using `LoadSnapshot` + `ResumeVM` (Day 8)
+- Feature-detection / degrade-off-Linux plumbing behind `//go:build linux`; unit tests with a fake VMM (Day 9)
+- microVM integration tests (gated on `/dev/kvm` availability) (Day 9)
+- Documentation: update `docs/prd/INDEX.md`, add template examples to `README`; GoReleaser + cosign + SLSA build wiring for the static binary (Day 10)
 - Final review, edge case hardening, and merge (Day 10)
 
 **Total: 10 working days (2 calendar weeks)**
 
-The Docker backend (Phase 1-2) is independently shippable as a v1 milestone and delivers the primary user value of <200ms cold starts for local development. The E2B backend (Phase 3) can ship as a follow-on release without blocking Phase 1-2 users.
+The container tier (Phase 1-2) is independently shippable as a v1 milestone and delivers the primary user value of <200ms cold starts on any OS with a Docker daemon. The Firecracker microVM tier (Phase 3) is **Linux-only** and ships as a follow-on without blocking Phase 1-2 users; on non-Linux hosts the binary transparently degrades to the container tier.
 

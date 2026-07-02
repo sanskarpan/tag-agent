@@ -1,10 +1,12 @@
 # PRD-109: HITL interrupt()+Command(resume=) (`tag workflow interrupt`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Workflow State
-**Affects:** `workflow_engine.py + controller.py`
+**Affects:** `internal/agent (interrupt flag) + internal/runtime + internal/store + internal/server + internal/cli`
 **Depends on:** PRD-110 (state serialization/checkpointing), PRD-112 (graph-based workflow), PRD-082 (multi-agent team primitives)
 **Inspired by:** LangGraph interrupt()+Command(resume=), CrewAI human input, AutoGen human proxy agent, OpenAI Swarm handoff
 
@@ -89,17 +91,22 @@ tag workflow interrupt show <session-id>
 tag workflow resume <session-id> --input "approved" [--timeout-action abort|skip]
 tag workflow list --filter interrupted
 
-# In workflow definition (Python API):
-from tag.workflow_engine import interrupt, get_interrupt_response
-
-def review_node(state):
-    human_input = interrupt(
-        question="About to delete 47 files. Proceed?",
-        context={"files": state["files_to_delete"], "count": 47}
-    )
-    if human_input.lower() in ("yes", "y", "approved"):
-        return {"approved": True}
-    return {"approved": False, "reason": human_input}
+# In a workflow node (Go API, internal/agent):
+func reviewNode(ctx context.Context, s *workflow.State) (workflow.Update, error) {
+    humanInput, err := workflow.Interrupt(ctx, workflow.InterruptRequest{
+        Question: "About to delete 47 files. Proceed?",
+        Context:  map[string]any{"files": s.FilesToDelete, "count": 47},
+    })
+    if errors.Is(err, workflow.ErrInterrupt) {
+        return workflow.Update{}, err // engine checkpoints + suspends
+    }
+    switch strings.ToLower(humanInput) {
+    case "yes", "y", "approved":
+        return workflow.Update{"approved": true}, nil
+    default:
+        return workflow.Update{"approved": false, "reason": humanInput}, nil
+    }
+}
 
 Options:
   --input TEXT          Human response to inject at the interrupt point
@@ -115,16 +122,16 @@ Options:
 
 | ID | Requirement |
 |----|------------|
-| FR-01 | `interrupt(question, context)` function: checkpoints current state, writes `workflow_interrupts` row with status `pending`, raises `InterruptException` to unwind the call stack. |
-| FR-02 | The workflow engine catches `InterruptException`, serializes state to SQLite (PRD-110), and prints the interrupt question + context to terminal before exiting. |
+| FR-01 | `workflow.Interrupt(ctx, req)`: checkpoints current state, writes a `workflow_interrupts` row with status `pending`, and returns the sentinel `ErrInterrupt` so the node returns early and the call stack unwinds via Go error propagation. |
+| FR-02 | The workflow engine detects `ErrInterrupt` (via `errors.Is`), serializes state to SQLite (PRD-110), emits the interrupt question + context over the runtime seam to the terminal (rendered by `internal/cli`, optionally the `internal/tui` bubbletea front-end), then returns cleanly (`ctx`-scoped, no leaked goroutines). |
 | FR-03 | `tag workflow resume` fetches the checkpoint (PRD-110), stores the operator's `--input` in the `workflow_interrupts` row, and re-executes the graph from the checkpoint. |
-| FR-04 | `get_interrupt_response()`: called within the same node after `interrupt()` returns on resume; returns the stored operator input string. |
-| FR-05 | On resume, the node that called `interrupt()` is re-executed from its beginning (not from mid-node); `interrupt()` returns immediately on re-execution with the stored response. |
-| FR-06 | `--auto-approve` flag sets a process-level flag that causes `interrupt()` to return the `--auto-input` value immediately without checkpointing or terminal prompt. |
-| FR-07 | Timeout: if the `workflow_interrupts` row remains `pending` beyond `--timeout` seconds, a daemon marks it `timed_out` and triggers the `--timeout-action`. |
+| FR-04 | `workflow.Interrupt` returns `(response, nil)` on re-execution: after resume, the same call within the re-run node returns the stored operator input string immediately (no new checkpoint). |
+| FR-05 | On resume, the node that called `Interrupt` is re-executed from its beginning (Go nodes are pure `func(ctx, *State) (Update, error)`, not resumable mid-body); `Interrupt` short-circuits with the stored response on that re-execution. |
+| FR-06 | `--auto-approve` sets a field on the session's `InterruptGate` config (threaded via `context`, not a package global) that causes `Interrupt` to return the `--auto-input` value immediately without checkpointing or terminal prompt. |
+| FR-07 | Timeout: if the `workflow_interrupts` row remains `pending` beyond `--timeout` seconds, a `context.WithTimeout`-driven check (evaluated on the next `resume` poll, per NFR-02) marks it `timed_out` and triggers the `--timeout-action`. |
 | FR-08 | `tag workflow list --filter interrupted` queries `workflow_sessions` WHERE status='interrupted' and shows session ID, goal, interrupt question, pending duration. |
-| FR-09 | Multiple interrupt points: after resume and re-execution past the first interrupt, subsequent `interrupt()` calls follow the same checkpoint/resume flow. |
-| FR-10 | Interrupt context is serialized as JSON and stored in `workflow_interrupts.context`; `tag workflow interrupt show` renders it formatted. |
+| FR-09 | Multiple interrupt points: after resume and re-execution past the first interrupt, subsequent `Interrupt` calls follow the same checkpoint/resume flow. |
+| FR-10 | Interrupt context is `encoding/json`-serialized into `workflow_interrupts.context`; `tag workflow interrupt show` renders it formatted. |
 
 ---
 
@@ -132,8 +139,8 @@ Options:
 
 | ID | Requirement |
 |----|------------|
-| NFR-01 | Checkpoint/resume must preserve exact Python object state (via pickle or JSON-serializable state dict). |
-| NFR-02 | No background daemon required for interrupt detection; polling from CLI on `resume` is sufficient. |
+| NFR-01 | Checkpoint/resume must preserve exact workflow state via an `encoding/json`-serializable `State` struct (no pickle/gob; JSON keeps checkpoints inspectable and cross-version-safe), persisted to SQLite by PRD-110. |
+| NFR-02 | No background goroutine/daemon required for interrupt detection; polling from the CLI on `resume` is sufficient. |
 | NFR-03 | Interrupt state must survive TAG process crash; state checkpointed before process exits. |
 | NFR-04 | `--auto-approve` must be opt-in via explicit flag; never the default. |
 
@@ -141,7 +148,9 @@ Options:
 
 ## 9. Technical Design
 
-### 9.1 SQLite DDL
+### 9.1 SQLite DDL (`internal/store`, modernc.org/sqlite)
+
+Persisted to the single pure-Go `modernc.org/sqlite` store (CGO_ENABLED=0, WAL); migration lives in `internal/store/migrate/`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS workflow_interrupts (
@@ -160,53 +169,82 @@ CREATE INDEX IF NOT EXISTS idx_workflow_interrupts_session
   ON workflow_interrupts(session_id, status);
 ```
 
-### 9.2 Python core
+### 9.2 Mechanism — cooperative interrupt over `context`, not exceptions
 
-```python
-from __future__ import annotations
-import json
-import os
-import uuid
-from typing import Any, Optional
+Go has no exceptions, no `pickle`, and no thread-local globals. The LangGraph `interrupt()`/`Command(resume=)` pattern maps onto the Hermes-style **cooperative interrupt flag + `context.Context` cancellation** already used by the `internal/agent` bounded loop:
 
-_CURRENT_SESSION_ID: Optional[str] = None
-_AUTO_APPROVE: bool = False
-_AUTO_INPUT: str = "approved"
+- Session-scoped state (current session ID, `--auto-approve`/`--auto-input`, the resume-response lookup, the DB handle) is threaded through the call chain via a typed `context` value (`InterruptGate`) — never a package-level global. This makes it goroutine-safe and testable.
+- `Interrupt` returns a sentinel error `ErrInterrupt` instead of raising; the engine unwinds via ordinary Go error propagation (`errors.Is`) rather than stack-unwinding an exception.
+- The pending interrupt is delivered to the operator over the `internal/runtime` wire seam. The terminal `internal/cli` client renders the prompt (and, when running under `tag serve`, the same event streams to the bubbletea `internal/tui` client via `tmaxmax/go-sse` on the `net/http`+`chi`/`huma` server). Per NG1 the operator-facing surface is terminal only; SSE is merely the transport to that terminal/TUI client, not a web approval UI.
+- On resume, `tag workflow resume` writes the operator input and re-runs the graph; `Interrupt` finds the `responded` row and returns the stored string immediately — the channel-based approval gate degenerates to a fast DB lookup, so no live blocking or background goroutine is needed (NFR-02).
 
-class InterruptException(Exception):
-    def __init__(self, interrupt_id: str) -> None:
-        self.interrupt_id = interrupt_id
-        super().__init__(f"Workflow interrupted: {interrupt_id}")
+### 9.3 Go core (`internal/agent`, `internal/store`)
 
-def interrupt(question: str, context: Any = None) -> str:
-    global _CURRENT_SESSION_ID, _AUTO_APPROVE, _AUTO_INPUT
-    if _AUTO_APPROVE:
-        return _AUTO_INPUT
-    if not _CURRENT_SESSION_ID:
-        raise RuntimeError("interrupt() called outside a workflow session")
-    interrupt_id = uuid.uuid4().hex[:8]
-    # Check if we're in a resume and this interrupt has already been responded to
-    from tag.workflow_engine import _get_db
-    conn = _get_db()
-    existing = conn.execute(
-        "SELECT operator_input, status FROM workflow_interrupts WHERE session_id=? AND step_id=? AND status='responded'",
-        (_CURRENT_SESSION_ID, interrupt_id)
-    ).fetchone()
-    if existing:
-        return existing["operator_input"]
-    # New interrupt — checkpoint and raise
-    conn.execute(
-        "INSERT INTO workflow_interrupts(id,session_id,step_id,question,context,status,created_at) VALUES(?,?,?,?,?,?,?)",
-        (interrupt_id, _CURRENT_SESSION_ID, interrupt_id, question, json.dumps(context) if context else None,
-         "pending", _utc_now())
-    )
-    conn.commit()
-    raise InterruptException(interrupt_id)
+```go
+package workflow
 
-def _utc_now() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
+// ErrInterrupt is the sentinel returned by Interrupt when a new pause is
+// recorded; the engine detects it with errors.Is and suspends the session.
+var ErrInterrupt = errors.New("workflow interrupted")
+
+// InterruptGate carries per-session interrupt config; threaded via context,
+// never a package global.
+type InterruptGate struct {
+    SessionID   string
+    AutoApprove bool
+    AutoInput   string   // default "approved"
+    Store       *store.DB
+}
+
+type InterruptRequest struct {
+    Question string         `json:"question"`
+    Context  map[string]any `json:"context,omitempty"`
+}
+
+func Interrupt(ctx context.Context, req InterruptRequest) (string, error) {
+    g, ok := gateFrom(ctx) // typed context-key lookup
+    if !ok {
+        return "", errors.New("Interrupt called outside a workflow session")
+    }
+    if g.AutoApprove {
+        return g.AutoInput, nil // FR-06: no checkpoint, no prompt
+    }
+    // Deterministic step id (hash of node + call ordinal) so a resumed re-run
+    // matches the same interrupt row.
+    stepID := stepIDFrom(ctx)
+
+    // Resume path: this interrupt already answered?
+    if in, err := g.Store.RespondedInput(ctx, g.SessionID, stepID); err == nil && in.Valid {
+        return in.String, nil // FR-04/FR-05
+    }
+
+    // New interrupt — persist pending row (single-writer store) and signal suspend.
+    ctxJSON, _ := json.Marshal(req.Context)
+    if err := g.Store.InsertInterrupt(ctx, store.Interrupt{
+        ID: newID(), SessionID: g.SessionID, StepID: stepID,
+        Question: req.Question, Context: ctxJSON,
+        Status: "pending", CreatedAt: time.Now().UTC(),
+    }); err != nil {
+        return "", err
+    }
+    return "", ErrInterrupt // FR-01
+}
 ```
+
+The engine wraps node execution:
+
+```go
+if update, err := node(ctx, state); err != nil {
+    if errors.Is(err, ErrInterrupt) {
+        checkpoint(ctx, session, state) // PRD-110, JSON state -> SQLite
+        emitPrompt(ctx, session)        // over runtime seam -> terminal / TUI
+        return nil                      // clean return; ctx-scoped, no leaked goroutines
+    }
+    return err
+}
+```
+
+All writes go through the single-writer `internal/store` (`modernc.org/sqlite`, flock + atomic RMW); the workflow engine never opens `tag.sqlite3` directly.
 
 ---
 
@@ -222,11 +260,14 @@ def _utc_now() -> str:
 
 ## 11. Testing Strategy
 
+Go `testing` (table-driven); `go test -race` on any path where the gate is read across goroutines; `testing.B` for the resume-latency and per-node overhead metrics. Store-backed tests run against a tmp/in-memory `modernc.org/sqlite` DB.
+
 | Layer | Tests |
 |-------|-------|
-| Unit | `interrupt()` raises `InterruptException`; re-execution returns stored response; `--auto-approve` returns immediately |
-| Integration | Full workflow: interrupt → checkpoint → resume → continuation; verify prior step state preserved |
-| Security | Ensure `--auto-approve` is not default; test timeout escalation |
+| Unit | Table-driven: `Interrupt` returns `ErrInterrupt` (assert `errors.Is`) on a new pause; returns `(stored, nil)` on the responded re-run; `--auto-approve` returns `AutoInput` immediately with no row written; deterministic `stepID` stable across re-execution |
+| Integration | Full workflow over a stub graph: interrupt → checkpoint (PRD-110 JSON state) → `resume --input` → continuation; assert prior node state preserved; multiple sequential interrupts (FR-09) |
+| Concurrency | `-race` over a session whose gate is read from node goroutines; assert `ErrInterrupt` return leaks no goroutines and honors `ctx` cancellation |
+| Security | Assert `--auto-approve` defaults false (config field, not global); `testing.B`/table test for timeout escalation evaluated on resume poll |
 
 ---
 
@@ -246,8 +287,11 @@ def _utc_now() -> str:
 
 | Dependency | Reason |
 |-----------|--------|
-| PRD-110 state serialization | Checkpoint/restore for suspend/resume |
-| PRD-112 graph-based workflow | Workflow node execution framework |
+| PRD-110 state serialization | JSON checkpoint/restore for suspend/resume |
+| PRD-112 graph-based workflow | Workflow node execution framework (`internal/agent`) |
+| `internal/store` (`modernc.org/sqlite`) | `workflow_interrupts` persistence, single-writer contract, WAL |
+| `internal/runtime` seam + `internal/cli`/`internal/tui` | Deliver the interrupt prompt to the terminal / bubbletea client |
+| `net/http`+`go-chi/chi` + `tmaxmax/go-sse` (huma) | SSE transport of the interrupt prompt to the client under `tag serve` (NG1: terminal-only surface) |
 
 ---
 
@@ -267,8 +311,8 @@ def _utc_now() -> str:
 
 | Phase | Work | Days |
 |-------|------|------|
-| 1 | `interrupt()` / `InterruptException` / SQLite DDL | 1 |
-| 2 | Checkpoint integration (PRD-110), resume logic | 2 |
-| 3 | CLI commands, `--auto-approve`, timeout handling | 2 |
-| 4 | Integration tests, documentation | 1 |
+| 1 | `workflow.Interrupt` / `ErrInterrupt` sentinel / `InterruptGate` context value / `internal/store` DDL + migration | 1 |
+| 2 | Checkpoint integration (PRD-110 JSON state), resume re-execution + deterministic `stepID`, prompt emit over runtime seam | 2 |
+| 3 | `internal/cli` commands, `--auto-approve`, timeout handling (resume-poll) | 2 |
+| 4 | Table-driven + `-race` + integration tests, documentation | 1 |
 

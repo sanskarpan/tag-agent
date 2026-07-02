@@ -1,10 +1,12 @@
 # PRD-113: Time-Travel Debugging (`tag workflow rewind`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P2
 **Estimated Effort:** M (5-8 days)
 **Category:** Workflow State
-**Affects:** `workflow_engine.py + controller.py`
+**Affects:** `internal/queue + internal/cli + internal/tui`
 **Depends on:** PRD-110 (state serialization/checkpointing), PRD-112 (graph-based workflow engine)
 **Inspired by:** LangGraph time-travel debugging, Redux DevTools state inspector, Temporal.io workflow replay, rr (Mozilla record-replay)
 
@@ -116,9 +118,9 @@ TUI controls:
 | ID | Requirement |
 |----|------------|
 | FR-01 | `tag workflow rewind <session-id>` (no step) opens TUI showing all checkpoint steps with step number, timestamp, and top-3 changed keys. |
-| FR-02 | TUI step selection loads the state dict from PRD-110 `SqliteCheckpointer.load_step()` and renders it as paginated JSON. |
+| FR-02 | TUI step selection loads the state map from the PRD-110 `Checkpointer.LoadStep()` store interface and renders it as a paginated JSON view (bubbles viewport + glamour). |
 | FR-03 | `--fork` creates a new `workflow_sessions` row with `forked_from = original_session_id, forked_at_step = N`. |
-| FR-04 | Fork execution: load state at step N, apply optional `--patch`, resume `CompiledGraph.run()` from step N+1 using the forked state. |
+| FR-04 | Fork execution: load state at step N, apply optional `--patch`, resume `Graph.Run()` from step N+1 using the forked state. |
 | FR-05 | `--patch JSON` is applied as a shallow merge over the checkpoint state dict; conflicting keys overwritten. |
 | FR-06 | `--diff N1 N2` loads both checkpoint states, computes the symmetric difference of keys and changed values, and renders as a colored diff table. |
 | FR-07 | `tag workflow graph list` shows `forked_from` column for forked sessions. |
@@ -132,16 +134,20 @@ TUI controls:
 
 | ID | Requirement |
 |----|------------|
-| NFR-01 | TUI must work in any 80×24 terminal; use `rich` for rendering. |
-| NFR-02 | State diffs computed in-process without external diff tools. |
-| NFR-03 | Fork creates a new SQLite session row; does not copy checkpoint blobs (they remain referenced by original session ID + step). |
-| NFR-04 | `--patch` validated as valid JSON before fork; malformed JSON raises a clear error. |
+| NFR-01 | TUI must work in any 80×24 terminal; rendered with charmbracelet bubbletea v2 + lipgloss v2 + bubbles v2 (viewport/table) and glamour for JSON/markdown display. |
+| NFR-02 | State diffs computed in-process in pure Go (`reflect`/map comparison), without external diff tools. |
+| NFR-03 | Fork creates a new SQLite session row in the event-sourced `internal/queue` store; does not copy checkpoint blobs (they remain referenced by original session ID + step). |
+| NFR-04 | `--patch` validated as valid JSON via `encoding/json` before fork; malformed JSON returns a clear `error`. |
 
 ---
 
 ## 9. Technical Design
 
+Time-travel is built directly on the event-sourced state persisted by the bespoke SQLite-backed DAG scheduler in `internal/queue` (GO_MIGRATION_PLAN decision #5). Every workflow node transition is appended as an event row to the single `tag.sqlite3` store (`modernc.org/sqlite`, pure-Go, CGO_ENABLED=0), so any historical checkpoint can be reconstructed by replaying events up to a given step. Rewind, fork, and diff are read-side projections and re-executions over that durable event log; no second datastore is involved.
+
 ### 9.1 SQLite changes
+
+SQL DDL below is DB-neutral but targets `modernc.org/sqlite`. Writes go through the single-writer store layer (`internal/store`), which serializes read-modify-write with `gofrs/flock` + `os.Rename` atomic swaps.
 
 ```sql
 -- Add forked_from column to workflow_sessions:
@@ -149,47 +155,121 @@ ALTER TABLE workflow_sessions ADD COLUMN forked_from TEXT;
 ALTER TABLE workflow_sessions ADD COLUMN forked_at_step INTEGER;
 ```
 
-### 9.2 Python core
+### 9.2 Go core
 
-```python
-from __future__ import annotations
-import copy
-import json
-from typing import Optional
+The `TimeTravel` type lives in `internal/queue` (package `timetravel`). `Checkpointer` is the store-layer interface that reads/writes event-sourced step state; `Graph` is the compiled workflow from PRD-112. State is a `map[string]any` decoded from the persisted JSON event payload; cloning is explicit (marshal/unmarshal) rather than `copy.deepcopy`. Session IDs come from `google/uuid` (or `crypto/rand` hex).
 
-class TimeTravel:
-    def __init__(self, checkpointer, graph: "CompiledGraph") -> None:
-        self.cp = checkpointer
-        self.graph = graph
+```go
+package timetravel
 
-    def fork(self, session_id: str, step: int,
-             patch: Optional[dict] = None) -> str:
-        import uuid
-        # Load state at step
-        state = self.cp.load_step(session_id, step)
-        if state is None:
-            raise ValueError(f"No checkpoint at step {step} for session {session_id}")
-        if patch:
-            state = {**state, **patch}
-        # Create new forked session
-        fork_id = uuid.uuid4().hex[:8]
-        # Copy checkpoints from original up to step so the new session has history
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat()
-        # Run from fork point
-        final = self.graph.run(state, session_id=fork_id)
-        return fork_id
+import (
+	"context"
+	"encoding/json"
+	"fmt"
 
-    def diff(self, session_id: str, step1: int, step2: int) -> dict:
-        s1 = self.cp.load_step(session_id, step1) or {}
-        s2 = self.cp.load_step(session_id, step2) or {}
-        all_keys = set(s1.keys()) | set(s2.keys())
-        changes = {}
-        for k in all_keys:
-            v1, v2 = s1.get(k), s2.get(k)
-            if v1 != v2:
-                changes[k] = {"before": v1, "after": v2}
-        return changes
+	"github.com/google/uuid"
+)
+
+// State is the workflow state dict reconstructed from the event log.
+type State = map[string]any
+
+// Checkpointer is implemented by the internal/store event-sourced layer.
+type Checkpointer interface {
+	// LoadStep replays events up to step and returns the projected state,
+	// or (nil, nil) if no checkpoint exists at that step.
+	LoadStep(ctx context.Context, sessionID string, step int) (State, error)
+}
+
+// Graph is the compiled workflow engine (PRD-112).
+type Graph interface {
+	Run(ctx context.Context, state State, sessionID string) (State, error)
+}
+
+type TimeTravel struct {
+	cp    Checkpointer
+	graph Graph
+}
+
+func New(cp Checkpointer, graph Graph) *TimeTravel {
+	return &TimeTravel{cp: cp, graph: graph}
+}
+
+// Fork loads the state at step, applies an optional shallow patch, creates a
+// new forked session, and resumes execution from that point.
+func (tt *TimeTravel) Fork(ctx context.Context, sessionID string, step int, patch State) (string, error) {
+	state, err := tt.cp.LoadStep(ctx, sessionID, step)
+	if err != nil {
+		return "", err
+	}
+	if state == nil {
+		return "", fmt.Errorf("no checkpoint at step %d for session %s", step, sessionID)
+	}
+	// Explicit clone so we never mutate the replayed projection.
+	forked := cloneState(state)
+	for k, v := range patch { // shallow merge; conflicting keys overwritten
+		forked[k] = v
+	}
+	forkID := uuid.NewString()[:8]
+	// The store records forked_from / forked_at_step when the new session row
+	// is created; graph.Run appends fresh events under forkID from step+1.
+	if _, err := tt.graph.Run(ctx, forked, forkID); err != nil {
+		return "", err
+	}
+	return forkID, nil
+}
+
+// Diff computes the key-level state change between two steps in pure Go.
+func (tt *TimeTravel) Diff(ctx context.Context, sessionID string, step1, step2 int) (map[string]Change, error) {
+	s1, err := tt.cp.LoadStep(ctx, sessionID, step1)
+	if err != nil {
+		return nil, err
+	}
+	s2, err := tt.cp.LoadStep(ctx, sessionID, step2)
+	if err != nil {
+		return nil, err
+	}
+	changes := map[string]Change{}
+	for k := range union(s1, s2) {
+		v1, v2 := s1[k], s2[k]
+		if !equalJSON(v1, v2) {
+			changes[k] = Change{Before: v1, After: v2}
+		}
+	}
+	return changes, nil
+}
+
+type Change struct {
+	Before any `json:"before"`
+	After  any `json:"after"`
+}
+
+func cloneState(s State) State {
+	b, _ := json.Marshal(s)
+	var out State
+	_ = json.Unmarshal(b, &out)
+	if out == nil {
+		out = State{}
+	}
+	return out
+}
+
+func union(a, b State) map[string]struct{} {
+	keys := map[string]struct{}{}
+	for k := range a {
+		keys[k] = struct{}{}
+	}
+	for k := range b {
+		keys[k] = struct{}{}
+	}
+	return keys
+}
+
+// equalJSON compares two arbitrary decoded-JSON values by canonical marshaling.
+func equalJSON(a, b any) bool {
+	ba, _ := json.Marshal(a)
+	bb, _ := json.Marshal(b)
+	return string(ba) == string(bb)
+}
 ```
 
 ---
@@ -207,9 +287,9 @@ class TimeTravel:
 
 | Layer | Tests |
 |-------|-------|
-| Unit | `diff()` correctness on known state pair; `fork()` state patch application |
-| Integration | Fork from step 5; verify new session runs from step 6 with patched state |
-| TUI | Keyboard simulation: navigate steps, press `f`, verify fork created |
+| Unit | Table-driven Go tests for `Diff()` correctness on known state pairs and `Fork()` shallow-patch application; benchmarks (`testing.B`) for fork launch + state-render latency |
+| Integration | Fork from step 5 against an event-sourced `modernc.org/sqlite` fixture; verify new session runs from step 6 with patched state |
+| TUI | bubbletea `teatest` model harness: send key msgs to navigate steps, press `f`, assert fork created |
 
 ---
 
@@ -230,7 +310,7 @@ class TimeTravel:
 | Dependency | Reason |
 |-----------|--------|
 | PRD-110 state serialization | Checkpoint load/restore infrastructure |
-| PRD-112 graph-based workflow | `CompiledGraph.run()` for fork re-execution |
+| PRD-112 graph-based workflow | `Graph.Run()` for fork re-execution |
 
 ---
 
@@ -250,8 +330,8 @@ class TimeTravel:
 
 | Phase | Work | Days |
 |-------|------|------|
-| 1 | `TimeTravel.fork()`, `diff()`, SQLite session updates | 2 |
-| 2 | TUI inspector (navigation, state render, keyboard shortcuts) | 2 |
+| 1 | `TimeTravel.Fork()`, `Diff()`, event-sourced session updates in `internal/queue`/`internal/store` | 2 |
+| 2 | bubbletea TUI inspector (navigation, state render, keyboard shortcuts) | 2 |
 | 3 | CLI commands, `--patch` validation, `--diff` rendering | 2 |
 | 4 | Integration tests, documentation | 1 |
 

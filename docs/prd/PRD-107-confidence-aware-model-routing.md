@@ -1,10 +1,12 @@
 # PRD-107: Confidence-Aware Model Routing with Cost/Accuracy Pareto Optimization (`tag route optimize`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P3
 **Estimated Effort:** L (2-4 weeks)
 **Category:** Advanced Reasoning & Planning
-**Affects:** `routing.py`
+**Affects:** `internal/llm` (routing + provider interface), `internal/obs` (cost/token attribution)
 **Depends on:** PRD-027 (eval framework — historical accuracy signal), PRD-028 (sandbox — isolated cascade execution), PRD-013 (agent tracing — per-decision span attribution), PRD-034 (secret scanning — prompt content before routing), PRD-012 (budget enforcement — per-tier cost guard), PRD-031 (model fallback chains — cascade overlap concerns), PRD-043 (vector tool retrieval — task-type embedding), PRD-041 (OTel span cost attribution — routing decision spans), PRD-045 (LLM-as-judge — confidence scoring), PRD-101 (self-consistency ensemble — confidence signal source)
 **Inspired by:** FrugalGPT, LLM routing (Martian, RouteLLM), Pareto-optimal cascades
 
@@ -14,11 +16,11 @@
 
 Every TAG task dispatches to a fixed model determined by profile configuration. The `coder` profile always uses `claude-opus-4`; the `researcher` profile always uses `claude-sonnet-4-6`. This hardwired assignment is safe but economically wasteful: empirical evidence from FrugalGPT (Chen et al. 2023) and RouteLLM (Ong et al. 2024) demonstrates that 60–80% of queries in typical workloads can be resolved correctly by a smaller, cheaper model, and only the genuinely difficult tail requires the most capable (and expensive) model tier. TAG currently has no mechanism to make this distinction — every task pays the full premium regardless of whether it needed it.
 
-The Confidence-Aware Model Routing feature introduces `routing.py`, a new first-class module that implements two complementary routing strategies: **pre-routing** (decide which model tier to use *before* any LLM call, in under 10 ms, using a lightweight BERT-class classifier trained on historical eval results) and **cascading** (call the cheapest tier first, score the response confidence, escalate to the next tier only when confidence falls below a threshold). These two strategies map directly to RouteLLM's binary pre-routing approach and FrugalGPT's sequential confidence-gated cascade respectively. TAG implements both, selectable per-task via CLI flags.
+The Confidence-Aware Model Routing feature adds routing logic to `internal/llm` (with cost attribution in `internal/obs`), implementing two complementary routing strategies: **pre-routing** (decide which model tier to use *before* any LLM call, in under 10 ms, using a lightweight embedding classifier trained on historical eval results) and **cascading** (call the cheapest tier first, score the response confidence, escalate to the next tier only when confidence falls below a threshold). These two strategies map directly to RouteLLM's binary pre-routing approach and FrugalGPT's sequential confidence-gated cascade respectively. TAG implements both, selectable per-task via CLI flags.
 
-The routing system is trained continuously on TAG's own historical data. Every eval result stored by `eval_framework.py` (PRD-027) records which model answered which task type correctly. The router trains on this ground truth: a SentenceBERT classifier learns to predict, given a new task's embedding, the probability that each model tier will answer correctly. This produces a calibrated confidence score per tier per query. The `tag route optimize` command reads historical eval results, fits the classifier, and emits a Pareto-optimal routing policy: for each accuracy target (e.g., 0.90), it computes the model mix that minimizes expected cost while hitting that target. The result is stored as a policy in SQLite and applied automatically to subsequent runs.
+The routing system is trained continuously on TAG's own historical data. Every eval result stored by the eval framework (PRD-027) records which model answered which task type correctly. The router trains on this ground truth: a logistic-regression classifier over task-prompt embeddings (from the `internal/memory` `Embedder`) learns to predict, given a new task's embedding, the probability that each model tier will answer correctly. This produces a calibrated confidence score per tier per query. The `tag route optimize` command reads historical eval results, fits the classifier, and emits a Pareto-optimal routing policy: for each accuracy target (e.g., 0.90), it computes the model mix that minimizes expected cost while hitting that target. The result is stored as a policy in the `internal/store` SQLite database and applied automatically to subsequent runs.
 
-Cascading (`tag route cascade`) is the reliability-first complement: call `haiku` → if confidence < threshold, call `sonnet` → if confidence < threshold, call `opus`. Unlike PRD-031's fallback chains (which trigger on *error conditions* like 429 or context overflow), cascading triggers on *quality conditions* — low confidence in the answer. Each cascade tier scores its own response using one of three confidence signals: (a) self-reported logit-based confidence markers parsed from structured output, (b) embedding-space consistency with self-consistency samples from PRD-101, or (c) a lightweight DistilBERT quality regression. The cascade exits as soon as a tier's response clears the threshold, paying only for the tiers actually invoked.
+Cascading (`tag route cascade`) is the reliability-first complement: call `haiku` → if confidence < threshold, call `sonnet` → if confidence < threshold, call `opus`. Unlike PRD-031's fallback chains (which trigger on *error conditions* like 429 or context overflow), cascading triggers on *quality conditions* — low confidence in the answer. Each cascade tier scores its own response using one of three confidence signals: (a) self-reported logit-based confidence markers parsed from structured output — where usable, per-token logprobs come from the provider API (OpenAI exposes them; Anthropic does not expose them uniformly, so this signal degrades to structured self-report), (b) embedding-space consistency with self-consistency samples from PRD-101, or (c) a lightweight quality-regression scorer (pure-Go, build-tag backend). The cascade exits as soon as a tier's response clears the threshold, paying only for the tiers actually invoked.
 
 The `tag route stats` command surfaces the operational picture: routing policy in effect, per-tier invocation rates, cost saved vs. always-using-the-most-expensive-model, and per-task-type accuracy by tier. Together, `optimize`, `cascade`, and `stats` close the loop: engineers set an accuracy target, the optimizer finds the cheapest policy that hits it, the cascade enforces it at runtime, and stats proves it delivered.
 
@@ -32,7 +34,7 @@ A `tag run --profile coder "add a docstring to this function"` dispatches to `cl
 
 ### 2.2 No Feedback Loop Between Eval Results and Routing Decisions
 
-`eval_framework.py` (PRD-027) records, for every eval suite run, whether each model succeeded on each task type. This dataset is a natural training signal for a router: if `claude-haiku-4-5` achieves 0.93 accuracy on `add-docstring` tasks but only 0.61 accuracy on `security-audit` tasks, the router should route `add-docstring` to Haiku and `security-audit` to Opus. But today this signal is never consumed by the routing layer. Eval results accumulate in `eval_results` and go nowhere. The routing decision for every task remains hardcoded in the profile YAML, unchanged by any empirical evidence.
+The eval framework (PRD-027) records, for every eval suite run, whether each model succeeded on each task type. This dataset is a natural training signal for a router: if `claude-haiku-4-5` achieves 0.93 accuracy on `add-docstring` tasks but only 0.61 accuracy on `security-audit` tasks, the router should route `add-docstring` to Haiku and `security-audit` to Opus. But today this signal is never consumed by the routing layer. Eval results accumulate in `eval_results` and go nowhere. The routing decision for every task remains hardcoded in the profile YAML, unchanged by any empirical evidence.
 
 ### 2.3 Cascade Failure Modes Are Not Separated from Quality Failure Modes
 
@@ -53,7 +55,7 @@ PRD-031 (Model Fallback Chains) handles routing on *error*: context overflow, 42
 | G5 | `tag route stats --json` reports per-profile routing decisions, tier invocation rates, estimated cost vs. always-opus baseline, and per-task-type accuracy by tier. |
 | G6 | Every routing decision is written to the `routing_decisions` SQLite table for audit, analysis, and future retraining. |
 | G7 | The classifier is retrained automatically when `tag route optimize` is run; no background daemon or separate training job is required. |
-| G8 | `tag route optimize` integrates with `budget.py` (PRD-012): it computes projected monthly cost under the recommended policy and displays it before writing the policy. |
+| G8 | `tag route optimize` integrates with the `internal/obs` budget gate (PRD-012): it computes projected monthly cost under the recommended policy and displays it before writing the policy. |
 | G9 | All cascade calls are attributed to separate child spans under the parent run span, with `routing.tier`, `routing.confidence`, and `routing.escalated` OTel attributes (PRD-013, PRD-041). |
 | G10 | The cascade is architecturally independent of PRD-031 fallback chains; the two co-exist without conflict. A cascade escalation does not consume a fallback hop. |
 | G11 | `tag route calibrate --profile <name>` runs a held-out accuracy check on the current routing policy, reporting PGR (Performance Gap Recovered) and cost reduction metrics. |
@@ -304,26 +306,26 @@ routing:
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-01 | `routing.py` exports a `ModelRouter` class with a `route(query: str, task_type: str) -> ModelChoice` method that returns in under 10 ms using a pre-loaded SentenceBERT classifier. | P0 |
-| FR-02 | `ModelRouter.route()` returns `ModelChoice(model_id, confidence, policy_id, reason)`. If no policy is active for the profile, it returns the profile's default model. | P0 |
-| FR-03 | Every call to `ModelRouter.route()` writes a row to `routing_decisions` table including `query_hash`, `task_type`, `policy_id`, `chosen_model_id`, `confidence_score`, `tier_index`, `latency_ms`, and `created_at`. | P0 |
-| FR-04 | `FrugalCascade` class accepts a list of `(model_id, scorer_fn, threshold)` tuples. It calls each tier in order, stopping when `scorer_fn(response) >= threshold` or all tiers exhausted. | P0 |
-| FR-05 | Three scorer implementations are provided: `MajorityVoteScorer` (uses N=`self_consistency.n_samples` parallel calls, returns fraction agreeing with modal answer), `EmbeddingConsistencyScorer` (uses `sentence-transformers`, returns cosine similarity of response to centroid of N=5 samples), `DistilBERTQualityScorer` (loads `distilbert-base-uncased` fine-tuned on quality labels, returns regression score). | P0 |
-| FR-06 | Auto-selection of scorer: if the response is valid JSON or a single-token discrete value, use `MajorityVoteScorer`; otherwise use `EmbeddingConsistencyScorer`. `DistilBERTQualityScorer` is only used when explicitly set via `--confidence-mode distilbert` or config. | P1 |
-| FR-07 | `RoutingPolicyTrainer.fit(eval_results: list[EvalResult]) -> RoutingPolicy` trains a `sklearn.linear_model.LogisticRegression` classifier on SentenceBERT embeddings of task prompts, with labels = `(model_id, correct: bool)`. Requires minimum `min_eval_cases` (default: 20) samples per tier. | P0 |
-| FR-08 | `RoutingPolicyTrainer.pareto_curve(models, eval_results) -> list[ParetoPoint]` computes the cost/accuracy Pareto frontier by sweeping the confidence threshold in 0.01 increments from 0.50 to 0.99, evaluating predicted accuracy and expected cost at each point. | P1 |
-| FR-09 | `tag route optimize` reads from `eval_results` and `eval_cases` tables (PRD-027 schema). If fewer than `min_eval_cases` rows exist for the target profile, it prints an error and exits non-zero. | P0 |
-| FR-10 | The trained policy is serialized to JSON and stored in `routing_policies` table with fields: `id`, `profile`, `accuracy_target`, `accuracy_estimate`, `policy_json`, `pgr`, `cost_per_task_usd`, `baseline_cost_usd`, `eval_cases_used`, `created_at`, `active`. Only one policy per profile may be `active = 1`. | P0 |
+| FR-01 | `internal/llm` exports a `ModelRouter` with a `Route(ctx, query, taskType string) -> ModelChoice` method that returns in under 10 ms using a pre-loaded embedding classifier (`internal/memory` `Embedder` + in-memory logistic-regression weights). | P0 |
+| FR-02 | `ModelRouter.Route()` returns `ModelChoice{ModelID, Confidence, PolicyID, Reason}`. If no policy is active for the profile, it returns the profile's default model. | P0 |
+| FR-03 | Every call to `ModelRouter.Route()` writes a row to `routing_decisions` including `query_hash`, `task_type`, `policy_id`, `chosen_model_id`, `confidence_score`, `tier_index`, `latency_ms`, and `created_at`, through the single `internal/store` writer. | P0 |
+| FR-04 | The `FrugalCascade` struct accepts a slice of tiers `{model func, scorer, threshold}`. It calls each tier in order, stopping when `scorer.Score(...) >= threshold` or all tiers exhausted. | P0 |
+| FR-05 | Three scorer implementations are provided: `MajorityVoteScorer` (issues N=`classifier.majority_n_samples` concurrent `Stream` calls via `errgroup`, returns the fraction agreeing with the modal answer), `EmbeddingConsistencyScorer` (uses the `Embedder` + an in-Go cosine loop, returns cosine similarity of the response to the centroid of N=5 samples), `QualityRegressionScorer` (a pure-Go text classifier via the build-tag `hugot`/`cybertron` backend, returns a regression score). | P0 |
+| FR-06 | Auto-selection of scorer: if the response is valid JSON or a single-token discrete value, use `MajorityVoteScorer`; otherwise use `EmbeddingConsistencyScorer`. `QualityRegressionScorer` is only used when explicitly set via `--confidence-mode distilbert` or config. | P1 |
+| FR-07 | `RoutingPolicyTrainer.Fit(evalResults []EvalResult) -> RoutingPolicy` trains a logistic-regression classifier (hand-rolled gradient descent over `gonum` vectors) on `Embedder` embeddings of task prompts, with labels = `(model_id, correct bool)`. Requires a minimum of `min_eval_cases` (default: 20) samples per tier. | P0 |
+| FR-08 | `RoutingPolicyTrainer.ParetoCurve(models, evalResults) -> []ParetoPoint` computes the cost/accuracy Pareto frontier by sweeping the confidence threshold in 0.01 increments from 0.50 to 0.99, evaluating predicted accuracy and expected cost at each point. | P1 |
+| FR-09 | `tag route optimize` reads from `eval_results` and `eval_cases` (PRD-027 schema). If fewer than `min_eval_cases` rows exist for the target profile, it prints an error and exits non-zero. | P0 |
+| FR-10 | The trained policy is serialized to JSON and stored in `routing_policies` with fields: `id`, `profile`, `accuracy_target`, `accuracy_estimate`, `policy_json`, `pgr`, `cost_per_task_usd`, `baseline_cost_usd`, `eval_cases_used`, `created_at`, `active`. The classifier weights are stored as plain JSON float arrays inside `policy_json` (no binary/pickle blob). Only one policy per profile may be `active = 1`. | P0 |
 | FR-11 | `tag route optimize --dry-run` computes and displays the policy but does not write to SQLite. Exit code 0. | P1 |
 | FR-12 | Cascade escalations are reported as WARNING-level log lines (matching PRD-031's substitution logging convention): `[routing] escalated from {from_model} to {to_model} (confidence={score:.3f} < threshold={threshold:.3f})`. | P1 |
 | FR-13 | Each tier in a cascade run emits a child span with attributes `routing.tier=<int>`, `routing.confidence=<float>`, `routing.escalated=<bool>`, `routing.model_id=<str>`, under the parent run span (PRD-013). | P1 |
 | FR-14 | `tag route stats` reads from `routing_decisions` table, aggregates by `(profile, model_id)`, computes invocation counts, escalation rates, total cost, and PGR/APGR metrics, and outputs the result in text or JSON. | P1 |
 | FR-15 | `tag route calibrate` splits `eval_results` for the profile into train/test (80/20 default), refits the classifier on the train split, evaluates on the test split, and reports: test accuracy by tier, calibration error (ECE), PGR, and APGR. | P1 |
-| FR-16 | When `routing.auto_route: true` is set in a profile and a matching active policy exists, `controller.py`'s run dispatch path calls `ModelRouter.route()` before constructing the Hermes call, and substitutes the returned `model_id` into the route. | P0 |
+| FR-16 | When `routing.auto_route: true` is set in a profile and a matching active policy exists, the `internal/agent` / `internal/runtime` run-dispatch path calls `ModelRouter.Route()` before constructing the provider `Request`, and substitutes the returned `model_id` into the route. | P0 |
 | FR-17 | `tag route policy delete <policy-id>` sets `active = 0` and `deleted_at = now()` on the policy row (soft delete). If the deleted policy was the active policy for its profile, `auto_route` is effectively disabled until a new `tag route optimize` is run. | P1 |
 | FR-18 | The cascade hard-caps at 5 tiers regardless of `--fallback-to` count. If more than 5 `--fallback-to` flags are provided, the command errors with a clear message. | P0 |
-| FR-19 | `security.py` (PRD-034) secret-scan the task text before routing. Routing decisions are never written with raw task text; only a SHA-256 hash of the task is stored in `query_hash`. | P0 |
-| FR-20 | `budget.py` (PRD-012) is consulted before each cascade tier: if the cumulative cascade cost would exceed the active budget, the cascade aborts and returns the highest-confidence response seen so far. | P1 |
+| FR-19 | `internal/security` (PRD-034) secret-scans the task text before routing. Routing decisions are never written with raw task text; only a `crypto/sha256` hash of the task is stored in `query_hash`. | P0 |
+| FR-20 | The `internal/obs` budget gate (PRD-012) is consulted before each cascade tier: if the cumulative cascade cost would exceed the active budget, the cascade aborts and returns the highest-confidence response seen so far. | P1 |
 
 ---
 
@@ -331,28 +333,28 @@ routing:
 
 | ID | Requirement | Target |
 |----|-------------|--------|
-| NFR-01 | Pre-routing classifier inference (SentenceBERT embedding + logistic regression predict) must complete in under 10 ms p99 on a MacBook M-series CPU with the model loaded in memory. | < 10 ms p99 |
-| NFR-02 | Classifier training (`RoutingPolicyTrainer.fit`) must complete in under 30 seconds on 1000 eval cases on a MacBook M-series CPU. | < 30 s |
-| NFR-03 | `routing.py` must not import `torch`, `sentence_transformers`, or `sklearn` at module load time. All heavy imports happen inside the `ModelRouter.__init__` call (lazy import pattern). | No import-time overhead |
-| NFR-04 | When `routing.auto_route: false` (the default), the routing module adds zero measurable overhead to `tag run`. | p50 overhead < 1 ms |
-| NFR-05 | `routing_decisions` table writes use WAL-mode SQLite with a 5-second busy timeout (matching `open_db()` conventions). No routing decision write may block `tag run` for more than 5 seconds. | < 5 s write block |
-| NFR-06 | The SentenceBERT model used for task embedding is `all-MiniLM-L6-v2` (22 MB) by default. The DistilBERT scorer uses `distilbert-base-uncased` (67 MB). Both are cached in `~/.tag/models/` on first use. | First-use download; cached thereafter |
-| NFR-07 | All routing decisions written to SQLite are attributed with `run_id` where available, enabling foreign-key join to the `runs` table. | 100% attribution |
-| NFR-08 | `routing.py` has test coverage ≥ 85% as measured by `pytest --cov`. | ≥ 85% coverage |
-| NFR-09 | The `FrugalCascade` class must be thread-safe for concurrent cascade invocations (e.g., from `queue_worker.py`). Use per-invocation state; no shared mutable class-level state. | Thread-safe |
+| NFR-01 | Pre-routing classifier inference (embedding + logistic-regression predict) must complete in under 10 ms p99 on a MacBook M-series CPU with the embedder loaded in memory. (With a provider embedding API this excludes the network embed; the offline `cybertron` build-tag embedder meets it end-to-end.) | < 10 ms p99 |
+| NFR-02 | Classifier training (`RoutingPolicyTrainer.Fit`) must complete in under 30 seconds on 1000 eval cases on a MacBook M-series CPU. | < 30 s |
+| NFR-03 | Because everything compiles into the single binary, there is no import-time cost: the heavy `Embedder` and any build-tag model backend are initialized lazily inside `NewModelRouter`, not at package init; `routing`-adjacent packages must not force embedder init on import. | No init-time overhead |
+| NFR-04 | When `routing.auto_route: false` (the default), the routing path adds zero measurable overhead to `tag run` (guarded by an early return before any router construction). | p50 overhead < 1 ms |
+| NFR-05 | `routing_decisions` writes go through the single `internal/store` writer (modernc.org/sqlite, WAL, `_busy_timeout=5000`). No routing decision write may block `tag run` for more than 5 seconds. | < 5 s write block |
+| NFR-06 | The default embedding model is `all-MiniLM-L6-v2` (22 MB) via the `Embedder` (provider API, or offline `cybertron` build tag). The optional quality-regression scorer uses a small pure-Go text classifier (`hugot`/`cybertron`, ~67 MB). Local model files are cached under `~/.tag/models/` on first use. | First-use download; cached thereafter |
+| NFR-07 | All routing decisions written to SQLite are attributed with `run_id` where available, enabling a foreign-key join to the `runs` table. | 100% attribution |
+| NFR-08 | The routing packages have test coverage ≥ 85% as measured by `go test -cover`. | ≥ 85% coverage |
+| NFR-09 | `FrugalCascade` must be safe for concurrent cascade invocations (e.g., from `internal/queue` workers). Use per-invocation state passed by value/receiver; no shared mutable package-level state. | Goroutine-safe |
 | NFR-10 | All user-facing cost figures are displayed to 4 decimal places in USD and prefixed with `$`. | Consistent formatting |
 
 ---
 
 ## 9. Technical Design
 
-### 9.1 New File: `src/tag/routing.py`
+### 9.1 New Package: `internal/llm/routing`
 
-This module is the sole owner of all routing and cascade logic. It does not import from `controller.py` to avoid circular dependencies; `controller.py` imports from `routing.py`.
+Routing and cascade logic live in `internal/llm` (`routing.go`, `cascade.go`, `scorer.go`, `trainer.go`), with cost/token attribution delegated to `internal/obs`. The router depends on `internal/memory` (`Embedder`), `internal/store` (persistence), `internal/security` (pre-route secret scan), and `internal/obs` (pricing table + spans). It does not depend on `internal/agent` or `internal/cli`; those depend on it — the same acyclic direction as the Python `controller.py` → `routing.py` boundary.
 
 ### 9.2 SQLite DDL
 
-Added to `open_db()` schema migration in `controller.py`:
+Added as numbered migrations in `internal/store/migrate/` (applied by the single-writer migrator):
 
 ```sql
 -- Stores fitted routing policies per profile
@@ -416,500 +418,510 @@ CREATE TABLE IF NOT EXISTS cascade_steps (
 CREATE INDEX IF NOT EXISTS idx_cs_decision ON cascade_steps(decision_id, tier_index);
 ```
 
-### 9.3 Core Dataclasses
+### 9.3 Core Structs
 
-```python
-# src/tag/routing.py
-from __future__ import annotations
-import hashlib
-import json
-import time
-import uuid
-from dataclasses import dataclass, field
-from typing import Callable, Literal
+Python dataclasses map to Go structs; `Optional[float]` fields become `*float64` (nil = "final fallback tier, always accept"); JSON serialization uses `encoding/json` struct tags.
 
-ConfidenceMode = Literal["majority", "embedding", "distilbert", "auto"]
+```go
+// internal/llm/routing.go
+package llm
 
+type ConfidenceMode string
 
-@dataclass
-class ModelChoice:
-    model_id: str
-    confidence: float          # 0.0–1.0; 1.0 when no policy active (default routing)
-    policy_id: str | None
-    tier_index: int
-    reason: str                # "policy", "default", "cascade-escalation"
-    latency_ms: int
+const (
+	ModeMajority   ConfidenceMode = "majority"
+	ModeEmbedding  ConfidenceMode = "embedding"
+	ModeDistilBERT ConfidenceMode = "distilbert" // pure-Go quality-regression backend
+	ModeAuto       ConfidenceMode = "auto"
+)
 
+type ModelChoice struct {
+	ModelID    string
+	Confidence float64 // 0.0–1.0; 1.0 when no policy active (default routing)
+	PolicyID   string  // "" when routed by default
+	TierIndex  int
+	Reason     string        // "policy","default","cascade-escalation"
+	Latency    time.Duration
+}
 
-@dataclass
-class CascadeStep:
-    tier_index: int
-    model_id: str
-    confidence: float
-    confidence_mode: ConfidenceMode
-    threshold: float
-    escalated: bool
-    response: str
-    response_hash: str
-    input_tokens: int
-    output_tokens: int
-    cost_usd: float
-    latency_ms: int
+type CascadeStep struct {
+	TierIndex      int
+	ModelID        string
+	Confidence     float64
+	ConfidenceMode ConfidenceMode
+	Threshold      float64
+	Escalated      bool
+	Response       string
+	ResponseHash   string
+	InputTokens    int
+	OutputTokens   int
+	CostUSD        float64
+	Latency        time.Duration
+}
 
+type CascadeResult struct {
+	FinalResponse   string
+	FinalModelID    string
+	Steps           []CascadeStep
+	TotalCostUSD    float64
+	TotalLatency    time.Duration
+	TiersInvoked    int
+	EscalationCount int
+}
 
-@dataclass
-class CascadeResult:
-    final_response: str
-    final_model_id: str
-    steps: list[CascadeStep]
-    total_cost_usd: float
-    total_latency_ms: int
-    tiers_invoked: int
-    escalation_count: int
+type ParetoPoint struct {
+	ConfidenceThreshold float64
+	AccuracyEstimate    float64
+	CostPerTaskUSD      float64
+	ModelDistribution   map[string]float64 // model_id -> fraction of queries
+	PGR                 float64
+}
 
+type PolicyTier struct {
+	ModelID             string   `json:"model_id"`
+	ConfidenceThreshold *float64 `json:"confidence_threshold"` // nil = final fallback
+	EstimatedFraction   float64  `json:"estimated_fraction"`
+	CostPer1MOutputUSD  float64  `json:"-"`
+}
 
-@dataclass
-class ParetoPoint:
-    confidence_threshold: float
-    accuracy_estimate: float
-    cost_per_task_usd: float
-    model_distribution: dict[str, float]  # model_id -> fraction of queries
-    pgr: float
+type RoutingPolicy struct {
+	ID               string       `json:"id"`
+	Profile          string       `json:"-"`
+	AccuracyTarget   float64      `json:"-"`
+	AccuracyEstimate float64      `json:"-"`
+	Tiers            []PolicyTier `json:"tiers"`
+	PGR              float64      `json:"-"`
+	APGR             float64      `json:"-"`
+	CostPerTaskUSD   float64      `json:"-"`
+	BaselineCostUSD  float64      `json:"-"`
+	EvalCasesUsed    int          `json:"-"`
+	CreatedAt        string       `json:"-"`
+	// ClassifierWeights holds the fitted logistic-regression weights per tier,
+	// serialized as plain JSON float arrays (no pickle/gob).
+	ClassifierWeights map[string][]float64 `json:"classifier_weights"`
+}
 
-
-@dataclass
-class RoutingPolicy:
-    id: str
-    profile: str
-    accuracy_target: float
-    accuracy_estimate: float
-    tiers: list[PolicyTier]
-    pgr: float
-    apgr: float
-    cost_per_task_usd: float
-    baseline_cost_usd: float
-    eval_cases_used: int
-    created_at: str
-
-    def to_json(self) -> str:
-        return json.dumps({
-            "id": self.id,
-            "tiers": [
-                {
-                    "model_id": t.model_id,
-                    "confidence_threshold": t.confidence_threshold,
-                    "estimated_fraction": t.estimated_fraction,
-                }
-                for t in self.tiers
-            ],
-        })
-
-
-@dataclass
-class PolicyTier:
-    model_id: str
-    confidence_threshold: float | None  # None = final fallback tier (always accept)
-    estimated_fraction: float
-    cost_per_1m_output_usd: float
+func (p *RoutingPolicy) MarshalJSON() ([]byte, error) { /* json.Marshal of id/tiers/weights */ }
 ```
 
-### 9.4 `ModelRouter` Class
+### 9.4 `ModelRouter`
 
-```python
-class ModelRouter:
-    """
-    Pre-routing classifier: given a task text, selects the cheapest model tier
-    predicted to answer correctly at or above the policy's accuracy target.
+Pre-routing classifier: given a task text, selects the cheapest model tier predicted to answer correctly at or above the policy's accuracy target. The `sklearn` classifier becomes a small in-process `logreg` (weights loaded from the policy JSON); the SentenceBERT encoder becomes the injected `Embedder`.
 
-    Lazy-imports sentence_transformers and sklearn on first construction.
-    """
+```go
+// logreg holds fitted per-tier weights; PredictProba is a plain sigmoid(w·x+b).
+type logreg struct {
+	weights map[string][]float64 // model_id -> [w0..wN, bias]
+}
 
-    def __init__(self, policy: RoutingPolicy) -> None:
-        # Lazy imports to avoid module-load overhead
-        from sentence_transformers import SentenceTransformer  # type: ignore
-        from sklearn.linear_model import LogisticRegression   # type: ignore
-        self._policy = policy
-        self._encoder = SentenceTransformer("all-MiniLM-L6-v2")
-        self._clf: LogisticRegression | None = None  # set by load_classifier()
+func (c *logreg) predict(modelID string, emb []float32) float64 {
+	w := c.weights[modelID]
+	z := w[len(w)-1] // bias
+	for i, x := range emb {
+		z += w[i] * float64(x)
+	}
+	return 1.0 / (1.0 + math.Exp(-z))
+}
 
-    def load_classifier(self, clf: object) -> None:
-        self._clf = clf
+type ModelRouter struct {
+	policy   RoutingPolicy
+	embedder memory.Embedder
+	clf      *logreg // nil until loadClassifier(); rebuilt from policy JSON
+}
 
-    def route(self, query: str, task_type: str | None = None) -> ModelChoice:
-        t0 = time.perf_counter()
-        if self._clf is None:
-            # No trained classifier; fall back to cheapest tier with confidence=1.0
-            tier = self._policy.tiers[0]
-            return ModelChoice(
-                model_id=tier.model_id,
-                confidence=1.0,
-                policy_id=self._policy.id,
-                tier_index=0,
-                reason="policy-no-classifier",
-                latency_ms=int((time.perf_counter() - t0) * 1000),
-            )
-        embedding = self._encoder.encode([query])  # shape (1, 384)
-        # clf predicts P(correct | tier) for each tier; pick cheapest above threshold
-        for i, tier in enumerate(self._policy.tiers):
-            proba = self._clf.predict_proba(embedding)[0]
-            confidence = float(proba[i])
-            if tier.confidence_threshold is None or confidence >= tier.confidence_threshold:
-                return ModelChoice(
-                    model_id=tier.model_id,
-                    confidence=confidence,
-                    policy_id=self._policy.id,
-                    tier_index=i,
-                    reason="policy",
-                    latency_ms=int((time.perf_counter() - t0) * 1000),
-                )
-        # Exhausted all tiers with thresholds; use final fallback
-        last = self._policy.tiers[-1]
-        return ModelChoice(
-            model_id=last.model_id,
-            confidence=0.0,
-            policy_id=self._policy.id,
-            tier_index=len(self._policy.tiers) - 1,
-            reason="policy-fallback",
-            latency_ms=int((time.perf_counter() - t0) * 1000),
-        )
+func NewModelRouter(policy RoutingPolicy, embedder memory.Embedder) *ModelRouter {
+	r := &ModelRouter{policy: policy, embedder: embedder}
+	if len(policy.ClassifierWeights) > 0 {
+		r.clf = &logreg{weights: policy.ClassifierWeights}
+	}
+	return r
+}
+
+func (r *ModelRouter) Route(ctx context.Context, query, taskType string) (ModelChoice, error) {
+	t0 := time.Now()
+	if r.clf == nil {
+		// No trained classifier; fall back to cheapest tier with confidence=1.0.
+		t := r.policy.Tiers[0]
+		return ModelChoice{ModelID: t.ModelID, Confidence: 1.0, PolicyID: r.policy.ID,
+			TierIndex: 0, Reason: "policy-no-classifier", Latency: time.Since(t0)}, nil
+	}
+	emb, err := r.embedder.Embed(ctx, query) // 384-dim MiniLM
+	if err != nil {
+		return ModelChoice{}, err
+	}
+	for i, tier := range r.policy.Tiers {
+		conf := r.clf.predict(tier.ModelID, emb) // P(correct | tier)
+		if tier.ConfidenceThreshold == nil || conf >= *tier.ConfidenceThreshold {
+			return ModelChoice{ModelID: tier.ModelID, Confidence: conf, PolicyID: r.policy.ID,
+				TierIndex: i, Reason: "policy", Latency: time.Since(t0)}, nil
+		}
+	}
+	last := r.policy.Tiers[len(r.policy.Tiers)-1]
+	return ModelChoice{ModelID: last.ModelID, Confidence: 0, PolicyID: r.policy.ID,
+		TierIndex: len(r.policy.Tiers) - 1, Reason: "policy-fallback", Latency: time.Since(t0)}, nil
+}
 ```
 
-### 9.5 `FrugalCascade` Class
+### 9.5 `FrugalCascade`
 
-```python
-class FrugalCascade:
-    """
-    Sequential confidence-gated cascade.
-    Calls model tiers in order, stopping when confidence >= threshold.
-    Each (model_fn, scorer_fn, threshold) tuple is a tier.
-    """
+Sequential confidence-gated cascade. Calls model tiers in order, stopping when `confidence >= threshold`. Each tier is a `{Model, Scorer, Threshold}` triple. `Model` runs one turn through the `internal/llm` provider `Stream(ctx, Request)`; token counts feed `internal/obs` cost attribution. The cascade holds no shared mutable state (NFR-09) and honours `ctx` cancellation.
 
-    def __init__(
-        self,
-        tiers: list[tuple[Callable[[str], tuple[str, int, int, float]], ConfidenceScorer, float]],
-    ) -> None:
-        if len(tiers) > 5:
-            raise ValueError("FrugalCascade: maximum 5 tiers supported")
-        self._tiers = tiers
+```go
+type ModelFunc func(ctx context.Context, task string) (resp string, inTok, outTok int, cost float64, err error)
 
-    def run(self, task: str, budget_guard: Callable[[float], bool] | None = None) -> CascadeResult:
-        steps: list[CascadeStep] = []
-        total_cost = 0.0
-        total_latency = 0
-        best_response = ""
-        best_confidence = 0.0
+type CascadeTier struct {
+	ModelID   string
+	Model     ModelFunc
+	Scorer    ConfidenceScorer
+	Threshold float64
+}
 
-        for i, (model_fn, scorer, threshold) in enumerate(self._tiers):
-            t0 = time.perf_counter()
-            response, input_tok, output_tok, cost = model_fn(task)
-            latency_ms = int((time.perf_counter() - t0) * 1000)
-            total_cost += cost
-            total_latency += latency_ms
+type FrugalCascade struct{ tiers []CascadeTier }
 
-            if budget_guard is not None and not budget_guard(total_cost):
-                # Over budget — return best so far
-                break
+func NewFrugalCascade(tiers []CascadeTier) (*FrugalCascade, error) {
+	if len(tiers) > 5 {
+		return nil, fmt.Errorf("FrugalCascade: maximum 5 tiers supported, got %d", len(tiers))
+	}
+	return &FrugalCascade{tiers: tiers}, nil
+}
 
-            confidence = scorer.score(task, response)
-            response_hash = hashlib.sha256(response.encode()).hexdigest()
-            is_last = i == len(self._tiers) - 1
-            escalated = (confidence < threshold) and not is_last
+// budgetGuard reports whether the running total is still within budget.
+func (c *FrugalCascade) Run(ctx context.Context, task string, budgetGuard func(totalCost float64) bool) (CascadeResult, error) {
+	var (
+		steps    []CascadeStep
+		total    float64
+		totalLat time.Duration
+		best     string
+		bestConf float64
+	)
+	for i, tier := range c.tiers {
+		t0 := time.Now()
+		resp, inTok, outTok, cost, err := tier.Model(ctx, task)
+		if err != nil {
+			return CascadeResult{}, err
+		}
+		lat := time.Since(t0)
+		total += cost
+		totalLat += lat
 
-            step = CascadeStep(
-                tier_index=i,
-                model_id=model_fn.__name__,  # caller sets __name__ to model_id
-                confidence=confidence,
-                confidence_mode=scorer.mode,
-                threshold=threshold,
-                escalated=escalated,
-                response=response,
-                response_hash=response_hash,
-                input_tokens=input_tok,
-                output_tokens=output_tok,
-                cost_usd=cost,
-                latency_ms=latency_ms,
-            )
-            steps.append(step)
+		if budgetGuard != nil && !budgetGuard(total) {
+			break // over budget — return best so far
+		}
 
-            if confidence >= confidence:
-                best_response = response
-                best_confidence = confidence
+		conf := tier.Scorer.Score(ctx, task, resp)
+		isLast := i == len(c.tiers)-1
+		escalated := conf < tier.Threshold && !isLast
 
-            if not escalated:
-                best_response = response
-                break
+		steps = append(steps, CascadeStep{
+			TierIndex: i, ModelID: tier.ModelID, Confidence: conf,
+			ConfidenceMode: tier.Scorer.Mode(), Threshold: tier.Threshold, Escalated: escalated,
+			Response: resp, ResponseHash: sha256Hex(resp),
+			InputTokens: inTok, OutputTokens: outTok, CostUSD: cost, Latency: lat,
+		})
 
-        escalation_count = sum(1 for s in steps if s.escalated)
-        return CascadeResult(
-            final_response=best_response,
-            final_model_id=steps[-1].model_id if steps else "",
-            steps=steps,
-            total_cost_usd=total_cost,
-            total_latency_ms=total_latency,
-            tiers_invoked=len(steps),
-            escalation_count=escalation_count,
-        )
+		if conf >= bestConf { // track best-so-far for budget/abort paths
+			best, bestConf = resp, conf
+		}
+		if !escalated {
+			best = resp
+			break
+		}
+	}
+
+	escalations := 0
+	finalModel := ""
+	for _, s := range steps {
+		if s.Escalated {
+			escalations++
+		}
+	}
+	if len(steps) > 0 {
+		finalModel = steps[len(steps)-1].ModelID
+	}
+	return CascadeResult{
+		FinalResponse: best, FinalModelID: finalModel, Steps: steps,
+		TotalCostUSD: total, TotalLatency: totalLat,
+		TiersInvoked: len(steps), EscalationCount: escalations,
+	}, nil
+}
 ```
 
 ### 9.6 Confidence Scorers
 
-```python
-class ConfidenceScorer:
-    mode: ConfidenceMode
+`ConfidenceScorer` is an interface. `SampleFunc` produces N additional samples through the `internal/llm` provider (concurrent via `errgroup`).
 
-    def score(self, prompt: str, response: str) -> float:
-        raise NotImplementedError
+```go
+type SampleFunc func(ctx context.Context, prompt string, n int) []string
 
+type ConfidenceScorer interface {
+	Mode() ConfidenceMode
+	Score(ctx context.Context, prompt, response string) float64
+}
 
-class MajorityVoteScorer(ConfidenceScorer):
-    """
-    Sample N responses from the same model; return fraction agreeing with modal answer.
-    Requires a callable that produces the N additional samples.
-    """
-    mode: ConfidenceMode = "majority"
+// MajorityVoteScorer: sample N responses; return the fraction agreeing with the modal answer.
+type MajorityVoteScorer struct {
+	sample SampleFunc
+	n      int // default 10
+}
 
-    def __init__(self, sample_fn: Callable[[str, int], list[str]], n: int = 10) -> None:
-        self._sample_fn = sample_fn
-        self._n = n
+func (s MajorityVoteScorer) Mode() ConfidenceMode { return ModeMajority }
+func (s MajorityVoteScorer) Score(ctx context.Context, prompt, response string) float64 {
+	all := append(s.sample(ctx, prompt, s.n), response)
+	counts := map[string]int{}
+	for _, x := range all {
+		counts[strings.ToLower(strings.TrimSpace(x))]++
+	}
+	best := 0
+	for _, c := range counts {
+		if c > best {
+			best = c
+		}
+	}
+	return float64(best) / float64(len(all))
+}
 
-    def score(self, prompt: str, response: str) -> float:
-        samples = self._sample_fn(prompt, self._n)
-        # Normalize: strip whitespace and lower-case for discrete answers
-        normalized = [s.strip().lower() for s in samples + [response]]
-        modal = max(set(normalized), key=normalized.count)
-        return normalized.count(modal) / len(normalized)
+// EmbeddingConsistencyScorer: cosine similarity of the response to the centroid of N=5 samples.
+// No extra LLM call beyond the samples; embeds via the injected Embedder.
+type EmbeddingConsistencyScorer struct {
+	embedder memory.Embedder
+	sample   SampleFunc
+	n        int // default 5
+}
 
+func (s EmbeddingConsistencyScorer) Mode() ConfidenceMode { return ModeEmbedding }
+func (s EmbeddingConsistencyScorer) Score(ctx context.Context, prompt, response string) float64 {
+	samples := s.sample(ctx, prompt, s.n)
+	dim := 0
+	embs := make([][]float32, 0, len(samples))
+	for _, t := range samples {
+		e, err := s.embedder.Embed(ctx, t)
+		if err == nil {
+			embs = append(embs, e)
+			dim = len(e)
+		}
+	}
+	respEmb, err := s.embedder.Embed(ctx, response)
+	if err != nil || len(embs) == 0 {
+		return 0
+	}
+	centroid := make([]float32, dim)
+	for _, e := range embs {
+		for i := range e {
+			centroid[i] += e[i] / float32(len(embs))
+		}
+	}
+	sim := cosine(centroid, respEmb) // shared in-Go cosine
+	if sim < 0 {
+		return 0
+	}
+	if sim > 1 {
+		return 1
+	}
+	return sim
+}
 
-class EmbeddingConsistencyScorer(ConfidenceScorer):
-    """
-    Embed the response and N=5 samples; return cosine similarity of response to centroid.
-    No extra LLM call.
-    """
-    mode: ConfidenceMode = "embedding"
+// QualityRegressionScorer: a pure-Go text-classification model (build-tag hugot/cybertron
+// backend) fine-tuned on quality labels. Replaces the Python HF-transformers DistilBERT
+// pipeline; no CGO, no Python runtime. Fastest tier — no extra LLM calls.
+type QualityRegressionScorer struct {
+	clf textClassifier // loaded from ~/.tag/models/quality-scorer; nil-guarded at construction
+}
 
-    def __init__(self, sample_fn: Callable[[str, int], list[str]], n: int = 5) -> None:
-        from sentence_transformers import SentenceTransformer  # lazy import
-        import numpy as np
-        self._encoder = SentenceTransformer("all-MiniLM-L6-v2")
-        self._sample_fn = sample_fn
-        self._n = n
-        self._np = np
-
-    def score(self, prompt: str, response: str) -> float:
-        np = self._np
-        samples = self._sample_fn(prompt, self._n)
-        all_texts = samples + [response]
-        embeddings = self._encoder.encode(all_texts)  # shape (n+1, 384)
-        centroid = embeddings[:-1].mean(axis=0)
-        response_emb = embeddings[-1]
-        # Cosine similarity
-        sim = float(
-            np.dot(centroid, response_emb)
-            / (np.linalg.norm(centroid) * np.linalg.norm(response_emb) + 1e-9)
-        )
-        return max(0.0, min(1.0, sim))
-
-
-class DistilBERTQualityScorer(ConfidenceScorer):
-    """
-    Regression score from a fine-tuned DistilBERT quality predictor.
-    Fastest inference; no extra LLM calls; requires pre-trained model file.
-    """
-    mode: ConfidenceMode = "distilbert"
-    _MODEL_PATH = "~/.tag/models/distilbert-quality-scorer"
-
-    def __init__(self) -> None:
-        import os
-        from pathlib import Path
-        model_path = Path(os.path.expanduser(self._MODEL_PATH))
-        if not model_path.exists():
-            raise FileNotFoundError(
-                f"DistilBERT quality scorer not found at {model_path}. "
-                "Run: tag route models download --scorer distilbert"
-            )
-        # Lazy pipeline load
-        from transformers import pipeline  # type: ignore
-        self._pipe = pipeline("text-classification", model=str(model_path))
-
-    def score(self, prompt: str, response: str) -> float:
-        text = f"[PROMPT] {prompt[:512]} [RESPONSE] {response[:512]}"
-        result = self._pipe(text, truncation=True)[0]
-        # Model outputs label GOOD/BAD with score; map to 0.0–1.0
-        return float(result["score"]) if result["label"] == "GOOD" else 1.0 - float(result["score"])
+func (s QualityRegressionScorer) Mode() ConfidenceMode { return ModeDistilBERT }
+func (s QualityRegressionScorer) Score(ctx context.Context, prompt, response string) float64 {
+	text := "[PROMPT] " + trunc(prompt, 512) + " [RESPONSE] " + trunc(response, 512)
+	label, score := s.clf.Classify(ctx, text) // "GOOD"/"BAD" + confidence
+	if label == "GOOD" {
+		return score
+	}
+	return 1.0 - score
+}
 ```
 
-### 9.7 `RoutingPolicyTrainer` Class
+> Note: `QualityRegressionScorer` is the single piece with no 1:1 Go analog — there is no `transformers.pipeline` in Go. It is implemented on the pure-Go `hugot`/`cybertron` inference backend behind a build tag and is optional (opt-in via `--confidence-mode distilbert`). If the backend is not compiled in, construction returns an error and the cascade auto-selects `MajorityVoteScorer`/`EmbeddingConsistencyScorer` instead.
 
-```python
-class RoutingPolicyTrainer:
-    """
-    Trains a logistic regression classifier on historical eval results
-    to predict per-model-tier success probability for new task embeddings.
-    """
+### 9.7 `RoutingPolicyTrainer`
 
-    def __init__(self, models: list[str], costs: dict[str, float]) -> None:
-        """
-        models: ordered list of model_id strings (cheapest to most expensive).
-        costs: model_id -> cost_per_1m_output_tokens_usd
-        """
-        self._models = models
-        self._costs = costs
+Trains a per-tier logistic-regression classifier on historical eval results to predict per-model success probability for new task embeddings. `sklearn.LogisticRegression` becomes a hand-rolled batch gradient-descent fit over `gonum` vectors; `SentenceTransformer` becomes the injected `Embedder`; `numpy.trapz` becomes a plain trapezoidal sum. Fitted weights serialize to plain JSON float arrays (§9.3), eliminating the Python pickle/joblib deserialization vector entirely.
 
-    def fit(
-        self,
-        eval_results: list[dict],  # rows from eval_results JOIN eval_cases
-        accuracy_target: float,
-        min_cases: int = 20,
-    ) -> RoutingPolicy:
-        from sentence_transformers import SentenceTransformer
-        from sklearn.linear_model import LogisticRegression
-        import numpy as np
+```go
+type EvalResult struct {
+	ModelID    string
+	InputText  string
+	OutputText string
+	Passed     bool
+}
 
-        # Validate minimum data
-        per_model_counts = {}
-        for r in eval_results:
-            m = r["model_id"]
-            per_model_counts[m] = per_model_counts.get(m, 0) + 1
-        for m in self._models:
-            if per_model_counts.get(m, 0) < min_cases:
-                raise ValueError(
-                    f"Insufficient eval data for {m}: "
-                    f"{per_model_counts.get(m, 0)} cases (need {min_cases})"
-                )
+type RoutingPolicyTrainer struct {
+	models []string             // cheapest -> most expensive
+	costs  map[string]float64   // model_id -> USD per 1M output tokens
+	embed  memory.Embedder
+}
 
-        encoder = SentenceTransformer("all-MiniLM-L6-v2")
-        prompts = [r["input_text"] for r in eval_results]
-        embeddings = encoder.encode(prompts)
+func (t *RoutingPolicyTrainer) Fit(ctx context.Context, evalResults []EvalResult, accuracyTarget float64, minCases int) (RoutingPolicy, error) {
+	counts := map[string]int{}
+	for _, r := range evalResults {
+		counts[r.ModelID]++
+	}
+	for _, m := range t.models {
+		if counts[m] < minCases {
+			return RoutingPolicy{}, fmt.Errorf("insufficient eval data for %s: %d cases (need %d)", m, counts[m], minCases)
+		}
+	}
 
-        # Train one-vs-rest classifier: P(correct) per model
-        # Label: 1 if model answered correctly, 0 otherwise
-        clfs: dict[str, LogisticRegression] = {}
-        for model_id in self._models:
-            model_rows = [r for r in eval_results if r["model_id"] == model_id]
-            X = np.array([embeddings[i] for i, r in enumerate(eval_results)
-                          if r["model_id"] == model_id])
-            y = np.array([1 if r["passed"] else 0 for r in model_rows])
-            clf = LogisticRegression(max_iter=1000)
-            clf.fit(X, y)
-            clfs[model_id] = clf
+	// Embed all prompts once; cache index-aligned with evalResults.
+	embs := make([][]float32, len(evalResults))
+	for i, r := range evalResults {
+		e, err := t.embed.Embed(ctx, r.InputText)
+		if err != nil {
+			return RoutingPolicy{}, err
+		}
+		embs[i] = e
+	}
 
-        # Compute Pareto curve by sweeping threshold
-        pareto = self.pareto_curve(embeddings, eval_results, clfs, accuracy_target)
+	// One classifier per model tier: P(correct | tier). trainLogReg = batch GD.
+	weights := map[string][]float64{}
+	for _, modelID := range t.models {
+		var X [][]float32
+		var y []float64
+		for i, r := range evalResults {
+			if r.ModelID != modelID {
+				continue
+			}
+			X = append(X, embs[i])
+			if r.Passed {
+				y = append(y, 1)
+			} else {
+				y = append(y, 0)
+			}
+		}
+		weights[modelID] = trainLogReg(X, y, 1000) // maxIter=1000
+	}
+	clf := &logreg{weights: weights}
 
-        # Select policy point closest to accuracy_target with minimum cost
-        viable = [p for p in pareto if p.accuracy_estimate >= accuracy_target]
-        if not viable:
-            viable = [max(pareto, key=lambda p: p.accuracy_estimate)]
-        best = min(viable, key=lambda p: p.cost_per_task_usd)
+	pareto := t.ParetoCurve(embs, evalResults, clf)
 
-        # Compute PGR and APGR
-        weak_acc = min(p.accuracy_estimate for p in pareto)
-        strong_acc = max(p.accuracy_estimate for p in pareto)
-        pgr = ((best.accuracy_estimate - weak_acc) / (strong_acc - weak_acc + 1e-9))
-        apgr = float(np.trapz(
-            [p.pgr for p in pareto],
-            [p.confidence_threshold for p in pareto],
-        )) / (pareto[-1].confidence_threshold - pareto[0].confidence_threshold + 1e-9)
+	// Cheapest viable point at/above the accuracy target (else best available accuracy).
+	var viable []ParetoPoint
+	for _, p := range pareto {
+		if p.AccuracyEstimate >= accuracyTarget {
+			viable = append(viable, p)
+		}
+	}
+	if len(viable) == 0 {
+		best := pareto[0]
+		for _, p := range pareto[1:] {
+			if p.AccuracyEstimate > best.AccuracyEstimate {
+				best = p
+			}
+		}
+		viable = []ParetoPoint{best}
+	}
+	best := viable[0]
+	for _, p := range viable[1:] {
+		if p.CostPerTaskUSD < best.CostPerTaskUSD {
+			best = p
+		}
+	}
 
-        # Build policy tiers
-        tiers = []
-        for i, model_id in enumerate(self._models):
-            threshold = best.confidence_threshold if i < len(self._models) - 1 else None
-            fraction = best.model_distribution.get(model_id, 0.0)
-            tiers.append(PolicyTier(
-                model_id=model_id,
-                confidence_threshold=threshold,
-                estimated_fraction=fraction,
-                cost_per_1m_output_usd=self._costs.get(model_id, 0.0),
-            ))
+	// PGR + APGR (trapezoidal integral of PGR over the swept thresholds).
+	weakAcc, strongAcc := pareto[0].AccuracyEstimate, pareto[0].AccuracyEstimate
+	for _, p := range pareto {
+		weakAcc = math.Min(weakAcc, p.AccuracyEstimate)
+		strongAcc = math.Max(strongAcc, p.AccuracyEstimate)
+	}
+	pgr := (best.AccuracyEstimate - weakAcc) / (strongAcc - weakAcc + 1e-9)
+	apgr := trapz(pgrSeries(pareto), thresholdSeries(pareto)) /
+		(pareto[len(pareto)-1].ConfidenceThreshold - pareto[0].ConfidenceThreshold + 1e-9)
 
-        import datetime
-        policy_id = f"policy-{uuid.uuid4().hex[:8]}"
-        return RoutingPolicy(
-            id=policy_id,
-            profile="",  # set by caller
-            accuracy_target=accuracy_target,
-            accuracy_estimate=best.accuracy_estimate,
-            tiers=tiers,
-            pgr=pgr,
-            apgr=apgr,
-            cost_per_task_usd=best.cost_per_task_usd,
-            baseline_cost_usd=self._costs.get(self._models[-1], 0.0) * 1000,
-            eval_cases_used=len(eval_results),
-            created_at=datetime.datetime.utcnow().isoformat() + "Z",
-        )
+	tiers := make([]PolicyTier, len(t.models))
+	for i, modelID := range t.models {
+		var thr *float64
+		if i < len(t.models)-1 {
+			v := best.ConfidenceThreshold
+			thr = &v
+		}
+		tiers[i] = PolicyTier{
+			ModelID: modelID, ConfidenceThreshold: thr,
+			EstimatedFraction: best.ModelDistribution[modelID],
+			CostPer1MOutputUSD: t.costs[modelID],
+		}
+	}
 
-    def pareto_curve(
-        self,
-        embeddings,
-        eval_results: list[dict],
-        clfs: dict,
-        accuracy_target: float,
-    ) -> list[ParetoPoint]:
-        import numpy as np
-        points: list[ParetoPoint] = []
-        for threshold_int in range(50, 100):
-            threshold = threshold_int / 100.0
-            # Simulate routing at this threshold
-            assigned: dict[str, int] = {m: 0 for m in self._models}
-            correct_count = 0
-            total_cost = 0.0
-            for i, r in enumerate(eval_results):
-                emb = embeddings[i].reshape(1, -1)
-                chosen_model = self._models[-1]  # default to strongest
-                for model_id in self._models[:-1]:
-                    prob = clfs[model_id].predict_proba(emb)[0][1]
-                    if prob >= threshold:
-                        chosen_model = model_id
-                        break
-                assigned[chosen_model] += 1
-                # Evaluate: was chosen_model correct on this task?
-                model_results = [x for x in eval_results
-                                 if x.get("model_id") == chosen_model
-                                 and x.get("input_text") == r.get("input_text")]
-                if model_results and model_results[0]["passed"]:
-                    correct_count += 1
-                # Simplified cost: cost_per_1m * estimated_tokens / 1e6
-                est_tokens = len(r.get("output_text", "")) // 4
-                total_cost += self._costs.get(chosen_model, 0.0) * est_tokens / 1e6
+	return RoutingPolicy{
+		ID: "policy-" + newID8(), AccuracyTarget: accuracyTarget,
+		AccuracyEstimate: best.AccuracyEstimate, Tiers: tiers, PGR: pgr, APGR: apgr,
+		CostPerTaskUSD: best.CostPerTaskUSD, BaselineCostUSD: t.costs[t.models[len(t.models)-1]] * 1000,
+		EvalCasesUsed: len(evalResults), CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		ClassifierWeights: weights,
+	}, nil
+}
 
-            n = len(eval_results)
-            accuracy = correct_count / n if n > 0 else 0.0
-            distribution = {m: assigned[m] / n for m in self._models}
-            weak_acc = 0.5  # heuristic baseline
-            strong_acc = 0.97
-            pgr = (accuracy - weak_acc) / (strong_acc - weak_acc + 1e-9)
-            points.append(ParetoPoint(
-                confidence_threshold=threshold,
-                accuracy_estimate=accuracy,
-                cost_per_task_usd=total_cost / n if n > 0 else 0.0,
-                model_distribution=distribution,
-                pgr=max(0.0, pgr),
-            ))
-        return points
+// ParetoCurve sweeps the confidence threshold 0.50..0.99 in 0.01 steps.
+func (t *RoutingPolicyTrainer) ParetoCurve(embs [][]float32, evalResults []EvalResult, clf *logreg) []ParetoPoint {
+	// Index passed(model,input) for O(1) correctness lookup.
+	passed := map[string]bool{}
+	for _, r := range evalResults {
+		passed[r.ModelID+"\x00"+r.InputText] = r.Passed
+	}
+	points := make([]ParetoPoint, 0, 50)
+	n := len(evalResults)
+	for ti := 50; ti < 100; ti++ {
+		threshold := float64(ti) / 100.0
+		assigned := map[string]int{}
+		correct := 0
+		totalCost := 0.0
+		for i, r := range evalResults {
+			chosen := t.models[len(t.models)-1] // default to strongest
+			for _, m := range t.models[:len(t.models)-1] {
+				if clf.predict(m, embs[i]) >= threshold {
+					chosen = m
+					break
+				}
+			}
+			assigned[chosen]++
+			if passed[chosen+"\x00"+r.InputText] {
+				correct++
+			}
+			estTokens := len(r.OutputText) / 4
+			totalCost += t.costs[chosen] * float64(estTokens) / 1e6
+		}
+		dist := map[string]float64{}
+		for _, m := range t.models {
+			dist[m] = float64(assigned[m]) / float64(n)
+		}
+		acc := float64(correct) / float64(n)
+		const weakAcc, strongAcc = 0.5, 0.97 // heuristic baselines (see OQ-8)
+		pgr := (acc - weakAcc) / (strongAcc - weakAcc + 1e-9)
+		points = append(points, ParetoPoint{
+			ConfidenceThreshold: threshold, AccuracyEstimate: acc,
+			CostPerTaskUSD: totalCost / float64(n), ModelDistribution: dist,
+			PGR: math.Max(0, pgr),
+		})
+	}
+	return points
+}
 ```
 
-### 9.8 Integration with `controller.py`
+### 9.8 Integration with the run dispatch path
 
-The routing module integrates into the existing `cmd_run` dispatch path in `controller.py` at the point where the Hermes call is constructed, before the subprocess is launched:
+The router integrates into the `internal/agent` / `internal/runtime` run-dispatch path at the point where the provider `Request` is constructed, before the `Stream(ctx, Request)` call. `deserialize_clf` is gone — the classifier weights are rebuilt from the policy JSON float arrays in `NewModelRouter` (no pickle path).
 
-```python
-# In controller.py, inside the run dispatch path (simplified):
-from tag.routing import ModelRouter, load_active_policy
-
-if profile_cfg.get("routing", {}).get("auto_route"):
-    policy = load_active_policy(db, profile_name=profile)
-    if policy is not None:
-        router = ModelRouter(policy)
-        # Load pre-trained classifier from routing_policies.policy_json
-        router.load_classifier(deserialize_clf(policy))
-        choice = router.route(query=prompt, task_type=task_type)
-        route = apply_route_model_overrides(route, master_model=choice.model_id)
-        _write_routing_decision(db, run_id=run_id, choice=choice, profile=profile)
-        log.info(
-            "[routing] pre-routed to %s (confidence=%.3f, policy=%s)",
-            choice.model_id, choice.confidence, choice.policy_id,
-        )
+```go
+// internal/agent (run dispatch, simplified):
+if profileCfg.Routing.AutoRoute {
+	policy, err := llm.LoadActivePolicy(ctx, store, profile)
+	if err == nil && policy != nil {
+		router := llm.NewModelRouter(*policy, embedder) // weights rebuilt from policy JSON
+		choice, err := router.Route(ctx, prompt, taskType)
+		if err == nil {
+			req.Model = choice.ModelID // substitute the routed model into the Request
+			_ = writeRoutingDecision(ctx, store, runID, choice, profile)
+			slog.Info("routing: pre-routed",
+				"model", choice.ModelID, "confidence", choice.Confidence, "policy", choice.PolicyID)
+		}
+	}
+}
 ```
 
 ### 9.9 OTel Span Attributes
@@ -959,17 +971,17 @@ routing:
 
 1. **No raw task text in routing_decisions.** The `query_hash` column stores only `SHA-256(task_text)`. The original task text is never persisted in routing tables. This prevents routing logs from becoming a secondary secret exfiltration vector independent of the `runs` table, which stores the prompt and is already gated by PRD-034 secret scanning.
 
-2. **Secret scanning before routing.** `security.py` (PRD-034) must scan the task text before it is passed to `ModelRouter.route()`. If a secret is detected, the task is refused at the security gate before any routing decision is made. This ensures that even the hash of a secret-containing task is not persisted to `routing_decisions`.
+2. **Secret scanning before routing.** `internal/security` (PRD-034) must scan the task text before it is passed to `ModelRouter.Route()`. If a secret is detected, the task is refused at the security gate before any routing decision is made. This ensures that even the hash of a secret-containing task is not persisted to `routing_decisions`.
 
-3. **No model serialization with pickle.** `RoutingPolicyTrainer` stores trained classifiers serialized with `sklearn`'s `joblib` in the `routing_policies.policy_json` field, base64-encoded. The deserialization in `ModelRouter.load_classifier` must validate the schema and only load classifiers that were written by TAG itself. Loading classifiers from arbitrary user-supplied paths is not supported. This prevents the pickle deserialization RCE vector (GHSA-mhr3-j7m5-c7c9) from applying to routing policies.
+3. **No code deserialization in classifier loading.** The Go build removes the entire pickle/joblib deserialization class of risk: `RoutingPolicyTrainer` stores only the fitted logistic-regression weights as plain JSON float arrays inside `routing_policies.policy_json`. `NewModelRouter` reconstructs the classifier by reading those numbers into a struct via `encoding/json` — there is no code/object deserialization path, so the pickle-RCE vector (GHSA-mhr3-j7m5-c7c9) that motivated this consideration in Python does not exist here. The loader still validates the schema (dimension/tier count) and refuses malformed weight arrays.
 
 4. **Policy write requires confirmation.** `tag route optimize` writes a routing policy that will affect all subsequent runs for a profile. The command requires interactive confirmation (or `--yes` / `CI=true`) before writing. This prevents accidental policy overwrites from automated pipelines.
 
 5. **Cascade escalation is audited, not silent.** Every cascade escalation from a cheaper model to a more capable one is logged at WARNING level and written to `cascade_steps`. Routing to a cheaper model (downgrade) is also logged. Silent capability changes are not permitted, consistent with PRD-031's substitution logging requirement.
 
-6. **Budget guard before each cascade tier.** `budget.py` (PRD-012) is consulted before each cascade tier call. If invoking the next tier would exceed the active budget, the cascade aborts and returns the best response seen. This prevents a misconfigured cascade from incurring unbounded cost by escalating through all tiers on every query.
+6. **Budget guard before each cascade tier.** The `internal/obs` budget gate (PRD-012) is consulted before each cascade tier call. If invoking the next tier would exceed the active budget, the cascade aborts and returns the best response seen. This prevents a misconfigured cascade from incurring unbounded cost by escalating through all tiers on every query.
 
-7. **Classifier training data is local-only.** `RoutingPolicyTrainer` reads only from the local SQLite database (`eval_results`, `eval_cases`). No data is transmitted to external services during training. The trained classifier is stored locally in SQLite. There is no opt-in telemetry or federated training path in this PRD.
+7. **Classifier training data is local-only.** `RoutingPolicyTrainer` reads only from the local `internal/store` SQLite database (`eval_results`, `eval_cases`). No data is transmitted to external services during training (aside from the `Embedder` call when a provider embedding API is configured; the offline build-tag embedder keeps training fully local). The trained classifier is stored locally in SQLite. There is no opt-in telemetry or federated training path in this PRD.
 
 8. **Confidence threshold tuning requires eval data, not production traffic.** The routing policy is trained on `eval_results` (manually curated suites), not on production task text. This prevents training a model that learns to route based on sensitive content patterns in production prompts.
 
@@ -977,45 +989,49 @@ routing:
 
 ## 11. Testing Strategy
 
-### 11.1 Unit Tests (`tests/test_routing.py`)
+### 11.1 Unit Tests (`internal/llm/routing_test.go`)
+
+Table-driven `testing` tests; the `Embedder`, provider `Stream`, scorer, and budget guard are injected as interfaces with fakes.
 
 | Test | What It Verifies |
 |------|-----------------|
-| `test_model_router_returns_cheapest_above_threshold` | Given a mock classifier returning high confidence for Haiku, `ModelRouter.route()` returns Haiku, not Sonnet or Opus. |
-| `test_model_router_falls_back_on_low_confidence` | Given a mock classifier returning confidence < threshold for all tiers, returns the final fallback tier. |
-| `test_model_router_latency_under_10ms` | `ModelRouter.route()` with cached SentenceBERT model completes in < 10 ms p99 over 100 calls. |
-| `test_frugal_cascade_stops_at_first_confident_tier` | Cascade with two tiers, first returns confidence 0.92 (threshold 0.85): only one tier invoked. |
-| `test_frugal_cascade_escalates_on_low_confidence` | Cascade with two tiers, first returns confidence 0.61: both tiers invoked, escalation logged. |
-| `test_frugal_cascade_budget_guard_aborts` | Budget guard returns False after tier 1: cascade aborts, returns tier 1 response. |
-| `test_cascade_hard_cap_at_5_tiers` | Constructing `FrugalCascade` with 6 tiers raises `ValueError`. |
-| `test_majority_vote_scorer_discrete` | 8/10 samples agree on "yes": score = 0.8. |
-| `test_embedding_consistency_scorer_identical_samples` | All N samples identical: cosine similarity = 1.0. |
-| `test_routing_decision_written_to_sqlite` | After `ModelRouter.route()` call, `routing_decisions` table has one row with correct `query_hash`. |
-| `test_query_hash_is_sha256_not_raw_text` | `routing_decisions.query_hash` matches `sha256(task_text)`, not the raw task text. |
-| `test_no_heavy_imports_at_module_load` | `import tag.routing` does not load `torch`, `sklearn`, or `sentence_transformers` into `sys.modules`. |
-| `test_policy_trainer_requires_min_cases` | `RoutingPolicyTrainer.fit()` with fewer than `min_cases` rows raises `ValueError`. |
-| `test_pareto_curve_monotone_accuracy_vs_cost` | Higher confidence threshold => higher accuracy estimate AND higher cost per task. |
-| `test_cascade_step_logs_written` | After a 2-tier cascade, `cascade_steps` table has 2 rows with correct `decision_id` FK. |
+| `TestModelRouterReturnsCheapestAboveThreshold` | Given a fake classifier returning high confidence for Haiku, `Route()` returns Haiku, not Sonnet or Opus. |
+| `TestModelRouterFallsBackOnLowConfidence` | Given a fake classifier returning confidence < threshold for all tiers, returns the final fallback tier. |
+| `TestModelRouterLatencyUnder10ms` | `Route()` with a preloaded (offline) embedder completes in < 10 ms p99 over 100 calls (`testing.B` p99 harness). |
+| `TestFrugalCascadeStopsAtFirstConfidentTier` | Cascade with two tiers, first returns confidence 0.92 (threshold 0.85): only one tier invoked. |
+| `TestFrugalCascadeEscalatesOnLowConfidence` | Cascade with two tiers, first returns confidence 0.61: both tiers invoked, escalation logged. |
+| `TestFrugalCascadeBudgetGuardAborts` | Budget guard returns false after tier 1: cascade aborts, returns tier 1 response. |
+| `TestCascadeHardCapAt5Tiers` | `NewFrugalCascade` with 6 tiers returns a non-nil error. |
+| `TestMajorityVoteScorerDiscrete` | 8/10 samples agree on "yes": score = 0.8. |
+| `TestEmbeddingConsistencyScorerIdenticalSamples` | All N samples identical: cosine similarity = 1.0. |
+| `TestRoutingDecisionWrittenToSQLite` | After a `Route()` call, `routing_decisions` has one row with the correct `query_hash`. |
+| `TestQueryHashIsSHA256NotRawText` | `routing_decisions.query_hash` matches `sha256Hex(task_text)`, not the raw task text. |
+| `TestClassifierWeightsAreJSONFloatsNotPickle` | The persisted `policy_json` is valid JSON of float arrays; no binary/base64 blob; round-trips through `NewModelRouter` without any code deserialization. |
+| `TestPolicyTrainerRequiresMinCases` | `RoutingPolicyTrainer.Fit()` with fewer than `minCases` rows returns an error. |
+| `TestParetoCurveMonotoneAccuracyVsCost` | Higher confidence threshold => higher accuracy estimate AND higher cost per task. |
+| `TestCascadeStepLogsWritten` | After a 2-tier cascade, `cascade_steps` has 2 rows with the correct `decision_id` FK. |
 
-### 11.2 Integration Tests (`tests/test_routing_integration.py`)
+### 11.2 Integration Tests (`internal/llm/routing_integration_test.go`)
 
-| Test | What It Verifies |
-|------|-----------------|
-| `test_optimize_reads_eval_results_and_writes_policy` | Seeds 30 `eval_results` rows for two model tiers; runs `cmd_route_optimize`; asserts `routing_policies` has one `active=1` row for the profile. |
-| `test_auto_route_applied_on_cmd_run` | Profile has `routing.auto_route: true`; `cmd_run` is called; `routing_decisions` has one row with `policy_id` matching the active policy. |
-| `test_cascade_cmd_produces_cascade_steps` | `cmd_route_cascade` is called with 3 tiers; `cascade_steps` table has ≥ 1 row. |
-| `test_route_stats_aggregates_decisions` | Seeds 50 `routing_decisions` rows; `cmd_route_stats --json` output contains `total_routed_tasks: 50`. |
-| `test_calibrate_holdout_accuracy_reported` | Seeds 100 eval results; `cmd_route_calibrate` output JSON contains `accuracy_estimate` field. |
-| `test_policy_delete_disables_auto_route` | Active policy is deleted; subsequent `cmd_run` with `auto_route: true` uses profile default model. |
-
-### 11.3 Performance Tests (`tests/test_routing_perf.py`)
+Real `internal/store` temp DB; fake provider `Stream`; offline embedder.
 
 | Test | What It Verifies |
 |------|-----------------|
-| `bench_router_route_p99_latency` | 200 calls to `ModelRouter.route()` with cached model: p99 < 10 ms. |
-| `bench_trainer_fit_1000_cases` | `RoutingPolicyTrainer.fit()` with 1000 synthetic eval rows: wall time < 30 s. |
-| `bench_embedding_scorer_5_samples` | `EmbeddingConsistencyScorer.score()` with 5 samples: < 500 ms. |
-| `bench_cascade_2tier_overhead` | 2-tier cascade where tier 1 is always confident: total overhead vs. direct single call < 50 ms. |
+| `TestOptimizeReadsEvalResultsAndWritesPolicy` | Seeds 30 `eval_results` rows for two model tiers; runs the `route optimize` handler; asserts `routing_policies` has one `active=1` row for the profile. |
+| `TestAutoRouteAppliedOnRun` | Profile has `routing.auto_route: true`; the run-dispatch path is invoked; `routing_decisions` has one row with `policy_id` matching the active policy. |
+| `TestCascadeCmdProducesCascadeSteps` | The `route cascade` handler is called with 3 tiers; `cascade_steps` has ≥ 1 row. |
+| `TestRouteStatsAggregatesDecisions` | Seeds 50 `routing_decisions` rows; `route stats --json` output contains `total_routed_tasks: 50`. |
+| `TestCalibrateHoldoutAccuracyReported` | Seeds 100 eval results; `route calibrate` output JSON contains an `accuracy_estimate` field. |
+| `TestPolicyDeleteDisablesAutoRoute` | Active policy is deleted; a subsequent run with `auto_route: true` uses the profile default model. |
+
+### 11.3 Benchmarks (`internal/llm/routing_bench_test.go`, `testing.B`)
+
+| Benchmark | What It Verifies |
+|------|-----------------|
+| `BenchmarkRouterRouteP99Latency` | 200 calls to `Route()` with a preloaded offline embedder: p99 < 10 ms. |
+| `BenchmarkTrainerFit1000Cases` | `RoutingPolicyTrainer.Fit()` with 1000 synthetic eval rows: wall time < 30 s. |
+| `BenchmarkEmbeddingScorer5Samples` | `EmbeddingConsistencyScorer.Score()` with 5 samples: < 500 ms. |
+| `BenchmarkCascade2TierOverhead` | 2-tier cascade where tier 1 is always confident: total overhead vs. a direct single call < 50 ms. |
 
 ---
 
@@ -1030,10 +1046,10 @@ routing:
 | AC-05 | `tag route cascade --task X --start-model haiku --fallback-to sonnet` where haiku confidence >= threshold: only `haiku` is called; `cascade_steps` has 1 row. | Integration test with mock LLM; assert call count = 1. |
 | AC-06 | `tag route cascade` with 6 `--fallback-to` flags exits with code 1 and prints error about 5-tier limit. | CLI invocation test. |
 | AC-07 | `tag route stats --json` returns correct `total_routed_tasks` count matching `routing_decisions` table row count for the profile. | Seed table; run command; parse JSON. |
-| AC-08 | `routing_decisions.query_hash` equals `hashlib.sha256(task_text.encode()).hexdigest()` for every row; `routing_decisions` has no column containing raw task text. | Schema inspection; unit test. |
-| AC-09 | `ModelRouter.route()` completes in < 10 ms p99 over 200 calls with loaded model. | Performance benchmark test. |
-| AC-10 | `import tag.routing` does not add `torch`, `sklearn`, `sentence_transformers`, or `transformers` to `sys.modules`. | `sys.modules` assertion in unit test immediately after import. |
-| AC-11 | With `routing.auto_route: true` in a profile with an active policy, `tag run --profile coder "add docstring"` dispatches to the model chosen by the router, not the profile's default model, and writes to `routing_decisions`. | Integration test with mock Hermes; inspect route sent to subprocess. |
+| AC-08 | `routing_decisions.query_hash` equals `sha256Hex(task_text)` (`crypto/sha256`) for every row; `routing_decisions` has no column containing raw task text. | Schema inspection; unit test. |
+| AC-09 | `ModelRouter.Route()` completes in < 10 ms p99 over 200 calls with a preloaded offline embedder. | `testing.B` benchmark. |
+| AC-10 | Importing the routing packages performs no init-time embedder/model load; `NewModelRouter` is the first point that touches the embedder (verified by a fake embedder whose init counter is 0 until `NewModelRouter`). | Init-counter assertion in unit test. |
+| AC-11 | With `routing.auto_route: true` in a profile with an active policy, `tag run --profile coder "add docstring"` dispatches to the model chosen by the router, not the profile's default model, and writes to `routing_decisions`. | Integration test with a fake provider; inspect the `Request.Model` sent to `Stream`. |
 | AC-12 | `tag route calibrate --profile coder` outputs `accuracy_estimate`, `pgr`, and `ece` fields in JSON. | Integration test; seed eval data; parse output. |
 | AC-13 | `tag route policy delete <policy-id>` sets `active=0` and `deleted_at` is non-null in the database. | Integration test; inspect SQLite after command. |
 | AC-14 | Every cascade tier call produces a distinct child span in the `spans` table with `routing.tier` attribute. | Integration test; query spans table after cascade run. |
@@ -1046,18 +1062,19 @@ routing:
 
 | Dependency | Type | Version / Notes | Required By |
 |------------|------|-----------------|-------------|
-| `sentence-transformers` | Python package | `>=2.2.0`; `all-MiniLM-L6-v2` model (22 MB, auto-downloaded to `~/.tag/models/`) | `ModelRouter`, `EmbeddingConsistencyScorer`, `RoutingPolicyTrainer` |
-| `scikit-learn` | Python package | `>=1.3.0`; `LogisticRegression` | `RoutingPolicyTrainer` |
-| `numpy` | Python package | `>=1.24.0`; already a transitive dep of sentence-transformers | `RoutingPolicyTrainer`, `EmbeddingConsistencyScorer` |
-| `transformers` | Python package | `>=4.35.0`; only required for `DistilBERTQualityScorer` (optional scorer) | `DistilBERTQualityScorer` |
+| `internal/memory` (`Embedder`) | Internal (Go) | `all-MiniLM-L6-v2` (22 MB); provider embedding API by default, offline via build-tag `cybertron`; cached in `~/.tag/models/`. Shared singleton with `internal/toolindex` (PRD-043). | `ModelRouter`, `EmbeddingConsistencyScorer`, `RoutingPolicyTrainer` |
+| `gonum.org/v1/gonum` | Go module | BSD-3, GA; float vector ops for the hand-rolled logistic-regression fit + trapezoidal APGR integral | `RoutingPolicyTrainer` |
+| `golang.org/x/sync/errgroup` | Go module | Concurrent sample calls for `MajorityVoteScorer` | `MajorityVoteScorer` |
+| `hugot` / `nlpodyssey/cybertron` | Go module | Pure-Go text-classification backend behind a build tag; replaces the Python HF-transformers DistilBERT pipeline; optional scorer | `QualityRegressionScorer` |
+| `internal/llm` provider interface | Internal (Go) | `Stream(ctx, Request)->chan Event` over anthropic-sdk-go v1.55 / openai-go/v3; token counts via tiktoken-go (OpenAI) / len/4 (Anthropic) | Cascade tiers, sample funcs |
+| `crypto/sha256`, `encoding/json` | Go stdlib | `query_hash`/`response_hash`; policy weight (de)serialization — no pickle/gob | `routing_decisions`, `RoutingPolicy` |
 | PRD-027 (eval framework) | Internal module | `eval_results`, `eval_cases` SQLite tables used as training data | `RoutingPolicyTrainer`, `tag route optimize` |
-| PRD-012 (budget enforcement) | Internal module | `budget.py` — consulted before each cascade tier | `FrugalCascade` budget guard |
-| PRD-013 (agent tracing) | Internal module | `tracing.py` — child spans for each routing decision and cascade tier | Span emission |
-| PRD-034 (secret scanning) | Internal module | `security.py` — scans task text before routing; must be called by dispatcher | `ModelRouter.route()` caller |
-| PRD-031 (model fallback chains) | Internal module | Co-existing routing path; must not conflict on `route` table or `cmd_route` dispatch | Architecture boundary |
-| PRD-043 (vector tool retrieval) | Internal module | `tool_retrieval.py` — `SentenceTransformer` already cached; share model instance | `ModelRouter`, `EmbeddingConsistencyScorer` |
-| PRD-041 (OTel span cost attribution) | Internal module | `otel_semconv.py` — routing span attributes follow GenAI semconv conventions | Span attributes |
-| `joblib` | Python package | `>=1.3.0`; already a transitive dep of scikit-learn; used for classifier serialization | `RoutingPolicyTrainer` |
+| PRD-012 (`internal/obs` budget) | Internal module | Budget gate consulted before each cascade tier | `FrugalCascade` budget guard |
+| PRD-013 (`internal/obs` tracing) | Internal module | `go.opentelemetry.io/otel` child spans for each routing decision and cascade tier | Span emission |
+| PRD-034 (`internal/security`) | Internal module | Scans task text before routing; called by the dispatcher | `ModelRouter.Route()` caller |
+| PRD-031 (model fallback chains) | Internal module | Co-existing routing path; must not conflict on the `route` overrides or `route` command dispatch | Architecture boundary |
+| PRD-043 (`internal/toolindex`) | Internal module | Shares the cached `Embedder` instance | `ModelRouter`, `EmbeddingConsistencyScorer` |
+| PRD-041 (`internal/obs` cost attribution) | Internal module | Routing span attributes follow the pinned GenAI semconv table + go:embed pricing table (gobwas/glob) | Span attributes, cost |
 
 ---
 
@@ -1065,8 +1082,8 @@ routing:
 
 | # | Question | Owner | Resolution Target |
 |---|----------|-------|-------------------|
-| OQ-1 | Should `ModelRouter` share the `SentenceTransformer` model instance with `tool_retrieval.py` (PRD-043) to avoid loading two copies of `all-MiniLM-L6-v2` into memory? If so, what is the module-level singleton pattern that avoids circular imports? | Routing + Tool Retrieval owners | Before implementation start |
-| OQ-2 | `DistilBERTQualityScorer` requires a fine-tuned model file at `~/.tag/models/distilbert-quality-scorer`. Does TAG ship this model, host it for download, or require users to supply it? If hosted, what is the distribution mechanism? | Platform team | Before beta release |
+| OQ-1 | Should `ModelRouter` share the `Embedder` instance with `internal/toolindex` (PRD-043) to avoid loading two copies of `all-MiniLM-L6-v2` into memory? If so, where does the shared singleton live (e.g., an `internal/memory`-level provider) to keep the package dependency graph acyclic? | Routing + Tool Retrieval owners | Before implementation start |
+| OQ-2 | `QualityRegressionScorer` requires a pure-Go quality-classifier model at `~/.tag/models/quality-scorer` (hugot/cybertron backend). Does TAG ship this model in the binary via `go:embed`, host it for download, or require users to supply it? If hosted, what is the distribution mechanism, and is it gated behind the build tag? | Platform team | Before beta release |
 | OQ-3 | The Pareto curve sweep is O(N_thresholds × N_eval_cases × N_models). At N=100 cases, 3 models, 50 threshold points, this is 15,000 operations — fast. At N=10,000 cases it becomes 1.5M. Is there a training data size cap, or should the trainer sample from eval_results when |eval_results| > some limit? | Engineering | Before implementation |
 | OQ-4 | PRD-031 fallback chains and PRD-107 cascade are architecturally separate, but both can override the model used for a run. If a cascade escalation produces an error that would normally trigger a PRD-031 fallback hop, which takes precedence? Proposed: PRD-031 fires after PRD-107 cascade exhausts its tiers. | Architecture review | Before implementation |
 | OQ-5 | Should `tag route optimize` also consume `steps` table data (actual run outputs) in addition to `eval_results`? Steps are not labeled with pass/fail, but their duration and token count are available as proxy signals. | Product | Phase 2 planning |
@@ -1080,43 +1097,43 @@ routing:
 
 ### Phase 1: Core Infrastructure (Days 1–5)
 
-- Define `routing_policies`, `routing_decisions`, `cascade_steps` SQLite tables in `open_db()` schema migration.
-- Implement `RoutingPolicy`, `PolicyTier`, `ModelChoice`, `CascadeStep`, `CascadeResult`, `ParetoPoint` dataclasses.
-- Implement `ModelRouter` with lazy SentenceBERT import and `route()` method (returning `ModelChoice`).
-- Implement `routing_decisions` write helper and wire into the `auto_route` dispatch path in `controller.py`.
-- Unit tests: `test_model_router_*` and `test_routing_decision_written_to_sqlite`.
+- Define `routing_policies`, `routing_decisions`, `cascade_steps` as numbered migrations in `internal/store/migrate/`.
+- Implement `RoutingPolicy`, `PolicyTier`, `ModelChoice`, `CascadeStep`, `CascadeResult`, `ParetoPoint` structs in `internal/llm`.
+- Implement `ModelRouter` with the injected `Embedder`, the in-process `logreg`, and the `Route()` method (returning `ModelChoice`).
+- Implement the `routing_decisions` write helper and wire it into the `auto_route` dispatch path in `internal/agent`.
+- Unit tests: `TestModelRouter*` and `TestRoutingDecisionWrittenToSQLite`.
 
 ### Phase 2: Cascade & Scorers (Days 6–10)
 
-- Implement `FrugalCascade` class with `run()` method, budget guard integration, and 5-tier hard cap.
-- Implement `MajorityVoteScorer`, `EmbeddingConsistencyScorer`, and `DistilBERTQualityScorer`.
-- Implement `cmd_route_cascade` CLI handler and parser registration in `controller.py`.
-- OTel span attribution for each cascade tier (PRD-013 integration).
-- Unit tests: `test_frugal_cascade_*`, `test_*_scorer_*`.
+- Implement `FrugalCascade` with `Run()`, budget-guard integration, and the 5-tier hard cap.
+- Implement `MajorityVoteScorer`, `EmbeddingConsistencyScorer`, and `QualityRegressionScorer` (build-tag backend).
+- Implement the `route cascade` cobra command in `internal/cli`.
+- OTel span attribution for each cascade tier via `internal/obs` (PRD-013 integration).
+- Unit tests: `TestFrugalCascade*`, `Test*Scorer*`.
 
 ### Phase 3: Policy Training & Optimize (Days 11–16)
 
-- Implement `RoutingPolicyTrainer` with `fit()` and `pareto_curve()` methods.
-- Implement `cmd_route_optimize` CLI handler: read eval_results, train, display Pareto point, confirm, write policy.
-- Implement `cmd_route_calibrate` CLI handler: holdout split, refit, evaluate, report ECE and PGR.
-- Implement `cmd_route_policy_*` (list, show, delete, activate) CLI handlers.
-- Unit tests: `test_policy_trainer_*`, `test_pareto_curve_*`.
+- Implement `RoutingPolicyTrainer` with `Fit()` (gonum logistic regression) and `ParetoCurve()`.
+- Implement the `route optimize` command: read eval_results, train, display the Pareto point, confirm, write policy.
+- Implement the `route calibrate` command: holdout split, refit, evaluate, report ECE and PGR.
+- Implement `route policy` subcommands (list, show, delete, activate).
+- Unit tests: `TestPolicyTrainer*`, `TestParetoCurve*`.
 
 ### Phase 4: Stats, Integration, and Config (Days 17–21)
 
-- Implement `cmd_route_stats` CLI handler with aggregation over `routing_decisions`.
-- Wire all config keys under `routing:` into the config schema and validation.
-- Integration tests: `test_optimize_reads_eval_results_and_writes_policy`, `test_auto_route_applied_on_cmd_run`, `test_cascade_cmd_produces_cascade_steps`, etc.
-- Performance benchmarks: `bench_router_route_p99_latency`, `bench_trainer_fit_1000_cases`.
+- Implement the `route stats` command with aggregation over `routing_decisions`.
+- Wire all config keys under `routing:` into the koanf/v2 config schema and validation.
+- Integration tests: `TestOptimizeReadsEvalResultsAndWritesPolicy`, `TestAutoRouteAppliedOnRun`, `TestCascadeCmdProducesCascadeSteps`, etc.
+- Benchmarks: `BenchmarkRouterRouteP99Latency`, `BenchmarkTrainerFit1000Cases`.
 - Documentation: update `tag route --help` and add `routing` config key docs.
 
 ### Phase 5: Hardening and Edge Cases (Days 22–26)
 
-- Budget guard integration with `budget.py` (PRD-012): pre-cascade and per-tier checks.
-- Secret scanning integration: ensure `security.py` is called before `ModelRouter.route()` in all dispatch paths.
+- Budget-guard integration with `internal/obs` (PRD-012): pre-cascade and per-tier checks.
+- Secret-scanning integration: ensure `internal/security` is called before `ModelRouter.Route()` in all dispatch paths.
 - Soft delete for `routing_policies` (`deleted_at` pattern, `active = 0`).
-- Shared SentenceBERT singleton with `tool_retrieval.py` (OQ-1 resolution).
-- Coverage audit: ensure ≥ 85% line coverage across `routing.py`.
+- Shared `Embedder` singleton with `internal/toolindex` (OQ-1 resolution).
+- Coverage audit: ensure ≥ 85% line coverage (`go test -cover`) across the routing packages.
 - Review against acceptance criteria AC-01 through AC-16; close all open questions with owners.
 
 **Total estimate: 26 working days (~5.5 weeks).** Effort estimate is L (2–4 weeks for implementation core, extended to 5.5 weeks including hardening and integration). Two engineers working in parallel on Phases 2 and 3 could compress the schedule to ~18 days.

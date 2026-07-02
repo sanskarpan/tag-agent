@@ -1,10 +1,12 @@
 # PRD-091: Configurable Sandbox TTL + Session Refresh (`tag sandbox set-ttl`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P2
 **Estimated Effort:** S (3-5 days)
 **Category:** Sandbox & Execution Environment
-**Affects:** `sandbox.py`
+**Affects:** `internal/sandbox`
 **Depends on:** PRD-028 (Sandbox Code Execution), PRD-013 (Agent Tracing / Observability), PRD-034 (Security Hardening), PRD-012 (Cost Tracking / Budget), PRD-040 (Notification Hooks)
 **Inspired by:** E2B sandbox TTL, Daytona workspace timeout, Gitpod timeout
 **GitHub Issue:** #348
@@ -13,13 +15,13 @@
 
 ## 1. Overview
 
-TAG's current sandbox implementation (`src/tag/sandbox.py`, PRD-028) supports ephemeral command execution in three backends — restricted subprocess, Docker, and Modal — with a single per-invocation `--timeout` wall-clock limit. Once `run_in_sandbox()` returns, there is no persistent sandbox session and therefore no TTL concept: the sandbox exists only for the duration of the subprocess call and is immediately destroyed. This model works well for one-shot code execution tasks but breaks down for interactive or long-lived workflows where an agent iterates inside the same sandbox environment — running tests, building artifacts, and debugging across multiple tool calls without paying the container startup cost on every call.
+TAG's current sandbox implementation (`internal/sandbox`, PRD-028) supports ephemeral command execution across a tiered isolation ladder — a restricted tier (landlock-lsm/go-landlock + elastic/go-seccomp-bpf + google/nftables), Docker (docker/docker moby client), and cloud backends (E2B/Modal via HTTP) — with a single per-invocation `--timeout` wall-clock limit enforced through `context.WithTimeout`. Once `RunInSandbox()` returns, there is no persistent sandbox session and therefore no TTL concept: the sandbox exists only for the duration of the `os/exec` child process (or cloud call) and is immediately destroyed. This model works well for one-shot code execution tasks but breaks down for interactive or long-lived workflows where an agent iterates inside the same sandbox environment — running tests, building artifacts, and debugging across multiple tool calls without paying the container startup cost on every call.
 
 Cloud sandbox providers have independently converged on a TTL-plus-keepalive model as the canonical lifecycle for long-lived sandboxes. E2B uses `timeout` at creation time (up to 86 400 s on Pro tier) with `sandbox.set_timeout()` and `sandbox.keep_alive()` for mid-session extension; every resume resets the idle timer. Daytona's workspace timeout is configured at the workspace level and can be updated via `UpdateWorkspaceDTO.auto_stop_minutes`; it expires on idle CPU/network quiescence. Gitpod uses per-workspace `timeout` strings (`"1h"`, `"30m"`) with optional `--extended` flags during active sessions. All three providers separately expose a session-level "refresh" or "keepalive" primitive so that programmatic automation can extend a running sandbox without creating a new one.
 
-This PRD adds configurable per-sandbox TTL and session refresh to TAG's sandbox subsystem. The core idea is: a sandbox session is now a first-class persistent record in SQLite with a creation time, a configured TTL, a last-activity timestamp, and a derived time-to-live. A background sweep (piggybacking on the cron scheduler from `cron_scheduler.py`) terminates sandboxes whose idle time has exceeded their TTL and fires a pre-expiry warning notification via `notifications.py` when a sandbox is within a configurable warning window (default: 60 seconds). The new `tag sandbox refresh <id>` command sends a keepalive that resets the last-activity clock, extending the session without changing the TTL contract. The new `tag sandbox set-ttl <id> --ttl <seconds>` command mutates the TTL for a running session, allowing operators to shorten or extend lifetime dynamically.
+This PRD adds configurable per-sandbox TTL and session refresh to TAG's sandbox subsystem. The core idea is: a sandbox session is now a first-class persistent record in `modernc.org/sqlite` (WAL, single-writer) with a creation time, a configured TTL, a last-activity timestamp (`expires_at`), and a derived time-to-live. A long-lived reaper goroutine (driven by a `time.Ticker`, optionally scheduled via `go-co-op/gocron` v2) terminates sandboxes whose idle time has exceeded their TTL and fires a pre-expiry warning notification via the `notifications` package when a sandbox is within a configurable warning window (default: 60 seconds). The new `tag sandbox refresh <id>` command sends a keepalive that resets the last-activity clock, extending the session without changing the TTL contract. The new `tag sandbox set-ttl <id> --ttl <seconds>` command mutates the TTL for a running session, allowing operators to shorten or extend lifetime dynamically.
 
-These additions are additive and backward compatible. Existing `tag sandbox run` invocations without `--ttl` default to the existing `--timeout` wall-clock behavior; TTL management only activates when a sandbox is launched with `--ttl` and enters the `running` state as a persistent session record. The change touches `sandbox.py` for all new logic, `controller.py` for the three new subcommands, and a one-time schema migration adds four new columns to `sandbox_runs`.
+These additions are additive and backward compatible. Existing `tag sandbox run` invocations without `--ttl` default to the existing `--timeout` wall-clock behavior; TTL management only activates when a sandbox is launched with `--ttl` and enters the `running` state as a persistent session record. The change touches the `internal/sandbox` package for all new logic, the `tag sandbox` command group (Cobra) for the three new subcommands, and a one-time schema migration adds four new columns to `sandbox_runs`.
 
 The feature has direct practical impact for agents that iterate inside a sandbox across multiple turns (code→test→fix cycles), for queue workers that reserve a Docker container for a batch job and release it when done, and for any scenario where the operator wants deterministic resource cleanup without relying on manual `tag sandbox kill` calls.
 
@@ -29,7 +31,7 @@ The feature has direct practical impact for agents that iterate inside a sandbox
 
 ### 2.1 No Lifecycle Management for Long-Lived Sandbox Sessions
 
-`run_in_sandbox()` is a blocking call: it spawns the backend, waits for the command to complete, records the result, and returns. There is no concept of a "session" that survives across multiple agent tool calls. When a TAG agent needs to run three sequential commands in the same Docker container — install dependencies, run tests, capture coverage — it must start three separate containers, paying startup latency on each invocation and losing all in-memory state between calls. The sandbox audit trail in `sandbox_runs` records three unrelated rows with no common session identity.
+`RunInSandbox()` is a blocking call: it spawns the backend (via `os/exec.CommandContext`), waits for the command to complete, records the result, and returns. There is no concept of a "session" that survives across multiple agent tool calls. When a TAG agent needs to run three sequential commands in the same Docker container — install dependencies, run tests, capture coverage — it must start three separate containers, paying startup latency on each invocation and losing all in-memory state between calls. The sandbox audit trail in `sandbox_runs` records three unrelated rows with no common session identity.
 
 For E2B and Modal backends, this is especially wasteful: a Firecracker micro-VM allocation costs ~150 ms of network round-trip and cloud compute; allocating one per tool call for a 10-step debug session adds 1.5 s of pure allocation overhead and can consume 10x the billed sandbox-hours that a single session would require.
 
@@ -57,8 +59,8 @@ E2B's `sandbox.keep_alive()` and Daytona's `UpdateWorkspaceDTO.auto_stop_minutes
 | G2 | Session keepalive: `tag sandbox refresh <id>` resets the `last_activity_at` timestamp for a running sandbox, extending effective lifetime without altering the configured TTL. |
 | G3 | Dynamic TTL mutation: `tag sandbox set-ttl <id> --ttl <seconds>` updates the TTL for a running sandbox session, effective immediately for the next TTL sweep. |
 | G4 | `tag sandbox list` includes `ttl_s`, `ttl_remaining_s`, and `last_activity_at` in both human-readable table and `--json` output. |
-| G5 | Pre-expiry notifications: when a sandbox has ≤ `ttl_warn_secs` seconds remaining (default 60), a warning is emitted to the terminal and via `notifications.py` hooks (Slack, webhook, etc.). |
-| G6 | TTL sweep runs on a configurable interval (default 30 s) without requiring a daemon process: it is triggered lazily on any `cmd_sandbox` call and optionally by `cron_scheduler.py` when available. |
+| G5 | Pre-expiry notifications: when a sandbox has ≤ `ttl_warn_secs` seconds remaining (default 60), a warning is emitted to the terminal and via the `internal/notifications` hooks (Slack, webhook, etc.). |
+| G6 | TTL sweep runs on a configurable interval (default 30 s) without requiring a daemon process: it is triggered lazily on any `tag sandbox` command and by a reaper goroutine, and optionally by the `go-co-op/gocron` scheduler when available. |
 | G7 | Backward compatibility: existing `tag sandbox run` invocations without `--ttl` continue to work exactly as before, with `--timeout` governing the synchronous wall-clock limit. |
 | G8 | All TTL events (created, refreshed, set-ttl, expired, warned) are appended to the sandbox audit log at `~/.tag/runtime/sandbox-audit.jsonl`. |
 | G9 | Schema migration is additive (ALTER TABLE with DEFAULT values), requiring no data migration for existing `sandbox_runs` rows. |
@@ -81,7 +83,7 @@ E2B's `sandbox.keep_alive()` and Daytona's `UpdateWorkspaceDTO.auto_stop_minutes
 
 | Metric | Target | Measurement Method |
 |--------|--------|--------------------|
-| TTL enforcement latency | Expired sandbox terminated within `sweep_interval + 5 s` of its TTL deadline | Unit test: mock `_utc_now()` to advance past deadline, run sweep, assert status=`expired` |
+| TTL enforcement latency | Expired sandbox terminated within `sweep_interval + 5 s` of its TTL deadline | Unit test: advance the fake `utcNow()` clock past deadline, run sweep, assert status=`expired` |
 | Keepalive extension accuracy | `sandbox refresh <id>` resets `last_activity_at` within 100 ms of call | Integration test: check DB timestamp delta |
 | Pre-expiry warning lead time | Warning fires with `ttl_warn_secs ± sweep_interval` seconds remaining | Unit test with fixed clock |
 | Backward compatibility | `tag sandbox run` without `--ttl` exits with identical behavior to pre-PRD-091 | Regression test against existing test suite |
@@ -120,7 +122,7 @@ EXISTING OPTIONS (unchanged)
   --backend docker|e2b|modal|restricted|auto
   --image <image>
   --timeout <seconds>            # hard wall-clock for blocking mode (unchanged)
-  --code <python_string>         # inline code shortcut
+  --code <code_string>           # inline code shortcut (workload language is user-chosen)
   --json
 
 NEW OPTIONS
@@ -296,20 +298,20 @@ EXIT CODES
 | FR-02 | If `--ttl` is not specified, `sandbox_runs.ttl_s` is NULL and TTL management is skipped for that row; `--timeout` wall-clock behavior is unchanged. | Must |
 | FR-03 | `tag sandbox list` computes `ttl_remaining_s = ttl_s - (now - last_activity_at)` at query time and includes it in both human-readable and JSON output; negative values are reported as `0` and the sandbox is marked for sweep. | Must |
 | FR-04 | `tag sandbox refresh <id>` sets `last_activity_at = utc_now()` for a sandbox in state `running` and writes a `refreshed` audit event. It MUST reject sandboxes in states `done`, `failed`, `expired`, or `killed`. | Must |
-| FR-05 | `tag sandbox set-ttl <id> --ttl <N>` updates `ttl_s` and resets `last_activity_at = utc_now()`. If the new TTL is already exceeded by the current idle time, the function calls `_terminate_sandbox()` immediately and sets state to `expired`. | Must |
-| FR-06 | The TTL sweep function `sweep_expired_sandboxes(conn)` selects all rows where `ttl_s IS NOT NULL AND state = 'running' AND (strftime('%s','now') - strftime('%s', last_activity_at)) > ttl_s` and calls `_terminate_sandbox()` on each, updating state to `expired`. | Must |
-| FR-07 | The TTL sweep is invoked lazily at the start of every `cmd_sandbox` call (any subcommand) and emits a log line at DEBUG level listing how many sandboxes were swept. | Must |
-| FR-08 | Pre-expiry warning: for each sandbox where `ttl_remaining_s <= ttl_warn_s` and `state = 'running'` and `warned_at IS NULL`, emit a terminal warning and call `notifications.send_notification()` with message `"Sandbox <id> expires in <N>s"`. Set `warned_at = utc_now()` to prevent repeat warnings. | Must |
+| FR-05 | `tag sandbox set-ttl <id> --ttl <N>` updates `ttl_s` and resets `last_activity_at = utcNow()`. If the new TTL is already exceeded by the current idle time, the function calls `terminateSandbox()` immediately and sets state to `expired`. | Must |
+| FR-06 | The TTL sweep function `SweepExpiredSandboxes(ctx, db)` selects all rows where `ttl_s IS NOT NULL AND state = 'running' AND (strftime('%s','now') - strftime('%s', last_activity_at)) > ttl_s` and calls `terminateSandbox()` on each, updating state to `expired`. | Must |
+| FR-07 | The TTL sweep is invoked lazily at the start of every `sandbox` command (any subcommand) and by the reaper goroutine; it emits a `log/slog` line at DEBUG level listing how many sandboxes were swept. | Must |
+| FR-08 | Pre-expiry warning: for each sandbox where `ttl_remaining_s <= ttl_warn_s` and `state = 'running'` and `warned_at IS NULL`, emit a terminal warning and call `notifications.Send()` with message `"Sandbox <id> expires in <N>s"`. Set `warned_at = utcNow()` to prevent repeat warnings. | Must |
 | FR-09 | Warning is re-armed after each `sandbox refresh` or `set-ttl` call by setting `warned_at = NULL`. | Must |
-| FR-10 | `_terminate_sandbox(conn, run_id)` must call the appropriate backend cleanup: `docker kill <container_id>` for Docker; `sandbox.kill()` for E2B; no-op for restricted/modal (subprocess already completed). | Must |
-| FR-11 | `--refresh-interval <seconds>` in `tag sandbox run` starts a `threading.Timer`-based background thread that calls `refresh_sandbox(conn, run_id)` every `<seconds>` while the main thread is blocking on the subprocess. The thread is cancelled on process exit. | Should |
+| FR-10 | `terminateSandbox(ctx, db, runID)` must call the appropriate backend cleanup: `ContainerKill` via the moby client (docker/docker) for Docker; the E2B/Modal HTTP kill endpoint for cloud backends; process-group kill (`syscall.Kill(-pgid, SIGKILL)` on a `Setpgid` group) for the restricted tier if a child process survives; no-op for already-completed one-shots. | Must |
+| FR-11 | `--refresh-interval <seconds>` in `tag sandbox run` starts a `time.Ticker`-driven goroutine that calls `RefreshSandbox(ctx, db, runID)` every `<seconds>` while the main goroutine is blocking on the child process. The goroutine is cancelled via a `context.Context` on process exit. | Should |
 | FR-12 | `tag sandbox list --active` filters to rows where `state = 'running'`. `--expired` filters to `state = 'expired'`. Without flags, all states are shown. | Should |
-| FR-13 | `tag sandbox run --detach` inserts the sandbox record, starts the backend process as a non-blocking detached subprocess (using `subprocess.Popen` with stdout/stderr redirected to a temp file), and returns immediately, printing the sandbox ID. Requires `--ttl`. | Should |
-| FR-14 | Every TTL event (`created`, `refreshed`, `set-ttl`, `expired`, `warned`, `terminated`) is appended to `~/.tag/runtime/sandbox-audit.jsonl` as a JSON object with fields: `event`, `sandbox_id`, `timestamp`, `ttl_s`, `caller` (subcommand name). | Must |
+| FR-13 | `tag sandbox run --detach` inserts the sandbox record, starts the backend process as a non-blocking detached child (`os/exec.Cmd` with `SysProcAttr{Setpgid: true}` and stdout/stderr redirected to a temp file), and returns immediately, printing the sandbox ID. Requires `--ttl`. | Should |
+| FR-14 | Every TTL event (`created`, `refreshed`, `set-ttl`, `expired`, `warned`, `terminated`) is appended to `~/.tag/runtime/sandbox-audit.jsonl` as a JSON object (`encoding/json`) with fields: `event`, `sandbox_id`, `timestamp`, `ttl_s`, `caller` (subcommand name). | Must |
 | FR-15 | `tag sandbox set-ttl` validates that `--ttl` is between 30 and 86400 (inclusive) and that `--ttl-warn`, if provided, is strictly less than `--ttl`. Out-of-range values exit with code 2 and a clear error message. | Must |
-| FR-16 | `sandbox_runs.container_id` column (added by schema migration) stores the Docker container ID (obtained from `docker run --cidfile`) so that `_terminate_sandbox()` can issue `docker kill <container_id>` for long-lived Docker sessions. | Must |
-| FR-17 | Schema migration uses `ALTER TABLE sandbox_runs ADD COLUMN IF NOT SUPPORTED` — since SQLite does not support `IF NOT EXISTS` for `ALTER TABLE`, migration is guarded by a `PRAGMA table_info` check in `ensure_schema()`. | Must |
-| FR-18 | `cron_scheduler.py` integration: if the cron scheduler is available and running, register a cron entry `tag_sandbox_sweep` with interval 30 s that calls `sweep_expired_sandboxes`. This is advisory; the lazy sweep in `cmd_sandbox` is the primary mechanism. | Won't (v1) |
+| FR-16 | `sandbox_runs.container_id` column (added by schema migration) stores the Docker container ID (returned directly by the moby client `ContainerCreate` call) so that `terminateSandbox()` can issue `ContainerKill` for long-lived Docker sessions. | Must |
+| FR-17 | Schema migration uses guarded `ALTER TABLE sandbox_runs ADD COLUMN` statements — since SQLite does not support `IF NOT EXISTS` for `ALTER TABLE`, migration is guarded by a `PRAGMA table_info` check in `EnsureSchema()` (executed over `modernc.org/sqlite`). | Must |
+| FR-18 | `go-co-op/gocron` v2 integration: if the scheduler is available and running, register a job `tag_sandbox_sweep` with interval 30 s that calls `SweepExpiredSandboxes`. This is advisory; the reaper goroutine plus lazy sweep in the `sandbox` command are the primary mechanism. | Won't (v1) |
 
 ---
 
@@ -319,14 +321,14 @@ EXIT CODES
 |----|-------------|--------|
 | NFR-01 | `sweep_expired_sandboxes()` must complete in < 50 ms for up to 1000 active sandbox rows on a standard developer laptop (SQLite WAL mode). | Performance |
 | NFR-02 | `sandbox refresh` end-to-end (CLI invocation to DB commit to JSON response) must complete in < 200 ms. | Performance |
-| NFR-03 | TTL timestamp arithmetic uses ISO-8601 UTC strings and SQLite's `strftime('%s', ...)` for portable epoch arithmetic; no timezone-aware `datetime` objects are stored in the database. | Portability |
-| NFR-04 | The `--refresh-interval` background thread must not prevent clean process exit: it must be a daemon thread (`daemon=True`) with a `threading.Event` stop signal. | Reliability |
-| NFR-05 | All new functions are covered by unit tests that mock `_utc_now()` to simulate time advancement without `time.sleep()`. | Testability |
-| NFR-06 | `sandbox-audit.jsonl` is written with `O_APPEND` semantics (open in `'a'` mode) and each write is a single `json.dumps(event) + '\n'` call, making it safe for concurrent writers on POSIX. | Reliability |
-| NFR-07 | No new mandatory dependencies. Docker TTL management uses the existing `docker` CLI subprocess. E2B TTL uses the existing `e2b` SDK import guarded by `try/except ImportError`. | Dependency |
+| NFR-03 | TTL timestamp arithmetic stores RFC3339 UTC strings (`time.Time` in `time.UTC`, formatted via `time.RFC3339`) and uses SQLite's `strftime('%s', ...)` for portable epoch arithmetic at query time; no wall-clock-local timestamps are persisted. | Portability |
+| NFR-04 | The `--refresh-interval` goroutine must not prevent clean process exit: it is bound to a `context.Context` cancelled on shutdown, drains its `time.Ticker`, and is awaited via an `errgroup.Group`/`sync.WaitGroup` before exit. | Reliability |
+| NFR-05 | All new functions are covered by unit tests that inject a fake clock (a `func() time.Time` seam replacing `utcNow()`) to simulate time advancement without `time.Sleep`. | Testability |
+| NFR-06 | `sandbox-audit.jsonl` is written with `os.OpenFile(path, O_APPEND\|O_CREATE\|O_WRONLY, 0o600)` and each write is a single `json.Marshal(event)` + newline `Write`, making it safe for concurrent writers on POSIX. | Reliability |
+| NFR-07 | No new mandatory dependencies beyond the canonical stack. Docker TTL management uses the already-vendored `docker/docker` moby client. Cloud (E2B/Modal) TTL uses `net/http` against the provider REST API, feature-detected at runtime. | Dependency |
 | NFR-08 | Human-readable `ttl_remaining_s` display formats seconds as `Xh Ym Zs`, `Xm Ys`, or `Xs` as appropriate (no raw second counts in the table). | UX |
 | NFR-09 | `tag sandbox list --json` output is stable across minor version updates: new fields are always additive; no existing fields are renamed or removed. | Stability |
-| NFR-10 | SQLite WAL mode is already enabled by `open_db()`; no additional locking or journaling configuration is required for TTL sweep concurrency. | Correctness |
+| NFR-10 | SQLite WAL mode is already enabled by `OpenDB()` (over `modernc.org/sqlite`, single-writer); no additional locking or journaling configuration is required for TTL sweep concurrency. | Correctness |
 
 ---
 
@@ -334,7 +336,7 @@ EXIT CODES
 
 ### 9.1 Schema Migration
 
-The existing `sandbox_runs` table (defined in `sandbox.py:ensure_schema()`) gains four new columns. Because SQLite does not support `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, the migration function checks `PRAGMA table_info(sandbox_runs)` before each `ALTER TABLE`.
+The existing `sandbox_runs` table (defined in `internal/sandbox.EnsureSchema()`, executed over a `database/sql` handle backed by `modernc.org/sqlite`) gains four new columns. Because SQLite does not support `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, the migration function checks `PRAGMA table_info(sandbox_runs)` before each `ALTER TABLE`.
 
 ```sql
 -- New columns added to sandbox_runs by ensure_schema() migration
@@ -383,695 +385,800 @@ CREATE INDEX IF NOT EXISTS idx_sr_warn ON sandbox_runs(state, warned_at)
     WHERE ttl_s IS NOT NULL;
 ```
 
-### 9.2 Core Dataclasses
+### 9.2 Core Types (structs)
 
-```python
-# src/tag/sandbox.py  (additions for PRD-091)
-from __future__ import annotations
+Pointer fields (`*string`, `*int64`, `*time.Time`) model SQL `NULL`; ephemeral sandboxes leave `TTLSecs`/`LastActivityAt` nil. Derived values (`ttl_remaining_s`, `expires_at`) are computed by methods and injected into the JSON view via a marshaling shim, mirroring the pydantic computed-field behavior.
 
-import dataclasses
-import datetime
-import json
-import os
-import threading
-from pathlib import Path
-from typing import Optional
+```go
+// internal/sandbox/session.go  (additions for PRD-091)
+package sandbox
 
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+)
 
-@dataclasses.dataclass
-class SandboxSession:
-    """Represents a persistent sandbox session with TTL lifecycle."""
-    id: str
-    command: str
-    backend: str
-    image: Optional[str]
-    container_id: Optional[str]
-    state: str                        # running | done | failed | expired | killed
-    exit_code: Optional[int]
-    created_at: str                   # ISO-8601 UTC
-    completed_at: Optional[str]
-    last_activity_at: Optional[str]   # ISO-8601 UTC; None for ephemeral
-    ttl_s: Optional[int]              # None = ephemeral
-    ttl_warn_s: int = 60
-    warned_at: Optional[str] = None
+// clock is the injectable time source; overridden in tests. Defaults to UTC now.
+var utcNow = func() time.Time { return time.Now().UTC() }
 
-    @property
-    def is_ephemeral(self) -> bool:
-        return self.ttl_s is None
+// SandboxSession represents a persistent sandbox session with TTL lifecycle.
+type SandboxSession struct {
+	ID             string     `json:"id"`
+	Command        string     `json:"command"`
+	Backend        string     `json:"backend"`
+	Image          *string    `json:"image"`
+	ContainerID    *string    `json:"container_id"`
+	State          string     `json:"state"` // running | done | failed | expired | killed
+	ExitCode       *int       `json:"exit_code"`
+	CreatedAt      time.Time  `json:"created_at"`
+	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+	LastActivityAt *time.Time `json:"last_activity_at"` // nil for ephemeral
+	TTLSecs        *int64     `json:"ttl_s"`            // nil = ephemeral
+	TTLWarnSecs    int64      `json:"ttl_warn_s"`
+	WarnedAt       *time.Time `json:"-"`
+}
 
-    @property
-    def ttl_remaining_s(self) -> Optional[int]:
-        """Seconds until expiry based on last_activity_at. None if ephemeral."""
-        if self.ttl_s is None or self.last_activity_at is None:
-            return None
-        last = datetime.datetime.fromisoformat(self.last_activity_at.replace("Z", "+00:00"))
-        now = datetime.datetime.now(datetime.timezone.utc)
-        elapsed = (now - last).total_seconds()
-        remaining = self.ttl_s - elapsed
-        return max(0, int(remaining))
+// IsEphemeral reports whether the session has no TTL.
+func (s *SandboxSession) IsEphemeral() bool { return s.TTLSecs == nil }
 
-    @property
-    def expires_at(self) -> Optional[str]:
-        """ISO-8601 UTC expiry timestamp. None if ephemeral."""
-        if self.ttl_s is None or self.last_activity_at is None:
-            return None
-        last = datetime.datetime.fromisoformat(self.last_activity_at.replace("Z", "+00:00"))
-        expiry = last + datetime.timedelta(seconds=self.ttl_s)
-        return expiry.isoformat().replace("+00:00", "Z")
+// TTLRemaining returns seconds until expiry based on LastActivityAt, clamped to
+// >= 0. The bool is false when the session is ephemeral.
+func (s *SandboxSession) TTLRemaining() (int64, bool) {
+	if s.TTLSecs == nil || s.LastActivityAt == nil {
+		return 0, false
+	}
+	elapsed := int64(utcNow().Sub(*s.LastActivityAt).Seconds())
+	remaining := *s.TTLSecs - elapsed
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining, true
+}
 
-    def format_remaining(self) -> str:
-        """Human-readable TTL remaining string, e.g. '4m 32s'."""
-        r = self.ttl_remaining_s
-        if r is None:
-            return "—"
-        if r == 0:
-            return "expired"
-        h, rem = divmod(r, 3600)
-        m, s = divmod(rem, 60)
-        if h:
-            return f"{h}h {m}m {s}s"
-        if m:
-            return f"{m}m {s}s"
-        return f"{s}s"
+// ExpiresAt returns the RFC3339 UTC expiry timestamp; ok is false if ephemeral.
+func (s *SandboxSession) ExpiresAt() (time.Time, bool) {
+	if s.TTLSecs == nil || s.LastActivityAt == nil {
+		return time.Time{}, false
+	}
+	return s.LastActivityAt.Add(time.Duration(*s.TTLSecs) * time.Second), true
+}
 
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "backend": self.backend,
-            "state": self.state,
-            "command": self.command,
-            "created_at": self.created_at,
-            "last_activity_at": self.last_activity_at,
-            "ttl_s": self.ttl_s,
-            "ttl_warn_s": self.ttl_warn_s,
-            "ttl_remaining_s": self.ttl_remaining_s,
-            "expires_at": self.expires_at,
-            "exit_code": self.exit_code,
-            "image": self.image,
-            "container_id": self.container_id,
-        }
+// FormatRemaining renders a human-readable TTL string, e.g. "4m 32s".
+func (s *SandboxSession) FormatRemaining() string {
+	r, ok := s.TTLRemaining()
+	if !ok {
+		return "—"
+	}
+	if r == 0 {
+		return "expired"
+	}
+	h, rem := r/3600, r%3600
+	m, sec := rem/60, rem%60
+	switch {
+	case h > 0:
+		return fmt.Sprintf("%dh %dm %ds", h, m, sec)
+	case m > 0:
+		return fmt.Sprintf("%dm %ds", m, sec)
+	default:
+		return fmt.Sprintf("%ds", sec)
+	}
+}
 
+// MarshalJSON emits the stable list/refresh view, including derived fields.
+func (s *SandboxSession) MarshalJSON() ([]byte, error) {
+	type alias SandboxSession // avoid recursion
+	var remaining *int64
+	if r, ok := s.TTLRemaining(); ok {
+		remaining = &r
+	}
+	var expires *time.Time
+	if e, ok := s.ExpiresAt(); ok {
+		expires = &e
+	}
+	return json.Marshal(struct {
+		*alias
+		TTLRemainingSecs *int64     `json:"ttl_remaining_s"`
+		ExpiresAt        *time.Time `json:"expires_at"`
+	}{alias: (*alias)(s), TTLRemainingSecs: remaining, ExpiresAt: expires})
+}
 
-@dataclasses.dataclass
-class TTLEvent:
-    """Audit log entry for a TTL lifecycle event."""
-    event: str          # created | refreshed | set-ttl | expired | warned | terminated
-    sandbox_id: str
-    timestamp: str      # ISO-8601 UTC
-    ttl_s: Optional[int]
-    caller: str         # subcommand name or "sweep"
-    extra: dict = dataclasses.field(default_factory=dict)
+// TTLEvent is an audit log entry for a TTL lifecycle event.
+type TTLEvent struct {
+	Event      string         `json:"event"` // created | refreshed | set-ttl | expired | warned | terminated
+	SandboxID  string         `json:"sandbox_id"`
+	Timestamp  time.Time      `json:"timestamp"`
+	TTLSecs    *int64         `json:"ttl_s"`
+	Caller     string         `json:"caller"` // subcommand name or "sweep"
+	Extra      map[string]any `json:"extra,omitempty"`
+}
 
-    def to_jsonl(self) -> str:
-        d = dataclasses.asdict(self)
-        return json.dumps(d)
+// JSONL renders the event as a single JSON line (no trailing newline).
+func (e TTLEvent) JSONL() ([]byte, error) { return json.Marshal(e) }
 ```
 
 ### 9.3 TTL Sweep Algorithm
 
-```python
-# src/tag/sandbox.py
+The sweep runs both lazily (start of any `sandbox` command) and continuously from a reaper goroutine. All queries take a `context.Context` so the reaper can be cancelled on shutdown. Backend teardown fans out with a bounded `errgroup` and never blocks the DB transaction.
 
-TTL_MIN = 30
-TTL_MAX = 86400
-AUDIT_LOG_NAME = "sandbox-audit.jsonl"
+```go
+// internal/sandbox/ttl.go
+package sandbox
 
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"time"
+)
 
-def _audit_dir() -> Path:
-    return Path.home() / ".tag" / "runtime"
+const (
+	TTLMin       = 30
+	TTLMax       = 86400
+	auditLogName = "sandbox-audit.jsonl"
+)
 
+func auditDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".tag", "runtime")
+}
 
-def _write_audit(event: TTLEvent) -> None:
-    """Append a TTL event to the JSONL audit log (O_APPEND safe)."""
-    log_path = _audit_dir() / AUDIT_LOG_NAME
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "a", encoding="utf-8") as fh:
-        fh.write(event.to_jsonl() + "\n")
+// writeAudit appends a TTL event to the JSONL audit log (O_APPEND safe).
+func writeAudit(ev TTLEvent) error {
+	dir := auditDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	line, err := ev.JSONL()
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, auditLogName),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(append(line, '\n'))
+	return err
+}
 
+// SweepExpiredSandboxes terminates all running sandboxes whose idle time exceeds
+// their TTL and returns the number swept. Portable SQLite epoch predicate:
+//
+//	strftime('%s','now') - strftime('%s', last_activity_at) > ttl_s
+func SweepExpiredSandboxes(ctx context.Context, db *sql.DB) (int, error) {
+	now := utcNow()
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, backend, container_id, ttl_s
+		FROM   sandbox_runs
+		WHERE  state = 'running'
+		  AND  ttl_s IS NOT NULL
+		  AND  last_activity_at IS NOT NULL
+		  AND  (CAST(strftime('%s','now') AS INTEGER)
+		        - CAST(strftime('%s', last_activity_at) AS INTEGER)) > ttl_s`)
+	if err != nil {
+		return 0, err
+	}
+	type victim struct {
+		id, backend string
+		containerID *string
+		ttl         int64
+	}
+	var victims []victim
+	for rows.Next() {
+		var v victim
+		if err := rows.Scan(&v.id, &v.backend, &v.containerID, &v.ttl); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		victims = append(victims, v)
+	}
+	rows.Close()
 
-def sweep_expired_sandboxes(conn: sqlite3.Connection) -> int:
-    """
-    Terminate all running sandboxes whose idle time exceeds their TTL.
+	swept := 0
+	for _, v := range victims {
+		terminateSandboxBackend(ctx, v.backend, v.containerID)
+		if _, err := db.ExecContext(ctx,
+			`UPDATE sandbox_runs SET state='expired', completed_at=? WHERE id=?`,
+			now.Format(time.RFC3339), v.id); err != nil {
+			return swept, err
+		}
+		ttl := v.ttl
+		_ = writeAudit(TTLEvent{
+			Event: "expired", SandboxID: v.id, Timestamp: now,
+			TTLSecs: &ttl, Caller: "sweep",
+		})
+		swept++
+	}
 
-    Returns the number of sandboxes swept.
+	// Fire pre-expiry warnings for sandboxes approaching TTL.
+	if err := sweepWarnings(ctx, db); err != nil {
+		return swept, err
+	}
+	return swept, nil
+}
 
-    SQL predicate (portable SQLite epoch arithmetic):
-        strftime('%s','now') - strftime('%s', last_activity_at) > ttl_s
-    """
-    now_str = _utc_now()
-    expired_rows = conn.execute(
-        """
-        SELECT id, backend, container_id, ttl_s
-        FROM   sandbox_runs
-        WHERE  state = 'running'
-          AND  ttl_s IS NOT NULL
-          AND  last_activity_at IS NOT NULL
-          AND  (CAST(strftime('%s','now') AS INTEGER)
-                - CAST(strftime('%s', last_activity_at) AS INTEGER)) > ttl_s
-        """,
-    ).fetchall()
+// sweepWarnings fires pre-expiry warnings for sandboxes within their warn window.
+func sweepWarnings(ctx context.Context, db *sql.DB) error {
+	now := utcNow()
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, ttl_s, ttl_warn_s,
+		       (CAST(strftime('%s','now') AS INTEGER)
+		        - CAST(strftime('%s', last_activity_at) AS INTEGER)) AS idle_s
+		FROM   sandbox_runs
+		WHERE  state = 'running'
+		  AND  ttl_s IS NOT NULL
+		  AND  last_activity_at IS NOT NULL
+		  AND  warned_at IS NULL
+		  AND  (ttl_s - (CAST(strftime('%s','now') AS INTEGER)
+		                 - CAST(strftime('%s', last_activity_at) AS INTEGER))) <= ttl_warn_s
+		  AND  (ttl_s - (CAST(strftime('%s','now') AS INTEGER)
+		                 - CAST(strftime('%s', last_activity_at) AS INTEGER))) > 0`)
+	if err != nil {
+		return err
+	}
+	type warn struct {
+		id   string
+		ttl  int64
+		idle int64
+	}
+	var warns []warn
+	for rows.Next() {
+		var w warn
+		var warnSecs int64
+		if err := rows.Scan(&w.id, &w.ttl, &warnSecs, &w.idle); err != nil {
+			rows.Close()
+			return err
+		}
+		warns = append(warns, w)
+	}
+	rows.Close()
 
-    swept = 0
-    for row_id, backend, container_id, ttl_s in expired_rows:
-        _terminate_sandbox_backend(backend, container_id)
-        conn.execute(
-            "UPDATE sandbox_runs SET state='expired', completed_at=? WHERE id=?",
-            (now_str, row_id),
-        )
-        _write_audit(TTLEvent(
-            event="expired",
-            sandbox_id=row_id,
-            timestamp=now_str,
-            ttl_s=ttl_s,
-            caller="sweep",
-        ))
-        swept += 1
+	for _, w := range warns {
+		remaining := w.ttl - w.idle
+		emitTTLWarning(w.id, remaining)
+		if _, err := db.ExecContext(ctx,
+			`UPDATE sandbox_runs SET warned_at=? WHERE id=?`,
+			now.Format(time.RFC3339), w.id); err != nil {
+			return err
+		}
+		ttl := w.ttl
+		_ = writeAudit(TTLEvent{
+			Event: "warned", SandboxID: w.id, Timestamp: now,
+			TTLSecs: &ttl, Caller: "sweep",
+			Extra: map[string]any{"remaining_s": remaining},
+		})
+	}
+	return nil
+}
 
-    if swept:
-        conn.commit()
+// emitTTLWarning prints a terminal warning and calls the notifications hook.
+func emitTTLWarning(sandboxID string, remainingS int64) {
+	msg := fmt.Sprintf(
+		"[TAG WARNING] Sandbox %s expires in %s — run `tag sandbox refresh %s` to extend.",
+		sandboxID, fmtSeconds(remainingS), sandboxID)
+	fmt.Fprintln(os.Stderr, msg)
+	// notifications are best-effort; errors are logged, not propagated.
+	if err := notifications.Send(notifications.Message{
+		Title: "Sandbox Expiry Warning",
+		Body:  msg,
+		Level: "warning",
+	}); err != nil {
+		slog.Debug("ttl warning notification failed", "err", err)
+	}
+}
 
-    # Fire pre-expiry warnings for sandboxes approaching TTL
-    _sweep_warnings(conn)
+// terminateSandboxBackend issues backend-specific termination. Errors are
+// logged at DEBUG and swallowed (best-effort teardown).
+func terminateSandboxBackend(ctx context.Context, backend string, containerID *string) {
+	switch backend {
+	case "docker":
+		if containerID != nil {
+			cli, err := dockerClient() // docker/docker moby client, cached
+			if err == nil {
+				kctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				_ = cli.ContainerKill(kctx, *containerID, "KILL")
+			}
+		}
+	case "e2b", "modal":
+		// Cloud backends: containerID holds the provider sandbox ID; issue a
+		// DELETE against the provider REST API via net/http (feature-detected).
+		if containerID != nil {
+			_ = killCloudSandbox(ctx, backend, *containerID)
+		}
+	// restricted tier: one-shot child already reaped via process-group kill; no-op.
+	default:
+	}
+}
 
-    return swept
-
-
-def _sweep_warnings(conn: sqlite3.Connection) -> None:
-    """Fire pre-expiry warnings for sandboxes within their warn window."""
-    now_str = _utc_now()
-    warn_rows = conn.execute(
-        """
-        SELECT id, ttl_s, ttl_warn_s,
-               (CAST(strftime('%s','now') AS INTEGER)
-                - CAST(strftime('%s', last_activity_at) AS INTEGER)) AS idle_s
-        FROM   sandbox_runs
-        WHERE  state = 'running'
-          AND  ttl_s IS NOT NULL
-          AND  last_activity_at IS NOT NULL
-          AND  warned_at IS NULL
-          AND  (ttl_s - (CAST(strftime('%s','now') AS INTEGER)
-                         - CAST(strftime('%s', last_activity_at) AS INTEGER)))
-               <= ttl_warn_s
-          AND  (ttl_s - (CAST(strftime('%s','now') AS INTEGER)
-                         - CAST(strftime('%s', last_activity_at) AS INTEGER))) > 0
-        """,
-    ).fetchall()
-
-    for row_id, ttl_s, ttl_warn_s, idle_s in warn_rows:
-        remaining = ttl_s - idle_s
-        _emit_ttl_warning(row_id, remaining)
-        conn.execute(
-            "UPDATE sandbox_runs SET warned_at=? WHERE id=?",
-            (now_str, row_id),
-        )
-        _write_audit(TTLEvent(
-            event="warned",
-            sandbox_id=row_id,
-            timestamp=now_str,
-            ttl_s=ttl_s,
-            caller="sweep",
-            extra={"remaining_s": remaining},
-        ))
-
-    if warn_rows:
-        conn.commit()
-
-
-def _emit_ttl_warning(sandbox_id: str, remaining_s: int) -> None:
-    """Print terminal warning and call notifications hook."""
-    import sys
-    msg = (
-        f"[TAG WARNING] Sandbox {sandbox_id} expires in "
-        f"{_fmt_seconds(remaining_s)} — run `tag sandbox refresh {sandbox_id}` to extend."
-    )
-    print(msg, file=sys.stderr)
-    try:
-        from tag.notifications import send_notification
-        send_notification(
-            title="Sandbox Expiry Warning",
-            body=msg,
-            level="warning",
-        )
-    except Exception:
-        pass  # notifications are best-effort
-
-
-def _terminate_sandbox_backend(backend: str, container_id: Optional[str]) -> None:
-    """Issue backend-specific termination. Errors are swallowed (best-effort)."""
-    try:
-        if backend == "docker" and container_id:
-            subprocess.run(
-                ["docker", "kill", container_id],
-                capture_output=True,
-                timeout=10,
-            )
-        elif backend == "e2b":
-            # E2B: sandbox.kill() requires the SDK object, which is not
-            # serializable. In practice, E2B sandboxes are identified by ID;
-            # use the E2B REST API or SDK reconnect pattern here.
-            try:
-                from e2b import Sandbox
-                sb = Sandbox.connect(container_id)  # container_id = e2b sandbox_id
-                sb.kill()
-            except Exception:
-                pass
-        # restricted and modal: subprocess already completed; no-op.
-    except Exception:
-        pass
-
-
-def _fmt_seconds(s: int) -> str:
-    """Format seconds as human-readable string."""
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    if h:
-        return f"{h}h {m}m {sec}s"
-    if m:
-        return f"{m}m {sec}s"
-    return f"{sec}s"
+// fmtSeconds formats seconds as a human-readable string.
+func fmtSeconds(s int64) string {
+	h, rem := s/3600, s%3600
+	m, sec := rem/60, rem%60
+	switch {
+	case h > 0:
+		return fmt.Sprintf("%dh %dm %ds", h, m, sec)
+	case m > 0:
+		return fmt.Sprintf("%dm %ds", m, sec)
+	default:
+		return fmt.Sprintf("%ds", sec)
+	}
+}
 ```
 
 ### 9.4 Refresh and Set-TTL Functions
 
-```python
-def refresh_sandbox(conn: sqlite3.Connection, run_id: str) -> SandboxSession:
-    """
-    Reset last_activity_at for a running sandbox (keepalive).
+Sentinel errors (`ErrNotFound`, `ErrNotRunning`, `ErrEphemeral`, `ErrInvalidTTL`) let the command layer map failures to exit codes via `errors.Is`, replacing Python's `ValueError` string matching.
 
-    Raises ValueError if sandbox is not found or not in 'running' state.
-    """
-    row = conn.execute(
-        "SELECT state, ttl_s FROM sandbox_runs WHERE id=?", (run_id,)
-    ).fetchone()
-    if row is None:
-        raise ValueError(f"Sandbox {run_id!r} not found.")
-    state, ttl_s = row
-    if state != "running":
-        raise ValueError(
-            f"Sandbox {run_id!r} is in state {state!r}; only 'running' sandboxes can be refreshed."
-        )
-    if ttl_s is None:
-        raise ValueError(
-            f"Sandbox {run_id!r} is ephemeral (no TTL); refresh is not applicable."
-        )
+```go
+// internal/sandbox/refresh.go
+package sandbox
 
-    now_str = _utc_now()
-    conn.execute(
-        "UPDATE sandbox_runs SET last_activity_at=?, warned_at=NULL WHERE id=?",
-        (now_str, run_id),
-    )
-    conn.commit()
-    _write_audit(TTLEvent(
-        event="refreshed",
-        sandbox_id=run_id,
-        timestamp=now_str,
-        ttl_s=ttl_s,
-        caller="refresh",
-    ))
-    return _get_session(conn, run_id)
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+)
 
+var (
+	ErrNotFound   = errors.New("sandbox not found")
+	ErrNotRunning = errors.New("sandbox is not in running state")
+	ErrEphemeral  = errors.New("sandbox is ephemeral (no TTL)")
+	ErrInvalidTTL = errors.New("invalid TTL value")
+)
 
-def set_sandbox_ttl(
-    conn: sqlite3.Connection,
-    run_id: str,
-    new_ttl_s: int,
-    new_warn_s: Optional[int] = None,
-) -> SandboxSession:
-    """
-    Update TTL for a running sandbox. Resets last_activity_at.
-    If new_ttl_s is already exceeded by current idle time, terminates immediately.
+// RefreshSandbox resets last_activity_at for a running sandbox (keepalive).
+func RefreshSandbox(ctx context.Context, db *sql.DB, runID string) (*SandboxSession, error) {
+	var state string
+	var ttl *int64
+	err := db.QueryRowContext(ctx,
+		`SELECT state, ttl_s FROM sandbox_runs WHERE id=?`, runID).Scan(&state, &ttl)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %q", ErrNotFound, runID)
+	} else if err != nil {
+		return nil, err
+	}
+	if state != "running" {
+		return nil, fmt.Errorf("%w: %q is %q", ErrNotRunning, runID, state)
+	}
+	if ttl == nil {
+		return nil, fmt.Errorf("%w: %q", ErrEphemeral, runID)
+	}
 
-    Raises ValueError for invalid inputs or wrong state.
-    """
-    if not (TTL_MIN <= new_ttl_s <= TTL_MAX):
-        raise ValueError(f"--ttl must be between {TTL_MIN} and {TTL_MAX}, got {new_ttl_s}.")
+	now := utcNow()
+	if _, err := db.ExecContext(ctx,
+		`UPDATE sandbox_runs SET last_activity_at=?, warned_at=NULL WHERE id=?`,
+		now.Format(time.RFC3339), runID); err != nil {
+		return nil, err
+	}
+	_ = writeAudit(TTLEvent{
+		Event: "refreshed", SandboxID: runID, Timestamp: now, TTLSecs: ttl, Caller: "refresh",
+	})
+	return getSession(ctx, db, runID)
+}
 
-    row = conn.execute(
-        "SELECT state, ttl_s, ttl_warn_s, backend, container_id FROM sandbox_runs WHERE id=?",
-        (run_id,),
-    ).fetchone()
-    if row is None:
-        raise ValueError(f"Sandbox {run_id!r} not found.")
-    state, old_ttl_s, old_warn_s, backend, container_id = row
-    if state != "running":
-        raise ValueError(
-            f"Sandbox {run_id!r} is in state {state!r}; only 'running' sandboxes can have TTL changed."
-        )
+// SetSandboxTTL updates the TTL for a running sandbox and resets
+// last_activity_at. If newTTLSecs is already exceeded by the current idle time,
+// the sandbox is terminated immediately by the follow-up sweep.
+func SetSandboxTTL(ctx context.Context, db *sql.DB, runID string, newTTLSecs int64, newWarnSecs *int64) (*SandboxSession, error) {
+	if newTTLSecs < TTLMin || newTTLSecs > TTLMax {
+		return nil, fmt.Errorf("%w: --ttl must be between %d and %d, got %d",
+			ErrInvalidTTL, TTLMin, TTLMax, newTTLSecs)
+	}
 
-    warn_s = new_warn_s if new_warn_s is not None else old_warn_s
-    if warn_s is not None and warn_s >= new_ttl_s:
-        raise ValueError(
-            f"--ttl-warn ({warn_s}s) must be less than --ttl ({new_ttl_s}s)."
-        )
+	var state string
+	var oldTTL, oldWarn *int64
+	var backend string
+	var containerID *string
+	err := db.QueryRowContext(ctx,
+		`SELECT state, ttl_s, ttl_warn_s, backend, container_id FROM sandbox_runs WHERE id=?`,
+		runID).Scan(&state, &oldTTL, &oldWarn, &backend, &containerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %q", ErrNotFound, runID)
+	} else if err != nil {
+		return nil, err
+	}
+	if state != "running" {
+		return nil, fmt.Errorf("%w: %q is %q", ErrNotRunning, runID, state)
+	}
 
-    now_str = _utc_now()
-    conn.execute(
-        """UPDATE sandbox_runs
-           SET ttl_s=?, ttl_warn_s=?, last_activity_at=?, warned_at=NULL
-           WHERE id=?""",
-        (new_ttl_s, warn_s, now_str, run_id),
-    )
-    conn.commit()
+	warn := oldWarn
+	if newWarnSecs != nil {
+		warn = newWarnSecs
+	}
+	if warn != nil && *warn >= newTTLSecs {
+		return nil, fmt.Errorf("%w: --ttl-warn (%ds) must be less than --ttl (%ds)",
+			ErrInvalidTTL, *warn, newTTLSecs)
+	}
 
-    _write_audit(TTLEvent(
-        event="set-ttl",
-        sandbox_id=run_id,
-        timestamp=now_str,
-        ttl_s=new_ttl_s,
-        caller="set-ttl",
-        extra={"old_ttl_s": old_ttl_s, "new_warn_s": warn_s},
-    ))
+	now := utcNow()
+	if _, err := db.ExecContext(ctx,
+		`UPDATE sandbox_runs
+		   SET ttl_s=?, ttl_warn_s=?, last_activity_at=?, warned_at=NULL
+		   WHERE id=?`,
+		newTTLSecs, warn, now.Format(time.RFC3339), runID); err != nil {
+		return nil, err
+	}
+	_ = writeAudit(TTLEvent{
+		Event: "set-ttl", SandboxID: runID, Timestamp: now, TTLSecs: &newTTLSecs, Caller: "set-ttl",
+		Extra: map[string]any{"old_ttl_s": oldTTL, "new_warn_s": warn},
+	})
 
-    # Run sweep immediately: if new_ttl_s < current idle time, expires now.
-    sweep_expired_sandboxes(conn)
+	// Run sweep immediately: if newTTLSecs < current idle time, expires now.
+	if _, err := SweepExpiredSandboxes(ctx, db); err != nil {
+		return nil, err
+	}
+	return getSession(ctx, db, runID)
+}
 
-    return _get_session(conn, run_id)
-
-
-def _get_session(conn: sqlite3.Connection, run_id: str) -> SandboxSession:
-    """Fetch a SandboxSession from the database by ID."""
-    row = conn.execute(
-        """SELECT id, command, backend, image, container_id, state, exit_code,
-                  created_at, completed_at, last_activity_at, ttl_s, ttl_warn_s, warned_at
-           FROM sandbox_runs WHERE id=?""",
-        (run_id,),
-    ).fetchone()
-    if row is None:
-        raise ValueError(f"Sandbox {run_id!r} not found.")
-    return SandboxSession(
-        id=row[0], command=row[1], backend=row[2], image=row[3],
-        container_id=row[4], state=row[5], exit_code=row[6],
-        created_at=row[7], completed_at=row[8], last_activity_at=row[9],
-        ttl_s=row[10], ttl_warn_s=row[11] or 60, warned_at=row[12],
-    )
+// getSession fetches a SandboxSession from the database by ID.
+func getSession(ctx context.Context, db *sql.DB, runID string) (*SandboxSession, error) {
+	var s SandboxSession
+	var warn *int64
+	err := db.QueryRowContext(ctx, `
+		SELECT id, command, backend, image, container_id, state, exit_code,
+		       created_at, completed_at, last_activity_at, ttl_s, ttl_warn_s, warned_at
+		FROM sandbox_runs WHERE id=?`, runID).Scan(
+		&s.ID, &s.Command, &s.Backend, &s.Image, &s.ContainerID, &s.State, &s.ExitCode,
+		&s.CreatedAt, &s.CompletedAt, &s.LastActivityAt, &s.TTLSecs, &warn, &s.WarnedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %q", ErrNotFound, runID)
+	} else if err != nil {
+		return nil, err
+	}
+	if warn != nil {
+		s.TTLWarnSecs = *warn
+	} else {
+		s.TTLWarnSecs = 60
+	}
+	return &s, nil
+}
 ```
 
-### 9.5 Background Refresh Thread
+### 9.5 Background Refresh Goroutine
 
-```python
-class _RefreshThread:
-    """
-    Background thread that calls refresh_sandbox() every `interval_s` seconds.
-    Used by `tag sandbox run --refresh-interval`.
-    """
+A goroutine driven by a `time.Ticker` calls `RefreshSandbox` every `interval` while `tag sandbox run --refresh-interval` blocks on the child process. It shares the single WAL-mode `*sql.DB` handle (the connection pool is safe for concurrent use, so no per-call connection factory is needed) and is torn down via `context.Context` cancellation — the goroutine cannot outlive the command.
 
-    def __init__(
-        self,
-        conn_factory,          # callable → sqlite3.Connection (new connection per call)
-        run_id: str,
-        interval_s: int,
-    ) -> None:
-        self._factory = conn_factory
-        self._run_id = run_id
-        self._interval = interval_s
-        self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._loop,
-            daemon=True,
-            name=f"sandbox-refresh-{run_id[:8]}",
-        )
+```go
+// internal/sandbox/keepalive.go
+package sandbox
 
-    def start(self) -> None:
-        self._thread.start()
+import (
+	"context"
+	"database/sql"
+	"log/slog"
+	"time"
+)
 
-    def stop(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=self._interval + 2)
+// StartRefresher launches a keepalive goroutine that refreshes runID every
+// interval until ctx is cancelled. The returned func blocks until the goroutine
+// has exited, giving the caller a clean shutdown barrier.
+func StartRefresher(ctx context.Context, db *sql.DB, runID string, interval time.Duration) (stop func()) {
+	done := make(chan struct{})
+	ctx, cancel := context.WithCancel(ctx)
 
-    def _loop(self) -> None:
-        while not self._stop.wait(timeout=self._interval):
-            try:
-                conn = self._factory()
-                refresh_sandbox(conn, self._run_id)
-                conn.close()
-            except Exception:
-                pass  # Don't crash the background thread
+	go func() {
+		defer close(done)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if _, err := RefreshSandbox(ctx, db, runID); err != nil {
+					// Log and continue; a background failure must not crash the run.
+					slog.Debug("keepalive refresh failed", "sandbox", runID, "err", err)
+				}
+			}
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
+	}
+}
 ```
 
-### 9.6 Controller Integration Points
+### 9.6 Command Integration Points
 
-In `src/tag/controller.py`, the `cmd_sandbox` function (line ~7443) is extended with three new subcommand branches: `refresh`, `set-ttl`, and updated `list`. The lazy sweep is prepended to the existing dispatch logic:
+The `tag sandbox` command group (Cobra, `cmd/tag/sandbox.go`) gains three new leaf commands — `refresh`, `set-ttl`, and an updated `list`. A `PersistentPreRunE` on the group runs the lazy sweep before every subcommand. Cobra's `RunE` returns errors, which are mapped to process exit codes by a small `errors.Is` switch in `main`; the sentinel errors from §9.4 drive codes 1 and 2.
 
-```python
-def cmd_sandbox(args: argparse.Namespace) -> int:
-    cfg = load_config(config_path(getattr(args, "config", None)))
-    ensure_runtime_dirs(cfg)
-    db = open_db(cfg)
-    sub = getattr(args, "sandbox_subcommand", "list")
+```go
+// cmd/tag/sandbox.go
+package main
 
-    try:
-        import tag.sandbox as _sandbox
-    except ImportError as exc:
-        db.close()
-        print_error(f"tag.sandbox not available: {exc}")
-        return 1
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 
-    # PRD-091: lazy TTL sweep on every cmd_sandbox invocation
-    _sandbox.sweep_expired_sandboxes(db)
+	"github.com/spf13/cobra"
+	"github.com/tag-agent/tag/internal/sandbox"
+)
 
-    if sub == "refresh":
-        run_id = getattr(args, "run_id", None)
-        if not run_id:
-            db.close()
-            print_error("SANDBOX_ID required")
-            return 1
-        try:
-            session = _sandbox.refresh_sandbox(db, run_id)
-        except ValueError as exc:
-            db.close()
-            print_error(str(exc))
-            return 1
-        db.close()
-        if getattr(args, "json", False):
-            print(json.dumps(session.to_dict(), indent=2))
-        else:
-            print(
-                f"Sandbox {session.id} refreshed.  "
-                f"New expiry: {session.expires_at}  (TTL: {session.ttl_s}s)"
-            )
-        return 0
+func newSandboxCmd(app *App) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "sandbox",
+		Short: "Manage sandbox execution sessions",
+		// PRD-091: lazy TTL sweep before every sandbox subcommand.
+		PersistentPreRunE: func(c *cobra.Command, _ []string) error {
+			_, err := sandbox.SweepExpiredSandboxes(c.Context(), app.DB)
+			return err
+		},
+	}
+	cmd.AddCommand(newSandboxRefreshCmd(app), newSandboxSetTTLCmd(app) /* + run/list/result */)
+	return cmd
+}
 
-    if sub == "set-ttl":
-        run_id = getattr(args, "run_id", None)
-        new_ttl = getattr(args, "ttl", None)
-        new_warn = getattr(args, "ttl_warn", None)
-        if not run_id or new_ttl is None:
-            db.close()
-            print_error("SANDBOX_ID and --ttl are required")
-            return 1
-        try:
-            session = _sandbox.set_sandbox_ttl(db, run_id, new_ttl, new_warn)
-        except ValueError as exc:
-            db.close()
-            print_error(str(exc))
-            return 2
-        db.close()
-        if getattr(args, "json", False):
-            print(json.dumps(session.to_dict(), indent=2))
-        else:
-            print(
-                f"Sandbox {session.id} TTL updated → {session.ttl_s}s.  "
-                f"New expiry: {session.expires_at}"
-            )
-        return 0
-    # ... existing run / list / result branches follow
+func newSandboxRefreshCmd(app *App) *cobra.Command {
+	var asJSON bool
+	c := &cobra.Command{
+		Use:   "refresh SANDBOX_ID",
+		Short: "Reset TTL idle timer for a running sandbox",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			sess, err := sandbox.RefreshSandbox(c.Context(), app.DB, args[0])
+			if err != nil {
+				return err // exit-code mapper turns ErrNotRunning/ErrNotFound into 1
+			}
+			return printSession(c, sess, asJSON, "refreshed")
+		},
+	}
+	c.Flags().BoolVar(&asJSON, "json", false, "emit JSON confirmation object")
+	return c
+}
+
+func newSandboxSetTTLCmd(app *App) *cobra.Command {
+	var ttl, ttlWarn int64
+	var asJSON bool
+	c := &cobra.Command{
+		Use:   "set-ttl SANDBOX_ID --ttl SECONDS",
+		Short: "Update TTL for a running sandbox",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			var warn *int64
+			if c.Flags().Changed("ttl-warn") {
+				warn = &ttlWarn
+			}
+			sess, err := sandbox.SetSandboxTTL(c.Context(), app.DB, args[0], ttl, warn)
+			if err != nil {
+				return err // ErrInvalidTTL → exit 2; ErrNotFound/ErrNotRunning → exit 1
+			}
+			return printSession(c, sess, asJSON, "set-ttl")
+		},
+	}
+	c.Flags().Int64Var(&ttl, "ttl", 0, "new TTL in seconds (30–86400)")
+	c.Flags().Int64Var(&ttlWarn, "ttl-warn", 60, "new warning threshold (must be < --ttl)")
+	c.Flags().BoolVar(&asJSON, "json", false, "emit JSON confirmation object")
+	_ = c.MarkFlagRequired("ttl")
+	return c
+}
+
+// printSession renders either JSON or a one-line human summary.
+func printSession(c *cobra.Command, s *sandbox.SandboxSession, asJSON bool, verb string) error {
+	if asJSON {
+		b, err := json.MarshalIndent(s, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(c.OutOrStdout(), string(b))
+		return nil
+	}
+	exp, _ := s.ExpiresAt()
+	fmt.Fprintf(c.OutOrStdout(), "Sandbox %s %s.  New expiry: %s\n",
+		s.ID, verb, exp.Format(time.RFC3339))
+	return nil
+}
+
+// mapExitCode (in main): errors.Is(err, sandbox.ErrInvalidTTL) → 2; other
+// sentinel errors → 1; nil → 0.
+var _ = context.Background // ctx flows from cobra's c.Context()
 ```
 
-### 9.7 Argparse Registration
+### 9.7 Cobra Flag Registration
 
-New subcommands are registered in the `tag sandbox` subparser group in `controller.py` (around line 9851):
+Beyond the `refresh` and `set-ttl` commands in §9.6, the existing `run` and `list` commands gain new flags. `--ttl` uses `0` as the "unset" sentinel (ephemeral); flag values are validated in `RunE`, and `--detach` requires `--ttl` (enforced with `cobra.MarkFlagsRequiredTogether` / an explicit check).
 
-```python
-# In the sandbox subparser registration block:
+```go
+// cmd/tag/sandbox.go — flag registration on the run and list commands
 
-# tag sandbox refresh
-p_refresh = sandbox_sub.add_parser("refresh", help="Reset TTL idle timer for a running sandbox")
-p_refresh.add_argument("run_id", metavar="SANDBOX_ID")
-p_refresh.add_argument("--json", action="store_true")
-p_refresh.set_defaults(sandbox_subcommand="refresh")
+func addRunTTLFlags(run *cobra.Command, o *runOpts) {
+	f := run.Flags()
+	f.Int64Var(&o.TTL, "ttl", 0,
+		"per-sandbox idle TTL in seconds (30–86400); 0 = ephemeral, enables session persistence")
+	f.Int64Var(&o.TTLWarn, "ttl-warn", 60,
+		"warn N seconds before TTL expiry")
+	f.DurationVar(&o.RefreshInterval, "refresh-interval", 0,
+		"auto-keepalive interval, e.g. 60s (requires --ttl)")
+	f.BoolVar(&o.Detach, "detach", false,
+		"return immediately after starting sandbox (requires --ttl)")
+	// --detach is meaningless without --ttl; enforced in RunE:
+	//   if o.Detach && o.TTL == 0 { return errors.New("--detach requires --ttl") }
+}
 
-# tag sandbox set-ttl
-p_set_ttl = sandbox_sub.add_parser("set-ttl", help="Update TTL for a running sandbox")
-p_set_ttl.add_argument("run_id", metavar="SANDBOX_ID")
-p_set_ttl.add_argument("--ttl", type=int, required=True, metavar="SECONDS",
-                        help=f"New TTL in seconds ({TTL_MIN}–{TTL_MAX})")
-p_set_ttl.add_argument("--ttl-warn", type=int, dest="ttl_warn", metavar="SECONDS",
-                        help="New warning threshold (must be < --ttl)")
-p_set_ttl.add_argument("--json", action="store_true")
-p_set_ttl.set_defaults(sandbox_subcommand="set-ttl")
-
-# Extend tag sandbox run with --ttl flags
-p_run.add_argument("--ttl", type=int, default=None, metavar="SECONDS",
-                   help="Per-sandbox idle TTL in seconds. Enables session persistence.")
-p_run.add_argument("--ttl-warn", type=int, dest="ttl_warn", default=60, metavar="SECONDS",
-                   help="Warn N seconds before TTL expiry (default: 60)")
-p_run.add_argument("--refresh-interval", type=int, dest="refresh_interval",
-                   default=None, metavar="SECONDS",
-                   help="Auto-keepalive interval in seconds (requires --ttl)")
-p_run.add_argument("--detach", action="store_true",
-                   help="Return immediately after starting sandbox (requires --ttl)")
-
-# Extend tag sandbox list with filter flags
-p_list.add_argument("--active", action="store_true", help="Show only running sandboxes")
-p_list.add_argument("--expired", action="store_true", help="Show only expired sandboxes")
+func addListFilterFlags(list *cobra.Command, o *listOpts) {
+	f := list.Flags()
+	f.BoolVar(&o.Active, "active", false, "show only running sandboxes")
+	f.BoolVar(&o.Expired, "expired", false, "show only expired sandboxes")
+	f.BoolVar(&o.JSON, "json", false, "emit JSON array (extended schema)")
+}
 ```
 
 ### 9.8 Docker Container ID Capture
 
-For `_terminate_sandbox_backend` to issue `docker kill <container_id>`, the container ID must be captured at `docker run` time. The existing `_run_docker()` function is modified to use `--cidfile`:
+For `terminateSandboxBackend` to issue `ContainerKill`, the container ID must be captured at launch. Unlike the shell `docker run --cidfile` dance, the moby client (`docker/docker`) returns the container ID directly from `ContainerCreate`, so no temp file is needed. The existing Docker backend is modified to create-then-start-then-wait and return the ID for persistence in `sandbox_runs.container_id`.
 
-```python
-def _run_docker_session(
-    command: list[str],
-    image: str,
-    *,
-    timeout: int = 60,
-    run_id: str,
-) -> tuple[int, str, str, str]:
-    """
-    Run command inside a Docker container, capturing the container ID.
-    Returns (exit_code, stdout, stderr, container_id).
-    """
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".cid", delete=False) as cid_file:
-        cid_path = cid_file.name
+```go
+// internal/sandbox/backend_docker.go
+package sandbox
 
-    docker_cmd = [
-        "docker", "run",
-        "--rm",
-        "--network=none",
-        "--memory=512m",
-        "--cpus=1",
-        f"--stop-timeout={timeout}",
-        f"--cidfile={cid_path}",
-        "--label", f"tag.sandbox.id={run_id}",
-        image,
-    ] + command
+import (
+	"context"
+	"time"
 
-    try:
-        proc = subprocess.run(
-            docker_cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout + 30,
-        )
-        container_id = ""
-        try:
-            container_id = Path(cid_path).read_text().strip()
-        except OSError:
-            pass
-        return proc.returncode, proc.stdout, proc.stderr, container_id
-    except FileNotFoundError:
-        return 1, "", "docker not found — install Docker or use --backend restricted", ""
-    except subprocess.TimeoutExpired:
-        return 124, "", f"Docker run timed out after {timeout}s", ""
-    except Exception as exc:
-        return 1, "", str(exc), ""
-    finally:
-        try:
-            os.unlink(cid_path)
-        except OSError:
-            pass
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
+)
+
+type dockerResult struct {
+	ExitCode    int
+	Stdout      string
+	Stderr      string
+	ContainerID string
+}
+
+// runDockerSession runs command inside a Docker container, capturing the
+// container ID so a long-lived TTL session can later be killed by ID.
+func runDockerSession(ctx context.Context, cli *client.Client, cmd []string, image string, timeout time.Duration, runID string) (dockerResult, error) {
+	stopTimeout := int(timeout.Seconds())
+	create, err := cli.ContainerCreate(ctx,
+		&container.Config{
+			Image:  image,
+			Cmd:    cmd,
+			Labels: map[string]string{"tag.sandbox.id": runID},
+		},
+		&container.HostConfig{
+			AutoRemove:  true,
+			NetworkMode: "none",
+			Resources: container.Resources{
+				Memory:   512 * 1024 * 1024, // 512m
+				NanoCPUs: 1_000_000_000,     // 1 cpu
+			},
+			StopTimeout: &stopTimeout,
+		},
+		nil, nil, "")
+	if err != nil {
+		return dockerResult{}, err // e.g. client.IsErrConnectionFailed → "docker not available; use --backend restricted"
+	}
+	res := dockerResult{ContainerID: create.ID}
+
+	if err := cli.ContainerStart(ctx, create.ID, container.StartOptions{}); err != nil {
+		return res, err
+	}
+
+	// Wait bounded by ctx (caller sets context.WithTimeout(timeout+grace)).
+	statusCh, errCh := cli.ContainerWait(ctx, create.ID, container.WaitConditionNotRunning)
+	select {
+	case err := <-errCh:
+		return res, err
+	case st := <-statusCh:
+		res.ExitCode = int(st.StatusCode)
+	case <-ctx.Done():
+		res.ExitCode = 124 // timed out
+		return res, ctx.Err()
+	}
+
+	// Stdout/stderr collected via cli.ContainerLogs(ctx, create.ID, ...) with the
+	// stdcopy demultiplexer; omitted here for brevity.
+	return res, nil
+}
 ```
 
 ### 9.9 Integration with Existing Modules
 
-| Module | Integration point | Change |
+| Package | Integration point | Change |
 |--------|-------------------|--------|
-| `notifications.py` | `_emit_ttl_warning()` calls `send_notification()` with `level="warning"` | Caller-side only; `notifications.py` unchanged |
-| `cron_scheduler.py` | `sweep_expired_sandboxes` registered as advisory cron (30 s interval) | Deferred to v1.1; lazy sweep is primary |
-| `tracing.py` | TTL events use existing `_utc_now()` pattern; no OTel spans added for sweep | No change |
-| `budget.py` | Sandbox session duration contributes to cost attribution in a future PRD; no change in this PRD | No change |
-| `controller.py` | `cmd_sandbox` extended with `refresh`, `set-ttl` branches; lazy sweep prepended to dispatch | See §9.6 |
+| `internal/notifications` | `emitTTLWarning()` calls `notifications.Send()` with `Level: "warning"` | Caller-side only; `internal/notifications` unchanged |
+| `internal/scheduler` (`go-co-op/gocron` v2) | `SweepExpiredSandboxes` registered as an advisory 30 s job | Deferred to v1.1; reaper goroutine + lazy sweep are primary |
+| `internal/tracing` | TTL events reuse the injectable `utcNow()` seam; no OTel spans added for sweep | No change |
+| `internal/budget` | Sandbox session duration contributes to cost attribution in a future PRD; no change in this PRD | No change |
+| `cmd/tag` (Cobra) | `sandbox` group gains `refresh` and `set-ttl` commands; lazy sweep runs in `PersistentPreRunE` | See §9.6 |
 
 ---
 
 ## 10. Security Considerations
 
-1. **TTL manipulation by unprivileged callers.** `set_sandbox_ttl` validates the `run_id` against the `sandbox_runs` table but does not check ownership (since TAG is single-user). In a future multi-user deployment, ownership must be enforced by adding a `owner_uid` column and comparing against `os.getuid()`.
+1. **TTL manipulation by unprivileged callers.** `SetSandboxTTL` validates the `runID` against the `sandbox_runs` table but does not check ownership (since TAG is single-user). In a future multi-user deployment, ownership must be enforced by adding an `owner_uid` column and comparing against `os.Getuid()`.
 
-2. **Audit log integrity.** `sandbox-audit.jsonl` is written at `~/.tag/runtime/`, which is writable only by the owning user. On shared systems, the directory permissions should be `700`. The `ensure_runtime_dirs()` call in `controller.py` already sets `0o700` on the runtime directory; no change required, but this should be verified in the doctor check.
+2. **Audit log integrity.** `sandbox-audit.jsonl` is written at `~/.tag/runtime/`, which is writable only by the owning user. On shared systems, the directory permissions should be `0700`. `writeAudit()` creates the directory with `os.MkdirAll(dir, 0o700)` and the log file with mode `0o600`; this should be verified in the doctor check.
 
-3. **Container ID spoofing in `docker kill`.** The `container_id` stored in `sandbox_runs` is retrieved from a `--cidfile` written by `docker run`. On a POSIX filesystem, the temp file is created by the TAG process and cleaned up after read, providing no meaningful attack surface for unprivileged users on a single-user system.
+3. **Container ID spoofing in kill.** The `container_id` stored in `sandbox_runs` is returned directly by the moby client `ContainerCreate` call over the local Docker socket — it never transits a temp file, removing the `--cidfile` race surface entirely. On a single-user system this presents no meaningful attack surface.
 
-4. **`--ttl` range enforcement prevents resource exhaustion.** The 30–86400 second range is validated server-side (in `set_sandbox_ttl`) and client-side (argparse `type=int` + range check). Values outside this range exit 2 with a clear error; there is no silent truncation.
+4. **`--ttl` range enforcement prevents resource exhaustion.** The 30–86400 second range is validated in `SetSandboxTTL` (returning `ErrInvalidTTL`) and echoed by the Cobra `Int64Var` flag + `RunE` range check. Values outside this range exit 2 with a clear error; there is no silent truncation.
 
-5. **Background refresh thread and credential leakage.** The `_RefreshThread` holds a `conn_factory` callable but no credentials. It opens new SQLite connections using `open_db(cfg)` which reads from the config file, not from an in-memory credential store. This is safe.
+5. **Background refresh goroutine and credential leakage.** The keepalive goroutine shares the process-wide `*sql.DB` handle and holds no credentials. The pool reads its DSN from the config-derived path (`modernc.org/sqlite`), not from an in-memory credential store. This is safe.
 
 6. **Notification content.** TTL warning notifications include the sandbox ID and remaining seconds but never the command string, output, or any data that might contain secrets. This prevents credential leakage via Slack/webhook notification bodies.
 
-7. **`--detach` and orphan risk.** Detached sandboxes that exceed their TTL are terminated by the sweep. However, if TAG is never invoked again (no `cmd_sandbox` calls), the lazy sweep never fires. Users who rely on deterministic cleanup for billing reasons should use the `cron_scheduler.py` integration (v1.1) or call `tag sandbox list` periodically.
+7. **`--detach` and orphan risk.** Detached sandboxes that exceed their TTL are terminated by the sweep. However, if TAG is never invoked again (no `sandbox` command) and no long-lived process hosts the reaper goroutine, the lazy sweep never fires. Users who rely on deterministic cleanup for billing reasons should use the `go-co-op/gocron` scheduler integration (v1.1) or call `tag sandbox list` periodically.
 
 ---
 
 ## 11. Testing Strategy
 
-### 11.1 Unit Tests (`tests/test_sandbox_ttl.py`)
+### 11.1 Unit Tests (`internal/sandbox/ttl_test.go`)
 
-```python
-# Tests use in-memory SQLite and mock _utc_now() to simulate time advancement
+Tests run against a real `modernc.org/sqlite` DB opened at `file::memory:?cache=shared` (or a `t.TempDir()` file) and override the package `utcNow` seam to simulate time advancement without `time.Sleep`. A `t.Cleanup` restores the real clock. Idiomatic Go: table-driven subtests via `t.Run`, `errors.Is` on sentinels, and `testing.T` helpers.
 
-def test_refresh_sandbox_resets_last_activity():
-    """refresh_sandbox() updates last_activity_at and clears warned_at."""
+```go
+// internal/sandbox/ttl_test.go
+package sandbox
 
-def test_refresh_rejects_non_running_state():
-    """refresh_sandbox() raises ValueError for done/failed/expired state."""
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
 
-def test_refresh_rejects_ephemeral_sandbox():
-    """refresh_sandbox() raises ValueError when ttl_s is NULL."""
+// withClock swaps utcNow for a controllable fake and restores it on cleanup.
+func withClock(t *testing.T, start time.Time) *time.Time {
+	t.Helper()
+	cur := start
+	orig := utcNow
+	utcNow = func() time.Time { return cur }
+	t.Cleanup(func() { utcNow = orig })
+	return &cur
+}
 
-def test_set_ttl_updates_ttl_and_resets_activity():
-    """set_sandbox_ttl() updates ttl_s and resets last_activity_at."""
+func TestRefreshSandbox_ResetsLastActivity(t *testing.T) {} // updates last_activity_at, clears warned_at
+func TestRefreshSandbox_RejectsNonRunning(t *testing.T)    {} // errors.Is(err, ErrNotRunning) for done/failed/expired
+func TestRefreshSandbox_RejectsEphemeral(t *testing.T)     {} // errors.Is(err, ErrEphemeral) when ttl_s IS NULL
 
-def test_set_ttl_validates_range():
-    """set_sandbox_ttl() raises ValueError for TTL < 30 or > 86400."""
+func TestSetSandboxTTL_UpdatesAndResetsActivity(t *testing.T) {} // ttl_s updated, last_activity_at reset
+func TestSetSandboxTTL_ValidatesRange(t *testing.T)          {} // errors.Is(err, ErrInvalidTTL) for <30 or >86400
+func TestSetSandboxTTL_ValidatesWarnLessThanTTL(t *testing.T) {} // ErrInvalidTTL when warn >= ttl
+func TestSetSandboxTTL_TriggersImmediateExpiry(t *testing.T)  {} // TTL shorter than idle → state expired
 
-def test_set_ttl_validates_warn_less_than_ttl():
-    """set_sandbox_ttl() raises ValueError when warn_s >= new_ttl_s."""
+func TestSweepExpiredSandboxes_MarksExpired(t *testing.T)   {} // overdue running rows → expired
+func TestSweepExpiredSandboxes_IgnoresEphemeral(t *testing.T) {} // rows with ttl_s IS NULL untouched
 
-def test_set_ttl_triggers_immediate_expiry():
-    """set_sandbox_ttl() with a TTL shorter than idle time expires the sandbox."""
+func TestSweepWarnings_FiresOnce(t *testing.T)         {} // warned_at set on first warn, skipped on second sweep
+func TestSweepWarnings_RearmedAfterRefresh(t *testing.T) {} // RefreshSandbox clears warned_at; next sweep re-fires
 
-def test_sweep_expired_sandboxes_marks_expired():
-    """sweep_expired_sandboxes() transitions overdue running sandboxes to expired."""
+func TestTTLRemaining_Computation(t *testing.T)  {} // (int64, bool) correct value, clamps to 0
+func TestFormatRemaining_HumanReadable(t *testing.T) {} // "Xh Ym Zs" / "Xm Ys" / "Xs"
 
-def test_sweep_does_not_affect_ephemeral_rows():
-    """sweep_expired_sandboxes() ignores rows where ttl_s IS NULL."""
-
-def test_warning_fires_once():
-    """_sweep_warnings() sets warned_at on first warning and skips on second sweep."""
-
-def test_warning_rearmed_after_refresh():
-    """refresh_sandbox() clears warned_at; next sweep can re-fire warning."""
-
-def test_ttl_remaining_s_computation():
-    """SandboxSession.ttl_remaining_s returns correct value and clamps to 0."""
-
-def test_format_remaining_human_readable():
-    """SandboxSession.format_remaining() returns 'Xh Ym Zs' / 'Xm Ys' / 'Xs'."""
-
-def test_audit_jsonl_written_for_all_events():
-    """Each TTL operation writes the correct event type to the JSONL audit log."""
-
-def test_schema_migration_is_idempotent():
-    """ensure_schema() on a DB with existing sandbox_runs does not drop data."""
-
-def test_backward_compat_ephemeral_run():
-    """run_in_sandbox() without --ttl writes ttl_s=NULL and is unaffected by sweep."""
+func TestWriteAudit_AllEventTypes(t *testing.T)   {} // each op appends the correct event to the JSONL log
+func TestEnsureSchema_Idempotent(t *testing.T)    {} // migration on existing sandbox_runs preserves rows
+func TestBackwardCompat_EphemeralRun(t *testing.T) {} // RunInSandbox w/o --ttl writes ttl_s=NULL, unaffected by sweep
 ```
 
 ### 11.2 Integration Tests
 
-- **`test_cli_sandbox_refresh`**: Invoke `tag sandbox run --ttl 300 --backend restricted --code "echo hi"`, capture sandbox ID from output, then call `tag sandbox refresh <id>`, verify `last_activity_at` updated in DB.
-- **`test_cli_sandbox_set_ttl`**: Create sandbox with `--ttl 300`, call `tag sandbox set-ttl <id> --ttl 600`, verify DB row has `ttl_s=600`.
-- **`test_cli_sandbox_list_json_ttl_fields`**: Create sandbox with `--ttl 300`, call `tag sandbox list --json`, assert JSON contains `ttl_remaining_s`, `ttl_s`, `last_activity_at`, `expires_at`.
-- **`test_cli_sandbox_set_ttl_immediate_expiry`**: Advance mock clock 60 s past a 30 s TTL, call `tag sandbox set-ttl <id> --ttl 10`, verify sandbox ends in state `expired`.
-- **`test_refresh_interval_thread`**: Verify that `_RefreshThread` updates `last_activity_at` at the configured interval and stops cleanly on `stop()`.
+CLI end-to-end tests build the binary once (`go test` + a `TestMain` that `go build`s `cmd/tag`, or exercise the root Cobra command in-process via `cmd.SetArgs(...)` + `cmd.Execute()`), then assert against DB state.
 
-### 11.3 Performance Tests
+- **`TestCLI_SandboxRefresh`**: Invoke `tag sandbox run --ttl 300 --backend restricted --code "echo hi"`, capture the sandbox ID from output, then call `tag sandbox refresh <id>`, verify `last_activity_at` updated in DB.
+- **`TestCLI_SandboxSetTTL`**: Create sandbox with `--ttl 300`, call `tag sandbox set-ttl <id> --ttl 600`, verify DB row has `ttl_s=600`.
+- **`TestCLI_SandboxListJSONTTLFields`**: Create sandbox with `--ttl 300`, call `tag sandbox list --json`, `json.Unmarshal` and assert `ttl_remaining_s`, `ttl_s`, `last_activity_at`, `expires_at` are present.
+- **`TestCLI_SandboxSetTTLImmediateExpiry`**: Advance the fake clock 60 s past a 30 s TTL, call `tag sandbox set-ttl <id> --ttl 10`, verify the sandbox ends in state `expired`.
+- **`TestKeepaliveGoroutine`**: Verify that `StartRefresher` updates `last_activity_at` at the configured interval and that the returned `stop()` func blocks until the goroutine exits (no leak; assert with `goleak` or a context-deadline check).
 
-- **Sweep performance**: Populate 1000 rows with `state='running'` and `ttl_s` set. Call `sweep_expired_sandboxes()`. Assert wall time < 50 ms on SQLite WAL mode.
-- **Concurrent refresh safety**: Spawn 10 threads each calling `refresh_sandbox()` concurrently on the same sandbox ID. Assert no `sqlite3.OperationalError` (WAL mode handles concurrent writers gracefully).
+### 11.3 Performance / Concurrency Tests
+
+- **Sweep performance** (`BenchmarkSweep` or a timed test): Populate 1000 rows with `state='running'` and `ttl_s` set. Call `SweepExpiredSandboxes()`. Assert wall time < 50 ms on SQLite WAL mode.
+- **Concurrent refresh safety**: Launch 10 goroutines (coordinated via `sync.WaitGroup`) each calling `RefreshSandbox()` on the same sandbox ID; run under `go test -race`. Assert no `SQLITE_BUSY`/locking error — the single-writer WAL pool serializes writers gracefully.
 
 ---
 
@@ -1079,21 +1186,21 @@ def test_backward_compat_ephemeral_run():
 
 | ID | Criteria | Verified By |
 |----|----------|-------------|
-| AC-01 | `tag sandbox run --ttl 300 --backend restricted --code "echo hi"` exits 0 and stores `ttl_s=300` and `last_activity_at IS NOT NULL` in `sandbox_runs`. | `test_cli_sandbox_ttl_stored` |
-| AC-02 | `tag sandbox run` without `--ttl` stores `ttl_s=NULL` and is not affected by subsequent sweep calls. | `test_backward_compat_ephemeral_run` |
-| AC-03 | `tag sandbox list --json` returns objects with `ttl_s`, `ttl_remaining_s`, `last_activity_at`, and `expires_at` fields for TTL-enabled sandboxes. | `test_cli_sandbox_list_json_ttl_fields` |
-| AC-04 | `tag sandbox refresh <id>` on a running sandbox exits 0 and updates `last_activity_at` to within 1 s of UTC now. | `test_cli_sandbox_refresh` |
-| AC-05 | `tag sandbox refresh <id>` on a non-running sandbox (state=`done`) exits 1 with a human-readable error message. | `test_refresh_rejects_non_running_state` |
-| AC-06 | `tag sandbox set-ttl <id> --ttl 600` exits 0, updates `ttl_s=600`, resets `last_activity_at`, and clears `warned_at`. | `test_cli_sandbox_set_ttl` |
-| AC-07 | `tag sandbox set-ttl <id> --ttl 10` when the sandbox has been idle for 45 s exits 0, immediately calls `_terminate_sandbox_backend()`, and sets `state='expired'`. | `test_cli_sandbox_set_ttl_immediate_expiry` |
-| AC-08 | `tag sandbox set-ttl <id> --ttl 29` exits 2 with error message containing "between 30 and 86400". | `test_set_ttl_validates_range` |
-| AC-09 | `sweep_expired_sandboxes()` transitions all rows where `idle_s > ttl_s` to state `expired` and writes `expired` events to `sandbox-audit.jsonl`. | `test_sweep_expired_sandboxes_marks_expired` |
-| AC-10 | A warning is emitted to stderr and to `notifications.send_notification()` when `ttl_remaining_s <= ttl_warn_s`, and `warned_at` is set to prevent duplicate warnings. | `test_warning_fires_once` |
-| AC-11 | After `sandbox refresh`, `warned_at` is cleared and the next sweep can re-fire the warning if the new idle time enters the warn window. | `test_warning_rearmed_after_refresh` |
-| AC-12 | `ensure_schema()` on a DB with pre-existing `sandbox_runs` rows (no TTL columns) adds all four new columns without data loss. | `test_schema_migration_is_idempotent` |
-| AC-13 | `sandbox-audit.jsonl` contains one entry per event: `created`, `refreshed`, `set-ttl`, `expired`, `warned`, with correct `sandbox_id` and `ttl_s` fields. | `test_audit_jsonl_written_for_all_events` |
-| AC-14 | `tag sandbox list` human-readable table shows `REMAINING` column formatted as `Xm Ys` (not raw seconds) for TTL-enabled sandboxes. | Manual / `test_format_remaining_human_readable` |
-| AC-15 | `_RefreshThread` daemon thread stops cleanly within `interval_s + 2` seconds of `stop()` being called. | `test_refresh_interval_thread` |
+| AC-01 | `tag sandbox run --ttl 300 --backend restricted --code "echo hi"` exits 0 and stores `ttl_s=300` and `last_activity_at IS NOT NULL` in `sandbox_runs`. | `TestCLI_SandboxTTLStored` |
+| AC-02 | `tag sandbox run` without `--ttl` stores `ttl_s=NULL` and is not affected by subsequent sweep calls. | `TestBackwardCompat_EphemeralRun` |
+| AC-03 | `tag sandbox list --json` returns objects with `ttl_s`, `ttl_remaining_s`, `last_activity_at`, and `expires_at` fields for TTL-enabled sandboxes. | `TestCLI_SandboxListJSONTTLFields` |
+| AC-04 | `tag sandbox refresh <id>` on a running sandbox exits 0 and updates `last_activity_at` to within 1 s of UTC now. | `TestCLI_SandboxRefresh` |
+| AC-05 | `tag sandbox refresh <id>` on a non-running sandbox (state=`done`) exits 1 with a human-readable error (`errors.Is(err, ErrNotRunning)`). | `TestRefreshSandbox_RejectsNonRunning` |
+| AC-06 | `tag sandbox set-ttl <id> --ttl 600` exits 0, updates `ttl_s=600`, resets `last_activity_at`, and clears `warned_at`. | `TestCLI_SandboxSetTTL` |
+| AC-07 | `tag sandbox set-ttl <id> --ttl 10` when the sandbox has been idle for 45 s exits 0, immediately calls `terminateSandboxBackend()`, and sets `state='expired'`. | `TestCLI_SandboxSetTTLImmediateExpiry` |
+| AC-08 | `tag sandbox set-ttl <id> --ttl 29` exits 2 (`errors.Is(err, ErrInvalidTTL)`) with error message containing "between 30 and 86400". | `TestSetSandboxTTL_ValidatesRange` |
+| AC-09 | `SweepExpiredSandboxes()` transitions all rows where `idle_s > ttl_s` to state `expired` and writes `expired` events to `sandbox-audit.jsonl`. | `TestSweepExpiredSandboxes_MarksExpired` |
+| AC-10 | A warning is emitted to stderr and to `notifications.Send()` when `ttl_remaining_s <= ttl_warn_s`, and `warned_at` is set to prevent duplicate warnings. | `TestSweepWarnings_FiresOnce` |
+| AC-11 | After `sandbox refresh`, `warned_at` is cleared and the next sweep can re-fire the warning if the new idle time enters the warn window. | `TestSweepWarnings_RearmedAfterRefresh` |
+| AC-12 | `EnsureSchema()` on a DB with pre-existing `sandbox_runs` rows (no TTL columns) adds all four new columns without data loss. | `TestEnsureSchema_Idempotent` |
+| AC-13 | `sandbox-audit.jsonl` contains one entry per event: `created`, `refreshed`, `set-ttl`, `expired`, `warned`, with correct `sandbox_id` and `ttl_s` fields. | `TestWriteAudit_AllEventTypes` |
+| AC-14 | `tag sandbox list` human-readable table shows `REMAINING` column formatted as `Xm Ys` (not raw seconds) for TTL-enabled sandboxes. | Manual / `TestFormatRemaining_HumanReadable` |
+| AC-15 | The keepalive goroutine stops cleanly (returned `stop()` returns, no leaked goroutine) after `context` cancellation. | `TestKeepaliveGoroutine` |
 
 ---
 
@@ -1101,15 +1208,18 @@ def test_backward_compat_ephemeral_run():
 
 | Dependency | Type | Version / Notes |
 |------------|------|-----------------|
-| PRD-028 (Sandbox Code Execution) | Blocking prerequisite | `sandbox.py` and `sandbox_runs` table must exist before TTL columns can be added |
-| PRD-013 (Agent Tracing) | Soft dependency | Audit log pattern follows tracing conventions; `_utc_now()` from `sandbox.py` is already used |
-| PRD-034 (Security Hardening) | Informational | Container ID capture and `docker kill` must comply with PRD-034 blocked-path validation |
-| PRD-040 (Notification Hooks) | Soft dependency | `notifications.send_notification()` is called for pre-expiry warnings; if not available, warnings degrade to stderr-only |
+| PRD-028 (Sandbox Code Execution) | Blocking prerequisite | `internal/sandbox` package and `sandbox_runs` table must exist before TTL columns can be added |
+| PRD-013 (Agent Tracing) | Soft dependency | Audit log pattern follows tracing conventions; the `utcNow()` seam from `internal/sandbox` is reused |
+| PRD-034 (Security Hardening) | Informational | Container ID capture and `ContainerKill` must comply with PRD-034 blocked-path validation |
+| PRD-040 (Notification Hooks) | Soft dependency | `notifications.Send()` is called for pre-expiry warnings; if it errors, warnings degrade to stderr-only |
 | PRD-012 (Cost Tracking) | Future | Sandbox session duration will feed cost attribution in a follow-on PRD; no blocking dependency |
-| `docker` CLI | Optional runtime | Must be on `$PATH` for Docker backend TTL enforcement; degraded gracefully if absent |
-| `e2b` Python SDK | Optional runtime | Required for E2B backend TTL enforcement via `Sandbox.connect().kill()`; guarded by `try/except ImportError` |
-| Python `threading` | stdlib | Used by `_RefreshThread`; no new dependency |
-| SQLite WAL mode | Already enabled | `open_db()` in `controller.py` enables WAL; no change required |
+| `modernc.org/sqlite` | Go module (existing) | Pure-Go SQLite driver (CGO_ENABLED=0); backs `sandbox_runs`; WAL enabled by `OpenDB()` |
+| `github.com/docker/docker` (moby client) | Go module (existing) | Docker backend TTL enforcement via `ContainerCreate`/`ContainerKill`; feature-detected, degrades gracefully if the daemon is absent |
+| `github.com/spf13/cobra` | Go module (existing) | `tag sandbox refresh` / `set-ttl` commands and flag parsing |
+| E2B / Modal REST API | Optional runtime | Cloud backend TTL enforcement via `net/http` DELETE against the provider API; enforcement is advisory (see NG5) |
+| `github.com/go-co-op/gocron/v2` | Go module (v1.1) | Advisory 30 s sweep job; not required for v1 (reaper goroutine is stdlib `time.Ticker`) |
+| `time` / `context` / `sync` | stdlib | Reaper + keepalive goroutines, TTL deadlines, clean shutdown; no new dependency |
+| SQLite WAL mode | Already enabled | `OpenDB()` enables WAL (single-writer); no change required |
 
 ---
 
@@ -1117,52 +1227,52 @@ def test_backward_compat_ephemeral_run():
 
 | # | Question | Owner | Resolution Target |
 |---|----------|-------|-------------------|
-| OQ-1 | Should `--ttl` reset on every sandbox command invocation that produces output (auto-activity tracking), or only on explicit `sandbox refresh`? Auto-tracking would require hooking `run_in_sandbox()` to update `last_activity_at` after every call; explicit is simpler but requires callers to opt in. | Sandbox team | Before implementation start |
-| OQ-2 | E2B SDK `Sandbox.connect(sandbox_id)` reconnect pattern: is the E2B sandbox ID the same as the TAG `run_id` or does it need to be stored separately as `container_id`? Clarify the mapping in `_get_session()`. | Backend integration | Sprint 1 |
-| OQ-3 | Should `tag sandbox list` compute `ttl_remaining_s` at the SQL layer (using `strftime` arithmetic) or in Python post-fetch? SQL is more efficient for large lists; Python is simpler to test. | Implementation | Sprint 1 |
+| OQ-1 | Should `--ttl` reset on every sandbox command invocation that produces output (auto-activity tracking), or only on explicit `sandbox refresh`? Auto-tracking would require hooking `RunInSandbox()` to update `last_activity_at` after every call; explicit is simpler but requires callers to opt in. | Sandbox team | Before implementation start |
+| OQ-2 | E2B/Modal REST reconnect pattern: is the provider sandbox ID the same as the TAG `runID` or does it need to be stored separately in `container_id`? Clarify the mapping in `getSession()`. | Backend integration | Sprint 1 |
+| OQ-3 | Should `tag sandbox list` compute `ttl_remaining_s` at the SQL layer (using `strftime` arithmetic) or in Go post-scan (via `SandboxSession.TTLRemaining()`)? SQL is more efficient for large lists; Go is simpler to test with the fake clock. | Implementation | Sprint 1 |
 | OQ-4 | What is the right behavior when `--detach` is used without `--ttl`? Options: (a) error, (b) require `--ttl`, (c) default TTL of 3600 s. Current spec says error. | CLI design | Before implementation start |
-| OQ-5 | Should the cron scheduler integration (FR-18) be deferred to v1.1 or included in the initial implementation? The lazy sweep covers all interactive use cases; the cron version is only needed for unattended operation. | Team | Sprint 1 planning |
+| OQ-5 | Should the `go-co-op/gocron` scheduler integration (FR-18) be deferred to v1.1 or included in the initial implementation? The reaper goroutine + lazy sweep cover all interactive use cases; the gocron version is only needed for unattended, long-idle operation. | Team | Sprint 1 planning |
 | OQ-6 | Pre-expiry warning: should the warning be rate-limited to fire at most once per warn window (current design) or fire on every sweep cycle while in the warn window? Current design fires once and requires a refresh to re-arm; continuous warnings would be more visible but noisier. | UX | Before implementation start |
-| OQ-7 | How should TTL interact with `tag sandbox run --timeout`? Current design: `--timeout` is the per-invocation wall-clock limit for the subprocess; `--ttl` is the idle-session TTL. For detached sessions, `--timeout` has no meaning. Clarify in CLI help text. | Docs | Sprint 1 |
+| OQ-7 | How should TTL interact with `tag sandbox run --timeout`? Current design: `--timeout` is the per-invocation wall-clock limit for the child process (a `context.WithTimeout` deadline); `--ttl` is the idle-session TTL. For detached sessions, `--timeout` has no meaning. Clarify in CLI help text. | Docs | Sprint 1 |
 | OQ-8 | Should `sandbox-audit.jsonl` rotate? Large installs with many short-TTL sandboxes could produce a large JSONL file. Consider a max-size or daily-rotation policy. | Ops | v1.1 |
 
 ---
 
 ## 15. Complexity and Timeline
 
-**Overall Estimate:** S — 3–5 days for one engineer familiar with `sandbox.py` and `controller.py`.
+**Overall Estimate:** S — 3–5 days for one engineer familiar with `internal/sandbox` and the `cmd/tag` Cobra command tree.
 
 ### Phase 1 — Schema & Core Logic (Day 1–2)
 
 | Task | Effort |
 |------|--------|
-| Add TTL columns to `ensure_schema()` with `PRAGMA table_info` migration guard | 1 h |
-| Implement `SandboxSession` and `TTLEvent` dataclasses | 1 h |
-| Implement `sweep_expired_sandboxes()` and `_sweep_warnings()` | 2 h |
-| Implement `refresh_sandbox()` and `set_sandbox_ttl()` | 2 h |
-| Implement `_terminate_sandbox_backend()` with Docker cidfile capture | 1.5 h |
-| Implement `_write_audit()` and audit log integration | 1 h |
-| Unit tests for all core functions (mock clock) | 3 h |
+| Add TTL columns to `EnsureSchema()` with `PRAGMA table_info` migration guard | 1 h |
+| Implement `SandboxSession` and `TTLEvent` structs (+ `MarshalJSON` shim) | 1 h |
+| Implement `SweepExpiredSandboxes()` and `sweepWarnings()` | 2 h |
+| Implement `RefreshSandbox()` and `SetSandboxTTL()` with sentinel errors | 2 h |
+| Implement `terminateSandboxBackend()` with moby `ContainerCreate`/`ContainerKill` capture | 1.5 h |
+| Implement `writeAudit()` and audit log integration | 1 h |
+| Unit tests for all core functions (fake clock seam) | 3 h |
 
 ### Phase 2 — CLI Surface (Day 3)
 
 | Task | Effort |
 |------|--------|
-| Add `--ttl`, `--ttl-warn`, `--refresh-interval`, `--detach` to `sandbox run` argparse | 1 h |
-| Add `refresh` subcommand argparse + `cmd_sandbox` branch | 1 h |
-| Add `set-ttl` subcommand argparse + `cmd_sandbox` branch | 1 h |
+| Add `--ttl`, `--ttl-warn`, `--refresh-interval`, `--detach` flags to `sandbox run` (Cobra) | 1 h |
+| Add `refresh` Cobra command + `RunE` handler | 1 h |
+| Add `set-ttl` Cobra command + `RunE` handler + exit-code mapping | 1 h |
 | Extend `sandbox list` with TTL columns (table + JSON) | 1.5 h |
-| Prepend lazy sweep to `cmd_sandbox` dispatch | 0.5 h |
-| Implement `_RefreshThread` for `--refresh-interval` | 1.5 h |
+| Add lazy sweep to the `sandbox` group `PersistentPreRunE` | 0.5 h |
+| Implement `StartRefresher` keepalive goroutine for `--refresh-interval` | 1.5 h |
 
 ### Phase 3 — Integration & Validation (Day 4–5)
 
 | Task | Effort |
 |------|--------|
-| Integration tests (CLI end-to-end, DB state verification) | 3 h |
-| Performance test (1000-row sweep < 50 ms) | 1 h |
-| Manual test against real Docker backend (cidfile capture, `docker kill`) | 1.5 h |
-| Update `sandbox-audit.jsonl` format in `CHANGELOG` / module docstring | 0.5 h |
+| Integration tests (CLI end-to-end, DB state verification; `go test -race`) | 3 h |
+| Performance test (1000-row sweep < 50 ms; `go test -bench`) | 1 h |
+| Manual test against real Docker backend (moby `ContainerCreate` ID capture, `ContainerKill`) | 1.5 h |
+| Update `sandbox-audit.jsonl` format in `CHANGELOG` / package doc comment | 0.5 h |
 | Code review and iteration | 2 h |
 | Verify backward compatibility with existing `tag sandbox run` tests | 1 h |
 

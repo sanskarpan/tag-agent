@@ -1,10 +1,12 @@
 # PRD-093: GPU Sandbox via Modal Backend (Complete the Modal Integration Stub) (`tag sandbox run --backend modal --gpu`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P3
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Sandbox & Execution Environment
-**Affects:** `sandbox.py (modal backend stub)`
+**Affects:** `internal/sandbox` (Backend interface + firecracker GPU tier + optional Modal HTTP remote backend)
 **Depends on:** PRD-028 (Sandbox Code Execution), PRD-013 (Agent Tracing & Observability), PRD-034 (Security / Secret Scanning), PRD-012 (Cost Tracking & Budget), PRD-005 (Execution Backend Selection), PRD-039 (Token Budget Enforcement)
 **Inspired by:** Modal GPU functions, E2B GPU (coming), Vast.ai
 
@@ -12,15 +14,17 @@
 
 ## 1. Overview
 
-TAG's sandbox subsystem (PRD-028) established three execution backends — restricted subprocess, Docker, and Modal — with the Modal backend landing as a documented stub: the `BACKENDS` constant lists `"modal"`, the schema records it, but `run_in_sandbox()` dispatches any `backend == "modal"` request to the restricted subprocess path without invoking Modal at all. This PRD specifies the complete implementation of the Modal backend, including GPU type selection, environment variable injection, host-directory volume mounts, structured exit-code and output capture, and per-run cost attribution written back to SQLite.
+TAG's sandbox subsystem (PRD-028) establishes an isolation ladder of execution backends. In the Go harness this is expressed as a single `Backend` interface in `internal/sandbox` (`Run(ctx, Spec) (Result, error)`) with concrete implementations registered at startup: the `restricted` tier (landlock + seccomp), the `docker` tier (docker/moby client), and — for GPU workloads, the strongest tier of the ladder — a native **Firecracker microVM** backend built on `firecracker-microvm/firecracker-go-sdk` with GPU passthrough via VFIO. Modal, which has **no official Go SDK**, is demoted to an *optional remote cloud backend* invoked over Modal's HTTP API via `net/http` behind the same `Backend` interface. This PRD specifies the complete GPU-tier implementation: GPU type selection, environment-variable injection, host-directory volume mounts, structured exit-code and output capture, and per-run cost attribution written back to SQLite via `internal/store`.
 
-The driving use case is ML practitioners who use TAG as an agent orchestration layer and want to run GPU-dependent code — PyTorch training loops, CUDA kernel benchmarks, HuggingFace inference — inside a cloud sandbox without standing up their own GPU infrastructure. Modal provides on-demand GPU functions billed per second, with H100 capacity available in under 60 seconds in most regions. TAG already depends on Modal for agent execution backend selection (controller.py reads `execution.backend: modal` from profile YAML); the sandbox extension reuses that credential surface and SDK import.
+> **Go re-framing note:** the original "complete the Modal Python-SDK stub" premise does not survive the Go move. There is no Go Modal SDK to complete. The native GPU path becomes `firecracker-go-sdk` (VFIO GPU passthrough), and Modal becomes an optional HTTP remote backend registered behind the `Backend` interface. GPU-tier/cost/env/volume feature scope is unchanged; only the mechanism is Go-native.
 
-The four GPU tiers targeted — T4, A10G, A100, H100 — cover the full cost/capability spectrum from $0.000059/GPU-second (T4, ~$0.21/hr) to $0.000305/GPU-second (H100, ~$1.10/hr). A cost-estimation call fires before each GPU run and prints a projected cost alongside a confirmation prompt unless `--yes` is passed or `CI=true` is set, matching the pattern established by `tag eval run`. Every run writes a `modal_cost_usd` column to `sandbox_runs` so that `tag budget` can aggregate GPU spend alongside LLM spend.
+The driving use case is ML practitioners who use TAG as an agent orchestration layer and want to run GPU-dependent code — PyTorch training loops, CUDA kernel benchmarks, HuggingFace inference — inside a strong sandbox without standing up their own orchestration. The native Firecracker tier gives a hardware-isolated microVM on Linux hosts with `/dev/kvm` and a VFIO-bound GPU; the Modal remote backend offers on-demand cloud GPU functions billed per second (H100 capacity in under 60 seconds in most regions) for users without local GPU hardware. Backend selection reuses the existing execution-backend surface (`internal/config` reads `execution.backend` from profile YAML via koanf) and, for Modal, the credential surface in `internal/credentials`.
 
-The implementation touches four files: `src/tag/sandbox.py` (the Modal backend itself), `src/tag/controller.py` (new `--gpu`, `--env`, `--volume`, `--timeout` flags on `tag sandbox run`), and the `sandbox_runs` SQLite schema (three new columns). No new top-level module is introduced; Modal remains an optional import guarded by a `try/except`, consistent with PRD-028's zero-mandatory-dependency goal.
+The four GPU tiers targeted — T4, A10G, A100, H100 — cover the full cost/capability spectrum from $0.000059/GPU-second (T4, ~$0.21/hr) to $0.000305/GPU-second (H100, ~$1.10/hr). A cost-estimation step fires before each GPU run and prints a projected cost alongside a confirmation prompt unless `--yes` is passed or `CI=true` is set, matching the pattern established by `tag eval run`. Every run writes a `modal_cost_usd` column to `sandbox_runs` so that `tag budget` can aggregate GPU spend alongside LLM spend. (The column name is retained for schema/data-model continuity; for the native Firecracker tier it holds the metered microVM GPU-second cost.)
 
-GPU sandbox runs are attributed to the calling agent run or queue job via the existing `run_id` / `job_id` context already threaded through `controller.py`. A new `sandbox_gpu_runs` view joins `sandbox_runs` with the `runs` table on `invoking_run_id`, allowing `tag trace` to show GPU sandbox invocations as child spans of agent runs.
+The implementation is contained in `internal/sandbox` (the `Backend` interface, the `firecracker` GPU backend, and the optional `modal` HTTP backend), `internal/cli` (new `--gpu`, `--env`, `--volume`, `--timeout` flags on the `sandbox run` cobra command, and a `sandbox cost` subcommand), and the `sandbox_runs` schema owned by `internal/store` (new columns). No CGO is introduced. The Modal backend is compiled unconditionally but registers itself only when Modal credentials/config are present (optional backend registration + a runtime capability check), preserving PRD-028's zero-mandatory-dependency goal without Python's lazy-import trick.
+
+GPU sandbox runs are attributed to the calling agent run or queue job via the existing `run_id` / `job_id` context threaded through `internal/runtime`. A new `sandbox_gpu_runs` view joins `sandbox_runs` with the `runs` table on `invoking_run_id`, allowing `tag trace` to show GPU sandbox invocations as child spans of agent runs.
 
 ---
 
@@ -247,28 +251,28 @@ $ tag doctor --backend modal
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-01 | `_run_modal()` MUST call `modal.Sandbox.create()` (or equivalent current Modal API) and NOT fall back to `_run_restricted()`. | P0 |
-| FR-02 | When `gpu` is not `None`, the Modal function/sandbox MUST be created with the corresponding GPU type string from the mapping table (`t4` → `"T4"`, `a10g` → `"A10G"`, `a100` → `"A100"`, `h100` → `"H100"`). | P0 |
-| FR-03 | When `gpu` is `None` and `--backend modal` is requested, the sandbox MUST run on CPU only (no `gpu=` argument to Modal). | P0 |
-| FR-04 | `--env KEY=VALUE` arguments MUST be passed to the Modal sandbox as the `environment` dict parameter; they MUST NOT be written to any file or logged. | P0 |
-| FR-05 | `--volume HOST_PATH:SANDBOX_PATH` arguments MUST be mounted using `modal.CloudBucketMount` or `modal.Mount.from_local_dir()` as appropriate; the mount MUST be read-write unless `--volume` is suffixed with `:ro`. | P1 |
-| FR-06 | Volume HOST_PATH values that match any PRD-028 blocked pattern (`*.env`, `*.key`, `*.pem`, `*secret*`, `*credential*`, `~/.ssh/*`, `~/.aws/*`, `~/.config/op/*`) MUST raise `ValueError` before any Modal call is made. | P0 |
-| FR-07 | `run_in_sandbox()` MUST return `exit_code`, `stdout` (up to 1 MB, truncated with warning), and `stderr` (up to 256 KB) from the Modal sandbox execution. | P0 |
-| FR-08 | The `sandbox_runs` table MUST be extended with columns `gpu_type TEXT`, `modal_function_id TEXT`, `modal_cost_usd REAL`, `duration_s REAL`, `invoking_run_id TEXT` before the first Modal write. | P0 |
-| FR-09 | `modal_cost_usd` MUST be computed from `duration_s * GPU_RATE_PER_SECOND[gpu_type]` and written to `sandbox_runs` after each completed or failed run. | P1 |
-| FR-10 | Before dispatching to Modal, `tag sandbox run` MUST print an estimated cost (ceiling at `--timeout` seconds) and prompt for `y/N` confirmation unless `--yes` is passed or `CI` environment variable is non-empty. | P1 |
-| FR-11 | If Modal is not installed (`ImportError`), `_run_modal()` MUST raise `RuntimeError("modal SDK not installed — pip install modal")` and the CLI MUST print a user-friendly error with install instructions. | P0 |
-| FR-12 | If Modal credentials are absent or expired, `_run_modal()` MUST catch the Modal authentication error and re-raise with a message directing the user to run `modal token new`. | P0 |
-| FR-13 | `tag sandbox cost` MUST query only `sandbox_runs WHERE backend='modal'` and present aggregated results by the requested `--group-by` dimension. | P1 |
+| FR-01 | The GPU `Backend.Run` implementation MUST dispatch to the selected GPU tier — the native Firecracker microVM backend or the Modal HTTP remote backend — and MUST NOT silently fall back to the `restricted` backend. A backend that cannot satisfy the request MUST return a non-nil `error`. | P0 |
+| FR-02 | When `gpu` is non-empty, the microVM (or Modal HTTP request) MUST be provisioned with the corresponding GPU type from the mapping table (`t4` → `"T4"`, `a10g` → `"A10G"`, `a100` → `"A100"`, `h100` → `"H100"`). For Firecracker this selects the VFIO device profile; for Modal it sets the `gpu` field of the JSON request body. | P0 |
+| FR-03 | When `gpu` is empty and a GPU backend is requested, the sandbox MUST run on CPU only (no VFIO device attached / no `gpu` field in the Modal request). | P0 |
+| FR-04 | `--env KEY=VALUE` arguments MUST be injected into the guest environment (Firecracker guest env / Modal `environment` request field); they MUST NOT be written to any file or logged. | P0 |
+| FR-05 | `--volume HOST_PATH:SANDBOX_PATH` arguments MUST be attached as a microVM block/virtio-fs mount (Firecracker) or uploaded as a mount payload over the Modal HTTP API; the mount MUST be read-write unless `--volume` is suffixed with `:ro`. | P1 |
+| FR-06 | Volume HOST_PATH values that match any PRD-028 blocked pattern (`*.env`, `*.key`, `*.pem`, `*secret*`, `*credential*`, `~/.ssh/*`, `~/.aws/*`, `~/.config/op/*`) MUST cause `Run` to return an error (`ErrBlockedMountPath`) before any microVM boot or Modal HTTP call is made. | P0 |
+| FR-07 | `Backend.Run` MUST return `ExitCode`, `Stdout` (up to 1 MB, truncated with warning), and `Stderr` (up to 256 KB) from the sandbox execution. | P0 |
+| FR-08 | The `sandbox_runs` table MUST be extended (via `internal/store` migration) with columns `gpu_type TEXT`, `modal_function_id TEXT`, `modal_cost_usd REAL`, `duration_s REAL`, `invoking_run_id TEXT` before the first GPU write. (`modal_function_id` holds the Modal function id for the remote backend, or the Firecracker VM id for the native backend.) | P0 |
+| FR-09 | `modal_cost_usd` MUST be computed from `duration_s * gpuRatePerSecond[gpu_type]` and written to `sandbox_runs` after each completed or failed run. | P1 |
+| FR-10 | Before dispatching a GPU run, `tag sandbox run` MUST print an estimated cost (ceiling at `--timeout` seconds) and prompt for `y/N` confirmation unless `--yes` is passed or the `CI` environment variable is non-empty. | P1 |
+| FR-11 | If the requested backend is unavailable (e.g. Firecracker requires Linux + `/dev/kvm`; Modal requires configured credentials), `Run` MUST return a descriptive `error` and the CLI MUST print a user-friendly message with remediation steps (no stack trace). Backend availability is a runtime capability check, not an import guard. | P0 |
+| FR-12 | If the Modal HTTP API returns an authentication failure (401/403), the Modal backend MUST wrap the error with a message directing the user to configure Modal credentials (`tag credentials add modal` / `modal token new`). | P0 |
+| FR-13 | `tag sandbox cost` MUST query only `sandbox_runs WHERE backend IN ('modal','firecracker')` and present aggregated results by the requested `--group-by` dimension. | P1 |
 | FR-14 | `tag sandbox cost` MUST complete in under 200ms for a `sandbox_runs` table of up to 100,000 rows (requires index on `(backend, created_at)`). | P1 |
-| FR-15 | `tag sandbox run --file <path>` MUST read the file, upload it to the Modal sandbox as `/workspace/<filename>`, and execute it with `python3 /workspace/<filename>` (or the shebang interpreter if present). | P1 |
-| FR-16 | The Modal sandbox MUST have `--timeout` enforced as the Modal function/sandbox timeout, not just a local subprocess timeout. | P0 |
-| FR-17 | An OpenTelemetry span named `sandbox.modal.run` MUST be emitted for every Modal run with attributes: `sandbox.backend`, `sandbox.gpu_type`, `sandbox.cost_usd`, `sandbox.exit_code`, `sandbox.duration_s`, `sandbox.modal_function_id`. | P2 |
-| FR-18 | `tag doctor` MUST include a `modal_gpu` check that verifies: (a) `modal` importable, (b) token file present, (c) optional network ping to `modal.com`. | P2 |
+| FR-15 | `tag sandbox run --file <path>` MUST read the file, place it into the guest as `/workspace/<filename>`, and execute it with `python3 /workspace/<filename>` (or the shebang interpreter if present). | P1 |
+| FR-16 | The GPU sandbox MUST have `--timeout` enforced at the isolation boundary (the Firecracker VM lifetime / the Modal function timeout) via a `context.WithTimeout` deadline propagated into `Run`, not merely a local wall-clock check. | P0 |
+| FR-17 | An OpenTelemetry span named `sandbox.gpu.run` MUST be emitted (via `internal/obs` / `go.opentelemetry.io/otel`) for every GPU run with attributes: `sandbox.backend`, `sandbox.gpu_type`, `sandbox.cost_usd`, `sandbox.exit_code`, `sandbox.duration_s`, `sandbox.modal_function_id`. | P2 |
+| FR-18 | `tag doctor` MUST include a `gpu_sandbox` check that verifies backend availability: for Firecracker (Linux + `/dev/kvm` + a VFIO-bound GPU) and, when configured, Modal credentials + optional reachability of the Modal API. | P2 |
 | FR-19 | `--json` flag on `tag sandbox run` MUST emit a single JSON object to stdout (not mixed with progress lines) containing all fields from the `sandbox_runs` row plus `gpu_type`, `modal_function_id`, `modal_cost_usd`, `duration_s`. | P1 |
-| FR-20 | Wall-clock `duration_s` MUST be measured from before the `modal.Sandbox.create()` call to after the final `.wait()` / `.poll()` call and written to `sandbox_runs`. | P1 |
+| FR-20 | Wall-clock `duration_s` MUST be measured from before the microVM boot / Modal HTTP submit to after the final wait/poll, using `time.Now()`/`time.Since`, and written to `sandbox_runs`. | P1 |
 | FR-21 | When `--file` and `--code` are both specified, the CLI MUST error with `"--file and --code are mutually exclusive"`. | P0 |
-| FR-22 | When neither `--file` nor `--code` is specified and `--backend modal` is passed, the CLI MUST error with `"modal backend requires --code or --file"`. | P0 |
+| FR-22 | When neither `--file` nor `--code` is specified and a GPU backend is passed, the CLI MUST error with `"gpu sandbox requires --code or --file"`. | P0 |
 
 ---
 
@@ -276,46 +280,80 @@ $ tag doctor --backend modal
 
 | ID | Requirement | Target |
 |----|-------------|--------|
-| NFR-01 | Cold-start latency for a T4 sandbox running a 1-line Python print is ≤90s end-to-end (network + container pull + execution). | p50 ≤90s |
-| NFR-02 | Warm-start latency (same image, same region, second run within 5 min) is ≤15s. | p50 ≤15s |
-| NFR-03 | The Modal SDK import MUST be lazy (inside `_run_modal()` function body), keeping `sandbox.py` importable in zero-Modal environments without triggering `ImportError`. | Always |
-| NFR-04 | `sandbox.py` MUST NOT import `modal` at module level; the import MUST live inside `_run_modal()` guarded by `try/except ImportError`. | Always |
+| NFR-01 | Cold-start latency for a T4 sandbox running a 1-line Python print is ≤90s end-to-end (microVM boot + rootfs + execution for Firecracker; network + container pull + execution for Modal). | p50 ≤90s |
+| NFR-02 | Warm-start latency (same image/rootfs, same region, second run within 5 min) is ≤15s. | p50 ≤15s |
+| NFR-03 | The Modal backend MUST be a compiled-in, optionally-registered `Backend` implementation; the binary MUST run with zero GPU/Modal configuration present and expose no GPU backend rather than failing at startup. | Always |
+| NFR-04 | `internal/sandbox` MUST NOT require any CGO or host GPU library to build (`CGO_ENABLED=0`); GPU/microVM availability is resolved at runtime via a capability check, never at build/link time. | Always |
 | NFR-05 | Environment variables passed via `--env` MUST NOT appear in the `command` column of `sandbox_runs`, in log output, or in OTel span attributes. | Always |
-| NFR-06 | `modal_cost_usd` MUST be accurate to within ±5% of Modal's actual billing for a given run duration using the static rate table. | ±5% |
-| NFR-07 | The implementation MUST be compatible with Modal SDK versions ≥0.60.0 (current stable as of 2026-Q2). Deprecation of the `Sandbox` API must be detected at import time and a clear error surfaced. | Always |
-| NFR-08 | No network call is made to Modal until after the user confirms the cost prompt (or `--yes`/`CI` bypasses it). | Always |
-| NFR-09 | `tag sandbox run` with `--backend modal` and invalid GPU tier MUST fail with exit code 1 and a human-readable message listing valid tiers — no stack trace exposed. | Always |
-| NFR-10 | All new code in `sandbox.py` MUST achieve ≥90% line coverage in `tests/test_sandbox_modal.py` using `pytest-mock` to mock the `modal` module. | ≥90% |
+| NFR-06 | `modal_cost_usd` MUST be accurate to within ±5% of the provider's actual billing for a given run duration using the static rate table. | ±5% |
+| NFR-07 | The Modal HTTP backend MUST target a pinned Modal REST API version constant and surface a clear error if the API responds with an unsupported/deprecated version. The Firecracker backend MUST target a pinned `firecracker-go-sdk` version. | Always |
+| NFR-08 | No network call is made to Modal (and no microVM is booted) until after the user confirms the cost prompt (or `--yes`/`CI` bypasses it). | Always |
+| NFR-09 | `tag sandbox run` with a GPU backend and an invalid GPU tier MUST fail with exit code 1 and a human-readable message listing valid tiers — no stack trace exposed. | Always |
+| NFR-10 | All new code in `internal/sandbox` MUST achieve ≥90% line coverage via table-driven Go `testing` tests that inject a fake `Backend` (dependency injection), with no live network or KVM required. | ≥90% |
 
 ---
 
 ## 10. Technical Design
 
-### 10.1 New and Modified Files
+### 10.0 Architecture — the `Backend` interface and the GPU tier
 
-| File | Change |
+The isolation ladder is expressed as one Go interface in `internal/sandbox`. Every tier (restricted, docker, gVisor, firecracker, modal) implements it, and the CLI/runtime select a tier by name and depend only on the interface — the same dependency-injection seam used by the tests to substitute a fake backend.
+
+```go
+package sandbox
+
+import (
+    "context"
+    "time"
+)
+
+// Backend is the isolation-ladder contract. The GPU tier is satisfied by the
+// native Firecracker microVM backend or the optional Modal HTTP remote backend.
+type Backend interface {
+    Name() string                                  // "firecracker", "modal", ...
+    Available(ctx context.Context) error           // runtime capability check; nil == usable
+    Run(ctx context.Context, spec Spec) (Result, error)
+}
+
+// Registry holds the backends registered at startup. Modal registers itself
+// only when credentials/config are present (optional backend registration),
+// replacing Python's lazy `import modal` guarded by try/except ImportError.
+type Registry struct{ backends map[string]Backend }
+
+func (r *Registry) Register(b Backend) { r.backends[b.Name()] = b }
+func (r *Registry) Get(name string) (Backend, bool) { b, ok := r.backends[name]; return b, ok }
+```
+
+### 10.1 New and Modified Packages
+
+| Package / file | Change |
 |------|--------|
-| `src/tag/sandbox.py` | Add `_run_modal()`, extend `ensure_schema()`, extend `run_in_sandbox()` dispatch, add `list_sandbox_cost()` |
-| `src/tag/controller.py` | Add `--gpu`, `--env`, `--volume`, `--no-cost-estimate` flags to `cmd_sandbox_run`; add `cmd_sandbox_cost` subcommand; extend `cmd_doctor` with `modal_gpu` check |
-| `pyproject.toml` | Add `modal` to `[project.optional-dependencies]` under key `modal` (already listed in `extras` per PRD-028, verify it is present) |
-| `tests/test_sandbox_modal.py` | New test file (see §11) |
+| `internal/sandbox/backend.go` | `Backend` interface, `Registry`, `Spec`/`Result` structs, `GPUTier` constants + rate table |
+| `internal/sandbox/firecracker.go` | Native GPU tier over `firecracker-microvm/firecracker-go-sdk` (VFIO GPU passthrough); build target: Linux only |
+| `internal/sandbox/modal.go` | Optional Modal remote backend over `net/http` (Modal REST API); self-registers when credentials present |
+| `internal/sandbox/mount.go` | `validateMountPath` credential-path blocker (uses `path/filepath` + `os`) |
+| `internal/sandbox/cost.go` | `EstimateCost`, `ListSandboxCost` (aggregation query via `internal/store`) |
+| `internal/store/migrate/` | Add `sandbox_runs` columns + index + `sandbox_gpu_runs` view migration (`database/sql` + modernc driver) |
+| `internal/cli/sandbox.go` | `--gpu`, `--env`, `--volume`, `--timeout`, `--no-cost-estimate`, `--yes` on `sandbox run`; `sandbox cost` subcommand; `doctor` gpu check (cobra) |
+| `internal/obs/` | `sandbox.gpu.run` span emission (`go.opentelemetry.io/otel`) |
+| `internal/credentials/` | Modal token source (already part of the 18-source credential import) |
+| `go.mod` | Add `github.com/firecracker-microvm/firecracker-go-sdk`; no Modal module exists (HTTP client only) |
 
 ### 10.2 SQLite DDL — Schema Extension
 
-The existing `ensure_schema()` function is extended to add new columns via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` idiom (SQLite does not support `IF NOT EXISTS` on `ALTER TABLE`, so the migration uses a `try/except sqlite3.OperationalError` guard):
+The schema stays SQL; the migration is Go over the `database/sql` API with the pure-Go `modernc.org/sqlite` driver (`CGO_ENABLED=0`, FTS5 built in). SQLite has no `ADD COLUMN IF NOT EXISTS`, so each `ALTER TABLE` is guarded by inspecting the returned error for the `duplicate column name` substring (the idiomatic Go replacement for Python's `try/except OperationalError`).
 
 ```sql
--- New columns added to sandbox_runs via migration in ensure_schema()
+-- New columns added to sandbox_runs via the internal/store migration
 ALTER TABLE sandbox_runs ADD COLUMN gpu_type          TEXT;
-ALTER TABLE sandbox_runs ADD COLUMN modal_function_id TEXT;
-ALTER TABLE sandbox_runs ADD COLUMN modal_cost_usd    REAL;
+ALTER TABLE sandbox_runs ADD COLUMN modal_function_id TEXT;   -- Modal fn id OR Firecracker VM id
+ALTER TABLE sandbox_runs ADD COLUMN modal_cost_usd    REAL;   -- metered GPU-second cost
 ALTER TABLE sandbox_runs ADD COLUMN duration_s        REAL;
 ALTER TABLE sandbox_runs ADD COLUMN invoking_run_id   TEXT;
 
 -- New index for tag sandbox cost queries
-CREATE INDEX IF NOT EXISTS idx_sr_modal_cost
-    ON sandbox_runs(backend, created_at)
-    WHERE backend = 'modal';
+CREATE INDEX IF NOT EXISTS idx_sr_gpu_cost
+    ON sandbox_runs(backend, created_at);
 
 -- Convenience view joining sandbox GPU runs to agent runs
 CREATE VIEW IF NOT EXISTS sandbox_gpu_runs AS
@@ -332,595 +370,729 @@ SELECT
     r.prompt           AS invoking_prompt
 FROM sandbox_runs sr
 LEFT JOIN runs r ON r.id = sr.invoking_run_id
-WHERE sr.backend = 'modal';
+WHERE sr.backend IN ('modal', 'firecracker');
 ```
 
-The `ensure_schema()` migration code:
+The Go migration (run inside `internal/store` under the single-writer + WAL contract):
 
-```python
-def _migrate_modal_columns(conn: sqlite3.Connection) -> None:
-    """Add Modal-specific columns to sandbox_runs if they do not exist."""
-    new_columns = [
-        ("gpu_type",          "TEXT"),
-        ("modal_function_id", "TEXT"),
-        ("modal_cost_usd",    "REAL"),
-        ("duration_s",        "REAL"),
-        ("invoking_run_id",   "TEXT"),
-    ]
-    for col_name, col_type in new_columns:
-        try:
-            conn.execute(f"ALTER TABLE sandbox_runs ADD COLUMN {col_name} {col_type}")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-    conn.executescript("""
-        CREATE INDEX IF NOT EXISTS idx_sr_modal_cost
-            ON sandbox_runs(backend, created_at);
+```go
+package migrate
+
+import (
+    "database/sql"
+    "strings"
+)
+
+var gpuColumns = []struct{ name, typ string }{
+    {"gpu_type", "TEXT"},
+    {"modal_function_id", "TEXT"},
+    {"modal_cost_usd", "REAL"},
+    {"duration_s", "REAL"},
+    {"invoking_run_id", "TEXT"},
+}
+
+// migrateGPUColumns adds Modal/Firecracker columns to sandbox_runs if absent.
+// error-check on "duplicate column name" replaces try/except OperationalError.
+func migrateGPUColumns(db *sql.DB) error {
+    for _, c := range gpuColumns {
+        _, err := db.Exec("ALTER TABLE sandbox_runs ADD COLUMN " + c.name + " " + c.typ)
+        if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+            return err
+        }
+    }
+    const ddl = `
+        CREATE INDEX IF NOT EXISTS idx_sr_gpu_cost ON sandbox_runs(backend, created_at);
         CREATE VIEW IF NOT EXISTS sandbox_gpu_runs AS
         SELECT sr.id AS sandbox_id, sr.command, sr.gpu_type,
                sr.modal_cost_usd, sr.duration_s, sr.status, sr.exit_code,
                sr.created_at, sr.invoking_run_id
-        FROM sandbox_runs sr WHERE sr.backend = 'modal';
-    """)
-    conn.commit()
+        FROM sandbox_runs sr WHERE sr.backend IN ('modal','firecracker');`
+    _, err := db.Exec(ddl)
+    return err
+}
 ```
 
-### 10.3 Key Dataclasses
+### 10.3 Key Types
 
-```python
-from __future__ import annotations
-import dataclasses
-from typing import Optional
+Python dataclasses become Go structs; the GPU-tier map becomes typed string constants plus a rate table; the Python tuple `(str, float, int)` becomes a named struct.
 
+```go
+package sandbox
 
-# GPU tier → Modal GPU string, rate per second (USD), vRAM GB
-GPU_TIERS: dict[str, tuple[str, float, int]] = {
-    "t4":   ("T4",   0.000059, 16),
-    "a10g": ("A10G", 0.000150, 24),
-    "a100": ("A100", 0.000214, 40),
-    "h100": ("H100", 0.000305, 80),
+// GPUTier is a typed enum of supported GPU tiers (case-insensitive on parse).
+type GPUTier string
+
+const (
+    GPUNone GPUTier = ""
+    GPUT4   GPUTier = "t4"
+    GPUA10G GPUTier = "a10g"
+    GPUA100 GPUTier = "a100"
+    GPUH100 GPUTier = "h100"
+)
+
+// gpuSpec maps a tier to its provider GPU string, USD rate/sec, and vRAM (GB).
+type gpuSpec struct {
+    ProviderName  string
+    RatePerSecond float64
+    VRAMGB        int
 }
 
+var gpuTiers = map[GPUTier]gpuSpec{
+    GPUT4:   {"T4", 0.000059, 16},
+    GPUA10G: {"A10G", 0.000150, 24},
+    GPUA100: {"A100", 0.000214, 40},
+    GPUH100: {"H100", 0.000305, 80},
+}
 
-@dataclasses.dataclass
-class ModalSandboxConfig:
-    """Complete configuration for a single Modal GPU sandbox run."""
-    # Execution
-    command: list[str]                    # final argv to execute inside sandbox
-    image: str = "python:3.12-slim"       # Docker image for the sandbox
-    gpu_type: Optional[str] = None        # None = CPU; one of GPU_TIERS keys
-    timeout: int = 300                    # seconds; enforced by Modal
+const cpuRatePerSecond = 0.0000020
 
-    # Injection
-    env_vars: dict[str, str] = dataclasses.field(default_factory=dict)
-    # List of (host_path, sandbox_path, read_only) tuples
-    mounts: list[tuple[str, str, bool]] = dataclasses.field(default_factory=list)
+// Mount is a resolved host→guest bind (Python's (host, sandbox, read_only) tuple).
+type Mount struct {
+    HostPath    string
+    SandboxPath string
+    ReadOnly    bool
+}
 
-    # File upload
-    upload_file: Optional[str] = None     # local path → /workspace/<name>
+// Spec is the complete configuration for a single GPU sandbox run.
+type Spec struct {
+    Command       []string          // argv to execute inside the guest
+    Image         string            // default "python:3.12-slim"
+    GPU           GPUTier           // GPUNone == CPU
+    Timeout       time.Duration     // enforced at the isolation boundary
+    EnvVars       map[string]string // injected; never persisted/logged
+    Mounts        []Mount
+    UploadFile    string // local path → /workspace/<name>
+    InvokingRunID string
+}
 
-    # Attribution
-    invoking_run_id: Optional[str] = None
-
-
-@dataclasses.dataclass
-class ModalSandboxResult:
-    """Structured result from a completed Modal sandbox run."""
-    exit_code: int
-    stdout: str
-    stderr: str
-    duration_s: float
-    modal_function_id: Optional[str]
-    cost_usd: float
-    truncated: bool = False               # True if output exceeded 1 MB cap
+// Result is the structured outcome of a completed run.
+type Result struct {
+    ExitCode        int
+    Stdout          string
+    Stderr          string
+    Duration        time.Duration
+    ModalFunctionID string  // Modal fn id or Firecracker VM id
+    CostUSD         float64
+    Truncated       bool // output exceeded the 1 MB cap
+}
 ```
 
-### 10.4 Core Algorithm — `_run_modal()`
+### 10.4 Native GPU tier — Firecracker backend
 
-```python
-def _run_modal(cfg: ModalSandboxConfig) -> ModalSandboxResult:
-    """Execute cfg inside a Modal Sandbox. Returns structured result."""
-    try:
-        import modal
-    except ImportError as exc:
-        raise RuntimeError(
-            "modal SDK not installed — run: pip install modal"
-        ) from exc
+The strongest tier of the isolation ladder. A microVM is booted with a VFIO-bound GPU passed through to the guest; the command runs inside, output is captured over the vsock/console, and the VM is torn down on `Run` return. `Available` performs the runtime capability check (Linux, `/dev/kvm`, a VFIO device) that replaces any import guard.
 
-    import time
+```go
+//go:build linux
 
-    # 1. Build Modal Image
-    image = modal.Image.from_registry(cfg.image, add_python="3.12")
-    if cfg.gpu_type and cfg.gpu_type.lower() == "t4":
-        # T4 images may need CUDA base for PyTorch GPU support
-        image = modal.Image.from_registry("pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime")
+package sandbox
 
-    # 2. Build mounts list
-    modal_mounts = []
-    for host_path, sandbox_path, read_only in cfg.mounts:
-        _validate_mount_path(host_path)  # raises ValueError on blocked pattern
-        modal_mounts.append(
-            modal.Mount.from_local_dir(host_path, remote_path=sandbox_path)
-        )
+import (
+    "context"
+    "errors"
+    "time"
 
-    # 3. Resolve GPU string
-    gpu_arg = None
-    if cfg.gpu_type:
-        modal_gpu_str, _, _ = GPU_TIERS[cfg.gpu_type.lower()]
-        gpu_arg = modal_gpu_str
+    fc "github.com/firecracker-microvm/firecracker-go-sdk"
+)
 
-    # 4. Upload script file if provided
-    upload_mount = None
-    if cfg.upload_file:
-        from pathlib import Path as _Path
-        local_path = _Path(cfg.upload_file)
-        upload_mount = modal.Mount.from_local_file(
-            local_path, remote_path=f"/workspace/{local_path.name}"
-        )
-        modal_mounts.append(upload_mount)
+type FirecrackerBackend struct {
+    kernelImage string
+    vfioDevice  string // host GPU bound to vfio-pci
+}
 
-    # 5. Create app and sandbox
-    app = modal.App.lookup("tag-sandbox", create_if_missing=True)
+func (b *FirecrackerBackend) Name() string { return "firecracker" }
 
-    t_start = time.monotonic()
-    try:
-        sb = modal.Sandbox.create(
-            *cfg.command,
-            app=app,
-            image=image,
-            gpu=gpu_arg,
-            timeout=cfg.timeout,
-            mounts=modal_mounts,
-            environment_variables=cfg.env_vars,
-        )
-        function_id = getattr(sb, "object_id", None) or getattr(sb, "sandbox_id", None)
-        sb.wait()
-        exit_code = sb.returncode
-        stdout = sb.stdout.read()[:1_000_000]       # 1 MB cap
-        stderr = sb.stderr.read()[:262_144]          # 256 KB cap
-        truncated = len(sb.stdout.read()) == 1_000_000
-    except modal.exception.AuthError as exc:
-        raise RuntimeError(
-            "Modal authentication failed — run: modal token new"
-        ) from exc
+func (b *FirecrackerBackend) Available(ctx context.Context) error {
+    // Linux + /dev/kvm + a VFIO-bound GPU. Returns a descriptive error otherwise
+    // so the CLI can print remediation (no panic, no stack trace).
+    return checkKVMAndVFIO(b.vfioDevice)
+}
 
-    duration_s = time.monotonic() - t_start
+func (b *FirecrackerBackend) Run(ctx context.Context, spec Spec) (Result, error) {
+    for _, m := range spec.Mounts {
+        if err := validateMountPath(m.HostPath); err != nil {
+            return Result{}, err // ErrBlockedMountPath before any VM boot
+        }
+    }
+    ctx, cancel := context.WithTimeout(ctx, spec.Timeout) // boundary-enforced timeout
+    defer cancel()
 
-    # 6. Cost calculation
-    rate = GPU_TIERS[cfg.gpu_type.lower()][1] if cfg.gpu_type else 0.0000020
-    cost_usd = round(duration_s * rate, 6)
+    cfg := fc.Config{ /* kernel, rootfs from spec.Image, vsock, drives from spec.Mounts */ }
+    if spec.GPU != GPUNone {
+        // Attach the VFIO GPU device profile for the requested tier.
+        attachVFIOGPU(&cfg, b.vfioDevice, gpuTiers[spec.GPU].ProviderName)
+    }
+    start := time.Now()
+    machine, err := fc.NewMachine(ctx, cfg)
+    if err != nil {
+        return Result{}, err
+    }
+    if err := machine.Start(ctx); err != nil {
+        return Result{}, err
+    }
+    exit, stdout, stderr, trunc := runGuestCommand(ctx, machine, spec) // 1MB/256KB caps
+    _ = machine.StopVMM()
+    dur := time.Since(start)
 
-    return ModalSandboxResult(
-        exit_code=exit_code,
-        stdout=stdout,
-        stderr=stderr,
-        duration_s=duration_s,
-        modal_function_id=str(function_id) if function_id else None,
-        cost_usd=cost_usd,
-        truncated=truncated,
+    return Result{
+        ExitCode:        exit,
+        Stdout:          stdout,
+        Stderr:          stderr,
+        Duration:        dur,
+        ModalFunctionID: machine.Cfg.VMID,
+        CostUSD:         EstimateActualCost(spec.GPU, dur),
+        Truncated:       trunc,
+    }, nil
+}
+
+var ErrBlockedMountPath = errors.New("refusing to mount credential path")
+```
+
+### 10.5 Optional remote tier — Modal HTTP backend
+
+Modal ships **no Go SDK**, so the remote tier is a thin `net/http` client against the Modal REST API. It self-registers only when a Modal token is resolvable via `internal/credentials`; otherwise the GPU tier is simply unavailable (no import to fail on).
+
+```go
+package sandbox
+
+import (
+    "bytes"
+    "context"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "time"
+)
+
+const modalAPIVersion = "2026-05" // pinned; see NFR-07
+
+type ModalBackend struct {
+    http  *http.Client
+    base  string // https://api.modal.com
+    token string // from internal/credentials; empty => not registered
+}
+
+func (b *ModalBackend) Name() string { return "modal" }
+
+func (b *ModalBackend) Available(ctx context.Context) error {
+    if b.token == "" {
+        return fmt.Errorf("modal backend: no credentials — run: tag credentials add modal")
+    }
+    return nil
+}
+
+func (b *ModalBackend) Run(ctx context.Context, spec Spec) (Result, error) {
+    for _, m := range spec.Mounts {
+        if err := validateMountPath(m.HostPath); err != nil {
+            return Result{}, err
+        }
+    }
+    ctx, cancel := context.WithTimeout(ctx, spec.Timeout)
+    defer cancel()
+
+    body, _ := json.Marshal(modalRunRequest{
+        Image:       spec.Image,
+        GPU:         gpuTiers[spec.GPU].ProviderName, // "" for CPU
+        Command:     spec.Command,
+        Environment: spec.EnvVars,                    // request field only; never logged
+        TimeoutSec:  int(spec.Timeout.Seconds()),
+    })
+    req, _ := http.NewRequestWithContext(ctx, http.MethodPost, b.base+"/v1/sandboxes", bytes.NewReader(body))
+    req.Header.Set("Authorization", "Bearer "+b.token)
+    req.Header.Set("Modal-Version", modalAPIVersion)
+
+    start := time.Now()
+    resp, err := b.http.Do(req)
+    if err != nil {
+        return Result{}, err
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+        return Result{}, fmt.Errorf("modal authentication failed — configure credentials: tag credentials add modal")
+    }
+    var out modalRunResponse
+    if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+        return Result{}, err
+    }
+    dur := time.Since(start)
+    return Result{
+        ExitCode:        out.ExitCode,
+        Stdout:          cap1MB(out.Stdout),
+        Stderr:          cap256KB(out.Stderr),
+        Duration:        dur,
+        ModalFunctionID: out.FunctionID,
+        CostUSD:         EstimateActualCost(spec.GPU, dur),
+        Truncated:       len(out.Stdout) >= 1_000_000,
+    }, nil
+}
+```
+
+### 10.6 Dispatch and registration
+
+Backends are registered at startup; the CLI resolves one by name and depends only on `Backend`. There is no silent fallback — an unavailable backend surfaces an error (FR-01/FR-11).
+
+```go
+func BuildRegistry(ctx context.Context, creds *credentials.Store) *Registry {
+    r := &Registry{backends: map[string]Backend{}}
+    r.Register(&RestrictedBackend{})
+    r.Register(&DockerBackend{})
+    r.Register(&FirecrackerBackend{ /* kernel, vfioDevice */ })
+    if tok := creds.Modal(); tok != "" { // optional backend registration
+        r.Register(&ModalBackend{http: &http.Client{}, base: "https://api.modal.com", token: tok})
+    }
+    return r
+}
+
+func Dispatch(ctx context.Context, r *Registry, name string, spec Spec) (Result, error) {
+    b, ok := r.Get(name)
+    if !ok {
+        return Result{}, fmt.Errorf("unknown sandbox backend %q", name)
+    }
+    if err := b.Available(ctx); err != nil {
+        return Result{}, err // never falls back to restricted
+    }
+    return b.Run(ctx, spec)
+}
+```
+
+### 10.7 Mount Path Validation
+
+The Python regex list ports to a slice of compiled `*regexp.Regexp`; `Path.expanduser().resolve()` becomes `expandUser` + `filepath.Abs`/`filepath.EvalSymlinks`. On a match, `Run` returns `ErrBlockedMountPath` instead of raising `ValueError`.
+
+```go
+package sandbox
+
+import (
+    "fmt"
+    "path/filepath"
+    "regexp"
+)
+
+var blockedMountPatterns = []*regexp.Regexp{
+    regexp.MustCompile(`(?i).*\.env$`),
+    regexp.MustCompile(`(?i).*\.key$`),
+    regexp.MustCompile(`(?i).*\.pem$`),
+    regexp.MustCompile(`(?i).*secret.*`),
+    regexp.MustCompile(`(?i).*credential.*`),
+    regexp.MustCompile(`.*/\.ssh(/.*)?$`),
+    regexp.MustCompile(`.*/\.aws(/.*)?$`),
+    regexp.MustCompile(`.*/\.config/op(/.*)?$`),
+    regexp.MustCompile(`(?i).*\.p12$`),
+    regexp.MustCompile(`(?i).*\.pfx$`),
+    regexp.MustCompile(`.*id_rsa.*`),
+    regexp.MustCompile(`.*id_ed25519.*`),
+    regexp.MustCompile(`(?i).*\.token$`),
+    regexp.MustCompile(`(?i).*vault.*`),
+    regexp.MustCompile(`.*/\.gnupg(/.*)?$`),
+}
+
+func validateMountPath(hostPath string) error {
+    expanded, err := filepath.EvalSymlinks(expandUser(hostPath))
+    if err != nil {
+        expanded, _ = filepath.Abs(expandUser(hostPath)) // best-effort canonicalization
+    }
+    for _, p := range blockedMountPatterns {
+        if p.MatchString(expanded) {
+            return fmt.Errorf("%w: %q (matched %q)", ErrBlockedMountPath, hostPath, p.String())
+        }
+    }
+    return nil
+}
+```
+
+### 10.8 Cost Estimation — Pre-Run Display
+
+```go
+// EstimateCost returns the worst-case USD cost (ceiling at timeout).
+func EstimateCost(gpu GPUTier, timeout time.Duration) float64 {
+    rate := cpuRatePerSecond
+    if s, ok := gpuTiers[gpu]; ok {
+        rate = s.RatePerSecond
+    }
+    return round4(rate * timeout.Seconds())
+}
+
+// EstimateActualCost meters the realized cost from a run's duration.
+func EstimateActualCost(gpu GPUTier, dur time.Duration) float64 {
+    rate := cpuRatePerSecond
+    if s, ok := gpuTiers[gpu]; ok {
+        rate = s.RatePerSecond
+    }
+    return round6(rate * dur.Seconds())
+}
+
+// ConfirmGPURun prints the estimate and prompts unless CI is set. The CLI layer
+// (internal/cli) reads from cmd.InOrStdin() for testability.
+func ConfirmGPURun(w io.Writer, in io.Reader, gpu GPUTier, timeout time.Duration) (bool, error) {
+    tier := "CPU"
+    if gpu != GPUNone {
+        tier = strings.ToUpper(string(gpu))
+    }
+    fmt.Fprintf(w, "Estimated cost: %s GPU for ~%.0fs ceiling → $%.4f USD\n",
+        tier, timeout.Seconds(), EstimateCost(gpu, timeout))
+    if os.Getenv("CI") != "" {
+        return true, nil
+    }
+    fmt.Fprint(w, "Proceed? [y/N]: ")
+    var ans string
+    if _, err := fmt.Fscanln(in, &ans); err != nil {
+        return false, nil
+    }
+    ans = strings.ToLower(strings.TrimSpace(ans))
+    return ans == "y" || ans == "yes", nil
+}
+```
+
+### 10.9 OTel Integration (PRD-013)
+
+Hand-rolled OTLP is replaced by `go.opentelemetry.io/otel` spans emitted through `internal/obs`. Env-var values are never set as attributes (NFR-05).
+
+```go
+func emitGPUSpan(ctx context.Context, r Result, spec Spec) {
+    tr := otel.Tracer("tag.sandbox")
+    _, span := tr.Start(ctx, "sandbox.gpu.run")
+    defer span.End()
+
+    backend := "firecracker"
+    if spec.GPU != GPUNone && r.ModalFunctionID != "" && strings.HasPrefix(r.ModalFunctionID, "fn-") {
+        backend = "modal"
+    }
+    gpu := "cpu"
+    if spec.GPU != GPUNone {
+        gpu = string(spec.GPU)
+    }
+    span.SetAttributes(
+        attribute.String("sandbox.backend", backend),
+        attribute.String("sandbox.gpu_type", gpu),
+        attribute.Float64("sandbox.cost_usd", r.CostUSD),
+        attribute.Int("sandbox.exit_code", r.ExitCode),
+        attribute.Float64("sandbox.duration_s", r.Duration.Seconds()),
     )
+    if r.ModalFunctionID != "" {
+        span.SetAttributes(attribute.String("sandbox.modal_function_id", r.ModalFunctionID))
+    }
+    if spec.InvokingRunID != "" {
+        span.SetAttributes(attribute.String("sandbox.invoking_run_id", spec.InvokingRunID))
+    }
+}
 ```
 
-### 10.5 `run_in_sandbox()` Dispatch Extension
+### 10.10 `tag sandbox cost` Implementation
 
-```python
-# Inside run_in_sandbox(), after the existing docker dispatch branch:
+```go
+type CostRow struct {
+    GroupKey       string  `json:"group_key"`
+    RunCount       int     `json:"run_count"`
+    TotalDurationS float64 `json:"total_duration_s"`
+    TotalCostUSD   float64 `json:"total_cost_usd"`
+}
 
-elif backend == "modal":
-    from dataclasses import asdict  # noqa: PLC0415
-    modal_cfg = ModalSandboxConfig(
-        command=cmd,
-        image=image,
-        gpu_type=kwargs.get("gpu_type"),
-        timeout=timeout,
-        env_vars=kwargs.get("env_vars", {}),
-        mounts=kwargs.get("mounts", []),
-        upload_file=kwargs.get("upload_file"),
-        invoking_run_id=kwargs.get("invoking_run_id"),
-    )
-    result = _run_modal(modal_cfg)
-    exit_code  = result.exit_code
-    stdout     = result.stdout
-    stderr     = result.stderr
-    cost_usd   = result.cost_usd
-    fn_id      = result.modal_function_id
-    duration_s = result.duration_s
-```
-
-### 10.6 Mount Path Validation
-
-```python
-import re as _re
-
-_BLOCKED_MOUNT_PATTERNS = [
-    _re.compile(r".*\.env$", _re.IGNORECASE),
-    _re.compile(r".*\.key$", _re.IGNORECASE),
-    _re.compile(r".*\.pem$", _re.IGNORECASE),
-    _re.compile(r".*secret.*", _re.IGNORECASE),
-    _re.compile(r".*credential.*", _re.IGNORECASE),
-    _re.compile(r".*/\.ssh(/.*)?$"),
-    _re.compile(r".*/\.aws(/.*)?$"),
-    _re.compile(r".*/\.config/op(/.*)?$"),
-    _re.compile(r".*\.p12$", _re.IGNORECASE),
-    _re.compile(r".*\.pfx$", _re.IGNORECASE),
-    _re.compile(r".*id_rsa.*"),
-    _re.compile(r".*id_ed25519.*"),
-    _re.compile(r".*\.token$", _re.IGNORECASE),
-    _re.compile(r".*vault.*", _re.IGNORECASE),
-    _re.compile(r".*/\.gnupg(/.*)?$"),
-]
-
-
-def _validate_mount_path(host_path: str) -> None:
-    """Raise ValueError if host_path matches any blocked credential pattern."""
-    from pathlib import Path as _P
-    expanded = str(_P(host_path).expanduser().resolve())
-    for pattern in _BLOCKED_MOUNT_PATTERNS:
-        if pattern.match(expanded):
-            raise ValueError(
-                f"Refusing to mount credential path: {host_path!r}\n"
-                f"Matched blocked pattern: {pattern.pattern!r}"
-            )
-```
-
-### 10.7 Cost Estimation — Pre-Run Display
-
-```python
-def _estimate_modal_cost(gpu_type: str | None, timeout_s: int) -> float:
-    """Return worst-case cost estimate in USD (ceiling at timeout_s)."""
-    if gpu_type and gpu_type.lower() in GPU_TIERS:
-        rate = GPU_TIERS[gpu_type.lower()][1]
-    else:
-        rate = 0.0000020  # CPU-only Modal rate
-    return round(rate * timeout_s, 4)
-
-
-def _confirm_gpu_run(gpu_type: str | None, timeout_s: int) -> bool:
-    """Print cost estimate and prompt for confirmation. Returns True if confirmed."""
-    import os
-    cost = _estimate_modal_cost(gpu_type, timeout_s)
-    tier_str = gpu_type.upper() if gpu_type else "CPU"
-    print(
-        f"Estimated cost: {tier_str} GPU for ~{timeout_s}s ceiling "
-        f"→ ${cost:.4f} USD"
-    )
-    if os.environ.get("CI"):
-        return True
-    answer = input("Proceed? [y/N]: ").strip().lower()
-    return answer in ("y", "yes")
-```
-
-### 10.8 OTel Integration (PRD-013)
-
-```python
-def _emit_sandbox_span(result: ModalSandboxResult, cfg: ModalSandboxConfig) -> None:
-    """Emit an OTel span for the Modal sandbox run. No-op if tracing not configured."""
-    try:
-        from tag.tracing import get_tracer  # type: ignore[import]
-        from tag.otel_semconv import SandboxAttributes  # type: ignore[import]
-    except ImportError:
-        return
-    tracer = get_tracer("tag.sandbox")
-    with tracer.start_as_current_span("sandbox.modal.run") as span:
-        span.set_attribute(SandboxAttributes.BACKEND, "modal")
-        span.set_attribute(SandboxAttributes.GPU_TYPE, cfg.gpu_type or "cpu")
-        span.set_attribute(SandboxAttributes.COST_USD, result.cost_usd)
-        span.set_attribute(SandboxAttributes.EXIT_CODE, result.exit_code)
-        span.set_attribute(SandboxAttributes.DURATION_S, result.duration_s)
-        if result.modal_function_id:
-            span.set_attribute(SandboxAttributes.MODAL_FUNCTION_ID, result.modal_function_id)
-        if cfg.invoking_run_id:
-            span.set_attribute(SandboxAttributes.INVOKING_RUN_ID, cfg.invoking_run_id)
-```
-
-### 10.9 `tag sandbox cost` Implementation
-
-```python
-def list_sandbox_cost(
-    conn: sqlite3.Connection,
-    *,
-    since: str | None = None,
-    until: str | None = None,
-    group_by: str = "gpu_type",
-) -> list[dict]:
-    """Query sandbox_runs for Modal GPU cost aggregation."""
-    ensure_schema(conn)
-    valid_groups = {"gpu_type", "date", "invoking_run_id"}
-    if group_by not in valid_groups:
-        raise ValueError(f"group_by must be one of {valid_groups}")
-
-    group_expr = {
+func ListSandboxCost(ctx context.Context, db *sql.DB, since, until, groupBy string) ([]CostRow, error) {
+    groupExpr, ok := map[string]string{
         "gpu_type":        "COALESCE(gpu_type, 'cpu')",
         "date":            "date(created_at)",
         "invoking_run_id": "COALESCE(invoking_run_id, 'direct')",
-    }[group_by]
+    }[groupBy]
+    if !ok {
+        return nil, fmt.Errorf("group_by must be one of gpu_type|date|invoking_run_id")
+    }
 
-    params: list = []
-    where_clauses = ["backend = 'modal'"]
-    if since:
-        where_clauses.append("created_at >= ?")
-        params.append(since)
-    if until:
-        where_clauses.append("created_at <= ?")
-        params.append(until + "T23:59:59Z")
+    where := []string{"backend IN ('modal','firecracker')"}
+    var args []any
+    if since != "" {
+        where = append(where, "created_at >= ?")
+        args = append(args, since)
+    }
+    if until != "" {
+        where = append(where, "created_at <= ?")
+        args = append(args, until+"T23:59:59Z")
+    }
+    q := fmt.Sprintf(`
+        SELECT %s AS group_key, COUNT(*) AS run_count,
+               SUM(COALESCE(duration_s,0)) AS total_duration_s,
+               SUM(COALESCE(modal_cost_usd,0)) AS total_cost_usd
+        FROM sandbox_runs WHERE %s
+        GROUP BY %s ORDER BY total_cost_usd DESC`,
+        groupExpr, strings.Join(where, " AND "), groupExpr)
 
-    where = " AND ".join(where_clauses)
-    sql = f"""
-        SELECT
-            {group_expr}                   AS group_key,
-            COUNT(*)                        AS run_count,
-            SUM(COALESCE(duration_s, 0))   AS total_duration_s,
-            SUM(COALESCE(modal_cost_usd,0)) AS total_cost_usd
-        FROM sandbox_runs
-        WHERE {where}
-        GROUP BY {group_expr}
-        ORDER BY total_cost_usd DESC
-    """
-    rows = conn.execute(sql, params).fetchall()
-    return [
-        {
-            "group_key":       r[0],
-            "run_count":       r[1],
-            "total_duration_s": r[2],
-            "total_cost_usd":  r[3],
+    rows, err := db.QueryContext(ctx, q, args...)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    var out []CostRow
+    for rows.Next() {
+        var r CostRow
+        if err := rows.Scan(&r.GroupKey, &r.RunCount, &r.TotalDurationS, &r.TotalCostUSD); err != nil {
+            return nil, err
         }
-        for r in rows
-    ]
+        out = append(out, r)
+    }
+    return out, rows.Err()
+}
 ```
 
-### 10.10 `controller.py` Integration Points
+### 10.11 `internal/cli` Integration Points (cobra)
 
-The following changes are required in `controller.py`:
+Python's argparse subparsers become cobra commands under `internal/cli`; `action="append"` flags become `StringArrayVar`.
 
-1. **`cmd_sandbox_run` argument parser** — add `--gpu`, `--env` (action=`append`), `--volume` (action=`append`), `--no-cost-estimate`, `--yes` to the `sandbox run` subparser.
+1. **`sandbox run` flags** — register `--gpu`, `--env` (`StringArrayVar`), `--volume` (`StringArrayVar`), `--timeout`, `--no-cost-estimate`, `--yes` on the `sandbox run` cobra command; parse `--gpu` into a `GPUTier`, rejecting unknown tiers with a message listing valid values (FR/NFR-09).
 
-2. **Pre-dispatch cost prompt** — before calling `run_in_sandbox()`, when `backend == "modal"`:
+2. **Pre-dispatch cost prompt** — before `Dispatch`, for a GPU backend:
 
-```python
-if backend == "modal" and not args.no_cost_estimate:
-    if not args.yes and not _confirm_gpu_run(args.gpu, args.timeout):
-        print("Aborted.")
-        return
+```go
+if isGPUBackend(backend) && !noCostEstimate {
+    ok, _ := sandbox.ConfirmGPURun(cmd.OutOrStdout(), cmd.InOrStdin(), gpu, timeout)
+    if !yes && !ok {
+        fmt.Fprintln(cmd.OutOrStdout(), "Aborted.")
+        return nil
+    }
+}
 ```
 
-3. **`cmd_sandbox_cost` subcommand** — new function wired to `tag sandbox cost`:
+3. **`sandbox cost` subcommand** — a cobra command wired to `ListSandboxCost`:
 
-```python
-def cmd_sandbox_cost(args: argparse.Namespace) -> None:
-    from tag.sandbox import list_sandbox_cost, open_db_sandbox
-    conn = open_db_sandbox()
-    rows = list_sandbox_cost(
-        conn,
-        since=args.since,
-        until=args.until,
-        group_by=args.group_by,
-    )
-    if args.json:
-        print(json.dumps(rows, indent=2))
-        return
-    # Formatted table output (reuse existing table-printing pattern from controller.py)
-    _print_cost_table(rows)
+```go
+func newSandboxCostCmd(store *store.DB) *cobra.Command {
+    var since, until, groupBy string
+    var asJSON bool
+    cmd := &cobra.Command{Use: "cost", Short: "Summarise GPU sandbox spend",
+        RunE: func(cmd *cobra.Command, _ []string) error {
+            rows, err := sandbox.ListSandboxCost(cmd.Context(), store.DB(), since, until, groupBy)
+            if err != nil {
+                return err
+            }
+            if asJSON {
+                return json.NewEncoder(cmd.OutOrStdout()).Encode(rows)
+            }
+            return printCostTable(cmd.OutOrStdout(), rows)
+        }}
+    cmd.Flags().StringVar(&since, "since", "", "start date YYYY-MM-DD")
+    cmd.Flags().StringVar(&until, "until", "", "end date YYYY-MM-DD")
+    cmd.Flags().StringVar(&groupBy, "group-by", "gpu_type", "gpu_type|date|run_id")
+    cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON")
+    return cmd
+}
 ```
 
-4. **`cmd_doctor` extension** — add `modal_gpu` check:
+4. **`doctor` extension** — a `gpu_sandbox` check that iterates the registry and reports each GPU backend's `Available(ctx)`:
 
-```python
-def _check_modal_gpu() -> tuple[str, str, str]:
-    """Returns (name, status, detail) for modal GPU doctor check."""
-    try:
-        import modal
-        version = getattr(modal, "__version__", "unknown")
-        token_path = Path.home() / ".modal" / "token_id"
-        if not token_path.exists():
-            return "modal_token", "warn", "no token at ~/.modal/token_id — run: modal token new"
-        return "modal_gpu", "ok", f"modal {version} ready"
-    except ImportError:
-        return "modal_sdk", "error", "modal not installed — pip install modal"
+```go
+func checkGPUSandbox(ctx context.Context, r *sandbox.Registry) []DoctorResult {
+    var out []DoctorResult
+    for _, name := range []string{"firecracker", "modal"} {
+        b, ok := r.Get(name)
+        if !ok {
+            out = append(out, DoctorResult{name, "warn", "backend not registered"})
+            continue
+        }
+        if err := b.Available(ctx); err != nil {
+            out = append(out, DoctorResult{name, "warn", err.Error()})
+        } else {
+            out = append(out, DoctorResult{name, "ok", "ready"})
+        }
+    }
+    return out
+}
 ```
 
 ---
 
 ## 11. Security Considerations
 
-1. **Credential path blocking** — all 15 blocked patterns from `_BLOCKED_MOUNT_PATTERNS` are enforced before any Modal API call. The check uses `Path.expanduser().resolve()` to canonicalize symlinks and `~` expansion before pattern matching, preventing bypass via relative paths or symlink chains.
+1. **Credential path blocking** — all 15 patterns in `blockedMountPatterns` are enforced (via `validateMountPath`) before any microVM boot or Modal HTTP call. The check canonicalizes with `filepath.EvalSymlinks` plus `~` expansion before matching, preventing bypass via relative paths or symlink chains.
 
-2. **Environment variable secrecy** — `--env` values are stored in `ModalSandboxConfig.env_vars` dict and passed directly to `modal.Sandbox.create(environment_variables=...)`. They are never written to the `command` column of `sandbox_runs`, never logged via Python `logging`, and never set as OTel span attributes. The `sandbox_runs.command` column stores only the user-supplied `--code` string or `--file` path, not the env vars.
+2. **Environment variable secrecy** — `--env` values live only in `Spec.EnvVars` and are injected into the guest environment (Firecracker) or the Modal HTTP request `environment` field. They are never written to the `command` column of `sandbox_runs`, never logged, and never set as OTel span attributes. The `sandbox_runs.command` column stores only the user-supplied `--code` string or `--file` path, not the env vars.
 
-3. **Modal credential isolation** — TAG uses the user's existing `~/.modal/token_id` credential established by `modal token new`. TAG never reads, copies, stores, or transmits the Modal token. If the token is absent, TAG raises a clear error and directs the user to re-authenticate directly with Modal CLI.
+3. **Provider credential isolation** — for the Modal remote backend, TAG resolves the token through `internal/credentials` (the user's existing Modal token); TAG never copies or persists it. If absent, `Available` returns a clear error directing the user to configure credentials. The native Firecracker tier needs no cloud credential at all — a further isolation win of the Go move.
 
-4. **Output truncation** — stdout is capped at 1 MB and stderr at 256 KB before being written to SQLite. This prevents runaway sandbox output from filling the local database. A `truncated: true` field is set in the result and surfaced in `--json` output.
+4. **Output truncation** — stdout is capped at 1 MB and stderr at 256 KB before being written to SQLite. This prevents runaway sandbox output from filling the local database. A `Truncated` field is set in the `Result` and surfaced in `--json` output.
 
-5. **Timeout enforcement at Modal** — the `timeout` parameter is passed to `modal.Sandbox.create(timeout=...)`, not just enforced locally via `subprocess.run(timeout=...)`. This ensures the GPU is released even if the TAG client process is killed or the network connection drops.
+5. **Timeout enforcement at the isolation boundary** — the timeout is a `context.WithTimeout` deadline propagated into `Run`, enforced as the Firecracker VM lifetime or the Modal function timeout — not merely a local wall-clock check. This ensures the GPU is released even if the TAG process is killed or the network connection drops.
 
-6. **PRD-034 secret scanning** — the `--code` inline string and uploaded `--file` content are NOT scanned for secrets (that would require executing PRD-034's scanner, which is out of scope here), but the volume-path blocker ensures credential files cannot be read from disk. Users are warned in the CLI help text that `--code` content is sent to Modal's cloud and should not contain plaintext secrets.
+6. **PRD-034 secret scanning** — the `--code` inline string and uploaded `--file` content are NOT scanned for secrets (that would require PRD-034's scanner, out of scope here), but the volume-path blocker ensures credential files cannot be read from disk. Users are warned in the CLI help text that `--code` content sent to the Modal remote backend leaves the host and should not contain plaintext secrets. (The native Firecracker tier keeps code on-host.)
 
-7. **Modal app isolation** — all TAG sandbox runs use a dedicated Modal app named `tag-sandbox` (created if missing). This isolates TAG's sandbox traffic from any other Modal apps the user may have, simplifying billing attribution and access control in the Modal dashboard.
+7. **Provider workload isolation** — Modal remote runs are submitted under a dedicated Modal app/namespace (`tag-sandbox`), isolating TAG's traffic from other user apps and simplifying billing attribution. Native Firecracker runs are isolated per-microVM by hardware virtualization.
 
-8. **No persistent Modal sandbox sessions** — each `tag sandbox run` creates a fresh ephemeral Modal Sandbox that is terminated on completion. No sandbox is reused across runs, eliminating any risk of cross-run data leakage.
+8. **No persistent sandbox sessions** — each `tag sandbox run` provisions a fresh ephemeral microVM (or Modal sandbox) that is torn down on completion. No sandbox is reused across runs, eliminating any risk of cross-run data leakage.
 
 ---
 
 ## 12. Testing Strategy
 
-### 12.1 Unit Tests (`tests/test_sandbox_modal.py`)
+Go standard `testing` with table-driven cases. The sandbox backend is mocked via a Go `fakeBackend` that satisfies the `Backend` interface (dependency injection) — no monkeypatching, no live KVM, no live network. Integration tests are gated behind a build tag (`//go:build integration`) and an env guard.
 
-All Modal SDK calls are mocked via `pytest-mock` to avoid live network calls in CI.
+### 12.1 Unit Tests (`internal/sandbox/*_test.go`)
 
-```python
-import pytest
-from unittest.mock import MagicMock, patch
+```go
+package sandbox
 
-@pytest.fixture
-def mock_modal(monkeypatch):
-    """Inject a mock modal module into sandbox._run_modal's import."""
-    mock_mod = MagicMock()
-    # Simulate Sandbox.create() returning a mock sandbox
-    mock_sb = MagicMock()
-    mock_sb.returncode = 0
-    mock_sb.stdout.read.return_value = "True NVIDIA A10G\n"
-    mock_sb.stderr.read.return_value = ""
-    mock_mod.Sandbox.create.return_value = mock_sb
-    mock_mod.Image.from_registry.return_value = MagicMock()
-    mock_mod.Mount.from_local_dir.return_value = MagicMock()
-    mock_mod.App.lookup.return_value = MagicMock()
-    monkeypatch.setitem(sys.modules, "modal", mock_mod)
-    return mock_mod
+import (
+    "context"
+    "errors"
+    "testing"
+    "time"
+)
 
+// fakeBackend is injected in place of firecracker/modal to test dispatch,
+// cost, env-secrecy, and persistence without KVM or the network.
+type fakeBackend struct {
+    name   string
+    avail  error
+    result Result
+    ran    bool
+}
 
-def test_run_modal_dispatches_not_restricted(mock_modal, tmp_path):
-    """_run_modal() must call modal.Sandbox.create, never subprocess.run."""
-    from tag.sandbox import ModalSandboxConfig, _run_modal
-    cfg = ModalSandboxConfig(command=["python3", "-c", "print('hi')"], gpu_type="a10g")
-    with patch("subprocess.run") as mock_sub:
-        result = _run_modal(cfg)
-    mock_sub.assert_not_called()
-    mock_modal.Sandbox.create.assert_called_once()
-    assert result.exit_code == 0
+func (f *fakeBackend) Name() string                        { return f.name }
+func (f *fakeBackend) Available(context.Context) error     { return f.avail }
+func (f *fakeBackend) Run(context.Context, Spec) (Result, error) {
+    f.ran = true
+    return f.result, nil
+}
 
+func TestDispatchNeverFallsBackToRestricted(t *testing.T) {
+    gpu := &fakeBackend{name: "firecracker", result: Result{ExitCode: 0}}
+    r := &Registry{backends: map[string]Backend{"firecracker": gpu}}
+    res, err := Dispatch(context.Background(), r, "firecracker", Spec{GPU: GPUA10G})
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    if !gpu.ran || res.ExitCode != 0 {
+        t.Fatal("GPU backend must run; no restricted fallback")
+    }
+}
 
-@pytest.mark.parametrize("tier,expected_modal_str", [
-    ("t4",   "T4"),
-    ("a10g", "A10G"),
-    ("a100", "A100"),
-    ("h100", "H100"),
-])
-def test_gpu_tier_mapping(mock_modal, tier, expected_modal_str):
-    from tag.sandbox import ModalSandboxConfig, _run_modal
-    cfg = ModalSandboxConfig(command=["python3", "-c", "pass"], gpu_type=tier)
-    _run_modal(cfg)
-    call_kwargs = mock_modal.Sandbox.create.call_args.kwargs
-    assert call_kwargs["gpu"] == expected_modal_str
+func TestUnavailableBackendReturnsError(t *testing.T) {
+    gpu := &fakeBackend{name: "firecracker", avail: errors.New("no /dev/kvm")}
+    r := &Registry{backends: map[string]Backend{"firecracker": gpu}}
+    if _, err := Dispatch(context.Background(), r, "firecracker", Spec{}); err == nil {
+        t.Fatal("expected error when backend unavailable")
+    }
+}
 
+func TestGPUTierMapping(t *testing.T) {
+    for _, tc := range []struct {
+        tier GPUTier
+        want string
+    }{{GPUT4, "T4"}, {GPUA10G, "A10G"}, {GPUA100, "A100"}, {GPUH100, "H100"}} {
+        if got := gpuTiers[tc.tier].ProviderName; got != tc.want {
+            t.Errorf("%s: got %q want %q", tc.tier, got, tc.want)
+        }
+    }
+}
 
-def test_blocked_mount_path_raises():
-    from tag.sandbox import _validate_mount_path
-    with pytest.raises(ValueError, match="credential path"):
-        _validate_mount_path("~/.ssh/id_rsa")
+func TestBlockedMountPaths(t *testing.T) {
+    for _, p := range []string{
+        "~/.ssh/id_rsa", "~/.aws/credentials", "~/.env", "/secrets/api.key",
+        "/home/user/.config/op/config", "/data/vault.json",
+        "/app/secret_token", "./credentials.pem",
+    } {
+        if err := validateMountPath(p); !errors.Is(err, ErrBlockedMountPath) {
+            t.Errorf("%q: expected ErrBlockedMountPath, got %v", p, err)
+        }
+    }
+}
 
+func TestEnvVarsNeverPersisted(t *testing.T) {
+    // run_in_sandbox equivalent persists Spec.Command, never Spec.EnvVars.
+    db := newTestDB(t) // modernc.org/sqlite in-memory/tmp with WAL
+    spec := Spec{Command: []string{"python3", "-c", "pass"}, GPU: GPUT4,
+        EnvVars: map[string]string{"SECRET_KEY": "super-secret"}}
+    persistRun(db, spec, Result{})
+    var command string
+    _ = db.QueryRow("SELECT command FROM sandbox_runs LIMIT 1").Scan(&command)
+    if strings.Contains(command, "super-secret") {
+        t.Fatal("env var leaked into command column")
+    }
+}
 
-@pytest.mark.parametrize("blocked", [
-    "~/.aws/credentials", "~/.env", "/secrets/api.key",
-    "/home/user/.config/op/config", "/data/vault.json",
-    "/app/secret_token", "./credentials.pem",
-])
-def test_all_blocked_patterns_rejected(blocked):
-    from tag.sandbox import _validate_mount_path
-    with pytest.raises(ValueError):
-        _validate_mount_path(blocked)
-
-
-def test_env_vars_not_in_command_column(mock_modal, tmp_db):
-    import sqlite3
-    from tag.sandbox import run_in_sandbox, ensure_schema
-    conn = sqlite3.connect(tmp_db)
-    ensure_schema(conn)
-    run_in_sandbox(
-        conn, "python3 -c 'pass'",
-        backend="modal", gpu_type="t4",
-        env_vars={"SECRET_KEY": "super-secret"},
-    )
-    row = conn.execute("SELECT command FROM sandbox_runs LIMIT 1").fetchone()
-    assert "super-secret" not in (row[0] or "")
-
-
-def test_cost_computed_from_duration(mock_modal, tmp_db):
-    import sqlite3
-    from tag.sandbox import run_in_sandbox, ensure_schema
-    conn = sqlite3.connect(tmp_db)
-    ensure_schema(conn)
-    run_in_sandbox(conn, "python3 -c 'pass'", backend="modal", gpu_type="a100")
-    row = conn.execute(
-        "SELECT modal_cost_usd, duration_s FROM sandbox_runs LIMIT 1"
-    ).fetchone()
-    assert row[0] is not None and row[0] >= 0
-    assert row[1] is not None and row[1] >= 0
-
-
-def test_modal_not_installed_raises_runtime_error(monkeypatch):
-    monkeypatch.setitem(sys.modules, "modal", None)  # simulate ImportError
-    from tag.sandbox import ModalSandboxConfig, _run_modal
-    cfg = ModalSandboxConfig(command=["python3", "-c", "pass"])
-    with pytest.raises(RuntimeError, match="pip install modal"):
-        _run_modal(cfg)
-
-
-def test_file_and_code_mutually_exclusive(cli_runner):
-    result = cli_runner.invoke(["sandbox", "run", "--backend", "modal",
-                                "--code", "pass", "--file", "train.py"])
-    assert result.exit_code == 1
-    assert "mutually exclusive" in result.output
-
-
-def test_no_code_no_file_errors(cli_runner):
-    result = cli_runner.invoke(["sandbox", "run", "--backend", "modal"])
-    assert result.exit_code == 1
-    assert "requires --code or --file" in result.output
+func TestCostComputedFromDuration(t *testing.T) {
+    got := EstimateActualCost(GPUA100, 10*time.Second)
+    if got <= 0 {
+        t.Fatalf("cost must be > 0, got %v", got)
+    }
+}
 ```
+
+CLI-level table tests (in `internal/cli`) exercise mutual-exclusion and missing-input errors by invoking the cobra command with a captured buffer and asserting the returned error/exit code (`--file`+`--code` → "mutually exclusive"; neither → "gpu sandbox requires --code or --file"; unknown backend/credentials → descriptive error, no stack trace).
 
 ### 12.2 Integration Tests
 
-Integration tests run only when `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` are set in the environment (skipped in default CI):
+Gated behind `//go:build integration` and skipped unless the backend is actually available. Firecracker tests require Linux + `/dev/kvm` + a VFIO GPU; Modal tests require a configured token.
 
-```python
-@pytest.mark.integration
-@pytest.mark.skipif(not os.environ.get("MODAL_TOKEN_ID"), reason="Modal creds not set")
-def test_modal_t4_cuda_availability():
-    """Live T4 test: verify CUDA is available in the sandbox."""
-    from tag.sandbox import ModalSandboxConfig, _run_modal
-    cfg = ModalSandboxConfig(
-        command=["python3", "-c",
-                 "import torch; print(torch.cuda.is_available())"],
-        gpu_type="t4",
-        image="pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime",
-        timeout=120,
-    )
-    result = _run_modal(cfg)
-    assert result.exit_code == 0
-    assert "True" in result.stdout
+```go
+//go:build integration
 
+package sandbox
 
-@pytest.mark.integration
-@pytest.mark.skipif(not os.environ.get("MODAL_TOKEN_ID"), reason="Modal creds not set")
-@pytest.mark.parametrize("tier", ["t4", "a10g"])
-def test_modal_gpu_tiers_execute(tier):
-    from tag.sandbox import ModalSandboxConfig, _run_modal
-    cfg = ModalSandboxConfig(
-        command=["python3", "-c", "print('ok')"],
-        gpu_type=tier,
-        timeout=90,
-    )
-    result = _run_modal(cfg)
-    assert result.exit_code == 0
-    assert "ok" in result.stdout
-    assert result.cost_usd > 0
+import (
+    "context"
+    "os"
+    "strings"
+    "testing"
+    "time"
+)
+
+func TestFirecrackerT4CUDA(t *testing.T) {
+    b := &FirecrackerBackend{ /* kernel, vfioDevice from env */ }
+    if err := b.Available(context.Background()); err != nil {
+        t.Skipf("firecracker unavailable: %v", err)
+    }
+    res, err := b.Run(context.Background(), Spec{
+        Command: []string{"python3", "-c", "import torch; print(torch.cuda.is_available())"},
+        GPU:     GPUT4, Image: "pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime",
+        Timeout: 120 * time.Second,
+    })
+    if err != nil || res.ExitCode != 0 || !strings.Contains(res.Stdout, "True") {
+        t.Fatalf("CUDA not available: err=%v code=%d out=%q", err, res.ExitCode, res.Stdout)
+    }
+}
+
+func TestModalGPUTiers(t *testing.T) {
+    if os.Getenv("MODAL_TOKEN") == "" {
+        t.Skip("Modal creds not set")
+    }
+    b := &ModalBackend{ /* http, base, token from env */ }
+    for _, tier := range []GPUTier{GPUT4, GPUA10G} {
+        res, err := b.Run(context.Background(), Spec{
+            Command: []string{"python3", "-c", "print('ok')"}, GPU: tier, Timeout: 90 * time.Second})
+        if err != nil || res.ExitCode != 0 || !strings.Contains(res.Stdout, "ok") || res.CostUSD <= 0 {
+            t.Fatalf("tier %s failed: err=%v res=%+v", tier, err, res)
+        }
+    }
+}
 ```
 
 ### 12.3 Performance Tests
 
-```python
-def test_sandbox_cost_query_large_table(tmp_db):
-    """list_sandbox_cost must complete in <200ms for 100k rows."""
-    import sqlite3, time, random
-    from tag.sandbox import ensure_schema, list_sandbox_cost
-    conn = sqlite3.connect(tmp_db)
-    ensure_schema(conn)
-    rows = [
-        (f"id{i}", "python3 -c 'pass'", "modal", None, "done", 0, "", None,
-         f"2026-06-{(i%28)+1:02d}T10:00:00Z", f"2026-06-{(i%28)+1:02d}T10:01:00Z",
-         random.choice(["t4", "a10g", "a100", "h100"]),
-         f"fn-{i}", round(random.uniform(0.001, 1.0), 6),
-         random.uniform(10, 3600), None)
-        for i in range(100_000)
-    ]
-    conn.executemany(
-        """INSERT INTO sandbox_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        rows
-    )
-    conn.commit()
-    t0 = time.monotonic()
-    result = list_sandbox_cost(conn, group_by="gpu_type")
-    elapsed = time.monotonic() - t0
-    assert elapsed < 0.200
-    assert len(result) == 4  # one row per GPU tier
+```go
+func TestSandboxCostQueryLargeTable(t *testing.T) {
+    db := newTestDB(t) // modernc.org/sqlite with idx_sr_gpu_cost applied
+    tiers := []string{"t4", "a10g", "a100", "h100"}
+    tx, _ := db.Begin()
+    stmt, _ := tx.Prepare(`INSERT INTO sandbox_runs
+        (id,command,backend,status,exit_code,created_at,completed_at,gpu_type,
+         modal_function_id,modal_cost_usd,duration_s) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    for i := 0; i < 100_000; i++ {
+        day := (i % 28) + 1
+        ts := fmt.Sprintf("2026-06-%02dT10:00:00Z", day)
+        _, _ = stmt.Exec(fmt.Sprintf("id%d", i), "python3 -c 'pass'", "modal", "done", 0,
+            ts, ts, tiers[i%4], fmt.Sprintf("fn-%d", i),
+            rand.Float64(), 10+rand.Float64()*3590)
+    }
+    _ = tx.Commit()
+
+    start := time.Now()
+    rows, err := ListSandboxCost(context.Background(), db, "", "", "gpu_type")
+    if err != nil {
+        t.Fatal(err)
+    }
+    if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+        t.Fatalf("query took %v, want <200ms", elapsed)
+    }
+    if len(rows) != 4 {
+        t.Fatalf("want 4 tier rows, got %d", len(rows))
+    }
+}
 ```
 
 ---
@@ -929,23 +1101,23 @@ def test_sandbox_cost_query_large_table(tmp_db):
 
 | ID | Criterion | Test Reference |
 |----|-----------|----------------|
-| AC-01 | `tag sandbox run --backend modal --gpu a10g --code "print('hi')" --yes` exits 0 and prints `hi` in the output section. | `test_modal_a10g_inline` (integration) |
-| AC-02 | `tag sandbox run --backend modal --gpu h100 --file train.py --yes` creates a `sandbox_runs` row with `backend='modal'`, `gpu_type='h100'`, non-NULL `modal_cost_usd`. | `test_modal_h100_file` (integration) |
-| AC-03 | When Modal SDK is not installed, `tag sandbox run --backend modal --gpu t4 --code "x"` prints `modal SDK not installed — run: pip install modal` and exits 1. | `test_modal_not_installed_raises_runtime_error` |
-| AC-04 | When Modal token is absent, `tag sandbox run --backend modal --gpu t4 --code "x"` prints a message directing user to `modal token new` and exits 1. | `test_modal_auth_error` |
-| AC-05 | `--volume ~/.ssh:/host-ssh` is rejected before any Modal call with exit code 1 and message `Refusing to mount credential path`. | `test_blocked_mount_path_raises` |
-| AC-06 | `--env SECRET=abc` passed values do NOT appear in the `command` column of `sandbox_runs`. | `test_env_vars_not_in_command_column` |
-| AC-07 | `tag sandbox cost --group-by gpu_type` returns a table with columns `GPU`, `Runs`, `Total Duration`, `Total Cost`. | `test_sandbox_cost_output_format` |
-| AC-08 | `tag sandbox cost` completes in <200ms on a 100,000-row `sandbox_runs` table. | `test_sandbox_cost_query_large_table` |
-| AC-09 | `modal_cost_usd` in `sandbox_runs` equals `duration_s * GPU_TIERS[gpu_type][1]` to within ±1% for all four GPU tiers. | `test_cost_accuracy_per_tier` |
-| AC-10 | `tag sandbox run --backend modal --code "x" --file y.py` exits 1 with `--file and --code are mutually exclusive`. | `test_file_and_code_mutually_exclusive` |
-| AC-11 | `tag sandbox run --backend modal` (no `--code` or `--file`) exits 1 with `modal backend requires --code or --file`. | `test_no_code_no_file_errors` |
-| AC-12 | `tag doctor` includes a `modal_gpu` check that exits green when Modal is installed and token is present. | `test_doctor_modal_gpu_check` |
-| AC-13 | `tag sandbox run --backend modal --gpu t4 --code "print('x')" --yes --json` emits valid JSON with fields `id`, `exit_code`, `output`, `gpu_type`, `modal_cost_usd`. | `test_json_output_fields` |
-| AC-14 | Without `--yes` and with `CI` unset, a confirmation prompt is printed before any Modal call; answering `N` aborts without making any Modal API call. | `test_cost_prompt_abort_no_modal_call` |
-| AC-15 | OTel span `sandbox.modal.run` is emitted with attributes `sandbox.gpu_type` and `sandbox.cost_usd` when tracing is configured. | `test_otel_span_emitted` |
-| AC-16 | All four GPU tiers (`t4`, `a10g`, `a100`, `h100`) are accepted without error; an invalid tier (e.g., `a9000`) exits 1 with a message listing valid tiers. | `test_gpu_tier_mapping`, `test_invalid_gpu_tier` |
-| AC-17 | `sandbox_runs` table after a Modal run has non-NULL values for `gpu_type`, `modal_function_id`, `duration_s`, and `modal_cost_usd`. | `test_cost_computed_from_duration` |
+| AC-01 | `tag sandbox run --backend firecracker --gpu a10g --code "print('hi')" --yes` exits 0 and prints `hi` in the output section. | `TestFirecrackerA10GInline` (integration) |
+| AC-02 | `tag sandbox run --backend firecracker --gpu h100 --file train.py --yes` creates a `sandbox_runs` row with `backend='firecracker'`, `gpu_type='h100'`, non-NULL `modal_cost_usd`. | `TestFirecrackerH100File` (integration) |
+| AC-03 | When no GPU backend is available (no `/dev/kvm`, no Modal credentials), `tag sandbox run --gpu t4 --code "x"` prints a descriptive capability error with remediation and exits 1 (no stack trace). | `TestUnavailableBackendReturnsError` |
+| AC-04 | When the Modal HTTP API returns 401/403, `tag sandbox run --backend modal --gpu t4 --code "x"` prints a message directing the user to configure credentials and exits 1. | `TestModalAuthError` |
+| AC-05 | `--volume ~/.ssh:/host-ssh` is rejected before any microVM boot / Modal call with exit code 1 and message `refusing to mount credential path`. | `TestBlockedMountPaths` |
+| AC-06 | `--env SECRET=abc` values do NOT appear in the `command` column of `sandbox_runs`. | `TestEnvVarsNeverPersisted` |
+| AC-07 | `tag sandbox cost --group-by gpu_type` returns a table with columns `GPU`, `Runs`, `Total Duration`, `Total Cost`. | `TestSandboxCostOutputFormat` |
+| AC-08 | `tag sandbox cost` completes in <200ms on a 100,000-row `sandbox_runs` table. | `TestSandboxCostQueryLargeTable` |
+| AC-09 | `modal_cost_usd` in `sandbox_runs` equals `duration_s * gpuTiers[gpu].RatePerSecond` to within ±1% for all four GPU tiers. | `TestCostAccuracyPerTier` |
+| AC-10 | `tag sandbox run --gpu t4 --code "x" --file y.py` exits 1 with `--file and --code are mutually exclusive`. | `TestFileAndCodeMutuallyExclusive` |
+| AC-11 | `tag sandbox run --backend firecracker --gpu t4` (no `--code` or `--file`) exits 1 with `gpu sandbox requires --code or --file`. | `TestNoCodeNoFileErrors` |
+| AC-12 | `tag doctor` includes a `gpu_sandbox` check that reports each GPU backend's `Available` status (green when Firecracker or Modal is usable). | `TestDoctorGPUSandboxCheck` |
+| AC-13 | `tag sandbox run --gpu t4 --code "print('x')" --yes --json` emits valid JSON with fields `id`, `exit_code`, `output`, `gpu_type`, `modal_cost_usd`. | `TestJSONOutputFields` |
+| AC-14 | Without `--yes` and with `CI` unset, a confirmation prompt is printed before any microVM boot / Modal call; answering `N` aborts without provisioning anything. | `TestCostPromptAbortNoRun` |
+| AC-15 | OTel span `sandbox.gpu.run` is emitted with attributes `sandbox.gpu_type` and `sandbox.cost_usd` when tracing is configured. | `TestOTelSpanEmitted` |
+| AC-16 | All four GPU tiers (`t4`, `a10g`, `a100`, `h100`) are accepted; an invalid tier (e.g., `a9000`) exits 1 with a message listing valid tiers. | `TestGPUTierMapping`, `TestInvalidGPUTier` |
+| AC-17 | `sandbox_runs` after a GPU run has non-NULL `gpu_type`, `modal_function_id`, `duration_s`, and `modal_cost_usd`. | `TestCostComputedFromDuration` |
 
 ---
 
@@ -953,15 +1125,17 @@ def test_sandbox_cost_query_large_table(tmp_db):
 
 | Dependency | Version | Type | Notes |
 |------------|---------|------|-------|
-| `modal` | ≥0.60.0 | Optional Python package | `pip install modal`; lazy-imported inside `_run_modal()` |
-| PRD-028 | Implemented | Internal | `sandbox_runs` table schema and `run_in_sandbox()` function signature |
-| PRD-013 | Optional | Internal | OTel tracing; graceful no-op if `tag.tracing` not importable |
+| `github.com/firecracker-microvm/firecracker-go-sdk` | latest GA | Go module (Apache-2.0) | Native GPU tier — microVMs with VFIO GPU passthrough; Linux + `/dev/kvm` at runtime |
+| Modal REST API | pinned `Modal-Version` const | HTTP (no Go SDK) | Optional remote backend via `net/http`; no dependency added, credentials via `internal/credentials` |
+| `modernc.org/sqlite` | GA | Go module (BSD-3, pure-Go) | Project-wide SQLite driver (`CGO_ENABLED=0`, FTS5 built in) via `internal/store` |
+| `go.opentelemetry.io/otel` + `/sdk` | GA | Go module (Apache-2.0) | `sandbox.gpu.run` span emission via `internal/obs` |
+| `github.com/spf13/cobra` | GA | Go module (Apache-2.0) | `sandbox run`/`sandbox cost` command tree in `internal/cli` |
+| PRD-028 | Implemented | Internal | `sandbox_runs` schema, `Backend` interface, isolation ladder |
+| PRD-013 | Optional | Internal | OTel tracing; graceful no-op if tracing not configured |
 | PRD-012 | Optional | Internal | `tag budget` aggregation; no code dependency, only data convention |
 | PRD-034 | None (awareness) | Internal | Blocked mount patterns inherited from PRD-034 security patterns |
 | PRD-005 | Awareness | Internal | Execution backend selection context; no code dependency |
-| `pytest-mock` | ≥3.11 | Test | Mock `modal` module in unit tests |
-| `sqlite3` | stdlib | Runtime | Already used throughout TAG; no new dependency |
-| `pathlib` | stdlib | Runtime | `Path.expanduser().resolve()` for mount validation |
+| Go stdlib (`net/http`, `path/filepath`, `regexp`, `database/sql`, `context`, `testing`) | 1.24+ | Runtime/Test | Modal HTTP client, mount validation, migrations, table-driven tests — no third-party test/mocking lib needed (fake `Backend` via interface) |
 
 ---
 
@@ -969,15 +1143,15 @@ def test_sandbox_cost_query_large_table(tmp_db):
 
 | ID | Question | Owner | Resolution Target |
 |----|----------|-------|-------------------|
-| OQ-01 | Does `modal.Sandbox.create()` support passing GPU type as a string in Modal SDK ≥0.67? The Sandbox API differs from the `@app.function(gpu=...)` decorator API. Needs verification against Modal changelog. | Engineering | Sprint 1, Day 1 |
-| OQ-02 | Should `modal_cost_usd` use the static `GPU_TIERS` rate table or call Modal's billing API (`modal.client.get_usage()`) for post-run actuals? Billing API may introduce latency. | Product | Sprint 1, Day 3 |
-| OQ-03 | What is the correct Modal image for T4 GPU runs requiring CUDA? `pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime` is the current heuristic but may lag new PyTorch releases. Should TAG hard-code or expose `--image`? | Engineering | Sprint 1, Day 2 |
-| OQ-04 | Should `--volume` use `modal.Mount.from_local_dir()` (copies files at launch time) or `modal.CloudBucketMount` (S3-backed)? The former is simpler but limited to ~500 MB; the latter requires Modal storage setup. | Engineering | Sprint 1, Day 3 |
-| OQ-05 | Should `tag sandbox run --backend modal` (CPU, no GPU) be a supported use case? PRD-028 envisioned Modal for GPU but CPU Modal sandboxes are valid. The `--gpu` flag would be optional. | Product | Sprint 1, Day 1 |
-| OQ-06 | Should `invoking_run_id` be auto-populated from the current TAG session context (e.g., from an env var `TAG_RUN_ID` set by `cmd_submit`)? This would enable zero-friction attribution. | Engineering | Sprint 2, Day 1 |
-| OQ-07 | How should `tag sandbox run --backend modal --gpu a100 --file train.py` handle large uploads (e.g., a 200 MB checkpoint file passed as `--file`)? Modal file upload has practical limits; should there be a size guard? | Engineering | Sprint 2, Day 2 |
-| OQ-08 | Should `tag sandbox cost` roll up into `tag budget status`? This would require `budget.py` to query `sandbox_runs` in addition to `runs`. Scope of budget integration is TBD. | Product | Sprint 2, Day 3 |
-| OQ-09 | Live stdout streaming from Modal Sandbox (via `sb.stdout` as an async iterator) — is this achievable in v1 given the complexity of async/sync bridge in `sandbox.py`? Or should streaming be a hard non-goal until a follow-on PRD? | Engineering | Sprint 1, Day 4 |
+| OQ-01 | What is the exact VFIO device-profile mapping per GPU tier for `firecracker-go-sdk` (kernel args, PCI passthrough config), and the corresponding JSON request shape for the Modal REST `/v1/sandboxes` endpoint (GPU string field)? Both need verification (Firecracker GPU-passthrough docs; Modal API reference). | Engineering | Sprint 1, Day 1 |
+| OQ-02 | Should `modal_cost_usd` use the static `gpuTiers` rate table or, for the Modal remote backend, read post-run actuals from the Modal usage endpoint? A billing call may introduce latency. | Product | Sprint 1, Day 3 |
+| OQ-03 | What is the correct guest rootfs/image for T4 GPU runs requiring CUDA? `pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime` is the current heuristic but may lag new PyTorch releases. Should TAG hard-code or expose `--image`? | Engineering | Sprint 1, Day 2 |
+| OQ-04 | For `--volume`, should the Firecracker tier use a virtio-fs share or a block device, and should the Modal remote backend upload as a multipart HTTP payload or a pre-staged bucket? Trade simplicity vs. large-file limits (~500 MB). | Engineering | Sprint 1, Day 3 |
+| OQ-05 | Should a GPU backend (`firecracker`/`modal`) with no `--gpu` (CPU-only) be a supported use case? PRD-028 envisioned these for GPU, but CPU microVMs/sandboxes are valid. The `--gpu` flag would be optional. | Product | Sprint 1, Day 1 |
+| OQ-06 | Should `invoking_run_id` be auto-populated from the current run context threaded through `internal/runtime` (via `context.Context` or a `TAG_RUN_ID` env var)? This would enable zero-friction attribution. | Engineering | Sprint 2, Day 1 |
+| OQ-07 | How should a GPU run with `--file train.py` handle large uploads (e.g., a 200 MB checkpoint)? The Modal HTTP upload and the Firecracker mount both have practical limits; should there be a size guard? | Engineering | Sprint 2, Day 2 |
+| OQ-08 | Should `tag sandbox cost` roll up into `tag budget status`? This would require the budget command (`internal/cli` + `internal/obs`) to query `sandbox_runs` in addition to `runs`. Scope of budget integration is TBD. | Product | Sprint 2, Day 3 |
+| OQ-09 | Live stdout streaming from the guest — for Firecracker over vsock/console, and for Modal over a streaming HTTP response — is this achievable in v1 by piping output through a Go channel/goroutine, or should streaming be a hard non-goal until a follow-on PRD? | Engineering | Sprint 1, Day 4 |
 
 ---
 
@@ -985,30 +1159,30 @@ def test_sandbox_cost_query_large_table(tmp_db):
 
 **Estimated Effort:** M (1-2 weeks, 1 engineer)
 
-### Phase 1 — Core Modal Backend (Days 1-4)
+### Phase 1 — Backend interface + GPU tiers (Days 1-4)
 
 | Day | Task |
 |-----|------|
-| 1 | Audit Modal SDK `Sandbox` API (OQ-01, OQ-03, OQ-04). Confirm `modal.Sandbox.create(gpu=...)` signature. Write `GPU_TIERS` rate table and `ModalSandboxConfig`/`ModalSandboxResult` dataclasses. |
-| 2 | Implement `_run_modal()` with GPU string mapping, environment variable injection, timeout, output capture. Write `_validate_mount_path()` with all 15 blocked patterns. |
-| 3 | Extend `ensure_schema()` with `_migrate_modal_columns()`. Extend `run_in_sandbox()` dispatch to call `_run_modal()`. Implement `_estimate_modal_cost()` and `_confirm_gpu_run()`. |
-| 4 | Add `list_sandbox_cost()` query function. Write all unit tests in `tests/test_sandbox_modal.py`. Achieve ≥90% coverage with mocked `modal`. |
+| 1 | Confirm Firecracker VFIO GPU-passthrough config and the Modal REST request shape (OQ-01, OQ-03, OQ-04). Define the `Backend` interface, `Registry`, `Spec`/`Result` structs, `GPUTier` constants, and the `gpuTiers` rate table in `internal/sandbox/backend.go`. |
+| 2 | Implement the Firecracker GPU backend (`internal/sandbox/firecracker.go`, `//go:build linux`) with tier→VFIO mapping, env injection, context-deadline timeout, output capture. Implement `validateMountPath` with all 15 blocked patterns (`mount.go`). |
+| 3 | Implement the optional Modal HTTP backend (`modal.go`) + registration/capability checks. Add the `internal/store` migration (`migrateGPUColumns`, guarded by `duplicate column name`). Implement `Dispatch`, `EstimateCost`, `ConfirmGPURun`. |
+| 4 | Add `ListSandboxCost`. Write table-driven unit tests with the injected `fakeBackend`. Achieve ≥90% coverage with no KVM/network. |
 
 ### Phase 2 — CLI Surface and Integration (Days 5-8)
 
 | Day | Task |
 |-----|------|
-| 5 | Add `--gpu`, `--env`, `--volume`, `--no-cost-estimate`, `--yes` flags to `cmd_sandbox_run` in `controller.py`. Add `cmd_sandbox_cost` subcommand. Wire `--json` output path. |
-| 6 | Add `modal_gpu` check to `cmd_doctor`. Add `--file` upload path in `_run_modal()`. Handle `--file`/`--code` mutual exclusion. |
-| 7 | Add OTel span emission via `_emit_sandbox_span()`. Add `sandbox_gpu_runs` view to `ensure_schema()`. Add `invoking_run_id` threading from `cmd_submit` context. |
-| 8 | Write integration test scaffold (`@pytest.mark.integration`) with `MODAL_TOKEN_ID` skip guard. Write performance test `test_sandbox_cost_query_large_table`. Manual smoke test on T4 and A10G. |
+| 5 | Add `--gpu`, `--env`, `--volume`, `--no-cost-estimate`, `--yes` to the `sandbox run` cobra command in `internal/cli`. Add the `sandbox cost` subcommand. Wire the `--json` output path. |
+| 6 | Add the `gpu_sandbox` check to `tag doctor`. Add the `--file` guest-upload path. Handle `--file`/`--code` mutual exclusion. |
+| 7 | Add OTel span emission via `internal/obs` (`sandbox.gpu.run`). Add the `sandbox_gpu_runs` view to the migration. Thread `invoking_run_id` from `internal/runtime` via `context.Context`. |
+| 8 | Write `//go:build integration` tests with backend-availability skip guards. Write `TestSandboxCostQueryLargeTable`. Manual smoke test on T4 and A10G (Firecracker where KVM+GPU present; Modal where credentialed). |
 
 ### Phase 3 — Polish and Review (Days 9-10)
 
 | Day | Task |
 |-----|------|
-| 9 | Address open questions OQ-02 (billing API vs static table), OQ-08 (budget rollup). Update `pyproject.toml` optional deps. Write changelog entry. |
-| 10 | Code review, fix review feedback, run full test suite. Update `docs/prd/INDEX.md` with PRD-093. Close GitHub issue #348. |
+| 9 | Address OQ-02 (billing endpoint vs static table), OQ-08 (budget rollup). Add `firecracker-go-sdk` to `go.mod` and tidy. Write changelog entry. |
+| 10 | Code review, fix review feedback, run `go test ./...`. Update `docs/prd/INDEX.md` with PRD-093. Close GitHub issue #348. |
 
 ---
 

@@ -1,10 +1,12 @@
 # PRD-101: Self-Consistency Ensemble: Sample N, Majority-Vote (`tag submit --samples N --vote majority`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P2
 **Estimated Effort:** S (3-5 days)
 **Category:** Advanced Reasoning & Planning
-**Affects:** `ensemble.py` (new), `src/tag/controller.py` (flag wiring), `tag.sqlite3` (new tables)
+**Affects:** `internal/agent/selfconsistency` (new package), `internal/cli` (flag wiring on `submit`/`run`), `internal/store` (new tables + Go migrations)
 **Depends on:** PRD-027 (eval framework — quality scoring), PRD-028 (sandbox — isolated code execution per sample), PRD-013 (agent tracing — per-sample span attribution), PRD-034 (secret scanning — prompt content before sampling), PRD-012 (budget enforcement — N×cost guard), PRD-043 (vector tool retrieval — embedding-space aggregation), PRD-041 (OTel span cost attribution — per-sample cost tags), PRD-045 (LLM-as-judge — USC meta-judge path)
 **Inspired by:** Self-consistency prompting (Wang et al. 2022), EMS paper 2025, multi-agent voting
 
@@ -18,7 +20,7 @@ Self-consistency, introduced by Wang et al. (2022), addresses this by sampling N
 
 TAG must handle three answer types: discrete/closed-form (yes/no, vulnerability class labels, tool-call decisions), open-ended prose (code explanations, review summaries), and structured JSON (tool call arguments, diff patches). This PRD specifies a three-mode aggregation stack: (a) hard majority vote for discrete answers, (b) embedding-space centroid clustering via `sentence-transformers` (USC-embedding) for open-ended prose without an extra LLM call, and (c) LLM-as-judge meta-call (USC-LLM) for open-ended prose when an authoritative synthesis is preferred over the nearest-centroid. Mode selection is automatic based on answer-type detection with a manual override flag.
 
-The feature integrates with existing TAG infrastructure at every layer: `budget.py` gates total N×cost before the first sample fires; `tracing.py` emits one child span per sample under a parent `ensemble` span; `eval_framework.py` treats ensemble runs as a first-class evaluation variant; `security.py` scans the prompt before sampling to prevent secret leakage into N parallel API calls; and the `sc_samples` SQLite table stores all raw samples for debugging, cost attribution, and future fine-tuning datasets.
+The feature integrates with existing TAG infrastructure at every layer: `internal/obs` (budget) gates total N×cost before the first sample fires; `internal/obs` tracing emits one child span per sample under a parent `ensemble` span; `internal/eval` treats ensemble runs as a first-class evaluation variant; `internal/security` scans the prompt before sampling to prevent secret leakage into N parallel API calls; and the `sc_samples` SQLite table stores all raw samples for debugging, cost attribution, and future fine-tuning datasets.
 
 Early stopping (`--stop-early`) aborts remaining samples as soon as a consensus threshold is reached, reducing cost on easy queries. The stop-early check runs after each batch of concurrent samples and terminates the remaining futures before any network call is made.
 
@@ -32,7 +34,7 @@ TAG's primary use cases — security review, code refactoring, and architecture 
 
 ### 2.2 No Structured Mechanism for Answer Confidence Beyond Token Probabilities
 
-Token log-probabilities are unavailable or unreliable as confidence signals for multi-step reasoning tasks. They reflect single-token prediction confidence, not the confidence of a multi-step conclusion. TAG currently has no mechanism to estimate answer confidence at the semantic level. The `eval_framework.py` (PRD-027) provides quality scoring after the fact using an LLM judge, but this is expensive ($0.01–$0.05 per eval call) and requires manual invocation. Self-consistency provides a cheap, automatic confidence proxy — the fraction of N samples that agree on the winning answer — without any judge model call for the majority-vote path.
+Token log-probabilities are unavailable or unreliable as confidence signals for multi-step reasoning tasks. They reflect single-token prediction confidence, not the confidence of a multi-step conclusion. TAG currently has no mechanism to estimate answer confidence at the semantic level. The `internal/eval` framework (PRD-027) provides quality scoring after the fact using an LLM judge, but this is expensive ($0.01–$0.05 per eval call) and requires manual invocation. Self-consistency provides a cheap, automatic confidence proxy — the fraction of N samples that agree on the winning answer — without any judge model call for the majority-vote path.
 
 ### 2.3 Open-Ended Outputs Have No Aggregation Primitive
 
@@ -77,11 +79,11 @@ Wang et al.'s original majority vote applies only to closed-form answers. TAG ro
 |--------|--------|--------------------|
 | Majority-vote correctness lift | ≥ 10 pp accuracy improvement vs. single-sample on TAG eval suite (PRD-027) for N=5, discrete prompts | Run `tag eval run` with `--samples 5 --vote majority` vs. baseline; compare `pass_count / total_count` |
 | USC-embedding similarity | Winning sample cosine similarity to centroid ≥ 0.85 (all-MiniLM-L6-v2) | Assert in unit test with synthetic N=10 fixture |
-| Stop-early cancellation | When consensus reached at sample K < N, remaining N-K futures are cancelled before any network bytes sent | Mock `httpx` at transport layer; assert call count = K |
+| Stop-early cancellation | When consensus reached at sample K < N, remaining N-K goroutines are cancelled before any network bytes sent | Fake `Provider` at the transport layer; assert call count = K |
 | Cost gate accuracy | Displayed pre-flight cost estimate within ±15 % of actual spend | Compare estimate vs. `sc_samples.prompt_tokens + completion_tokens` sum after run |
-| SQLite persistence | All N samples written to `sc_samples` within 100 ms of ensemble completion | Assert in integration test; measure with `time.perf_counter` |
+| SQLite persistence | All N samples written to `sc_samples` within 100 ms of ensemble completion | Assert in integration test; measure with `time.Since` |
 | Span attribution | `ensemble` parent span + N child spans visible in `tag trace show` | Integration test asserting span count = N+1 |
-| Budget enforcement | `tag submit --samples 10` blocked if N×estimated_cost > active budget cap | Unit test with mocked budget.get_remaining() = 0 |
+| Budget enforcement | `tag submit --samples 10` blocked if N×estimated_cost > active budget cap | Unit test with a fake budget reporting remaining = 0 |
 | Wall-time overhead (N=1) | `--samples 1` latency ≤ 105 % of baseline `tag submit` (ensemble scaffolding overhead < 5 %) | Benchmark 20 runs; 95th-percentile ratio |
 
 ---
@@ -226,22 +228,22 @@ Actual cost: $0.019 (3 samples, early stop saved $0.012)
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-01 | When `--samples 1` (or `--samples` is absent), `ensemble.py` is not imported and the code path is identical to the current single-call path with zero overhead. | Must |
-| FR-02 | When N > 1, the system fires N concurrent API calls using `asyncio.gather` (or `ThreadPoolExecutor` for sync Hermes callers), each with an independent random seed derived from `uuid4()`. | Must |
+| FR-01 | When `--samples 1` (or `--samples` is absent), the `internal/agent/selfconsistency` package is never entered — the CLI dispatches straight to the current single-call path with zero overhead. | Must |
+| FR-02 | When N > 1, the system fans out N concurrent completions as goroutines over the `internal/llm` provider `Stream(ctx, Request) -> <-chan Event` interface, coordinated by an `golang.org/x/sync/errgroup.Group` with bounded concurrency (`errgroup.SetLimit`), each goroutine carrying an independent random seed derived from a fresh `uuid.NewString()`. Per-sample results are collected over a channel. | Must |
 | FR-03 | `majority_vote(samples)` normalises each sample's final answer by stripping punctuation and lowercasing, counts frequencies, and returns the modal answer plus its count and the total N. In the case of a tie, the sample with the lowest `latency_ms` among the tied answers is preferred. | Must |
-| FR-04 | `embedding_vote(samples, model)` encodes all N sample texts with `SentenceTransformer(model)`, runs agglomerative clustering (`sklearn.cluster.AgglomerativeClustering`, `metric='cosine'`, `linkage='average'`), identifies the largest cluster, computes the centroid, and returns the sample with maximum cosine similarity to the centroid. | Must |
-| FR-05 | `llm_vote(samples, judge_model, profile)` constructs a USC meta-prompt listing all N samples and calls the judge model once, returning its synthesis. The meta-prompt template is stored as `USC_META_PROMPT` in `ensemble.py`. | Must |
-| FR-06 | `detect_answer_type(prompt_text)` returns `"discrete"` if the prompt contains decision-requesting patterns (regex: `r'\b(yes|no|true|false|correct|incorrect|vulnerable|safe)\b'` or ends with `?` and is < 200 chars), otherwise returns `"open_ended"`. This drives auto-mode selection. | Must |
-| FR-07 | `--stop-early` checks consensus after each sample completes (not in a batch). If `winning_count / n_sampled >= consensus_threshold`, all pending futures are cancelled via `future.cancel()` before any HTTP request is dispatched. | Must |
-| FR-08 | Before the first API call, `compute_preflight_cost(n, model_id, prompt_tokens)` estimates total cost as `n × (prompt_tokens × prompt_rate + max_completion_tokens × completion_rate)` using rates from `budget.py`. If `--yes` is not set and `CI` env var is not `"true"`, the user is prompted for confirmation. | Must |
-| FR-09 | Budget enforcement calls `budget.check_and_reserve(profile, estimated_cost)` before sampling. If the budget would be exceeded, the command exits with code 1 and a human-readable error message showing remaining budget. | Must |
-| FR-10 | Every sample is written to `sc_samples` (see SQLite DDL in §9.1) within the same `open_db()` transaction as the ensemble row, using `INSERT OR REPLACE`. | Must |
-| FR-11 | Tracing: an `ensemble` parent span is opened via `tracing.open_span()` at the start; each sample opens a child span with attributes `sc.sample_index`, `sc.vote_key` (normalised answer for majority mode), `sc.prompt_tokens`, `sc.completion_tokens`; the parent span is closed with `sc.vote_winner` and `sc.consensus_ratio` attributes. | Must |
-| FR-12 | Secret scanning (PRD-034): `security.scan_for_secrets(prompt_text)` is called before the pre-flight cost display. If secrets are detected, the command aborts with exit code 1 and does not display the prompt content in the error message. | Must |
+| FR-04 | `EmbeddingVote(samples, model)` encodes all N sample texts through the `internal/memory/embed` `Embedder` interface (provider embedding API by default; build-tag offline MiniLM), runs agglomerative clustering (average-linkage over cosine distance, ported as plain Go slices/loops), identifies the largest cluster, computes the centroid, and returns the sample with maximum cosine similarity to the centroid. | Must |
+| FR-05 | `LLMVote(samples, judgeModel, profile)` constructs a USC meta-prompt listing all N samples and calls the judge model once through the `internal/llm` provider interface, returning its synthesis. The meta-prompt template is a package-level `const USCMetaPrompt` in `internal/agent/selfconsistency`. | Must |
+| FR-06 | `DetectAnswerType(promptText)` returns `AnswerDiscrete` if the prompt contains decision-requesting patterns (RE2 regexp: `\b(yes|no|true|false|correct|incorrect|vulnerable|safe)\b` or ends with `?` and is < 200 chars), otherwise returns `AnswerOpenEnded`. This drives auto-mode selection. | Must |
+| FR-07 | `--stop-early` checks consensus after each sample completes (not in a batch). If `winningCount / nSampled >= consensusThreshold`, the shared `context.Context` passed to the errgroup is cancelled, aborting all in-flight goroutines and preventing any not-yet-dispatched provider request. | Must |
+| FR-08 | Before the first API call, `ComputePreflightCost(n, modelID, promptTokens)` estimates total cost as `n × (promptTokens × promptRate + maxCompletionTokens × completionRate)` using the `internal/obs` pricing table. If `--yes` is not set and the `CI` env var is not `"true"`, the user is prompted for confirmation. | Must |
+| FR-09 | Budget enforcement calls `obs.Budget.CheckAndReserve(profile, estimatedCost)` before sampling. If the budget would be exceeded, the command returns a non-nil error, exits with code 1, and prints a human-readable message showing remaining budget. | Must |
+| FR-10 | Every sample is written to `sc_samples` (see SQLite DDL in §9.1) within the same `internal/store` transaction (`*sql.Tx`) as the ensemble row, via an upsert (`INSERT ... ON CONFLICT DO UPDATE`). | Must |
+| FR-11 | Tracing: an `ensemble` parent span is started via `otel` (`tracer.Start(ctx, ...)`) at the start; each sample opens a child span with attributes `sc.sample_index`, `sc.vote_key` (normalised answer for majority mode), `sc.prompt_tokens`, `sc.completion_tokens`; the parent span is ended with `sc.vote_winner` and `sc.consensus_ratio` attributes. | Must |
+| FR-12 | Secret scanning (PRD-034): `security.ScanForSecrets(promptText)` is called before the pre-flight cost display. If secrets are detected, the command returns an error, exits with code 1, and does not display the prompt content in the error message. | Must |
 | FR-13 | `tag ensemble list` reads from `sc_ensembles` ordered by `created_at DESC`, with `--last N` (default 20), `--profile NAME` filter, and `--json` flag. | Should |
 | FR-14 | `tag ensemble show <ensemble_id>` reads from `sc_samples` for that ensemble, rendering each sample's text (truncated to 200 chars in human mode), vote key, latency, and cost. `--sample-index K` prints the full text for sample K. | Should |
 | FR-15 | `tag ensemble export <ensemble_id> --output FILE` writes a JSONL file with one object per sample, formatted as `{"prompt": "...", "completion": "...", "vote_key": "...", "is_winner": true/false}`, suitable for SFT fine-tuning datasets. | Could |
-| FR-16 | When `--vote embedding` is used and `sentence-transformers` is not installed, the command falls back to `majority` mode (if discrete) or `llm` mode (if open-ended), emitting a `print_warning()` with install instructions. | Must |
+| FR-16 | When `--vote embedding` is used and no `Embedder` is available (offline with no provider embedding endpoint reachable and the offline-MiniLM build tag absent), the command falls back to `majority` mode (if discrete) or `llm` mode (if open-ended), emitting a warning with configuration guidance. | Must |
 | FR-17 | The `--samples-temperature` value must be > 0 when N > 1; if the user sets `--samples-temperature 0`, the CLI emits a warning and overrides to 0.1 to preserve diversity. | Must |
 | FR-18 | The `--judge-model` flag defaults to the value of `self_consistency.judge_model` in the TAG config, then to `claude-haiku-4-5` (cheapest capable model), then to the profile's default model. | Should |
 | FR-19 | `tag ensemble stats --profile NAME --last N` computes mean consensus ratio, mean samples used, mean cost per ensemble, and p50/p95 latency across the last N ensemble runs for a given profile. | Could |
@@ -253,16 +255,16 @@ Actual cost: $0.019 (3 samples, early stop saved $0.012)
 
 | ID | Requirement | Target |
 |----|-------------|--------|
-| NFR-01 | **Latency (wall time, N samples)** | Wall time for N concurrent samples ≤ 1.2× the single-sample wall time for N ≤ 5 on the same model, assuming sufficient API concurrency. |
-| NFR-02 | **Memory footprint** | Embedding matrix for N=40 samples × 384-dim (MiniLM) = 61 KB; total peak memory increase from ensemble module < 50 MB including model load (model is lazy-loaded and cached across calls). |
-| NFR-03 | **SQLite write performance** | All N sample rows inserted in a single transaction; total SQLite write overhead < 10 ms for N ≤ 40 on SSD. |
-| NFR-04 | **Graceful degradation** | If any single sample's API call fails with a retriable error (5xx, timeout), that sample is retried once with 1 s backoff. If it fails again, it is recorded as `status='error'` in `sc_samples` and excluded from voting. Voting proceeds on the remaining samples if at least ⌈N/2⌉ succeed. |
-| NFR-05 | **Cancellation correctness** | When stop-early triggers, cancelled futures must not result in any pending HTTP connection being left open; `httpx.AsyncClient` context managers must be properly exited. |
+| NFR-01 | **Latency (wall time, N samples)** | Wall time for N goroutine-fanned samples ≤ 1.2× the single-sample wall time for N ≤ 5 on the same model, assuming sufficient API concurrency (errgroup limit ≥ N). |
+| NFR-02 | **Memory footprint** | Embedding matrix for N=40 samples × 384-dim (MiniLM) = 61 KB held as `[]float32`; total peak memory increase from the selfconsistency package < 50 MB including any offline model load (offline model lazily initialised once behind a `sync.Once` and cached across calls). |
+| NFR-03 | **SQLite write performance** | All N sample rows inserted in a single `modernc.org/sqlite` transaction; total SQLite write overhead < 10 ms for N ≤ 40 on SSD (allow headroom for modernc's ~2× query cost vs CGO drivers). |
+| NFR-04 | **Graceful degradation** | If any single sample's provider call fails with a retriable error (5xx, timeout), that sample is retried once with 1 s backoff (`cenkalti/backoff/v4` at orchestration level). If it fails again, it is recorded as `status='error'` in `sc_samples` and excluded from voting. Voting proceeds on the remaining samples if at least ⌈N/2⌉ succeed. |
+| NFR-05 | **Cancellation correctness** | When stop-early triggers, cancelling the shared `context.Context` must propagate to every in-flight goroutine so the provider `Stream` channels are drained/closed and no HTTP connection is leaked; `errgroup.Wait()` must return after all goroutines observe cancellation. |
 | NFR-06 | **Reproducibility** | Given `--samples-temperature 0` (overridden to 0.1 per FR-17), the majority-vote winner across runs for the same prompt should be stable (>= 80 % identical across 5 independent runs in CI). Not guaranteed but targeted. |
-| NFR-07 | **Security** | The USC meta-prompt for `--vote llm` must not include secret-scanned tokens detected by `security.py`; raw sample texts passed to the judge are filtered through the same secret-masking logic. |
-| NFR-08 | **Cost ceiling** | A hard-coded maximum N of 40 (matching Wang et al. 2022's largest experiment) is enforced; `--samples > 40` raises `ValueError` with a message referencing the paper's diminishing-returns finding. |
-| NFR-09 | **Import isolation** | `import tag.ensemble` must not be triggered when `--samples 1` (or absent); the import is deferred inside `cmd_submit` / `cmd_run` behind `if args.samples > 1`. |
-| NFR-10 | **OTel compatibility** | All ensemble spans conform to TAG's OTel semantic conventions (PRD-041); `sc.sample_index` is a standard integer attribute; `sc.consensus_ratio` is a float attribute; both are listed in `otel_semconv.py`. |
+| NFR-07 | **Security** | The USC meta-prompt for `--vote llm` must not include secret-scanned tokens detected by `internal/security`; raw sample texts passed to the judge are filtered through the same secret-masking logic. |
+| NFR-08 | **Cost ceiling** | A hard-coded maximum N of 40 (matching Wang et al. 2022's largest experiment) is enforced; `--samples > 40` returns an error with a message referencing the paper's diminishing-returns finding. |
+| NFR-09 | **Path isolation** | The `internal/agent/selfconsistency` package must not be entered when `--samples 1` (or absent); the CLI branches on `samples > 1` in the `submit`/`run` cobra handlers before any selfconsistency call, so its cost/tracing/DDL machinery is inert on the single-call path. |
+| NFR-10 | **OTel compatibility** | All ensemble spans conform to TAG's OTel semantic conventions (PRD-041); `sc.sample_index` is an `attribute.Int` value; `sc.consensus_ratio` is an `attribute.Float64` value; both constants live in `internal/obs` alongside the hardcoded `gen_ai.*` table and pinned `SEMCONV_VERSION`. |
 
 ---
 
@@ -270,7 +272,7 @@ Actual cost: $0.019 (3 samples, early stop saved $0.012)
 
 ### 9.1 SQLite DDL
 
-All tables use WAL-mode inherited from `open_db()`. Foreign key enforcement is enabled per connection.
+Persistence uses `modernc.org/sqlite` (pure-Go, CGO_ENABLED=0), the project-wide driver. The DDL below is unchanged SQL, applied as idempotent Go migrations under `internal/store/migrate/` (`CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`). All tables use WAL-mode inherited from the single `internal/store` connection; foreign-key enforcement is set via `PRAGMA foreign_keys=ON` per connection. Writes route through the single-writer store handle (flock + `os.Rename` atomic RMW discipline).
 
 ```sql
 -- Parent record: one row per ensemble invocation
@@ -327,376 +329,451 @@ CREATE INDEX IF NOT EXISTS idx_scs_winner   ON sc_samples(ensemble_id, is_winner
 -- self_consistency.embed_model        TEXT    DEFAULT 'all-MiniLM-L6-v2'
 ```
 
-### 9.2 Core Dataclasses
+### 9.2 Core Structs
 
-```python
-# src/tag/ensemble.py
-from __future__ import annotations
+```go
+// internal/agent/selfconsistency/types.go
+package selfconsistency
 
-import asyncio
-import hashlib
-import re
-import time
-import uuid
-from dataclasses import dataclass, field
-from typing import Literal
+// AnswerType is a typed string constant (replaces the Python Literal).
+type AnswerType string
 
-AnswerType = Literal["discrete", "open_ended", "structured"]
-VoteMode   = Literal["majority", "embedding", "llm", "auto"]
+const (
+	AnswerDiscrete  AnswerType = "discrete"
+	AnswerOpenEnded AnswerType = "open_ended"
+	AnswerStructured AnswerType = "structured"
+)
 
+// VoteMode is a typed string constant.
+type VoteMode string
 
-@dataclass
-class SampleResult:
-    """Result of a single sampled completion."""
-    id: str                         # scs-<uuid4>
-    ensemble_id: str
-    sample_index: int
-    text: str
-    vote_key: str | None = None     # normalised key (majority mode)
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    cost_usd: float = 0.0
-    latency_ms: int = 0
-    status: str = "ok"              # 'ok' | 'error' | 'cancelled'
-    error_msg: str | None = None
-    embedding: list[float] | None = field(default=None, repr=False)
-    cluster_id: int | None = None
-    cosine_to_centroid: float | None = None
-    is_winner: bool = False
+const (
+	VoteMajority  VoteMode = "majority"
+	VoteEmbedding VoteMode = "embedding"
+	VoteLLM       VoteMode = "llm"
+	VoteAuto      VoteMode = "auto"
+)
 
+// SampleResult is the result of a single sampled completion.
+type SampleResult struct {
+	ID               string    // scs-<uuid>
+	EnsembleID       string
+	SampleIndex      int
+	Text             string
+	VoteKey          string    // normalised key (majority mode); "" if unset
+	PromptTokens     int
+	CompletionTokens int
+	CostUSD          float64
+	LatencyMS        int
+	Status           string    // "ok" | "error" | "cancelled"
+	ErrorMsg         string
+	Embedding        []float32 // nil unless embedding mode
+	ClusterID        int       // -1 if unassigned
+	CosineToCentroid float64
+	IsWinner         bool
+}
 
-@dataclass
-class EnsembleResult:
-    """Aggregated result of an N-sample ensemble run."""
-    id: str                         # ens-<uuid4>
-    profile: str
-    model_id: str
-    prompt_sha256: str
-    prompt_preview: str
-    n_requested: int
-    vote_mode: VoteMode
-    answer_type: AnswerType
-    samples: list[SampleResult] = field(default_factory=list)
-    winner: SampleResult | None = None
-    consensus_ratio: float | None = None
-    stop_early_triggered: bool = False
-    estimated_cost_usd: float = 0.0
-    actual_cost_usd: float = 0.0
-    status: str = "running"
+// EnsembleResult is the aggregated result of an N-sample ensemble run.
+type EnsembleResult struct {
+	ID                 string   // ens-<uuid>
+	Profile            string
+	ModelID            string
+	PromptSHA256       string
+	PromptPreview      string
+	NRequested         int
+	VoteMode           VoteMode
+	AnswerType         AnswerType
+	Samples            []SampleResult
+	Winner             *SampleResult
+	ConsensusRatio     float64  // valid once voting completes
+	StopEarlyTriggered bool
+	EstimatedCostUSD   float64
+	ActualCostUSD      float64
+	Status             string   // "running" | "done" | "error"
+}
 
+// Config is the runtime configuration for a single ensemble invocation.
+type Config struct {
+	N                   int
+	VoteMode            VoteMode
+	Temperature         float64
+	StopEarly           bool
+	ConsensusThreshold  float64
+	EmbedModel          string
+	JudgeModel          string
+	MaxCompletionTokens int
+	DryRun              bool
+	SkipConfirm         bool
+}
 
-@dataclass
-class EnsembleConfig:
-    """Runtime configuration for a single ensemble invocation."""
-    n: int = 1
-    vote_mode: VoteMode = "auto"
-    temperature: float = 0.7
-    stop_early: bool = False
-    consensus_threshold: float = 0.6
-    embed_model: str = "all-MiniLM-L6-v2"
-    judge_model: str | None = None
-    max_completion_tokens: int = 2048
-    dry_run: bool = False
-    skip_confirm: bool = False
+// DefaultConfig mirrors the Python dataclass defaults.
+func DefaultConfig() Config {
+	return Config{
+		N:                   1,
+		VoteMode:            VoteAuto,
+		Temperature:         0.7,
+		ConsensusThreshold:  0.6,
+		EmbedModel:          "all-MiniLM-L6-v2",
+		MaxCompletionTokens: 2048,
+	}
+}
 ```
 
 ### 9.3 Core Algorithms
 
-#### 9.3.1 `detect_answer_type`
+#### 9.3.1 `DetectAnswerType`
 
-```python
-_DISCRETE_PATTERNS = re.compile(
-    r"""
-    \b(yes|no|true|false|correct|incorrect|vulnerable|safe|pass|fail)\b |
-    \b(is\s+this|does\s+this|should\s+i|can\s+you\s+tell\s+me\s+if)\b |
-    \?\s*$                    # ends with question mark
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-_STRUCTURED_PATTERNS = re.compile(
-    r"(json|yaml|xml|csv|tool.call|function.call|structured.output)",
-    re.IGNORECASE,
+Go's `regexp` (RE2) has no verbose/inline-comment mode, so the patterns are written as plain case-insensitive alternations and compiled once at package init via `regexp.MustCompile`.
+
+```go
+var (
+	discretePatterns = regexp.MustCompile(`(?i)\b(yes|no|true|false|correct|incorrect|vulnerable|safe|pass|fail)\b|\b(is\s+this|does\s+this|should\s+i|can\s+you\s+tell\s+me\s+if)\b|\?\s*$`)
+	structuredPatterns = regexp.MustCompile(`(?i)(json|yaml|xml|csv|tool.call|function.call|structured.output)`)
 )
 
-def detect_answer_type(prompt_text: str) -> AnswerType:
-    if _STRUCTURED_PATTERNS.search(prompt_text):
-        return "structured"
-    if _DISCRETE_PATTERNS.search(prompt_text) and len(prompt_text) < 500:
-        return "discrete"
-    return "open_ended"
+func DetectAnswerType(promptText string) AnswerType {
+	if structuredPatterns.MatchString(promptText) {
+		return AnswerStructured
+	}
+	if discretePatterns.MatchString(promptText) && len(promptText) < 500 {
+		return AnswerDiscrete
+	}
+	return AnswerOpenEnded
+}
 ```
 
-#### 9.3.2 `majority_vote`
+#### 9.3.2 `MajorityVote`
 
-```python
-import collections
+Voting is plain arithmetic ported 1:1 — a `map[string][]SampleResult` bucket, frequency count, and a lowest-latency tie-break. Errors are returned, not raised.
 
-_NORMALISE = re.compile(r"[^\w\s]")
+```go
+var normalisePattern = regexp.MustCompile(`[^\w\s]`)
 
-def _normalise_key(text: str) -> str:
-    """Strip punctuation, collapse whitespace, lowercase."""
-    return _NORMALISE.sub("", text).strip().lower()
+func normaliseKey(text string) string {
+	return strings.ToLower(strings.TrimSpace(normalisePattern.ReplaceAllString(text, "")))
+}
 
-def majority_vote(samples: list[SampleResult]) -> tuple[SampleResult, float]:
-    """
-    Return the winning SampleResult and its consensus ratio.
-    Ties broken by lowest latency_ms.
-    """
-    keyed: dict[str, list[SampleResult]] = collections.defaultdict(list)
-    for s in samples:
-        if s.status == "ok" and s.vote_key:
-            keyed[s.vote_key].append(s)
+// MajorityVote returns the winning sample and its consensus ratio.
+// Ties are broken by lowest LatencyMS.
+func MajorityVote(samples []SampleResult) (SampleResult, float64, error) {
+	keyed := map[string][]SampleResult{}
+	for _, s := range samples {
+		if s.Status == "ok" && s.VoteKey != "" {
+			keyed[s.VoteKey] = append(keyed[s.VoteKey], s)
+		}
+	}
+	if len(keyed) == 0 {
+		return SampleResult{}, 0, errors.New("no valid samples available for majority vote")
+	}
 
-    if not keyed:
-        raise ValueError("No valid samples available for majority vote")
+	// Pick the key with the highest frequency; break ties by lowest min latency.
+	var winnerKey string
+	var best []SampleResult
+	for k, group := range keyed {
+		if best == nil ||
+			len(group) > len(best) ||
+			(len(group) == len(best) && minLatency(group) < minLatency(best)) {
+			winnerKey, best = k, group
+		}
+	}
+	_ = winnerKey
 
-    # Sort by frequency desc, then min latency asc (stable tie-break)
-    winner_key = max(
-        keyed,
-        key=lambda k: (len(keyed[k]), -min(s.latency_ms for s in keyed[k])),
-    )
-    winner_samples = keyed[winner_key]
-    winner = min(winner_samples, key=lambda s: s.latency_ms)
-    consensus_ratio = len(winner_samples) / len(samples)
-    return winner, consensus_ratio
+	winner := best[0]
+	for _, s := range best[1:] {
+		if s.LatencyMS < winner.LatencyMS {
+			winner = s
+		}
+	}
+	consensus := float64(len(best)) / float64(len(samples))
+	return winner, consensus, nil
+}
+
+func minLatency(group []SampleResult) int {
+	m := group[0].LatencyMS
+	for _, s := range group[1:] {
+		if s.LatencyMS < m {
+			m = s.LatencyMS
+		}
+	}
+	return m
+}
 ```
 
-#### 9.3.3 `embedding_vote`
+#### 9.3.3 `EmbeddingVote`
 
-```python
-import struct
+There is no numpy/sklearn in Go, but none is needed: at N ≤ 40 the clustering is plain arithmetic over `[]float32` slices — normalised embeddings, average-linkage agglomerative clustering, centroid, and cosine — all ported 1:1 as loops (no `gonum` required; it would only be justified for real linear algebra at large scale). Encoding goes through the `internal/memory/embed.Embedder` interface (provider embedding API by default; build-tag offline MiniLM), so the reasoning layer never imports an ML SDK directly.
 
-def embedding_vote(
-    samples: list[SampleResult],
-    model_name: str = "all-MiniLM-L6-v2",
-) -> tuple[SampleResult, float]:
-    """
-    Agglomerative clustering on sentence embeddings.
-    Returns the sample nearest the centroid of the largest cluster.
-    Requires: sentence-transformers, sklearn
-    """
-    from sentence_transformers import SentenceTransformer
-    from sklearn.cluster import AgglomerativeClustering
-    import numpy as np
+```go
+// Embedder is satisfied by internal/memory/embed (provider default / offline MiniLM).
+type Embedder interface {
+	Encode(ctx context.Context, texts []string) ([][]float32, error) // rows L2-normalised
+}
 
-    valid = [s for s in samples if s.status == "ok"]
-    if len(valid) == 1:
-        return valid[0], 1.0
+// EmbeddingVote clusters sample embeddings and returns the sample nearest the
+// centroid of the largest cluster, plus its consensus ratio.
+func EmbeddingVote(ctx context.Context, samples []SampleResult, emb Embedder) (SampleResult, float64, error) {
+	valid := valid(samples)
+	if len(valid) == 1 {
+		return valid[0], 1.0, nil
+	}
 
-    model = SentenceTransformer(model_name)
-    texts = [s.text for s in valid]
-    embs = model.encode(texts, normalize_embeddings=True)  # shape (N, D)
+	texts := make([]string, len(valid))
+	for i, s := range valid {
+		texts[i] = s.Text
+	}
+	embs, err := emb.Encode(ctx, texts) // shape (N, D), rows normalised
+	if err != nil {
+		return SampleResult{}, 0, err
+	}
+	for i := range valid {
+		valid[i].Embedding = embs[i] // persist back on the sample
+	}
 
-    # Store embeddings back on samples for persistence
-    for s, emb in zip(valid, embs):
-        s.embedding = emb.tolist()
+	// n_clusters := min(len, max(2, len/2)) — same heuristic as the original.
+	nClusters := min(len(valid), max(2, len(valid)/2))
+	labels := agglomerativeCosine(embs, nClusters) // average-linkage, plain loops
 
-    # Determine n_clusters: min(len(valid), 3) unless N < 3
-    n_clusters = min(len(valid), max(2, len(valid) // 2))
-    clusterer = AgglomerativeClustering(
-        n_clusters=n_clusters,
-        metric="cosine",
-        linkage="average",
-    )
-    labels = clusterer.fit_predict(embs)
+	// Largest cluster.
+	counts := map[int]int{}
+	for _, l := range labels {
+		counts[l]++
+	}
+	largest, largestN := -1, -1
+	for l, c := range counts {
+		if c > largestN {
+			largest, largestN = l, c
+		}
+	}
 
-    # Find largest cluster
-    counts = collections.Counter(labels)
-    largest_label = counts.most_common(1)[0][0]
+	// Centroid of the largest cluster (mean of member rows), then normalise.
+	dim := len(embs[0])
+	centroid := make([]float32, dim)
+	for i, l := range labels {
+		if l == largest {
+			for d := 0; d < dim; d++ {
+				centroid[d] += embs[i][d]
+			}
+		}
+	}
+	var norm float64
+	for d := 0; d < dim; d++ {
+		centroid[d] /= float32(largestN)
+		norm += float64(centroid[d]) * float64(centroid[d])
+	}
+	inv := float32(1.0 / (math.Sqrt(norm) + 1e-9))
+	for d := 0; d < dim; d++ {
+		centroid[d] *= inv
+	}
 
-    # Compute centroid of largest cluster
-    cluster_mask = labels == largest_label
-    centroid = embs[cluster_mask].mean(axis=0)
-    centroid /= np.linalg.norm(centroid) + 1e-9
+	// Sample in the largest cluster closest to the centroid.
+	bestIdx, bestCos := -1, -1.0
+	for i := range valid {
+		valid[i].ClusterID = labels[i]
+		cos := dot(embs[i], centroid)
+		valid[i].CosineToCentroid = cos
+		if labels[i] == largest && cos > bestCos {
+			bestCos, bestIdx = cos, i
+		}
+	}
 
-    # Find sample closest to centroid in that cluster
-    best_idx, best_cos = -1, -1.0
-    for i, (s, emb, label) in enumerate(zip(valid, embs, labels)):
-        s.cluster_id = int(label)
-        cos = float(np.dot(emb, centroid))
-        s.cosine_to_centroid = cos
-        if label == largest_label and cos > best_cos:
-            best_cos, best_idx = cos, i
+	consensus := float64(largestN) / float64(len(valid))
+	return valid[bestIdx], consensus, nil
+}
 
-    winner = valid[best_idx]
-    consensus_ratio = counts[largest_label] / len(valid)
-    return winner, consensus_ratio
+func dot(a, b []float32) float64 {
+	var s float64
+	for i := range a {
+		s += float64(a[i]) * float64(b[i])
+	}
+	return s
+}
 ```
 
-#### 9.3.4 `llm_vote` (USC meta-call)
+`agglomerativeCosine` is a ~40-line bottom-up merge (each point starts as its own cluster; repeatedly merge the two clusters with the highest average pairwise cosine until `nClusters` remain) — arithmetic only, deterministic given the input embeddings.
 
-```python
-USC_META_PROMPT = """\
-You are given {n} independent responses to the following prompt:
+#### 9.3.4 `LLMVote` (USC meta-call)
+
+The meta-prompt is a package-level `const` and Go's `text/template` (or `fmt.Sprintf`) fills it. The judge model is invoked through the `internal/llm` provider `Stream` interface — never a provider SDK directly — and the accumulated text + `Usage` event give tokens.
+
+```go
+const USCMetaPrompt = `You are given %d independent responses to the following prompt:
 
 ---
-{original_prompt}
+%s
 ---
 
 Responses:
-{responses}
+%s
 
-Select the response that best answers the prompt. If multiple responses are \
-consistent, synthesise them into a single authoritative answer. Output only \
-the final answer — do not explain your selection process.
-"""
+Select the response that best answers the prompt. If multiple responses are consistent, synthesise them into a single authoritative answer. Output only the final answer — do not explain your selection process.
+`
 
-def llm_vote(
-    samples: list[SampleResult],
-    original_prompt: str,
-    judge_model: str,
-    hermes_call: callable,
-) -> tuple[SampleResult, float]:
-    """
-    Universal Self-Consistency via a single meta-LLM call.
-    Returns a synthetic SampleResult containing the judge's synthesis.
-    consensus_ratio is always 1.0 (judge is authoritative by design).
-    """
-    valid = [s for s in samples if s.status == "ok"]
-    responses_block = "\n\n".join(
-        f"[Response {i+1}]\n{s.text}" for i, s in enumerate(valid)
-    )
-    meta_prompt = USC_META_PROMPT.format(
-        n=len(valid),
-        original_prompt=original_prompt,
-        responses=responses_block,
-    )
-    synthesis_text, usage = hermes_call(meta_prompt, model=judge_model)
+// Provider is the reasoning layer's view of internal/llm.
+type Provider interface {
+	Stream(ctx context.Context, req llm.Request) (<-chan llm.Event, error)
+}
 
-    synthesis = SampleResult(
-        id=f"scs-{uuid.uuid4()}",
-        ensemble_id=valid[0].ensemble_id,
-        sample_index=len(valid),   # sentinel index for the meta-call
-        text=synthesis_text,
-        prompt_tokens=usage.get("prompt_tokens", 0),
-        completion_tokens=usage.get("completion_tokens", 0),
-        is_winner=True,
-        status="ok",
-    )
-    return synthesis, 1.0
+// LLMVote performs Universal Self-Consistency via a single meta-LLM call.
+// Returns a synthetic SampleResult holding the judge's synthesis; consensus is
+// always 1.0 (the judge is authoritative by design).
+func LLMVote(ctx context.Context, samples []SampleResult, originalPrompt, judgeModel string, p Provider) (SampleResult, float64, error) {
+	vs := valid(samples)
+	var b strings.Builder
+	for i, s := range vs {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		fmt.Fprintf(&b, "<response_%d>\n%s\n</response_%d>", i+1, s.Text, i+1)
+	}
+	metaPrompt := fmt.Sprintf(USCMetaPrompt, len(vs), originalPrompt, b.String())
+
+	text, usage, err := collect(ctx, p, llm.Request{Model: judgeModel, Prompt: metaPrompt})
+	if err != nil {
+		return SampleResult{}, 0, err
+	}
+
+	synth := SampleResult{
+		ID:               "scs-" + uuid.NewString(),
+		EnsembleID:       vs[0].EnsembleID,
+		SampleIndex:      len(vs), // sentinel index for the meta-call
+		Text:             text,
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		IsWinner:         true,
+		Status:           "ok",
+	}
+	return synth, 1.0, nil
+}
+
+// valid returns the ok samples; collect drains a provider stream into (text, usage).
+func valid(samples []SampleResult) []SampleResult {
+	out := make([]SampleResult, 0, len(samples))
+	for _, s := range samples {
+		if s.Status == "ok" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
 ```
 
-#### 9.3.5 Stop-Early Logic
+#### 9.3.5 Stop-Early Logic (goroutine fan-out)
 
-```python
-async def run_ensemble_async(
-    hermes_call_async: callable,
-    prompt: str,
-    cfg: EnsembleConfig,
-    ensemble_id: str,
-) -> list[SampleResult]:
-    """
-    Fire up to cfg.n samples concurrently. Cancel remaining tasks
-    if consensus threshold is reached (stop_early=True).
-    """
-    tasks: list[asyncio.Task] = []
-    results: list[SampleResult] = []
-    n_done = 0
+This is the headline Python→Go swap: `asyncio.gather` / `asyncio.as_completed` becomes a goroutine fan-out over the `internal/llm` provider, coordinated by `errgroup` with bounded concurrency (`SetLimit`). Each goroutine emits its `SampleResult` on a channel; a collector reads them, and when the consensus threshold is hit it calls the `context.CancelFunc`, which propagates through every in-flight `Stream` call and stops the remaining workers before their provider request completes. `sync.Once` guards the single cancel; no future-by-future `.cancel()` bookkeeping is needed.
 
-    async def _sample_one(index: int) -> SampleResult:
-        t0 = time.perf_counter()
-        try:
-            text, usage = await hermes_call_async(
-                prompt,
-                temperature=cfg.temperature,
-                max_tokens=cfg.max_completion_tokens,
-            )
-            latency_ms = int((time.perf_counter() - t0) * 1000)
-            return SampleResult(
-                id=f"scs-{uuid.uuid4()}",
-                ensemble_id=ensemble_id,
-                sample_index=index,
-                text=text,
-                vote_key=_normalise_key(text[:100]),  # first 100 chars for discrete
-                prompt_tokens=usage.get("prompt_tokens", 0),
-                completion_tokens=usage.get("completion_tokens", 0),
-                cost_usd=usage.get("cost_usd", 0.0),
-                latency_ms=latency_ms,
-                status="ok",
-            )
-        except Exception as exc:
-            return SampleResult(
-                id=f"scs-{uuid.uuid4()}",
-                ensemble_id=ensemble_id,
-                sample_index=index,
-                text="",
-                status="error",
-                error_msg=str(exc),
-            )
+```go
+// RunEnsemble fans out up to cfg.N samples as goroutines over the provider,
+// cancelling the shared context once the consensus threshold is reached
+// (StopEarly). Returns the collected results in completion order.
+func RunEnsemble(ctx context.Context, p Provider, prompt string, cfg Config, ensembleID string) ([]SampleResult, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-    for i in range(cfg.n):
-        tasks.append(asyncio.create_task(_sample_one(i)))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(cfg.N) // bound concurrency; raise the ceiling here if desired
 
-    for future in asyncio.as_completed(tasks):
-        result = await future
-        results.append(result)
-        n_done += 1
+	out := make(chan SampleResult, cfg.N)
+	for i := 0; i < cfg.N; i++ {
+		i := i
+		g.Go(func() error {
+			t0 := time.Now()
+			text, usage, err := collect(gctx, p, llm.Request{
+				Prompt:      prompt,
+				Temperature: cfg.Temperature,
+				MaxTokens:   cfg.MaxCompletionTokens,
+			})
+			latency := int(time.Since(t0).Milliseconds())
+			if err != nil {
+				// context cancellation (stop-early) is expected, not a failure.
+				status := "error"
+				if errors.Is(err, context.Canceled) {
+					status = "cancelled"
+				}
+				out <- SampleResult{ID: "scs-" + uuid.NewString(), EnsembleID: ensembleID, SampleIndex: i, Status: status, ErrorMsg: err.Error()}
+				return nil // one failed sample must not tear down the group
+			}
+			key := ""
+			if len(text) > 0 {
+				n := min(100, len(text)) // first 100 chars for discrete keying
+				key = normaliseKey(text[:n])
+			}
+			out <- SampleResult{
+				ID: "scs-" + uuid.NewString(), EnsembleID: ensembleID, SampleIndex: i,
+				Text: text, VoteKey: key,
+				PromptTokens: usage.PromptTokens, CompletionTokens: usage.CompletionTokens,
+				CostUSD: usage.CostUSD, LatencyMS: latency, Status: "ok",
+			}
+			return nil
+		})
+	}
+	go func() { _ = g.Wait(); close(out) }()
 
-        if cfg.stop_early and cfg.vote_mode == "majority":
-            ok = [r for r in results if r.status == "ok"]
-            if ok:
-                from collections import Counter
-                counts = Counter(r.vote_key for r in ok)
-                top_count = counts.most_common(1)[0][1]
-                if top_count / cfg.n >= cfg.consensus_threshold:
-                    # Cancel remaining pending tasks
-                    for t in tasks:
-                        if not t.done():
-                            t.cancel()
-                    break
-
-    return results
+	var (
+		results []SampleResult
+		once    sync.Once
+		counts  = map[string]int{}
+	)
+	for r := range out {
+		results = append(results, r)
+		if cfg.StopEarly && cfg.VoteMode == VoteMajority && r.Status == "ok" {
+			counts[r.VoteKey]++
+			top := 0
+			for _, c := range counts {
+				if c > top {
+					top = c
+				}
+			}
+			if float64(top)/float64(cfg.N) >= cfg.ConsensusThreshold {
+				once.Do(cancel) // stop the remaining goroutines
+			}
+		}
+	}
+	return results, nil
+}
 ```
 
-### 9.4 New File: `src/tag/ensemble.py`
+### 9.4 New Package: `internal/agent/selfconsistency`
 
-The new file implements:
+The package exports (Go has no async/sync split — a single `context`-aware `RunEnsemble` replaces the Python async+`asyncio.run` wrapper pair):
 
-- Module-level constants: `MAX_SAMPLES = 40`, `USC_META_PROMPT`, regex patterns
-- `detect_answer_type(prompt_text: str) -> AnswerType`
-- `compute_preflight_cost(n, model_id, prompt_text, cfg) -> float`
-- `normalise_vote_key(text: str) -> str`
-- `majority_vote(samples) -> tuple[SampleResult, float]`
-- `embedding_vote(samples, model_name) -> tuple[SampleResult, float]`
-- `llm_vote(samples, original_prompt, judge_model, hermes_call) -> tuple[SampleResult, float]`
-- `run_ensemble_async(hermes_call_async, prompt, cfg, ensemble_id) -> list[SampleResult]`
-- `run_ensemble_sync(hermes_call, prompt, cfg, ensemble_id) -> list[SampleResult]` (wraps async in `asyncio.run`)
-- `persist_ensemble(conn, ensemble: EnsembleResult) -> None`
-- `persist_samples(conn, samples: list[SampleResult]) -> None`
-- `cmd_ensemble_list(args, db_path) -> int`
-- `cmd_ensemble_show(args, db_path) -> int`
-- `cmd_ensemble_export(args, db_path) -> int`
-- `cmd_ensemble_stats(args, db_path) -> int`
+- Package constants: `MaxSamples = 40`, `USCMetaPrompt`, package-init `regexp` patterns
+- `DetectAnswerType(promptText string) AnswerType`
+- `ComputePreflightCost(n int, modelID, promptText string, cfg Config) float64`
+- `normaliseKey(text string) string`
+- `MajorityVote(samples []SampleResult) (SampleResult, float64, error)`
+- `EmbeddingVote(ctx, samples []SampleResult, emb Embedder) (SampleResult, float64, error)`
+- `LLMVote(ctx, samples []SampleResult, originalPrompt, judgeModel string, p Provider) (SampleResult, float64, error)`
+- `RunEnsemble(ctx, p Provider, prompt string, cfg Config, ensembleID string) ([]SampleResult, error)`
+- `PersistEnsemble(ctx, tx *sql.Tx, e EnsembleResult) error`
+- `PersistSamples(ctx, tx *sql.Tx, samples []SampleResult) error`
 
-### 9.5 Integration Points in `controller.py`
+The `tag ensemble` subcommand handlers (`list`/`show`/`export`/`stats`) live in `internal/cli` and call query helpers in `internal/store`, returning an `error` (cobra maps a non-nil error to exit code 1).
 
-```python
-# In cmd_submit() and cmd_run(), after argument parsing:
-if getattr(args, "samples", 1) > 1:
-    from tag.ensemble import (
-        EnsembleConfig, detect_answer_type, compute_preflight_cost,
-        run_ensemble_sync, majority_vote, embedding_vote, llm_vote,
-        persist_ensemble, persist_samples, EnsembleResult,
-    )
-    # ... ensemble path
-else:
-    # existing single-call path, unchanged
+### 9.5 Integration Points in `internal/cli`
+
+```go
+// In the submit/run cobra RunE, after flag binding:
+if samples > 1 {
+	cfg := selfconsistency.Config{ /* from flags + koanf defaults */ }
+	// ... ensemble path: DetectAnswerType, ComputePreflightCost,
+	// RunEnsemble, MajorityVote/EmbeddingVote/LLMVote,
+	// PersistEnsemble + PersistSamples in one store.Tx.
+	return runEnsemble(cmd.Context(), cfg)
+}
+// else: existing single-call path, unchanged (selfconsistency never entered)
 ```
 
-`cmd_ensemble` is wired as:
-```python
-# In build_parser() / main():
-ensemble_parser = subparsers.add_parser("ensemble")
-ensemble_sub = ensemble_parser.add_subparsers(dest="ensemble_cmd")
-ensemble_sub.add_parser("list")
-ensemble_sub.add_parser("show")
-ensemble_sub.add_parser("export")
-ensemble_sub.add_parser("stats")
+`tag ensemble` is wired as a cobra command tree:
+```go
+// In internal/cli:
+ensembleCmd := &cobra.Command{Use: "ensemble"}
+ensembleCmd.AddCommand(ensembleListCmd, ensembleShowCmd, ensembleExportCmd, ensembleStatsCmd)
+rootCmd.AddCommand(ensembleCmd)
 ```
 
 ### 9.6 Config Keys
 
-New keys in the existing `tag_config` table (no schema change, uses existing KV store):
+New keys layered through `internal/config` (koanf v2 read + yaml.v3/flock/os.Rename atomic write-back), no schema change:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -710,19 +787,21 @@ Set via: `tag config set self_consistency.n_samples 3`
 
 ### 9.7 OTel Semantic Conventions
 
-New attributes added to `otel_semconv.py`:
+New attribute-key constants added to `internal/obs` (alongside the hardcoded `gen_ai.*` table and pinned `SEMCONV_VERSION`), used with `go.opentelemetry.io/otel/attribute`:
 
-```python
-# Self-consistency ensemble attributes
-SC_SAMPLE_INDEX       = "sc.sample_index"        # int: 0-based sample position
-SC_VOTE_KEY           = "sc.vote_key"            # str: normalised answer key
-SC_VOTE_MODE          = "sc.vote_mode"           # str: 'majority'|'embedding'|'llm'
-SC_CONSENSUS_RATIO    = "sc.consensus_ratio"     # float: winner_count / n_sampled
-SC_STOP_EARLY         = "sc.stop_early"          # bool: whether --stop-early was set
-SC_STOP_EARLY_TRIGGERED = "sc.stop_early_triggered"  # bool: whether it fired
-SC_N_REQUESTED        = "sc.n_requested"         # int: N from --samples
-SC_N_SAMPLED          = "sc.n_sampled"           # int: actual samples used
-SC_ANSWER_TYPE        = "sc.answer_type"         # str: detected answer type
+```go
+// Self-consistency ensemble attribute keys.
+const (
+	SCSampleIndex        = "sc.sample_index"          // attribute.Int: 0-based sample position
+	SCVoteKey            = "sc.vote_key"              // attribute.String: normalised answer key
+	SCVoteMode           = "sc.vote_mode"             // attribute.String: majority|embedding|llm
+	SCConsensusRatio     = "sc.consensus_ratio"       // attribute.Float64: winnerCount / nSampled
+	SCStopEarly          = "sc.stop_early"            // attribute.Bool: whether --stop-early was set
+	SCStopEarlyTriggered = "sc.stop_early_triggered"  // attribute.Bool: whether it fired
+	SCNRequested         = "sc.n_requested"           // attribute.Int: N from --samples
+	SCNSampled           = "sc.n_sampled"             // attribute.Int: actual samples used
+	SCAnswerType         = "sc.answer_type"           // attribute.String: detected answer type
+)
 ```
 
 ---
@@ -733,13 +812,13 @@ SC_ANSWER_TYPE        = "sc.answer_type"         # str: detected answer type
 
 2. **USC meta-prompt injection.** When building the `USC_META_PROMPT` for `--vote llm`, raw sample texts from N model calls are embedded into a new prompt that is sent to the judge model. A malicious sample could contain prompt-injection instructions targeting the judge. Mitigation: each sample block is enclosed in literal XML-style delimiters (`<response_1>...</response_1>`) and the meta-prompt includes an explicit instruction to ignore formatting or instructions within response blocks.
 
-3. **Embedding model supply-chain trust.** `SentenceTransformer("all-MiniLM-L6-v2")` downloads a model from HuggingFace Hub on first use. In air-gapped or security-hardened environments, this may fail or pull an untrusted model. Mitigation: `--embed-model` accepts a local path; documentation recommends pinning to a model SHA via `HF_HOME` and `TRANSFORMERS_OFFLINE=1`. No code change required, but noted in deployment docs.
+3. **Embedding model supply-chain trust.** In the default CGO-free binary, `--vote embedding` calls a provider embedding API through the `Embedder` interface — no model download. The optional offline path (build-tag MiniLM via cybertron/hugot) fetches model weights on first use; in air-gapped or hardened environments this may fail or pull an untrusted model. Mitigation: `--embed-model` accepts a local path, and the offline build documents pinning weights by digest and pre-provisioning them. No code change required, but noted in deployment docs.
 
-4. **SQLite `text` column contains full completion text.** The `sc_samples.text` column stores raw model outputs. If a model completion contains sensitive information (e.g., the model reproduced a secret from its context), that content persists in `~/.tag/runtime/tag.sqlite3`. Mitigation: the same secret-scanning logic runs on each sample's text before writing to SQLite; flagged content is replaced with `[REDACTED:secret]`. This is an opt-in behaviour controlled by `security.redact_on_persist` config key (default: `true`).
+4. **SQLite `text` column contains full completion text.** The `sc_samples.text` column stores raw model outputs. If a model completion contains sensitive information (e.g., the model reproduced a secret from its context), that content persists in `~/.tag/runtime/tag.sqlite3`. Mitigation: the same secret-scanning logic runs on each sample's text before writing to SQLite; flagged content is replaced with `[REDACTED:secret]`. This is controlled by the `security.redact_on_persist` config key (default: `true`).
 
 5. **Budget bypass via concurrent N calls.** Without the pre-flight budget check (FR-08, FR-09), a user could accidentally exhaust their API budget with a large N. The budget reservation must be atomic: `budget.check_and_reserve()` checks and increments a `reserved_usd` counter in a single SQLite transaction, preventing concurrent `tag submit` calls from each individually clearing the check before the other has reserved its cost.
 
-6. **Pickle-free embedding storage.** Embeddings are stored in `sc_samples.embedding_blob` as raw IEEE 754 float32 bytes (`struct.pack(f"{len(emb)}f", *emb)`), not pickled. This eliminates the pickle RCE vector (referenced in GHSA-mhr3-j7m5-c7c9) that would exist if numpy arrays were pickled to SQLite.
+6. **Serialization-free embedding storage.** Embeddings are stored in `sc_samples.embedding_blob` as raw IEEE 754 float32 little-endian bytes (`binary.Write(buf, binary.LittleEndian, emb)`), never through `encoding/gob` or any reflective deserializer. Reading back is a fixed-width `binary.Read` into `[]float32`. This keeps the column a plain byte array with no deserialization-RCE surface (the Go analogue of the pickle-RCE class that motivated GHSA-mhr3-j7m5-c7c9 in the Python design).
 
 7. **USC judge call content filtering.** The synthesis text returned by `--vote llm` passes through the same output filtering as a normal `tag submit` response. There is no special trust level for judge outputs.
 
@@ -747,51 +826,53 @@ SC_ANSWER_TYPE        = "sc.answer_type"         # str: detected answer type
 
 ## 11. Testing Strategy
 
-### 11.1 Unit Tests (`tests/test_ensemble.py`)
+Tests use the standard-library `testing` package with table-driven cases. Determinism comes from dependency injection, not monkeypatching: a fake `Provider` implementing `internal/llm`'s `Stream(ctx, Request) -> <-chan Event` returns canned samples so voting/aggregation is exercised offline, and a fake `Embedder` returns fixed vectors. The store is a temp `modernc.org/sqlite` file (or `:memory:`). Provider streaming suites use `go-vcr` cassettes where a real event ordering is needed.
+
+### 11.1 Unit Tests (`internal/agent/selfconsistency/*_test.go`)
 
 | Test | Description |
 |------|-------------|
-| `test_detect_answer_type_discrete` | Verifies `detect_answer_type("Is this a SQL injection? Yes or No.")` returns `"discrete"`. |
-| `test_detect_answer_type_open_ended` | Verifies `detect_answer_type("Explain the architectural tradeoffs of...")` returns `"open_ended"`. |
-| `test_detect_answer_type_structured` | Verifies `detect_answer_type("Return a JSON object with...")` returns `"structured"`. |
-| `test_majority_vote_clear_winner` | `["yes", "yes", "no"]` → winner is `"yes"`, consensus_ratio = 0.667. |
-| `test_majority_vote_tie_broken_by_latency` | Two `"yes"` samples (latency 500 ms, 200 ms) and two `"no"` samples → tie resolved by 200 ms `"yes"` sample winning. |
-| `test_majority_vote_no_valid_samples` | All samples `status='error'` → `ValueError` raised. |
-| `test_normalise_key` | `"Yes! SQL injection."` → `"yes sql injection"`. |
-| `test_embedding_vote_single_sample` | N=1 valid sample → returns it with consensus_ratio=1.0, no clustering attempted. |
-| `test_embedding_vote_largest_cluster` | Synthetic embeddings with two clear clusters; largest cluster winner is selected. Requires `sentence-transformers` and `sklearn`. Marked `pytest.mark.optional`. |
-| `test_llm_vote_meta_prompt_construction` | Mock `hermes_call`; assert the prompt passed to it contains all 3 sample texts wrapped in delimiters. |
-| `test_stop_early_cancels_futures` | N=5, consensus reached at K=3; assert remaining 2 tasks have `cancelled()=True`. |
-| `test_compute_preflight_cost` | N=5, 100 prompt tokens, known rate → assert estimate within 1 % of manual calculation. |
-| `test_embedding_fallback_no_st` | Monkeypatch `_ST_AVAILABLE=False`; assert `embedding_vote` raises `ImportError` caught by caller, which falls back to `majority_vote`. |
-| `test_temperature_zero_override` | `EnsembleConfig(temperature=0.0, n=3)` → `run_ensemble_sync` overrides temperature to 0.1. |
-| `test_samples_max_exceeded` | `--samples 41` → `ValueError` with reference to N=40 cap. |
-| `test_secret_scan_aborts` | Monkeypatch `security.scan_for_secrets` to return detections; assert `cmd_submit` exits with code 1 before any API call. |
-| `test_sqlite_schema_creation` | `ensure_schema(conn)` on empty DB → both `sc_ensembles` and `sc_samples` tables exist with correct columns. |
-| `test_persist_ensemble_and_samples` | Full `EnsembleResult` round-trip: persist → read back → assert all fields match. |
-| `test_embedding_blob_no_pickle` | `embedding_blob` stored as raw bytes; assert `struct.unpack` recovers original values; assert no `pickle` import in `ensemble.py`. |
+| `TestDetectAnswerTypeDiscrete` | Verifies `DetectAnswerType("Is this a SQL injection? Yes or No.")` returns `AnswerDiscrete`. |
+| `TestDetectAnswerTypeOpenEnded` | Verifies `DetectAnswerType("Explain the architectural tradeoffs of...")` returns `AnswerOpenEnded`. |
+| `TestDetectAnswerTypeStructured` | Verifies `DetectAnswerType("Return a JSON object with...")` returns `AnswerStructured`. |
+| `TestMajorityVoteClearWinner` | `["yes", "yes", "no"]` → winner is `"yes"`, consensus ratio ≈ 0.667. |
+| `TestMajorityVoteTieBrokenByLatency` | Two `"yes"` samples (latency 500 ms, 200 ms) and two `"no"` samples → tie resolved by the 200 ms `"yes"` sample winning. |
+| `TestMajorityVoteNoValidSamples` | All samples `status='error'` → non-nil error returned. |
+| `TestNormaliseKey` | `"Yes! SQL injection."` → `"yes sql injection"`. |
+| `TestEmbeddingVoteSingleSample` | N=1 valid sample → returns it with consensus 1.0, no clustering attempted. |
+| `TestEmbeddingVoteLargestCluster` | Fake `Embedder` yields two clear clusters; the largest-cluster winner is selected. No ML dependency — pure fixture vectors. |
+| `TestLLMVoteMetaPromptConstruction` | Fake `Provider` records its request; assert the meta-prompt contains all 3 sample texts wrapped in `<response_N>` delimiters. |
+| `TestStopEarlyCancelsGoroutines` | N=5, consensus reached at K=3; assert the shared context is cancelled and the remaining samples land as `status='cancelled'`. |
+| `TestComputePreflightCost` | N=5, 100 prompt tokens, known rate → estimate within 1 % of the manual calculation. |
+| `TestEmbeddingFallbackNoEmbedder` | Inject a nil/unavailable `Embedder`; assert `EmbeddingVote` returns an error the caller handles by falling back to `MajorityVote`. |
+| `TestTemperatureZeroOverride` | `Config{Temperature: 0.0, N: 3}` → `RunEnsemble` overrides temperature to 0.1. |
+| `TestSamplesMaxExceeded` | `--samples 41` → error referencing the N=40 cap. |
+| `TestSecretScanAborts` | Fake secret scanner returns detections; assert the `submit` handler returns an error (exit 1) before any provider call. |
+| `TestSQLiteSchemaCreation` | Running the migrations on an empty DB creates both `sc_ensembles` and `sc_samples` with correct columns. |
+| `TestPersistEnsembleAndSamples` | Full `EnsembleResult` round-trip: persist → read back → assert all fields match. |
+| `TestEmbeddingBlobNoGob` | `embedding_blob` stored as raw float32 bytes; assert `binary.Read` recovers the original values; assert no `encoding/gob` import in the package. |
 
-### 11.2 Integration Tests (`tests/integration/test_ensemble_integration.py`)
-
-| Test | Description |
-|------|-------------|
-| `test_end_to_end_majority_N3` | Run `cmd_submit` with `--samples 3 --vote majority` against a mocked Hermes bridge returning deterministic responses; assert winner text, consensus ratio, and SQLite rows. |
-| `test_stop_early_integration` | Mock Hermes to return `"yes"` for all samples; assert only 2 samples fired (first consensus at 2/3 > 0.6), third future cancelled. |
-| `test_dry_run_no_api_call` | `--dry-run --samples 5` → assert Hermes mock call count = 0, exit code = 0. |
-| `test_ensemble_list_cmd` | Seed two ensemble rows in SQLite; run `cmd_ensemble list`; assert both appear in output. |
-| `test_ensemble_show_cmd` | Seed ensemble + 3 samples; run `cmd_ensemble show <id>`; assert all 3 samples visible. |
-| `test_budget_enforcement` | Mock `budget.get_remaining()` = 0; assert command exits code 1 with budget-exceeded message. |
-| `test_span_count` | After a 3-sample ensemble, assert `tag trace show` returns 4 spans (1 parent + 3 children). |
-| `test_json_output_schema` | `--json` output parses as valid JSON; assert all required keys present (`ensemble_id`, `winner`, `consensus_ratio`, `samples`, `total_cost_usd`). |
-
-### 11.3 Performance Tests (`tests/perf/test_ensemble_perf.py`)
+### 11.2 Integration Tests (`internal/agent/selfconsistency/integration_test.go`)
 
 | Test | Description |
 |------|-------------|
-| `test_sqlite_write_N40` | Insert 40 sample rows in a single transaction; assert total wall time < 10 ms on SSD. |
-| `test_embedding_encode_N40` | Encode 40 × 200-token texts with MiniLM; assert total time < 2 s. |
-| `test_ensemble_overhead_N1` | `--samples 1` wall time is within 5 % of baseline single-call path (20 run average). |
-| `test_cancel_latency` | Stop-early cancel of 4 remaining asyncio tasks completes within 5 ms. |
+| `TestEndToEndMajorityN3` | Run the `submit` handler with `--samples 3 --vote majority` against a fake `Provider` returning deterministic responses; assert winner text, consensus ratio, and SQLite rows. |
+| `TestStopEarlyIntegration` | Fake `Provider` returns `"yes"` for all samples; assert consensus at 2/3 > 0.6 cancels the context and remaining samples are `cancelled`. |
+| `TestDryRunNoProviderCall` | `--dry-run --samples 5` → assert fake provider call count = 0, exit code 0. |
+| `TestEnsembleListCmd` | Seed two ensemble rows in SQLite; run `tag ensemble list`; assert both appear in output. |
+| `TestEnsembleShowCmd` | Seed ensemble + 3 samples; run `tag ensemble show <id>`; assert all 3 samples visible. |
+| `TestBudgetEnforcement` | Fake budget with remaining = 0; assert command exits code 1 with budget-exceeded message. |
+| `TestSpanCount` | After a 3-sample ensemble, assert an in-memory otel span recorder holds 4 spans (1 parent + 3 children). |
+| `TestJSONOutputSchema` | `--json` output parses as valid JSON; assert required keys present (`ensemble_id`, `winner`, `consensus_ratio`, `samples`, `total_cost_usd`). |
+
+### 11.3 Benchmarks (`internal/agent/selfconsistency/bench_test.go`)
+
+| Benchmark | Description |
+|------|-------------|
+| `BenchmarkSQLiteWriteN40` | Insert 40 sample rows in a single transaction; assert total wall time < 10 ms on SSD (modernc headroom). |
+| `BenchmarkEmbeddingEncodeN40` | Encode 40 × 200-token texts via the offline MiniLM `Embedder`; assert total time < 2 s. |
+| `BenchmarkEnsembleOverheadN1` | `--samples 1` wall time within 5 % of the baseline single-call path (`b.N` iterations). |
+| `BenchmarkCancelLatency` | Stop-early cancel of 4 remaining goroutines settles within 5 ms after `cancel()`. |
 
 ---
 
@@ -799,23 +880,23 @@ SC_ANSWER_TYPE        = "sc.answer_type"         # str: detected answer type
 
 | ID | Criterion | How to Verify |
 |----|-----------|--------------|
-| AC-01 | `tag submit --samples 3 --vote majority --prompt "Is X vulnerable? Yes or No."` with 2/3 responses returning "yes" returns `"yes"` as the winner. | Integration test `test_end_to_end_majority_N3` |
-| AC-02 | `--stop-early` with N=5 and threshold=0.6 fires at most 4 samples when 3 agree on the same answer (3/5 ≥ 0.6 = 0.6). | Integration test `test_stop_early_integration` |
-| AC-03 | `--dry-run` exits with code 0 and zero API calls for any N. | Integration test `test_dry_run_no_api_call` |
-| AC-04 | Both `sc_ensembles` and `sc_samples` tables are created by `ensure_schema()` on first run with correct column names and indexes. | Unit test `test_sqlite_schema_creation` |
-| AC-05 | `--samples 1` (default) produces no import of `tag.ensemble` and no additional SQLite writes vs. baseline. | Unit test asserting `sys.modules` excludes `tag.ensemble` after single-call `cmd_submit` |
-| AC-06 | `--samples 41` exits with code 1 and a message mentioning the 40-sample cap. | Unit test `test_samples_max_exceeded` |
-| AC-07 | A prompt containing a mock API key pattern is blocked by `security.scan_for_secrets` before any API call is made. | Unit test `test_secret_scan_aborts` |
-| AC-08 | `--vote embedding` with `sentence-transformers` not installed falls back to `majority` (discrete) or `llm` (open-ended) and emits a warning. | Unit test `test_embedding_fallback_no_st` |
-| AC-09 | `--json` output is valid JSON containing `ensemble_id`, `n_requested`, `n_sampled`, `consensus_ratio`, `winner`, `samples` array, and `total_cost_usd`. | Integration test `test_json_output_schema` |
-| AC-10 | `tag ensemble list` shows the ensemble run after a successful `tag submit --samples 3` call. | Integration test `test_ensemble_list_cmd` |
-| AC-11 | `tag ensemble show <id>` displays all 3 sample texts (truncated) with their vote keys and costs. | Integration test `test_ensemble_show_cmd` |
-| AC-12 | Budget enforcement blocks a `--samples 10` run when remaining budget is $0.00. | Integration test `test_budget_enforcement` |
-| AC-13 | Tracing produces N+1 spans (1 `ensemble` parent + N child sample spans) visible in `tag trace show`. | Integration test `test_span_count` |
-| AC-14 | Embedding blobs are stored as raw float32 bytes, not pickle; `struct.unpack` recovers original values. | Unit test `test_embedding_blob_no_pickle` |
-| AC-15 | Pre-flight cost estimate is printed before any API call and within ±15 % of actual spend. | Integration test with mock usage data |
-| AC-16 | `--samples-temperature 0` is overridden to 0.1 with a printed warning. | Unit test `test_temperature_zero_override` |
-| AC-17 | `--vote llm` meta-prompt wraps each sample in `<response_N>` delimiters. | Unit test `test_llm_vote_meta_prompt_construction` |
+| AC-01 | `tag submit --samples 3 --vote majority --prompt "Is X vulnerable? Yes or No."` with 2/3 responses returning "yes" returns `"yes"` as the winner. | Integration test `TestEndToEndMajorityN3` |
+| AC-02 | `--stop-early` with N=5 and threshold=0.6 fires at most 4 samples when 3 agree on the same answer (3/5 ≥ 0.6 = 0.6). | Integration test `TestStopEarlyIntegration` |
+| AC-03 | `--dry-run` exits with code 0 and zero API calls for any N. | Integration test `TestDryRunNoProviderCall` |
+| AC-04 | Both `sc_ensembles` and `sc_samples` tables are created by the `internal/store` migrations on first run with correct column names and indexes. | Unit test `TestSQLiteSchemaCreation` |
+| AC-05 | `--samples 1` (default) never enters `internal/agent/selfconsistency` and performs no additional SQLite writes vs. baseline. | Unit test asserting the `submit` handler takes the single-call branch (fake provider called exactly once) |
+| AC-06 | `--samples 41` exits with code 1 and a message mentioning the 40-sample cap. | Unit test `TestSamplesMaxExceeded` |
+| AC-07 | A prompt containing a mock API key pattern is blocked by `security.ScanForSecrets` before any API call is made. | Unit test `TestSecretScanAborts` |
+| AC-08 | `--vote embedding` with no available `Embedder` falls back to `majority` (discrete) or `llm` (open-ended) and emits a warning. | Unit test `TestEmbeddingFallbackNoEmbedder` |
+| AC-09 | `--json` output is valid JSON containing `ensemble_id`, `n_requested`, `n_sampled`, `consensus_ratio`, `winner`, `samples` array, and `total_cost_usd`. | Integration test `TestJSONOutputSchema` |
+| AC-10 | `tag ensemble list` shows the ensemble run after a successful `tag submit --samples 3` call. | Integration test `TestEnsembleListCmd` |
+| AC-11 | `tag ensemble show <id>` displays all 3 sample texts (truncated) with their vote keys and costs. | Integration test `TestEnsembleShowCmd` |
+| AC-12 | Budget enforcement blocks a `--samples 10` run when remaining budget is $0.00. | Integration test `TestBudgetEnforcement` |
+| AC-13 | Tracing produces N+1 spans (1 `ensemble` parent + N child sample spans) visible in `tag trace show`. | Integration test `TestSpanCount` |
+| AC-14 | Embedding blobs are stored as raw float32 bytes (no `encoding/gob`); `binary.Read` recovers original values. | Unit test `TestEmbeddingBlobNoGob` |
+| AC-15 | Pre-flight cost estimate is printed before any API call and within ±15 % of actual spend. | Integration test with fake usage data |
+| AC-16 | `--samples-temperature 0` is overridden to 0.1 with a printed warning. | Unit test `TestTemperatureZeroOverride` |
+| AC-17 | `--vote llm` meta-prompt wraps each sample in `<response_N>` delimiters. | Unit test `TestLLMVoteMetaPromptConstruction` |
 | AC-18 | `tag ensemble export <id> --output samples.jsonl` writes valid JSONL with one object per sample. | Integration test reading exported file |
 
 ---
@@ -824,17 +905,17 @@ SC_ANSWER_TYPE        = "sc.answer_type"         # str: detected answer type
 
 | Dependency | Type | Required? | Version | Notes |
 |------------|------|-----------|---------|-------|
-| `sentence-transformers` | Python package | Optional | `>=2.2.0` | Required for `--vote embedding`. Graceful fallback if absent. |
-| `scikit-learn` | Python package | Optional | `>=1.3.0` | `AgglomerativeClustering` for embedding mode. Pulled in by `sentence-transformers` transitively in most installs. |
-| `numpy` | Python package | Optional | `>=1.24.0` | Centroid computation. Pulled in transitively. |
-| `asyncio` | stdlib | Required | Python 3.11+ | Already required by TAG. |
-| `budget.py` | Internal module | Required | PRD-012 | `check_and_reserve()`, cost rate lookup. |
-| `tracing.py` | Internal module | Required | PRD-013 | `open_span()`, `close_span()`. |
-| `security.py` | Internal module | Required | PRD-034 | `scan_for_secrets()`, secret redaction. |
-| `eval_framework.py` | Internal module | Optional | PRD-027 | For `tag eval run --samples N` integration. |
-| `tool_retrieval.py` | Internal module | Optional | PRD-043 | Shares `SentenceTransformer` instance; model cache should be shared to avoid double-load. |
-| `otel_semconv.py` | Internal module | Required | PRD-041 | New `sc.*` attribute constants. |
-| `hermes_bridge.py` | Internal module | Required | — | `hermes_call()` / `hermes_call_async()`. |
+| `golang.org/x/sync/errgroup` | Go module | Required | latest | Bounded goroutine fan-out (`SetLimit`) + first-error/context cancellation for the N-sample sampling. |
+| `github.com/google/uuid` | Go module | Required | latest | Ensemble/sample IDs and per-sample seed derivation. |
+| `internal/memory/embed` (Embedder) | Internal package | Optional | PRD-043/072 | Provider embedding API default; build-tag offline MiniLM (`nlpodyssey/cybertron`/`knights-analytics/hugot`). Required only for `--vote embedding`; graceful fallback if unavailable. |
+| `github.com/cenkalti/backoff/v4` | Go module | Optional | v4 | Orchestration-level retry of a failed sample (NFR-04). |
+| stdlib `math`, `sort`, `encoding/binary`, `regexp` | stdlib | Required | Go 1.24+ | Cosine/centroid arithmetic, tie-break ordering, float32 blob (de)serialization, RE2 answer-type detection. |
+| `internal/llm` (Provider) | Internal package | Required | — | `Stream(ctx, Request) -> <-chan Event`; anthropic-sdk-go + openai-go/v3 behind the interface (never called directly from the reasoning layer). |
+| `internal/obs` (budget + pricing) | Internal package | Required | PRD-012/041/046 | `CheckAndReserve()`, cost rate lookup, `sc.*` OTel attribute keys. |
+| `go.opentelemetry.io/otel` | Go module | Required | PRD-013/041 | Parent + per-sample child spans. |
+| `internal/security` | Internal package | Required | PRD-034 | `ScanForSecrets()`, secret redaction. |
+| `internal/eval` | Internal package | Optional | PRD-027 | For `tag eval run --samples N` integration. |
+| `internal/store` | Internal package | Required | — | `modernc.org/sqlite` connection, migrations, single-writer atomic RMW. |
 | GitHub Issue #349 | Tracker | — | — | Feature request tracking. |
 
 ---
@@ -843,10 +924,10 @@ SC_ANSWER_TYPE        = "sc.answer_type"         # str: detected answer type
 
 | # | Question | Owner | Resolution Target |
 |---|----------|-------|-------------------|
-| OQ-01 | Should `--vote embedding` share the `SentenceTransformer` model instance with `tool_retrieval.py` (PRD-043) to avoid loading the model twice in the same process? The models may differ (`all-MiniLM-L6-v2` vs. whatever tool retrieval uses). | Implementer | Before implementation — check `tool_retrieval.EMBED_MODEL_NAME` and decide on a shared model cache in a new `embed_cache.py` helper or in `tool_retrieval.py`. |
+| OQ-01 | Should `--vote embedding` share the `Embedder` instance with the tool-index (PRD-043) to avoid initialising the offline model twice in the same process? The models may differ (`all-MiniLM-L6-v2` vs. whatever tool retrieval uses). | Implementer | Before implementation — check the tool-index embed model name and decide on a shared `Embedder` provided via DI in `internal/memory/embed` rather than two independent initialisations. |
 | OQ-02 | Should `sc_samples.text` be encrypted at rest (e.g., using a key stored in the system keychain) given that it contains full model outputs that may include sensitive context? | Security | Before merge — current plan is secret redaction (§10 point 4); full encryption may be added via PRD-034 extension. |
-| OQ-03 | For `--vote embedding` on structured JSON outputs, should clustering operate on the raw JSON string or on a normalised form (key-sorted, whitespace-collapsed)? Raw strings will produce spurious distance from formatting differences. | Implementer | Implement normalisation for `"structured"` answer type: `json.dumps(json.loads(text), sort_keys=True)` before encoding. |
-| OQ-04 | What is the correct behaviour when all N samples fail (all `status='error'`)? Currently `majority_vote` raises `ValueError`. Should it instead fall back to a single retry with the standard call path? | Product | Decide before implementation. Current proposal: raise `ValueError`; let `cmd_submit` catch it and retry once with N=1. |
+| OQ-03 | For `--vote embedding` on structured JSON outputs, should clustering operate on the raw JSON string or on a normalised form (key-sorted, whitespace-collapsed)? Raw strings will produce spurious distance from formatting differences. | Implementer | Implement normalisation for the `AnswerStructured` type: decode into `map[string]any` and re-`json.Marshal` (Go marshals map keys in sorted order) before encoding. |
+| OQ-04 | What is the correct behaviour when all N samples fail (all `status='error'`)? Currently `MajorityVote` returns a non-nil error. Should it instead fall back to a single retry with the standard call path? | Product | Decide before implementation. Current proposal: return the error; let the `submit` handler detect it and retry once with N=1. |
 | OQ-05 | Should `tag ensemble export` support a `--winner-only` flag to export only the winning samples across all ensembles for a profile, producing a cleaner fine-tuning dataset? | Product | Post-MVP; add to backlog as enhancement to FR-15. |
 | OQ-06 | The `USC_META_PROMPT` uses model-agnostic wording. Should there be judge-model-specific prompt templates (Claude vs. GPT-4o system prompt conventions differ)? | Implementer | Start with a single template; refine based on empirical quality testing. |
 | OQ-07 | For the `--vote majority` tie-break (lowest latency), is latency a good proxy? On some API providers, latency correlates with token count, meaning shorter (potentially incomplete) answers win ties. Alternative: prefer the sample with the highest completion token count in a tie. | Implementer | Expose `--tie-break {latency, length}` in a follow-up. Default to `latency` for now per PRD spec. |
@@ -857,47 +938,46 @@ SC_ANSWER_TYPE        = "sc.answer_type"         # str: detected answer type
 
 **Overall estimate:** S (3–5 days) — Difficulty 2/5
 
-### Phase 1 — Schema and Core Dataclasses (Day 1)
+### Phase 1 — Schema and Core Structs (Day 1)
 
-- Create `src/tag/ensemble.py` with all dataclasses (`SampleResult`, `EnsembleResult`, `EnsembleConfig`).
-- Write `ensure_schema()` with `sc_ensembles` and `sc_samples` DDL.
-- Write `persist_ensemble()` and `persist_samples()`.
-- Write `detect_answer_type()`.
-- Write `compute_preflight_cost()`.
-- Add new `sc.*` constants to `otel_semconv.py`.
-- Unit tests: schema, dataclasses, `detect_answer_type`, `compute_preflight_cost`.
+- Create the `internal/agent/selfconsistency` package with all structs (`SampleResult`, `EnsembleResult`, `Config`) and typed constants.
+- Add `sc_ensembles` and `sc_samples` DDL as idempotent `internal/store/migrate` migrations.
+- Write `PersistEnsemble()` and `PersistSamples()` over `*sql.Tx`.
+- Write `DetectAnswerType()`.
+- Write `ComputePreflightCost()`.
+- Add new `sc.*` attribute-key constants to `internal/obs`.
+- Unit tests: migrations, structs, `DetectAnswerType`, `ComputePreflightCost`.
 
 ### Phase 2 — Aggregation Algorithms (Day 2)
 
-- Implement `majority_vote()` with normalisation and tie-break.
-- Implement `embedding_vote()` with agglomerative clustering and graceful ImportError fallback.
-- Implement `llm_vote()` with USC meta-prompt and delimiter wrapping.
-- Implement `run_ensemble_async()` with stop-early cancellation.
-- Implement `run_ensemble_sync()` wrapper.
-- Unit tests: all aggregation functions, stop-early cancellation, temperature override, max-N guard.
+- Implement `MajorityVote()` with normalisation and tie-break.
+- Implement `EmbeddingVote()` with plain-Go agglomerative clustering and graceful fallback when the `Embedder` is unavailable.
+- Implement `LLMVote()` with USC meta-prompt and `<response_N>` delimiter wrapping.
+- Implement `RunEnsemble()` with the errgroup goroutine fan-out + context-cancellation stop-early (replaces the async+sync Python pair).
+- Table-driven unit tests: all aggregation functions, stop-early cancellation, temperature override, max-N guard.
 
-### Phase 3 — Controller Integration (Day 3)
+### Phase 3 — CLI Integration (Day 3)
 
-- Wire `--samples`, `--vote`, `--stop-early`, `--consensus-threshold`, `--embed-model`, `--judge-model`, `--samples-temperature`, `--dry-run`, `--yes` flags onto `tag submit` and `tag run` argument parsers in `controller.py`.
-- Deferred import of `tag.ensemble` behind `if args.samples > 1`.
+- Wire `--samples`, `--vote`, `--stop-early`, `--consensus-threshold`, `--embed-model`, `--judge-model`, `--samples-temperature`, `--dry-run`, `--yes` flags onto the `submit` and `run` cobra commands in `internal/cli`.
+- Branch on `samples > 1` before entering `selfconsistency` (zero-overhead single-call path).
 - Pre-flight secret scan, cost estimate, budget reservation.
-- Tracing span instrumentation (parent + child spans).
-- `--json` output serialisation.
+- Tracing span instrumentation (parent + child otel spans).
+- `--json` output serialisation via `encoding/json`.
 - Integration tests: end-to-end majority, stop-early, dry-run, budget enforcement, JSON output schema.
 
 ### Phase 4 — `tag ensemble` Subcommands (Day 4)
 
-- Implement `cmd_ensemble_list`, `cmd_ensemble_show`, `cmd_ensemble_export`, `cmd_ensemble_stats`.
-- Wire into controller subparser.
-- Human-readable table rendering (Rich table via `tui_output.py`).
+- Implement `ensemble list`, `ensemble show`, `ensemble export`, `ensemble stats` cobra handlers in `internal/cli` over `internal/store` queries.
+- Wire the subcommand tree onto the root command.
+- Human-readable table rendering via lipgloss/bubbles (or a plain tabwriter in non-TTY mode).
 - Integration tests: list, show, export JSONL.
 
 ### Phase 5 — Hardening and Docs (Day 5)
 
-- Security: secret redaction on `sc_samples.text` write path.
-- Performance tests: SQLite write N=40, embedding encode N=40, overhead N=1.
+- Security: secret redaction on the `sc_samples.text` write path.
+- Benchmarks: SQLite write N=40, embedding encode N=40, overhead N=1.
 - Config key documentation in `tag config list` output.
-- OQ-03 resolution: JSON normalisation for structured mode.
+- OQ-03 resolution: JSON normalisation for structured mode (`json.Marshal` of a decoded, key-sorted value).
 - Final acceptance criteria verification sweep.
 - Update `docs/prd/INDEX.md` with PRD-101 entry.
 
@@ -958,25 +1038,32 @@ tag submit --prompt "Find all edge cases in this parsing function" \
 
 ### Judge Vote Implementation
 
-```python
-def judge_vote(samples: list[Sample], judge_profile: str,
-               goal: str, mode: str = "select") -> Sample:
-    """Call judge_profile to select or synthesize from N diverse outputs."""
-    prompt = JUDGE_VOTE_PROMPT.format(
-        goal=goal,
-        candidates="\n\n".join(
-            f"--- Candidate {i+1} (profile: {s.profile}) ---\n{s.text}"
-            for i, s in enumerate(samples)
-        ),
-        mode=mode,
-    )
-    result_text = _invoke_profile(judge_profile, prompt)
-    if mode == "select":
-        idx = _parse_selection_index(result_text, len(samples))
-        return samples[idx]
-    else:  # synthesize
-        return Sample(text=result_text, profile="synthesized",
-                      consensus_ratio=1.0)
+```go
+// JudgeVote calls judgeProfile to select or synthesize from N diverse outputs.
+func JudgeVote(ctx context.Context, samples []SampleResult, judgeProfile, goal, mode string, p Provider) (SampleResult, error) {
+	var cands strings.Builder
+	for i, s := range samples {
+		if i > 0 {
+			cands.WriteString("\n\n")
+		}
+		fmt.Fprintf(&cands, "--- Candidate %d (profile: %s) ---\n%s", i+1, s.Profile, s.Text)
+	}
+	prompt := fmt.Sprintf(JudgeVotePrompt, goal, cands.String(), mode)
+
+	resultText, err := invokeProfile(ctx, p, judgeProfile, prompt)
+	if err != nil {
+		return SampleResult{}, err
+	}
+	if mode == "select" {
+		idx, err := parseSelectionIndex(resultText, len(samples))
+		if err != nil {
+			return SampleResult{}, err
+		}
+		return samples[idx], nil
+	}
+	// synthesize
+	return SampleResult{Text: resultText, Profile: "synthesized", CosineToCentroid: 1.0}, nil
+}
 ```
 
 ### Tournament Mode
@@ -991,16 +1078,19 @@ For N profiles/samples, run pairwise LLM-judge elimination:
 
 When `--profile-instructions` is passed, each profile receives a different system instruction prepended to the shared goal:
 
-```python
-for profile, instruction in profile_instructions.items():
-    full_prompt = f"{instruction}\n\n{goal}"
-    sample = _run_sample(profile, full_prompt, temperature)
-    samples.append(sample)
+```go
+for profile, instruction := range profileInstructions {
+	fullPrompt := instruction + "\n\n" + goal
+	s := runSample(ctx, p, profile, fullPrompt, cfg.Temperature)
+	samples = append(samples, s)
+}
 ```
 
-This replicates Conductor's core differentiator — specialist instructions per worker — at zero training cost.
+This replicates Conductor's core differentiator — specialist instructions per worker — at zero training cost. (Each `runSample` fans out as its own goroutine under the same errgroup as the base ensemble.)
 
 ### Updated DB Schema
+
+Applied as additional idempotent `internal/store/migrate` steps (ALTER-if-missing, replayed verbatim); the SQL is unchanged:
 
 ```sql
 -- New columns on sc_samples (ALTER TABLE)
@@ -1011,9 +1101,9 @@ ALTER TABLE sc_samples ADD COLUMN tournament_match_id INTEGER;
 ALTER TABLE sc_samples ADD COLUMN judge_selected INTEGER DEFAULT 0;  -- 1 if this sample was selected by judge
 
 -- New ensemble run metadata
-ALTER TABLE sc_runs ADD COLUMN vote_mode TEXT DEFAULT 'majority';
-ALTER TABLE sc_runs ADD COLUMN judge_profile TEXT;
-ALTER TABLE sc_runs ADD COLUMN profiles_json TEXT;  -- JSON array of profiles used
+ALTER TABLE sc_ensembles ADD COLUMN vote_mode_ext TEXT DEFAULT 'majority';
+ALTER TABLE sc_ensembles ADD COLUMN judge_profile TEXT;
+ALTER TABLE sc_ensembles ADD COLUMN profiles_json TEXT;  -- JSON array of profiles used
 ```
 
 ### Performance Characteristics
@@ -1027,13 +1117,13 @@ ALTER TABLE sc_runs ADD COLUMN profiles_json TEXT;  -- JSON array of profiles us
 
 | Test | Assertion |
 |---|---|
-| `test_judge_vote_selects_valid` | Returns one of the input samples; index in range |
-| `test_synthesize_mode_returns_text` | Synthesize mode returns non-empty text |
-| `test_tournament_N4` | 4 candidates → 2 rounds → 1 winner |
-| `test_tournament_N1` | 1 candidate → returned immediately, no judge call |
-| `test_diverse_profiles_all_called` | With `--profiles A,B,C`, each profile called exactly once |
-| `test_profile_instructions_prepended` | Each sample's prompt contains its profile-specific instruction |
-| `test_pareto_vote_respects_cost` | Pareto vote prefers lower-cost sample when quality is equal |
+| `TestJudgeVoteSelectsValid` | Returns one of the input samples; index in range |
+| `TestSynthesizeModeReturnsText` | Synthesize mode returns non-empty text |
+| `TestTournamentN4` | 4 candidates → 2 rounds → 1 winner |
+| `TestTournamentN1` | 1 candidate → returned immediately, no judge call |
+| `TestDiverseProfilesAllCalled` | With `--profiles A,B,C`, each profile called exactly once (fake `Provider` records per-profile calls) |
+| `TestProfileInstructionsPrepended` | Each sample's prompt contains its profile-specific instruction |
+| `TestParetoVoteRespectsCost` | Pareto vote prefers lower-cost sample when quality is equal |
 
 *End of PRD-101*
 

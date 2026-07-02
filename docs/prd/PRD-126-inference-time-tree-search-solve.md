@@ -1,11 +1,13 @@
 # PRD-126: Inference-Time Multi-Model Tree Search (`tag solve`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P1
 **Estimated Effort:** L (2–3 sprints, ~5 weeks)
 **Category:** Advanced Reasoning & Planning (Cluster G extension)
-**Affects:** `src/tag/solver.py` (new), `src/tag/controller.py` (`cmd_solve`), `tag.sqlite3` (new `solve_runs`, `solve_nodes` tables)
-**Depends on:** PRD-023 (swarm context routing — subprocess runner), PRD-013 (agent tracing), PRD-012 (budget enforcement), PRD-027 (eval framework — judge scoring), PRD-101 (self-consistency ensemble — aggregation primitives), PRD-045 (LLM-as-judge — reviewer-as-judge path)
+**Affects:** `internal/runtime/solve` (new package: `SolveRunner`), `internal/cli` (`solve` command tree), `internal/store` (new `solve_runs`, `solve_nodes` tables + migration)
+**Depends on:** PRD-023 (swarm context routing — goroutine task runner), PRD-013 (agent tracing), PRD-012 (budget enforcement), PRD-027 (eval framework — judge scoring), PRD-101 (self-consistency ensemble — aggregation primitives), PRD-045 (LLM-as-judge — reviewer-as-judge path)
 **Inspired by:** Sakana AI AB-MCTS (arXiv:2503.04412, NeurIPS 2025 Spotlight), TreeQuest multi-model tree search, OpenAI o3 inference-time scaling, Gemini 2.5 thinking budget
 
 ---
@@ -54,7 +56,7 @@ With `--samples N` (PRD-101), TAG generates N independent attempts and votes. Th
 ## 4. Non-Goals
 
 - Replacing `tag submit` for routine tasks (solve is 3–20× more expensive; explicit opt-in required).
-- Distributed execution across machines (single-machine concurrency via ThreadPoolExecutor, same as swarm).
+- Distributed execution across machines (single-machine concurrency via a bounded goroutine pool / `errgroup`, same as swarm).
 - Learning or updating model weights (inference-time only; no fine-tuning).
 - General neural architecture search or evolutionary algorithm over model parameters.
 
@@ -129,13 +131,15 @@ tag solve resume <solve-id>
 
 ### 5.4 Multi-Profile Thompson Sampling Bandit
 
-When `--profiles A,B,C` is specified:
+When `--profiles A,B,C` is specified, the bandit uses `gonum.org/v1/gonum/stat/distuv.Beta` for sampling and `math/rand` seeding (deterministic under a `--seed` flag for reproducible tests):
 
-1. Initialise Beta(1,1) prior per profile.
-2. Per node expansion: sample θ ~ Beta(α, β) for each profile; select argmax(θ).
-3. After verifier scores the node: update Beta(α+score, β+(1−score)) for the selected profile.
-4. Track per-profile call count, mean score, and 95% CI in `solve_nodes` table.
+1. Initialise `distuv.Beta{Alpha: 1, Beta: 1}` prior per profile.
+2. Per node expansion: draw θ ← `beta.Rand()` for each profile; select `argmax(θ)`.
+3. After verifier scores the node: update `Alpha += score`, `Beta += (1 − score)` for the selected profile.
+4. Track per-profile call count, mean score, and 95% CI (computed via `gonum/stat`) in the `solve_nodes` table.
 5. `tag solve status <id>` shows per-profile empirical win rate.
+
+Bandit state is held per-run in the `SolveRunner` struct and rehydrated from `solve_nodes` on resume; concurrent node expansions serialize bandit updates through a `sync.Mutex`.
 
 ### 5.5 Database Schema
 
@@ -188,18 +192,20 @@ CREATE INDEX IF NOT EXISTS idx_solve_nodes_score ON solve_nodes(solve_id, score 
 
 ### 5.6 Adaptive Branching Decision (AB-MCTS Core)
 
-```python
-def _should_deepen(node_score: float, tree_best_score: float,
-                   depth: int, max_depth: int,
-                   calls_remaining: int) -> bool:
-    """Return True to refine this node, False to branch from best leaf."""
-    if depth >= max_depth:
-        return False
-    if calls_remaining <= 2:
-        return False
-    # Deepen if this node is close to or better than tree best
-    proximity = node_score / max(tree_best_score, 1e-9)
-    return proximity >= 0.85
+```go
+// shouldDeepen reports whether to refine this node (true) or branch from
+// the best leaf (false) — the AB-MCTS adaptive-branching decision.
+func shouldDeepen(nodeScore, treeBestScore float64, depth, maxDepth, callsRemaining int) bool {
+	if depth >= maxDepth {
+		return false
+	}
+	if callsRemaining <= 2 {
+		return false
+	}
+	// Deepen if this node is close to or better than tree best.
+	proximity := nodeScore / math.Max(treeBestScore, 1e-9)
+	return proximity >= 0.85
+}
 ```
 
 This replicates AB-MCTS's core insight: nodes scoring ≥85% of tree-best get deepened; others trigger new branches from the current best leaf.
@@ -235,19 +241,21 @@ On `Ctrl+C` or `tag solve abort <id>`:
 ## 6. Architecture
 
 ```
-cmd_solve (controller.py)
+internal/cli  (solve command tree: run/status/results/list/abort/resume)
     │
     ▼
-SolveRunner (solver.py)
-    ├── _select_profile()      # Thompson Sampling bandit
-    ├── _generate_candidate()  # invoke profile subprocess (reuses swarm._run_task pattern)
-    ├── _score_candidate()     # verifier dispatch
-    ├── _should_deepen()       # AB-MCTS decision
-    ├── _branch()              # expand new candidate from best leaf
-    ├── _deepen()              # refine existing node
-    ├── _synthesize()          # top-K synthesis pass (optional)
-    └── _checkpoint()          # write best node to solve_runs on each iteration
+solve.SolveRunner  (internal/runtime/solve)
+    ├── selectProfile()    # Thompson Sampling bandit (gonum distuv.Beta)
+    ├── generateCandidate()# run profile via internal/llm provider iface (reuses swarm goroutine-task pattern)
+    ├── scoreCandidate()   # verifier dispatch (judge=internal/llm | shell=os/exec | keyword/regex)
+    ├── shouldDeepen()     # AB-MCTS decision
+    ├── branch()           # expand new candidate from best leaf
+    ├── deepen()           # refine existing node
+    ├── synthesize()       # top-K synthesis pass (optional)
+    └── checkpoint()       # persist best node to solve_runs via internal/store on each iteration
 ```
+
+Concurrency: the search frontier is expanded by a bounded worker pool (`golang.org/x/sync/errgroup` with `SetLimit(N)`), one goroutine per candidate generation, cancelled via `context.Context` on `Ctrl+C`/abort/budget-exceeded. Each node emits a child span through `internal/obs` (PRD-013). Candidate generation calls the `internal/llm` `Stream(ctx, Request)` interface directly (no subprocess fork — the Go binary owns the runtime), so profiles map to provider+model configs resolved through the same `ProviderProfile` used everywhere else.
 
 ---
 
@@ -255,18 +263,18 @@ SolveRunner (solver.py)
 
 | Step | Task | File | Est. |
 |---|---|---|---|
-| 1 | Schema: `solve_runs`, `solve_nodes`, migration in `open_db()` | `controller.py` | 0.5d |
-| 2 | `SolveRunner` class: wide strategy (pure sampling baseline) | `solver.py` | 1d |
-| 3 | Verifier dispatch: judge, shell, keyword, regex | `solver.py` | 1d |
-| 4 | Deep strategy: sequential refinement loop | `solver.py` | 0.5d |
-| 5 | Adaptive strategy: `_should_deepen()` + tree traversal | `solver.py` | 2d |
-| 6 | Thompson Sampling bandit for multi-profile | `solver.py` | 1d |
-| 7 | Beam and tournament strategies | `solver.py` | 1d |
-| 8 | Synthesis pass | `solver.py` | 0.5d |
-| 9 | Resume protocol: `solve abort` + `solve resume` | `solver.py` + `controller.py` | 1d |
-| 10 | `cmd_solve` + argparse: `solve`, `status`, `results`, `list`, `abort`, `resume` | `controller.py` | 1d |
-| 11 | Tests: wide/deep/adaptive, verifier types, bandit allocation, resume | `tests/` | 2d |
-| 12 | Integration: budget enforcement, tracing child spans per node | `budget.py`, `tracing.py` | 0.5d |
+| 1 | Schema: `solve_runs`, `solve_nodes` + migration in `internal/store` | `internal/store/migrate` | 0.5d |
+| 2 | `SolveRunner` struct: wide strategy (pure sampling baseline) over the `errgroup` worker pool | `internal/runtime/solve` | 1d |
+| 3 | Verifier dispatch: judge (`internal/llm`), shell (`os/exec` CommandContext), keyword, regex | `internal/runtime/solve` | 1d |
+| 4 | Deep strategy: sequential refinement loop | `internal/runtime/solve` | 0.5d |
+| 5 | Adaptive strategy: `shouldDeepen()` + tree traversal | `internal/runtime/solve` | 2d |
+| 6 | Thompson Sampling bandit (gonum `distuv.Beta`) for multi-profile | `internal/runtime/solve` | 1d |
+| 7 | Beam and tournament strategies | `internal/runtime/solve` | 1d |
+| 8 | Synthesis pass | `internal/runtime/solve` | 0.5d |
+| 9 | Resume protocol: `solve abort` + `solve resume` (rehydrate tree + bandit from `solve_nodes`) | `internal/runtime/solve` + `internal/cli` | 1d |
+| 10 | `solve` cobra command tree: `run`, `status`, `results`, `list`, `abort`, `resume` (+ `--json` via `encoding/json`) | `internal/cli` | 1d |
+| 11 | Tests: wide/deep/adaptive, verifier types, bandit allocation, resume (fake `llm.Provider`) | `*_test.go` | 2d |
+| 12 | Integration: budget enforcement (`internal/obs`), tracing child spans per node (PRD-013) | `internal/obs` | 0.5d |
 
 **Total:** ~11.5 dev-days (~2.5 sprints)
 
@@ -300,8 +308,8 @@ SolveRunner (solver.py)
 | Runaway cost with many profiles × many calls | Hard `--budget-usd` cap enforced before each candidate generation; default max-calls=12 |
 | Verifier LLM call doubles cost | Judge verifier cached by output hash; `--verifier none` skips entirely |
 | Thompson bandit starves weak profiles early | Exploration floor: every profile guaranteed ≥2 calls before bandit fully concentrates |
-| Resume after code change produces inconsistent tree | Resume checks `solver.py` hash; warns if code changed since run |
-| Long-running solve blocks terminal | `--background` flag runs as queue job (PRD-008); status via `tag solve status` |
+| Resume after code change produces inconsistent tree | Resume records the binary build version (ldflags `-X` version stamp) on the run; warns if the running binary differs from the one that started the run |
+| Long-running solve blocks terminal | `--background` flag enqueues on the bespoke SQLite DAG scheduler (`internal/queue`, PRD-008); status via `tag solve status` |
 
 ---
 

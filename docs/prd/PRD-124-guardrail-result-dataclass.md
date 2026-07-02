@@ -1,22 +1,24 @@
-# PRD-124: GuardrailResult Dataclass (`tag guardrail result`)
+# PRD-124: GuardrailResult Type (`tag guardrail result`)
+
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
 **Status:** Proposed
 **Priority:** P1
 **Estimated Effort:** S (1-2 days)
 **Category:** Security/Guardrails
-**Affects:** `guardrail_result.py`
+**Affects:** `internal/runtime/guardrail/result.go`
 **Depends on:** (foundational — no dependencies)
-**Inspired by:** Guardrails AI `ValidationResult`, Pydantic validation errors, Python `dataclasses`, OpenAPI error response schemas
+**Inspired by:** Guardrails AI `ValidationResult`, OpenAPI error response schemas; Go idioms: value structs + string-typed enums + `encoding/json`
 
 ---
 
 ## 1. Overview
 
-The TAG guardrail system (PRD-121, PRD-122, PRD-123) requires a shared, typed return type for all guardrail check functions. Without a common dataclass, each guardrail returns a different structure — some return tuples, some return dicts, some raise exceptions — making it impossible to build a composable pipeline that uniformly handles pass/block/sanitize/warn/interrupt decisions.
+The TAG guardrail system (PRD-121, PRD-122, PRD-123) requires a shared, typed return type for all guardrail check functions. Without a common type, each guardrail returns a different structure — some return tuples, some return errors, some return maps — making it impossible to build a composable pipeline that uniformly handles pass/block/sanitize/warn/interrupt decisions.
 
-`GuardrailResult` is a lightweight dataclass that standardizes the return contract of all guardrail implementations. It carries: the action taken (PASS/BLOCK/SANITIZE/WARN/INTERRUPT), the reason string, the originating guardrail name, an optional sanitized text (for SANITIZE action), an optional message (for INTERRUPT action), and metadata for audit logging.
+`GuardrailResult` is a lightweight Go value struct that standardizes the return contract of all guardrail implementations. It carries: the action taken (PASS/BLOCK/SANITIZE/WARN/INTERRUPT), the reason string, the originating guardrail name, an optional sanitized text (for SANITIZE action), an optional message (for INTERRUPT action), and metadata for audit logging.
 
-This PRD is intentionally minimal — it defines the shared data structure that all other guardrail PRDs (121-125) depend on. It is a pure library module with no CLI surface and minimal logic.
+This PRD is intentionally minimal — it defines the shared data structure that all other guardrail PRDs (121-125) depend on. It is a pure package (`internal/runtime/guardrail`) with no CLI surface and minimal logic, imported by the guardrail middleware that wraps the agent loop.
 
 ---
 
@@ -28,11 +30,11 @@ PRD-121 (output) and PRD-122 (input) both need to return a result indicating whe
 
 ### 2.2 Audit logging requires consistent structure
 
-The `guardrail_events` SQLite table needs to record the action, reason, and guardrail name from every check. A shared dataclass makes this serialization deterministic.
+The `guardrail_events` SQLite table needs to record the action, reason, and guardrail name from every check. A shared struct with JSON tags makes this serialization deterministic.
 
 ### 2.3 Type safety for pipeline composition
 
-Python type hints on `OutputGuardrailPipeline.process() -> GuardrailResult` provide static analysis benefits — editors and mypy can catch mismatches at development time.
+A Go interface `OutputGuardrail.Process(...) GuardrailResult` gives the compiler-enforced contract for free — mismatches are caught at build time by the Go compiler and `go vet`/`staticcheck`, not at runtime.
 
 ---
 
@@ -40,11 +42,11 @@ Python type hints on `OutputGuardrailPipeline.process() -> GuardrailResult` prov
 
 | ID | Goal |
 |----|------|
-| G1 | Define `GuardrailAction` enum with values: PASS, BLOCK, SANITIZE, WARN, INTERRUPT. |
-| G2 | Define `GuardrailResult` dataclass with fields: `action`, `reason`, `guardrail`, `sanitized_text`, `message`, `metadata`. |
-| G3 | Provide `GuardrailResult.is_blocking()` helper that returns True for BLOCK and INTERRUPT actions. |
-| G4 | Provide `GuardrailResult.to_dict()` for JSON serialization to the audit log. |
-| G5 | Module is importable with zero external dependencies (stdlib only). |
+| G1 | Define `GuardrailAction` as a string-typed const set with values: PASS, BLOCK, SANITIZE, WARN, INTERRUPT. |
+| G2 | Define `GuardrailResult` struct with fields: `Action`, `Reason`, `Guardrail`, `SanitizedText`, `Message`, `Metadata`. |
+| G3 | Provide `GuardrailResult.IsBlocking() bool` helper that returns true for BLOCK and INTERRUPT actions. |
+| G4 | Marshal to JSON for the audit log via `encoding/json` struct tags (no custom serializer). |
+| G5 | Package imports the Go stdlib only (`encoding/json`); zero external module dependencies. |
 
 ## 3.1 Non-Goals
 
@@ -53,7 +55,7 @@ Python type hints on `OutputGuardrailPipeline.process() -> GuardrailResult` prov
 | NG1 | Guardrail logic implementation (belongs in PRD-121/122/123). |
 | NG2 | CLI surface. |
 | NG3 | SQLite persistence (belongs in the audit log infrastructure of PRD-121). |
-| NG4 | Async support. |
+| NG4 | `context.Context` plumbing / concurrency primitives (results are plain values; callers own goroutines). |
 
 ---
 
@@ -61,9 +63,9 @@ Python type hints on `OutputGuardrailPipeline.process() -> GuardrailResult` prov
 
 | Metric | Target | Measurement |
 |--------|--------|-------------|
-| Import time | < 5ms (no heavy imports) | Benchmark test |
-| mypy compatibility | Zero mypy errors on the module | CI check |
-| Dataclass immutability | `frozen=True` prevents accidental mutation | Unit test |
+| Import weight | stdlib-only (`encoding/json`); no external modules | `go mod graph` check |
+| Vet cleanliness | Zero `go vet`/`staticcheck` findings on the package | CI check |
+| Value semantics | Passed/returned by value; no shared mutable state across guardrails | Unit test |
 
 ---
 
@@ -71,9 +73,9 @@ Python type hints on `OutputGuardrailPipeline.process() -> GuardrailResult` prov
 
 | ID | As a... | I want to... | So that... |
 |----|---------|-------------|------------|
-| US1 | Guardrail implementor | Return `GuardrailResult(action=GuardrailAction.BLOCK, reason="PII_DETECTED", guardrail="pii")` | I have a typed, consistent return contract |
-| US2 | Pipeline developer | Call `result.is_blocking()` to check if execution should halt | I avoid string comparison bugs |
-| US3 | Audit log writer | Call `result.to_dict()` to get a JSON-serializable representation | I write to `guardrail_events` without custom serialization |
+| US1 | Guardrail implementor | Return `guardrail.Block("PII_DETECTED:email", "pii")` | I have a typed, consistent return contract |
+| US2 | Pipeline developer | Call `result.IsBlocking()` to check if execution should halt | I avoid string comparison bugs |
+| US3 | Audit log writer | `json.Marshal(result)` to get a serializable representation | I write to `guardrail_events` without custom serialization |
 
 ---
 
@@ -87,14 +89,14 @@ None. This is a pure library module.
 
 | ID | Requirement |
 |----|------------|
-| FR-01 | `GuardrailAction` is a `str` enum (not IntEnum) for JSON-serializability. |
-| FR-02 | `GuardrailResult` is a `frozen=True` dataclass with fields: `action: GuardrailAction`, `reason: str = ""`, `guardrail: str = ""`, `sanitized_text: Optional[str] = None`, `message: Optional[str] = None`, `metadata: dict = field(default_factory=dict)`. |
-| FR-03 | `GuardrailResult.is_blocking() -> bool` returns True if `action in (BLOCK, INTERRUPT)`. |
-| FR-04 | `GuardrailResult.to_dict() -> dict` returns a JSON-serializable dict of all fields (None values included as null). |
-| FR-05 | `GuardrailResult.should_sanitize() -> bool` returns True if `action == SANITIZE and sanitized_text is not None`. |
-| FR-06 | Module exports: `GuardrailAction`, `GuardrailResult`. |
-| FR-07 | `GuardrailAction.PASS`, `.BLOCK`, `.SANITIZE`, `.WARN`, `.INTERRUPT` are the five values; no others. |
-| FR-08 | Default `GuardrailResult` (no arguments except `action=PASS`) is valid and represents a clean pass. |
+| FR-01 | `GuardrailAction` is defined as `type GuardrailAction string` (string-backed for JSON-serializability), not an integer iota. |
+| FR-02 | `GuardrailResult` is a struct with JSON-tagged fields: `Action GuardrailAction`, `Reason string`, `Guardrail string`, `SanitizedText *string` (omitempty), `Message *string` (omitempty), `Metadata map[string]any`. |
+| FR-03 | `GuardrailResult.IsBlocking() bool` returns true if `Action` is `ActionBlock` or `ActionInterrupt`. |
+| FR-04 | `GuardrailResult` marshals via `encoding/json` to an object with all fields; nil pointers serialize as `null` (or omitted where `omitempty` is set). |
+| FR-05 | `GuardrailResult.ShouldSanitize() bool` returns true if `Action == ActionSanitize && SanitizedText != nil`. |
+| FR-06 | Package `guardrail` exports: `GuardrailAction`, `GuardrailResult`, the five action consts, and the convenience constructors. |
+| FR-07 | `ActionPass`, `ActionBlock`, `ActionSanitize`, `ActionWarn`, `ActionInterrupt` are the five values; no others. |
+| FR-08 | The zero value of `GuardrailResult` has `Action == ""`; a clean pass is constructed via `Pass(guardrail)` (or by explicitly setting `ActionPass`). |
 
 ---
 
@@ -102,10 +104,10 @@ None. This is a pure library module.
 
 | ID | Requirement |
 |----|------------|
-| NFR-01 | Zero runtime dependencies beyond the Python stdlib (`dataclasses`, `enum`, `typing`). |
-| NFR-02 | `frozen=True` on the dataclass for hashability and immutability. |
-| NFR-03 | Full mypy strict-mode compatibility. |
-| NFR-04 | Module size: < 50 lines of production code. |
+| NFR-01 | Zero external module dependencies; Go stdlib only (`encoding/json`). |
+| NFR-02 | Value semantics: `GuardrailResult` is passed and returned by value; guardrails never share a mutable result. (`Metadata` is a map — treat as read-only after construction; constructors allocate a fresh map.) |
+| NFR-03 | Zero `go vet` / `staticcheck` findings under the project lint config. |
+| NFR-04 | Package size: < 80 lines of production code. |
 
 ---
 
@@ -115,94 +117,78 @@ None. This is a pure library module.
 
 | File | Change |
 |------|--------|
-| `src/tag/guardrail_result.py` | New module: `GuardrailAction`, `GuardrailResult` |
+| `internal/runtime/guardrail/result.go` | New package `guardrail`: `GuardrailAction`, `GuardrailResult`, constructors |
 
 ### 9.2 Implementation
 
-```python
-"""Shared result types for all TAG guardrail implementations."""
-from __future__ import annotations
+```go
+// Package guardrail defines the shared result contract returned by every
+// TAG guardrail implementation (input/output/runtime/constitutional).
+package guardrail
 
-import dataclasses
-from enum import Enum
-from typing import Any, Dict, Optional
+import "fmt"
 
+// GuardrailAction is the action a guardrail check has decided to take.
+// String-backed so it JSON-marshals to a stable wire value.
+type GuardrailAction string
 
-class GuardrailAction(str, Enum):
-    """The action a guardrail check has decided to take."""
-    PASS = "pass"
-    BLOCK = "block"
-    SANITIZE = "sanitize"
-    WARN = "warn"
-    INTERRUPT = "interrupt"
+const (
+	ActionPass      GuardrailAction = "pass"
+	ActionBlock     GuardrailAction = "block"
+	ActionSanitize  GuardrailAction = "sanitize"
+	ActionWarn      GuardrailAction = "warn"
+	ActionInterrupt GuardrailAction = "interrupt"
+)
 
+// GuardrailResult is the standardized return type for all guardrail checks.
+// It is passed and returned BY VALUE; guardrails never share a mutable result.
+type GuardrailResult struct {
+	Action        GuardrailAction `json:"action"`
+	Reason        string          `json:"reason"`
+	Guardrail     string          `json:"guardrail"`
+	SanitizedText *string         `json:"sanitized_text"` // set only when Action == ActionSanitize
+	Message       *string         `json:"message"`        // human-readable, shown on ActionInterrupt
+	Metadata      map[string]any  `json:"metadata,omitempty"`
+}
 
-@dataclasses.dataclass(frozen=True)
-class GuardrailResult:
-    """Standardized return type for all guardrail check() methods.
+// IsBlocking reports whether this result should stop downstream processing.
+func (r GuardrailResult) IsBlocking() bool {
+	return r.Action == ActionBlock || r.Action == ActionInterrupt
+}
 
-    Attributes:
-        action:         What the guardrail decided to do.
-        reason:         Machine-readable reason code (e.g. "PII_DETECTED:email").
-        guardrail:      Name of the guardrail that produced this result.
-        sanitized_text: Replacement text when action is SANITIZE.
-        message:        Human-readable message (shown on INTERRUPT).
-        metadata:       Optional extra data for audit logging.
-    """
-    action: GuardrailAction = GuardrailAction.PASS
-    reason: str = ""
-    guardrail: str = ""
-    sanitized_text: Optional[str] = None
-    message: Optional[str] = None
-    metadata: Dict[str, Any] = dataclasses.field(default_factory=dict)
+// ShouldSanitize reports whether SanitizedText should replace the original text.
+func (r GuardrailResult) ShouldSanitize() bool {
+	return r.Action == ActionSanitize && r.SanitizedText != nil
+}
 
-    def is_blocking(self) -> bool:
-        """Return True if this result should stop downstream processing."""
-        return self.action in (GuardrailAction.BLOCK, GuardrailAction.INTERRUPT)
+// Pass is the convenience constructor for a clean pass.
+func Pass(guardrail string) GuardrailResult {
+	return GuardrailResult{Action: ActionPass, Guardrail: guardrail}
+}
 
-    def should_sanitize(self) -> bool:
-        """Return True if sanitized_text should replace the original text."""
-        return self.action == GuardrailAction.SANITIZE and self.sanitized_text is not None
+// Block is the convenience constructor for a block result.
+func Block(reason, guardrail string, message ...string) GuardrailResult {
+	r := GuardrailResult{Action: ActionBlock, Reason: reason, Guardrail: guardrail}
+	if len(message) > 0 {
+		r.Message = &message[0]
+	}
+	return r
+}
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Return a JSON-serializable dict for audit log storage."""
-        return {
-            "action": self.action.value,
-            "reason": self.reason,
-            "guardrail": self.guardrail,
-            "sanitized_text": self.sanitized_text,
-            "message": self.message,
-            "metadata": self.metadata,
-        }
+// Sanitize is the convenience constructor for a sanitize result.
+func Sanitize(sanitized, reason, guardrail string) GuardrailResult {
+	return GuardrailResult{
+		Action: ActionSanitize, Reason: reason, Guardrail: guardrail, SanitizedText: &sanitized,
+	}
+}
 
-    @classmethod
-    def pass_result(cls, guardrail: str = "") -> "GuardrailResult":
-        """Convenience constructor for a clean pass."""
-        return cls(action=GuardrailAction.PASS, guardrail=guardrail)
-
-    @classmethod
-    def block_result(cls, reason: str, guardrail: str = "",
-                     message: Optional[str] = None) -> "GuardrailResult":
-        """Convenience constructor for a block result."""
-        return cls(action=GuardrailAction.BLOCK, reason=reason,
-                   guardrail=guardrail, message=message)
-
-    @classmethod
-    def sanitize_result(cls, sanitized_text: str, reason: str = "",
-                        guardrail: str = "") -> "GuardrailResult":
-        """Convenience constructor for a sanitize result."""
-        return cls(action=GuardrailAction.SANITIZE, reason=reason,
-                   guardrail=guardrail, sanitized_text=sanitized_text)
-
-    def __str__(self) -> str:
-        parts = [f"GuardrailResult(action={self.action.value}"]
-        if self.reason:
-            parts.append(f", reason={self.reason!r}")
-        if self.guardrail:
-            parts.append(f", guardrail={self.guardrail!r}")
-        parts.append(")")
-        return "".join(parts)
+// String implements fmt.Stringer for log-friendly output.
+func (r GuardrailResult) String() string {
+	return fmt.Sprintf("GuardrailResult(action=%s, reason=%q, guardrail=%q)", r.Action, r.Reason, r.Guardrail)
+}
 ```
+
+`encoding/json` handles audit-log serialization directly (`json.Marshal(result)`) using the struct tags — no `to_dict()` equivalent is needed. Downstream guardrail interfaces (PRD-121/122/123) return this value type; a Go interface such as `type OutputGuardrail interface { Process(ctx context.Context, text string) GuardrailResult }` gives compiler-checked composition.
 
 ---
 
@@ -216,8 +202,8 @@ None. This is a pure data structure with no execution logic or external I/O.
 
 | Layer | Tests |
 |-------|-------|
-| Unit | All five `GuardrailAction` values; `is_blocking()` for each; `should_sanitize()` with and without `sanitized_text`; `to_dict()` round-trip; `frozen=True` immutability |
-| Type checking | `mypy --strict src/tag/guardrail_result.py` passes with zero errors |
+| Unit | Table-driven test over all five `GuardrailAction` values; `IsBlocking()` for each; `ShouldSanitize()` with and without `SanitizedText`; `json.Marshal`/`Unmarshal` round-trip |
+| Static analysis | `go vet ./internal/runtime/guardrail/...` and `staticcheck` pass with zero findings |
 
 ---
 
@@ -225,12 +211,12 @@ None. This is a pure data structure with no execution logic or external I/O.
 
 | ID | Criterion |
 |----|----------|
-| AC-01 | `GuardrailResult(action=GuardrailAction.BLOCK).is_blocking()` returns `True` |
-| AC-02 | `GuardrailResult(action=GuardrailAction.PASS).is_blocking()` returns `False` |
-| AC-03 | `GuardrailResult(action=GuardrailAction.SANITIZE, sanitized_text="x").should_sanitize()` returns `True` |
-| AC-04 | `result.to_dict()` returns a JSON-serializable dict with all 6 fields |
-| AC-05 | Attempting to mutate a frozen `GuardrailResult` raises `FrozenInstanceError` |
-| AC-06 | `from tag.guardrail_result import GuardrailAction, GuardrailResult` succeeds with no errors |
+| AC-01 | `GuardrailResult{Action: ActionBlock}.IsBlocking()` returns `true` |
+| AC-02 | `GuardrailResult{Action: ActionPass}.IsBlocking()` returns `false` |
+| AC-03 | `Sanitize("x", "", "").ShouldSanitize()` returns `true` |
+| AC-04 | `json.Marshal(result)` produces an object with all six fields |
+| AC-05 | Passing a `GuardrailResult` by value into a guardrail does not mutate the caller's copy (value semantics) |
+| AC-06 | Package `github.com/tag-agent/tag/internal/runtime/guardrail` builds and exports `GuardrailAction`, `GuardrailResult`, the five action consts |
 
 ---
 
@@ -245,7 +231,8 @@ None. This is a foundational library module.
 | ID | Question |
 |----|---------|
 | OQ-01 | Should `GuardrailResult` support chaining (multiple guardrails in a composite result)? |
-| OQ-02 | Should metadata include a severity level for UI rendering? |
+| OQ-02 | Should `Metadata` include a severity level for UI rendering? |
+| OQ-03 | Should the zero value (`Action == ""`) be treated as an implicit pass, or should callers always use the `Pass()` constructor (current spec: use the constructor)? |
 
 ---
 
@@ -256,6 +243,6 @@ None. This is a foundational library module.
 
 | Phase | Work | Days |
 |-------|------|------|
-| 1 | `GuardrailAction` enum, `GuardrailResult` dataclass, unit tests | 1 |
-| 2 | Type checking, review, import in PRD-121/122/123 | 0.5 |
+| 1 | `GuardrailAction` consts, `GuardrailResult` struct + constructors, table-driven unit tests | 1 |
+| 2 | `go vet`/`staticcheck`, review, import in PRD-121/122/123 | 0.5 |
 

@@ -1,11 +1,13 @@
 # PRD-125: Constitutional AI Policy (`tag constitutional`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P2
 **Estimated Effort:** M (5-8 days)
 **Category:** Security/Guardrails
-**Affects:** `constitutional_ai.py + controller.py`
-**Depends on:** PRD-124 (GuardrailResult dataclass), PRD-121 (output guardrail processor), PRD-122 (input guardrail validator)
+**Affects:** `internal/runtime/guardrail/constitutional.go` + `internal/cli` + go:embed templates
+**Depends on:** PRD-124 (GuardrailResult type), PRD-121 (output guardrail processor), PRD-122 (input guardrail validator)
 **Inspired by:** Anthropic Constitutional AI (CAI), OpenAI policy spec, Guardrails AI validators, Nemo Guardrails policy engine
 
 ---
@@ -42,14 +44,14 @@ Rule-based guardrails block outputs without improvement. Constitutional AI's rev
 
 | ID | Goal |
 |----|------|
-| G1 | `ConstitutionalPolicy` loads a set of principles from a YAML/JSON file and makes them available for critique evaluation. |
-| G2 | `CritiqueRevisionLoop.evaluate(output: str, policy: ConstitutionalPolicy) -> GuardrailResult` runs the critique-revision cycle. |
+| G1 | `ConstitutionalPolicy` loads a set of principles (from SQLite, seeded by go:embed YAML templates) and makes them available for critique evaluation. |
+| G2 | `CritiqueRevisionLoop.Evaluate(ctx, output string, policy *ConstitutionalPolicy) guardrail.GuardrailResult` runs the critique-revision cycle. |
 | G3 | Support configurable max revision passes (default: 2) to bound computational cost. |
 | G4 | `tag constitutional add-principle --text TEXT --profile PROFILE` adds a principle to the active policy. |
 | G5 | `tag constitutional list` shows all active principles for a profile. |
 | G6 | `tag constitutional test --input TEXT` runs the critique-revision loop against a test string. |
 | G7 | Built-in constitutional templates: `default` (Anthropic-inspired), `medical`, `educational`, `financial`, `legal`. |
-| G8 | Critique model and revision model are configurable (default: `claude-haiku-4-5` for critique, same for revision). |
+| G8 | Critique and revision models are configurable and dispatched through the `internal/llm` provider interface (default: `claude-haiku-4-5` for both, via the anthropic-sdk-go adapter). |
 
 ## 3.1 Non-Goals
 
@@ -131,14 +133,14 @@ Options:
 | ID | Requirement |
 |----|------------|
 | FR-01 | `ConstitutionalPolicy` loads principles from SQLite `constitutional_principles` table for the given profile. |
-| FR-02 | `CritiqueRevisionLoop.evaluate(output, policy)`: for each revision pass, call the critique model with the output + all principles; parse the critique to determine if a violation was detected. |
+| FR-02 | `CritiqueRevisionLoop.Evaluate(ctx, output, policy)`: for each revision pass, call the critique model (via `internal/llm`) with the output + all principles; parse the critique to determine if a violation was detected. |
 | FR-03 | Critique prompt: `"Please critique the following output for compliance with these principles: {principles_list}\n\nOutput: {output}\n\nIdentify any violations and explain why."` |
 | FR-04 | Revision prompt (only when critique finds a violation): `"Revise the following output to comply with these principles while preserving the useful information: {principles_list}\n\nOriginal: {output}\nCritique: {critique}\n\nRevised:"` |
 | FR-05 | After max passes, if the last revision still has critique-detected violations, return `GuardrailResult(action=BLOCK, reason=CONSTITUTION_VIOLATION)`. |
 | FR-06 | If revision produces a compliant output, return `GuardrailResult(action=SANITIZE, sanitized_text=revised_output, reason=CONSTITUTION_REVISED)`. |
 | FR-07 | All critique-revision cycles logged to `constitutional_events` table: profile, original_output_hash, critique, revised_output, pass_num, final_action. |
 | FR-08 | `tag constitutional load-template` inserts the template principles into `constitutional_principles` for the profile. |
-| FR-09 | Integration with PRD-121 output guardrail pipeline: `ConstitutionalGuardrail` implements `OutputGuardrail` interface and is chainable. |
+| FR-09 | Integration with PRD-121 output guardrail pipeline: `ConstitutionalGuardrail` satisfies the `OutputGuardrail` Go interface (`Process(ctx, string) guardrail.GuardrailResult`) and is chainable in the pipeline. |
 | FR-10 | `tag constitutional test` runs the loop and prints each pass: critique text, revision text, final action. |
 
 ---
@@ -150,7 +152,7 @@ Options:
 | NFR-01 | Default max 2 revision passes to bound LLM API cost; configurable up to 5. |
 | NFR-02 | Principles list in critique prompt truncated to 2000 tokens; excess principles omitted (with warning). |
 | NFR-03 | `constitutional_events` table uses append-only inserts; never updated after creation. |
-| NFR-04 | Built-in templates stored as YAML files in the package `data/constitutions/` directory. |
+| NFR-04 | Built-in templates are YAML files compiled into the binary via `go:embed` (`//go:embed data/constitutions/*.yaml`), parsed with `gopkg.in/yaml.v3`; no on-disk data directory needed for the single static binary. |
 
 ---
 
@@ -186,8 +188,10 @@ CREATE TABLE IF NOT EXISTS constitutional_events (
 
 ### 9.2 Built-in templates
 
+Templates live under `internal/runtime/guardrail/data/constitutions/*.yaml` and are embedded with `//go:embed data/constitutions/*.yaml` into an `embed.FS`, then decoded with `gopkg.in/yaml.v3` at `load-template` time. No files ship alongside the binary.
+
 ```yaml
-# data/constitutions/default.yaml
+# data/constitutions/default.yaml (embedded via go:embed)
 name: default
 description: General-purpose Anthropic-inspired principles
 principles:
@@ -203,105 +207,128 @@ principles:
     category: fairness
 ```
 
-### 9.3 Python core
+### 9.3 Go core (`internal/runtime/guardrail`)
 
-```python
-from __future__ import annotations
-import hashlib
-import sqlite3
-import uuid
-from typing import List, Optional
-from tag.guardrail_result import GuardrailResult, GuardrailAction
+The critique and revision calls go through the `internal/llm` provider interface (`Stream(ctx, Request) -> <-chan Event`), so the loop is provider-neutral — the default model `claude-haiku-4-5` resolves to the anthropic-sdk-go adapter, but any registered provider works. Non-streaming completions accumulate the `TextDelta` events into a single string.
 
-class ConstitutionalPolicy:
-    def __init__(self, conn: sqlite3.Connection, profile: str) -> None:
-        rows = conn.execute(
-            "SELECT text FROM constitutional_principles WHERE profile=? AND enabled=1",
-            (profile,)
-        ).fetchall()
-        self.principles: List[str] = [r["text"] for r in rows]
-        self.profile = profile
+```go
+package guardrail
 
-    def format_for_prompt(self, max_tokens: int = 2000) -> str:
-        lines = []
-        token_est = 0
-        for i, p in enumerate(self.principles, 1):
-            line = f"{i}. {p}"
-            token_est += len(line.split()) * 1.3
-            if token_est > max_tokens:
-                break
-            lines.append(line)
-        return "\n".join(lines)
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
 
-class CritiqueRevisionLoop:
-    CRITIQUE_TMPL = (
-        "Critique the following output for compliance with these principles:\n"
-        "{principles}\n\nOutput:\n{output}\n\n"
-        "Identify any violations. If compliant, say 'COMPLIANT'. "
-        "If there are violations, describe them briefly."
-    )
-    REVISION_TMPL = (
-        "Revise the following output to comply with these principles "
-        "while preserving the useful information:\n"
-        "{principles}\n\nOriginal output:\n{output}\n\nCritique:\n{critique}\n\n"
-        "Revised output:"
-    )
+	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/store"
+)
 
-    def __init__(self, model: str = "claude-haiku-4-5", max_passes: int = 2,
-                 conn: Optional[sqlite3.Connection] = None) -> None:
-        self.model = model
-        self.max_passes = max_passes
-        self.conn = conn
+type ConstitutionalPolicy struct {
+	Profile    string
+	Principles []string
+}
 
-    def evaluate(self, output: str, policy: ConstitutionalPolicy,
-                 run_id: Optional[str] = None) -> GuardrailResult:
-        import anthropic
-        client = anthropic.Anthropic()
-        principles = policy.format_for_prompt()
-        current = output
-        for pass_num in range(1, self.max_passes + 1):
-            critique = client.messages.create(
-                model=self.model,
-                max_tokens=512,
-                messages=[{"role": "user", "content": self.CRITIQUE_TMPL.format(
-                    principles=principles, output=current)}]
-            ).content[0].text
-            compliant = "COMPLIANT" in critique.upper() and "violation" not in critique.lower()
-            if compliant:
-                self._log(policy.profile, run_id, pass_num, output, critique, current, "pass")
-                if current != output:
-                    return GuardrailResult(action=GuardrailAction.SANITIZE,
-                                           sanitized_text=current, reason="CONSTITUTION_REVISED",
-                                           guardrail="constitutional")
-                return GuardrailResult(action=GuardrailAction.PASS, guardrail="constitutional")
-            if pass_num < self.max_passes:
-                current = client.messages.create(
-                    model=self.model,
-                    max_tokens=1024,
-                    messages=[{"role": "user", "content": self.REVISION_TMPL.format(
-                        principles=principles, output=current, critique=critique)}]
-                ).content[0].text.strip()
-        self._log(policy.profile, run_id, self.max_passes, output, critique, current, "block")
-        return GuardrailResult(action=GuardrailAction.BLOCK, reason="CONSTITUTION_VIOLATION",
-                               guardrail="constitutional")
+// LoadPolicy reads enabled principles for a profile from the single-writer store.
+func LoadPolicy(ctx context.Context, st *store.Store, profile string) (*ConstitutionalPolicy, error) {
+	texts, err := st.ConstitutionalPrinciples(ctx, profile) // WHERE profile=? AND enabled=1
+	if err != nil {
+		return nil, err
+	}
+	return &ConstitutionalPolicy{Profile: profile, Principles: texts}, nil
+}
 
-    def _log(self, profile: str, run_id: Optional[str], pass_num: int,
-             original: str, critique: str, revised: str, action: str) -> None:
-        if not self.conn:
-            return
-        h = hashlib.sha256(original.encode()).hexdigest()[:16]
-        self.conn.execute(
-            "INSERT INTO constitutional_events(id,profile,run_id,pass_num,original_hash,critique,revised_output,final_action,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (uuid.uuid4().hex[:8], profile, run_id, pass_num, h, critique[:2000],
-             revised[:4000], action, _utc_now())
-        )
-        self.conn.commit()
+// FormatForPrompt renders principles, truncating to a rough token budget
+// (len(fields)*1.3 heuristic — no local Claude tokenizer exists; see obs pkg).
+func (p *ConstitutionalPolicy) FormatForPrompt(maxTokens int) string {
+	var b strings.Builder
+	tokenEst := 0.0
+	for i, pr := range p.Principles {
+		line := fmt.Sprintf("%d. %s", i+1, pr)
+		tokenEst += float64(len(strings.Fields(line))) * 1.3
+		if int(tokenEst) > maxTokens {
+			break
+		}
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
 
-def _utc_now() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
+const (
+	critiqueTmpl = "Critique the following output for compliance with these principles:\n" +
+		"%s\n\nOutput:\n%s\n\nIdentify any violations. If compliant, say 'COMPLIANT'. " +
+		"If there are violations, describe them briefly."
+	revisionTmpl = "Revise the following output to comply with these principles " +
+		"while preserving the useful information:\n%s\n\nOriginal output:\n%s\n\nCritique:\n%s\n\nRevised output:"
+)
+
+type CritiqueRevisionLoop struct {
+	Provider  llm.Provider // internal/llm interface; default resolves to claude-haiku-4-5
+	Model     string
+	MaxPasses int
+	Store     *store.Store // nil => no audit logging
+}
+
+func (l *CritiqueRevisionLoop) Evaluate(ctx context.Context, output string, policy *ConstitutionalPolicy, runID string) (GuardrailResult, error) {
+	principles := policy.FormatForPrompt(2000)
+	current := output
+	var critique string
+	for pass := 1; pass <= l.MaxPasses; pass++ {
+		var err error
+		critique, err = llm.Complete(ctx, l.Provider, l.Model, 512,
+			fmt.Sprintf(critiqueTmpl, principles, current))
+		if err != nil {
+			return GuardrailResult{}, err
+		}
+		compliant := strings.Contains(strings.ToUpper(critique), "COMPLIANT") &&
+			!strings.Contains(strings.ToLower(critique), "violation")
+		if compliant {
+			l.logEvent(ctx, policy.Profile, runID, pass, output, critique, current, "pass")
+			if current != output {
+				return Sanitize(current, "CONSTITUTION_REVISED", "constitutional"), nil
+			}
+			return Pass("constitutional"), nil
+		}
+		if pass < l.MaxPasses {
+			revised, err := llm.Complete(ctx, l.Provider, l.Model, 1024,
+				fmt.Sprintf(revisionTmpl, principles, current, critique))
+			if err != nil {
+				return GuardrailResult{}, err
+			}
+			current = strings.TrimSpace(revised)
+		}
+	}
+	l.logEvent(ctx, policy.Profile, runID, l.MaxPasses, output, critique, current, "block")
+	return Block("CONSTITUTION_VIOLATION", "constitutional"), nil
+}
+
+func (l *CritiqueRevisionLoop) logEvent(ctx context.Context, profile, runID string, pass int, original, critique, revised, action string) {
+	if l.Store == nil {
+		return
+	}
+	sum := sha256.Sum256([]byte(original))
+	_ = l.Store.InsertConstitutionalEvent(ctx, store.ConstitutionalEvent{
+		Profile: profile, RunID: runID, PassNum: pass,
+		OriginalHash: hex.EncodeToString(sum[:])[:16],
+		Critique:     truncate(critique, 2000),
+		RevisedOutput: truncate(revised, 4000),
+		FinalAction:  action,
+	}) // append-only insert through the single-writer store
+}
+
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
 ```
+
+`llm.Complete` is a small helper that drains the provider's `Event` channel, concatenating `TextDelta`s into a string with a `max_tokens` cap. Timestamps and event IDs are assigned by `internal/store` (via the `strftime` DDL defaults / a `crypto/rand` id), so the loop stays pure.
 
 ---
 
@@ -309,7 +336,7 @@ def _utc_now() -> str:
 
 | Risk | Mitigation |
 |------|-----------|
-| Critique model itself producing harmful guidance | Use only Anthropic models for critique; not user-configurable to external endpoints |
+| Critique model itself producing harmful guidance | Critique is pinned to trusted providers behind the `internal/llm` interface (default anthropic-sdk-go); base-URL override to arbitrary external endpoints is disallowed for the critique path |
 | Constitution bypassed by adversarial inputs | Constitutional AI is complementary to rule-based guardrails (PRD-121/122), not a replacement |
 | Cost overrun from critique loops | Max 2 passes by default; hard cap at 5; cost tracked per session |
 | Revision introducing new violations | After revision, the output passes through standard output guardrails (PRD-121) |
@@ -320,7 +347,7 @@ def _utc_now() -> str:
 
 | Layer | Tests |
 |-------|-------|
-| Unit | `ConstitutionalPolicy.format_for_prompt` token truncation; `CritiqueRevisionLoop` with mock model |
+| Unit | `ConstitutionalPolicy.FormatForPrompt` token truncation; `CritiqueRevisionLoop` with a fake `llm.Provider` (table-driven, scripted critique/revision responses) |
 | Integration | Full loop: harmful input → critique detects violation → revision → re-critique → SANITIZE result |
 | Evaluation | 20-case test set with known-violating/known-compliant outputs; recall and precision metrics |
 
@@ -344,8 +371,9 @@ def _utc_now() -> str:
 | Dependency | Reason |
 |-----------|--------|
 | PRD-124 GuardrailResult | Shared result type |
-| PRD-121 output guardrail | Pipeline integration |
-| `anthropic` SDK | Critique and revision model API |
+| PRD-121 output guardrail | Pipeline integration (`OutputGuardrail` interface) |
+| `internal/llm` provider iface | Critique + revision calls (default anthropic-sdk-go adapter) |
+| `gopkg.in/yaml.v3` + `embed` | Parse go:embed'd constitution templates |
 
 ---
 

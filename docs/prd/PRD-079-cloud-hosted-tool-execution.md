@@ -1,10 +1,12 @@
 # PRD-079: Cloud-Hosted Tool Execution with Version Pinning (`tag mcp host`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P3
 **Estimated Effort:** L (2-4 weeks)
 **Category:** MCP Ecosystem & Tool Connectivity
-**Affects:** `sandbox.py + mcp_host.py` (new), `controller.py` (new `cmd_mcp_host_*` handlers), `tag.sqlite3` (new tables)
+**Affects:** `internal/mcp/host` (new package), `internal/cli/cmd_mcp_host.go` (new CLI handlers), `internal/store` (new migration + tables), `internal/runtime` (session startup hook)
 **Depends on:** PRD-028 (sandbox code execution), PRD-014 (MCP server registry), PRD-013 (agent tracing/observability), PRD-034 (secret scanning), PRD-039 (token budget enforcement)
 **Inspired by:** Toolhouse tool hosting, E2B tool execution, Composio hosted tools
 **GitHub Issue:** #346
@@ -314,15 +316,15 @@ tag mcp host quota reset <server-name>
 | FR-04 | On each subsequent session start that includes a hosted server, TAG MUST re-derive the contract hash from the live server and compare it to the snapshot. If they differ, TAG MUST emit a `ContractHashMismatch` error to stderr and exit non-zero unless `--allow-drift` is passed or `MCP_HOST_ALLOW_DRIFT=1` is set. | Must |
 | FR-05 | Per-server quota enforcement: TAG's bridge MUST track invocation counts per server per quota window in the `mcp_host_quota_usage` table; when `quota_calls_used >= quota_calls_limit`, the bridge MUST return a structured MCP error `{"error": {"code": -32099, "message": "Quota exceeded: notion reached 200/200 calls in 1h window."}}` without forwarding the call to the container. | Must |
 | FR-06 | Per-tool quota enforcement: if `--quota-calls` is applied at the tool level (via `tag mcp host quota set <server> <tool> --limit N`), the per-tool counter MUST be tracked independently and MUST take precedence over the per-server counter when both are configured. | Should |
-| FR-07 | The Docker backend MUST NOT use the Python `docker` SDK. All Docker operations MUST be performed via `subprocess.run(["docker", ...])` to avoid the Docker SDK's transitive dependency chain. | Must |
-| FR-08 | `tag mcp host logs <server> --follow` MUST stream container stdout and stderr to the terminal in real time using `subprocess.Popen` with `stdout=PIPE, stderr=STDOUT` and a read loop. The first line MUST appear within 500 ms of the container emitting it. | Must |
+| FR-07 | The Docker backend MUST NOT use the `docker/docker` moby client SDK. All Docker operations MUST be performed by invoking the `docker` CLI via `os/exec.CommandContext`, keeping the dependency surface minimal and matching the subprocess-only approach from the original design. | Must |
+| FR-08 | `tag mcp host logs <server> --follow` MUST stream container stdout and stderr to the terminal in real time. The implementation MUST use `os/exec.CommandContext` with `cmd.StdoutPipe()` and a goroutine read loop. The first line MUST appear within 500 ms of the container emitting it. | Must |
 | FR-09 | `tag mcp host remove` MUST execute `docker stop` followed by `docker rm` (or the Modal equivalent) and MUST verify the container is no longer running before returning success. | Must |
 | FR-10 | All hosted server activity (start, stop, tool call proxied, quota hit, hash mismatch, error) MUST be appended to `~/.tag/runtime/mcp-host-audit.jsonl` as newline-delimited JSON with fields: `timestamp`, `event`, `server_name`, `version`, `backend`, `tool_name` (nullable), `container_id`, `quota_used`, `quota_limit`, `details`. | Must |
 | FR-11 | `tag mcp host list --json` MUST return valid JSON to stdout with no additional text; human-readable output MUST go to stdout in table form; errors MUST go to stderr. | Must |
 | FR-12 | Environment variables passed via `--env KEY=VALUE` MUST be forwarded to the container or Modal function without being stored in the SQLite database. Secrets referenced via `--secret KEY=<keychain-ref>` MUST be fetched from the OS keychain at container start time using the `keyring` library and injected as environment variables; the keychain reference name MUST be stored in SQLite, not the secret value itself. | Must |
 | FR-13 | The `--pull-policy if-absent` (default) MUST check for the image locally via `docker image inspect` before pulling. `always` MUST pull unconditionally. `never` MUST fail if the image is not already present with a clear error. | Should |
 | FR-14 | The bridge process MUST handle the MCP stdio protocol framing (Content-Length headers + JSON-RPC body) correctly for both reads from the container and writes to Hermes. Malformed frames from the container MUST be logged to the audit file and forwarded as MCP error responses rather than silently dropped. | Must |
-| FR-15 | The Modal backend MUST deploy the server as a `modal.Function` with the server's container image, forward stdin via `modal.Function.spawn()`, and multiplex stdout back over a local socket that the bridge reads. | Should |
+| FR-15 | The Modal backend MUST interact with Modal's REST API using `net/http` + `cenkalti/backoff/v4` (no Modal Python SDK). It MUST create a Modal function run carrying the server's container image, open a bidirectional stream for stdin/stdout forwarding, and multiplex output back over a local channel that the bridge consumes. | Should |
 | FR-16 | Quota windows MUST be rolling (not fixed calendar windows). A `1h` window starting at 14:23 expires at 15:23, not at 15:00. The `quota_window_reset_at` field MUST reflect the rolling expiry. | Must |
 | FR-17 | `tag mcp host inspect --diff <other-version>` MUST produce a human-readable diff of tool names and schema hashes between two contract snapshots stored in SQLite for the same server name at two different versions. | Should |
 | FR-18 | When the Docker daemon is not running, `tag mcp host add --backend docker` MUST detect this via `docker info` exit code and emit an actionable error: "Docker daemon is not running. Start Docker Desktop or run `sudo systemctl start docker`." | Must |
@@ -341,7 +343,7 @@ tag mcp host quota reset <server-name>
 | NFR-04 | Audit log write performance | Each audit log write MUST complete in < 1 ms (non-blocking append to JSONL file) |
 | NFR-05 | SQLite write contention | All quota updates MUST use SQLite WAL mode with `BEGIN IMMEDIATE` to prevent write conflicts from concurrent agent sessions |
 | NFR-06 | Container startup reproducibility | Given the same image digest, `tag mcp host start` MUST produce the same container environment on 10 consecutive runs (no random ports, no time-seeded state) |
-| NFR-07 | Import isolation | `import tag.controller` MUST NOT import `modal`, `docker`, or `keyring` when `tag mcp host` has never been invoked. All imports MUST be deferred to the `cmd_mcp_host_*` handlers. |
+| NFR-07 | Init isolation | The `internal/mcp/host` package MUST NOT register any `init()` side effects that contact Docker, Modal, or the OS keyring. All I/O MUST be deferred to explicit `cmd_mcp_host_*` handler invocations. Running `tag --help` MUST NOT trigger any network or subprocess calls. |
 | NFR-08 | CLI startup time | `tag --help` wall time MUST NOT increase by more than 5 ms due to this feature (enforced by import isolation) |
 | NFR-09 | Error message quality | Every error from `tag mcp host` MUST include the server name, the attempted operation, the underlying error message, and an actionable next step. Generic "Operation failed" messages are not acceptable. |
 | NFR-10 | Cross-platform | Docker backend MUST work on macOS (ARM64 and x86_64), Ubuntu 22.04+, and Debian 12+. Modal backend is platform-agnostic (cloud-side). |
@@ -350,18 +352,28 @@ tag mcp host quota reset <server-name>
 
 ## 10. Technical Design
 
-### 10.1 New Files
+### 10.1 New Packages / Files
 
 ```
-src/tag/mcp_host.py          # Core hosted server lifecycle and bridge logic
-src/tag/sandbox.py           # Extended with ContainerBackend.MCP_HOST (see PRD-028)
-tests/test_mcp_host.py       # Unit and integration tests
+internal/mcp/host/            # Package mcphost: lifecycle, bridge, quota, contract, audit
+  host.go                     #   Add/Remove/Start/Stop orchestration
+  types.go                    #   HostedServerConfig, ContractSnapshot, QuotaState structs
+  contract.go                 #   ComputeContractHash, VerifyAllContractHashes
+  docker.go                   #   DockerStart, DockerStop, DockerLogs (os/exec only)
+  modal.go                    #   Modal REST API client (net/http + backoff)
+  bridge.go                   #   McpStdioBridge: Content-Length framer + quota intercept
+  quota.go                    #   Rolling-window quota enforcement (modernc.org/sqlite WAL)
+  audit.go                    #   WriteAuditEvent (best-effort JSONL append)
+  registry.go                 #   ResolveVersion (net/http + cenkalti/backoff/v4)
+internal/store/migrations/    #   PRD-079 migration applied via modernc.org/sqlite
+  prd079_mcp_host.go          #   migrate079Tables(db *sql.DB) error
+internal/cli/cmd_mcp_host.go  #   CLI handlers wired via go-chi/chi v5 + huma v2
 docs/prd/PRD-079-cloud-hosted-tool-execution.md
 ```
 
 ### 10.2 SQLite DDL
 
-All tables are added via a migration function `_migrate_prd_079_tables(conn)` called from the existing migration chain in `controller.py`.
+All tables are added via `migrate079Tables(db *sql.DB) error` called from the existing migration chain in `internal/store`.  The DDL is language-agnostic SQL executed through `modernc.org/sqlite` (pure-Go, CGO_ENABLED=0, FTS5 built-in); the single-writer discipline is enforced with `gofrs/flock` + `PRAGMA journal_mode=WAL`.
 
 ```sql
 -- Registered hosted MCP servers
@@ -371,15 +383,15 @@ CREATE TABLE IF NOT EXISTS mcp_hosted_servers (
     version         TEXT NOT NULL,                 -- concrete semver, never 'latest'
     image           TEXT NOT NULL,                 -- full image ref with digest
     backend         TEXT NOT NULL CHECK (backend IN ('docker', 'modal')),
-    container_id    TEXT,                          -- Docker container ID or Modal function ID
-    bridge_pid      INTEGER,                       -- PID of the local bridge process
+    container_id    TEXT,                          -- Docker container ID or Modal run ID
+    bridge_goroutine_id TEXT,                      -- opaque ID of the bridge goroutine
     status          TEXT NOT NULL DEFAULT 'stopped'
                         CHECK (status IN ('starting', 'running', 'stopped', 'error')),
     profile         TEXT,                          -- associated TAG profile (nullable)
     quota_calls_limit   INTEGER,                   -- NULL = unlimited
     quota_window_secs   INTEGER,                   -- NULL = no window
-    env_vars        TEXT,                          -- JSON dict of non-secret env vars
-    keychain_refs   TEXT,                          -- JSON dict of key -> keychain service name
+    env_vars        TEXT,                          -- JSON object of non-secret env vars
+    keychain_refs   TEXT,                          -- JSON object of key -> keychain service name
     registered_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     last_started_at TEXT,
     last_stopped_at TEXT
@@ -433,29 +445,17 @@ CREATE TABLE IF NOT EXISTS mcp_host_call_log (
 CREATE INDEX IF NOT EXISTS idx_mhcl_server ON mcp_host_call_log(server_name, called_at);
 ```
 
-### 10.3 Core Dataclasses
+### 10.3 Core Go Structs
 
-```python
-# src/tag/mcp_host.py
-from __future__ import annotations
+Pydantic dataclasses are replaced by plain Go structs tagged for `encoding/json`.  Schema generation for huma v2 uses `invopop/jsonschema`.
 
-import hashlib
-import json
-import os
-import subprocess
-import threading
-import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Iterator, Optional
+```go
+// internal/mcp/host/types.go
+package mcphost
 
-BACKENDS = {"docker", "modal"}
-QUOTA_WINDOWS = {"1h": 3600, "24h": 86400, "7d": 604800}
-AUDIT_LOG = Path.home() / ".tag" / "runtime" / "mcp-host-audit.jsonl"
+import "time"
 
-# Default image resolver: maps server name + version to a container image.
-# Users can override with --image.
-DEFAULT_IMAGE_MAP: dict[str, str] = {
+var defaultImageMap = map[string]string{
     "notion":     "ghcr.io/modelcontextprotocol/notion-mcp",
     "playwright": "ghcr.io/modelcontextprotocol/playwright-mcp",
     "postgres":   "ghcr.io/modelcontextprotocol/postgres-mcp",
@@ -464,414 +464,507 @@ DEFAULT_IMAGE_MAP: dict[str, str] = {
     "slack":      "ghcr.io/modelcontextprotocol/slack-mcp",
 }
 
+// HostedServerConfig is the persisted and runtime configuration for one hosted MCP server.
+type HostedServerConfig struct {
+    Name            string            `json:"name"`
+    Version         string            `json:"version"`          // always concrete semver
+    Image           string            `json:"image"`            // full image ref with digest
+    Backend         string            `json:"backend"`          // "docker" | "modal"
+    Profile         string            `json:"profile,omitempty"`
+    QuotaCallsLimit *int64            `json:"quota_calls_limit,omitempty"` // nil = unlimited
+    QuotaWindowSecs *int64            `json:"quota_window_secs,omitempty"` // nil = no window
+    EnvVars         map[string]string `json:"env_vars,omitempty"`
+    KeychainRefs    map[string]string `json:"keychain_refs,omitempty"`
+    PullPolicy      string            `json:"pull_policy"` // "always" | "if-absent" | "never"
+    NoPin           bool              `json:"no_pin,omitempty"`
+}
 
-@dataclass
-class HostedServerConfig:
-    name: str
-    version: str                            # always concrete semver
-    image: str                              # full image ref: registry/name:tag@sha256:...
-    backend: str                            # 'docker' | 'modal'
-    profile: Optional[str] = None
-    quota_calls_limit: Optional[int] = None
-    quota_window_secs: Optional[int] = None # None = no rolling window
-    env_vars: dict[str, str] = field(default_factory=dict)
-    keychain_refs: dict[str, str] = field(default_factory=dict)
-    pull_policy: str = "if-absent"          # 'always' | 'if-absent' | 'never'
-    no_pin: bool = False
+// ContractSnapshot holds the version-pinned tool interface hash for one server version.
+type ContractSnapshot struct {
+    ServerName   string       `json:"server_name"`
+    Version      string       `json:"version"`
+    ContractHash string       `json:"contract_hash"` // "sha256:<hex>"
+    ToolCount    int          `json:"tool_count"`
+    Tools        []ToolRecord `json:"tools"`
+    CapturedAt   time.Time    `json:"captured_at"`
+}
 
+// ToolRecord is one row of per-tool data within a ContractSnapshot.
+type ToolRecord struct {
+    Name        string `json:"name"`
+    Description string `json:"description"`
+    SchemaHash  string `json:"schema_hash"` // "sha256:<hex>"
+}
 
-@dataclass
-class ContractSnapshot:
-    server_name: str
-    version: str
-    contract_hash: str                      # 'sha256:<hex>'
-    tool_count: int
-    tools: list[dict[str, str]]             # [{name, description, schema_hash}]
-    captured_at: str
+// QuotaState is the live rolling-window counters for one server (or tool).
+type QuotaState struct {
+    ServerName    string    `json:"server_name"`
+    ToolName      *string   `json:"tool_name,omitempty"` // nil = server-level
+    WindowStartAt time.Time `json:"window_start_at"`
+    WindowEndAt   time.Time `json:"window_end_at"`
+    CallsUsed     int64     `json:"calls_used"`
+    CallsLimit    *int64    `json:"calls_limit,omitempty"` // nil = unlimited
+}
 
+func (q QuotaState) IsExceeded() bool {
+    return q.CallsLimit != nil && q.CallsUsed >= *q.CallsLimit
+}
 
-@dataclass
-class QuotaState:
-    server_name: str
-    tool_name: Optional[str]               # None = server-level
-    window_start_at: str
-    window_end_at: str
-    calls_used: int
-    calls_limit: Optional[int]
-
-    @property
-    def is_exceeded(self) -> bool:
-        return self.calls_limit is not None and self.calls_used >= self.calls_limit
-
-    @property
-    def utilization_pct(self) -> float:
-        if self.calls_limit is None or self.calls_limit == 0:
-            return 0.0
-        return (self.calls_used / self.calls_limit) * 100.0
-
-
-@dataclass
-class BridgeProcess:
-    """Manages the stdio proxy between Hermes and a hosted MCP container."""
-    server_name: str
-    container_id: str
-    backend: str
-    _proc: Optional[subprocess.Popen] = field(default=None, repr=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+func (q QuotaState) UtilizationPct() float64 {
+    if q.CallsLimit == nil || *q.CallsLimit == 0 {
+        return 0.0
+    }
+    return float64(q.CallsUsed) / float64(*q.CallsLimit) * 100.0
+}
 ```
 
 ### 10.4 Contract Hash Algorithm
 
-The hash must be deterministic across Python versions, OS platforms, and JSON library implementations:
+The hash must be deterministic across Go versions, OS platforms, and `encoding/json` implementations.  `encoding/json` sorts map keys lexicographically by default, providing the same guarantee as Python's `json.dumps(sort_keys=True)`.
 
-```python
-def compute_contract_hash(tools: list[dict[str, Any]]) -> tuple[str, list[dict[str, str]]]:
-    """
-    Compute a SHA-256 content hash of the tool interface.
+```go
+// internal/mcp/host/contract.go
+package mcphost
 
-    Input: raw MCP tools array from initialize response.
-    Output: (contract_hash, per_tool_records) where contract_hash is 'sha256:<hex>'
-    and per_tool_records is the list stored in mcp_contract_snapshots.tools_json.
+import (
+    "crypto/sha256"
+    "encoding/json"
+    "fmt"
+    "sort"
+)
 
-    Normalization rules:
-    1. Only include keys: name, description, inputSchema (ignore all others).
-    2. Sort tools list by name ascending.
-    3. Serialize with json.dumps(sort_keys=True, separators=(',', ':')) — no whitespace.
-    4. Encode as UTF-8 before hashing.
-    """
-    normalized = []
-    per_tool = []
-    for tool in sorted(tools, key=lambda t: t["name"]):
-        canonical = {
-            "name": tool["name"],
-            "description": tool.get("description", ""),
-            "inputSchema": tool.get("inputSchema", {}),
+// canonicalTool contains only the three fields included in the contract hash.
+// Excluding all other MCP server metadata ensures the hash is stable across
+// non-semantic server updates (e.g., packaging changes).
+type canonicalTool struct {
+    Name        string         `json:"name"`
+    Description string         `json:"description"`
+    InputSchema map[string]any `json:"inputSchema"`
+}
+
+// ComputeContractHash derives a SHA-256 content hash of the MCP tool interface.
+//
+// Input:  raw tools slice from the MCP initialize response ([]map[string]any).
+// Output: (contractHash, perToolRecords, error).  contractHash is "sha256:<hex>".
+//
+// Normalization rules:
+//  1. Only include fields: name, description, inputSchema (all others discarded).
+//  2. Sort tools by name ascending.
+//  3. Marshal with encoding/json — map keys are sorted lexicographically.
+//  4. Hash UTF-8 bytes with crypto/sha256.
+func ComputeContractHash(tools []map[string]any) (string, []ToolRecord, error) {
+    sorted := make([]map[string]any, len(tools))
+    copy(sorted, tools)
+    sort.Slice(sorted, func(i, j int) bool {
+        return fmt.Sprint(sorted[i]["name"]) < fmt.Sprint(sorted[j]["name"])
+    })
+
+    canonical := make([]canonicalTool, 0, len(sorted))
+    records := make([]ToolRecord, 0, len(sorted))
+
+    for _, t := range sorted {
+        name, _ := t["name"].(string)
+        desc, _ := t["description"].(string)
+        schema, _ := t["inputSchema"].(map[string]any)
+        if schema == nil {
+            schema = map[string]any{}
         }
-        canonical_bytes = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        tool_hash = "sha256:" + hashlib.sha256(canonical_bytes).hexdigest()
-        normalized.append(canonical)
-        per_tool.append({"name": tool["name"], "description": tool.get("description", ""), "schema_hash": tool_hash})
+        ct := canonicalTool{Name: name, Description: desc, InputSchema: schema}
+        canonical = append(canonical, ct)
 
-    full_payload = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    contract_hash = "sha256:" + hashlib.sha256(full_payload).hexdigest()
-    return contract_hash, per_tool
+        toolBytes, err := json.Marshal(ct)
+        if err != nil {
+            return "", nil, fmt.Errorf("marshal tool %q: %w", name, err)
+        }
+        h := sha256.Sum256(toolBytes)
+        records = append(records, ToolRecord{
+            Name:        name,
+            Description: desc,
+            SchemaHash:  fmt.Sprintf("sha256:%x", h),
+        })
+    }
+
+    fullBytes, err := json.Marshal(canonical)
+    if err != nil {
+        return "", nil, fmt.Errorf("marshal canonical tool list: %w", err)
+    }
+    h := sha256.Sum256(fullBytes)
+    return fmt.Sprintf("sha256:%x", h), records, nil
+}
 ```
 
 ### 10.5 Docker Backend: Container Lifecycle
 
-```python
-def docker_start(config: HostedServerConfig, env_secrets: dict[str, str]) -> str:
-    """
-    Pull (per pull_policy), start, and return container ID.
-    All operations use subprocess.run(["docker", ...]) — no Python Docker SDK.
-    """
-    # 1. Resolve or verify image
-    if config.pull_policy == "if-absent":
-        result = subprocess.run(
-            ["docker", "image", "inspect", config.image],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            _docker_pull(config.image)
-    elif config.pull_policy == "always":
-        _docker_pull(config.image)
-    elif config.pull_policy == "never":
-        result = subprocess.run(
-            ["docker", "image", "inspect", config.image],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Image {config.image!r} not found locally and --pull-policy=never was set. "
-                f"Run: docker pull {config.image}"
-            )
+All Docker operations use `os/exec.CommandContext` — no `docker/docker` moby client SDK.  Context cancellation propagates through every subprocess call, enabling clean timeout escalation.
 
-    # 2. Build docker run command
-    container_name = f"tag-mcp-{config.name}-{os.urandom(4).hex()}"
-    cmd = [
-        "docker", "run",
-        "--detach",
-        "--name", container_name,
-        "--label", f"tag.mcp.server={config.name}",
-        "--label", f"tag.mcp.version={config.version}",
-        "--rm",                             # auto-remove on stop
-        "--network", "host",               # needed for Hermes on loopback
+```go
+// internal/mcp/host/docker.go
+package mcphost
+
+import (
+    "context"
+    "crypto/rand"
+    "encoding/hex"
+    "fmt"
+    "io"
+    "os/exec"
+    "strings"
+)
+
+// DockerStart pulls (per PullPolicy), starts, and returns the container ID.
+func DockerStart(ctx context.Context, cfg HostedServerConfig, envSecrets map[string]string) (string, error) {
+    switch cfg.PullPolicy {
+    case "if-absent":
+        if err := exec.CommandContext(ctx, "docker", "image", "inspect", cfg.Image).Run(); err != nil {
+            if err := dockerPull(ctx, cfg.Image); err != nil {
+                return "", err
+            }
+        }
+    case "always":
+        if err := dockerPull(ctx, cfg.Image); err != nil {
+            return "", err
+        }
+    case "never":
+        if err := exec.CommandContext(ctx, "docker", "image", "inspect", cfg.Image).Run(); err != nil {
+            return "", fmt.Errorf("image %q not found locally and pull-policy=never; run: docker pull %s",
+                cfg.Image, cfg.Image)
+        }
+    }
+
+    b := make([]byte, 4)
+    _, _ = rand.Read(b)
+    containerName := fmt.Sprintf("tag-mcp-%s-%s", cfg.Name, hex.EncodeToString(b))
+
+    args := []string{
+        "run", "--detach",
+        "--name", containerName,
+        "--label", fmt.Sprintf("tag.mcp.server=%s", cfg.Name),
+        "--label", fmt.Sprintf("tag.mcp.version=%s", cfg.Version),
+        "--rm",
+        "--network", "host",
         "--memory", "512m",
         "--cpus", "2.0",
         "--pids-limit", "256",
-    ]
-    # Inject non-secret env vars
-    for k, v in config.env_vars.items():
-        cmd += ["-e", f"{k}={v}"]
-    # Inject secrets (resolved at call time, not stored)
-    for k, v in env_secrets.items():
-        cmd += ["-e", f"{k}={v}"]
-    cmd.append(config.image)
+    }
+    for k, v := range cfg.EnvVars {
+        args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+    }
+    for k, v := range envSecrets {
+        args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+    }
+    args = append(args, cfg.Image)
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"docker run failed for {config.name}:\n{result.stderr.strip()}"
-        )
-    return result.stdout.strip()  # container ID
+    out, err := exec.CommandContext(ctx, "docker", args...).Output()
+    if err != nil {
+        return "", fmt.Errorf("docker run for %s: %w", cfg.Name, err)
+    }
+    return strings.TrimSpace(string(out)), nil
+}
 
+// DockerStop stops and removes the container.
+func DockerStop(ctx context.Context, containerID string) error {
+    exec.CommandContext(ctx, "docker", "stop", "--time", "10", containerID).Run() //nolint:errcheck
+    return exec.CommandContext(ctx, "docker", "rm", "--force", containerID).Run()
+}
 
-def docker_stop(container_id: str, server_name: str) -> None:
-    subprocess.run(["docker", "stop", "--time", "10", container_id],
-                   capture_output=True, timeout=20)
-    subprocess.run(["docker", "rm", "--force", container_id],
-                   capture_output=True, timeout=10)
+// DockerLogs streams container stdout+stderr lines on the returned channel.
+// The channel is closed when the log stream ends or ctx is cancelled.
+func DockerLogs(ctx context.Context, containerID string, tail int, follow bool) (<-chan string, error) {
+    args := []string{"logs", "--timestamps", "--tail", fmt.Sprintf("%d", tail)}
+    if follow {
+        args = append(args, "--follow")
+    }
+    args = append(args, containerID)
 
+    cmd := exec.CommandContext(ctx, "docker", args...)
+    pr, pw := io.Pipe()
+    cmd.Stdout = pw
+    cmd.Stderr = pw
+    if err := cmd.Start(); err != nil {
+        return nil, err
+    }
 
-def docker_logs(container_id: str, *, tail: int = 50, follow: bool = False) -> Iterator[str]:
-    cmd = ["docker", "logs", "--timestamps"]
-    if follow:
-        cmd.append("--follow")
-    cmd += ["--tail", str(tail), container_id]
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            yield line.rstrip("\n")
+    ch := make(chan string, 64)
+    go func() {
+        defer close(ch)
+        defer pw.Close()
+        buf := make([]byte, 4096)
+        var line strings.Builder
+        for {
+            n, err := pr.Read(buf)
+            for _, b := range buf[:n] {
+                if b == '\n' {
+                    ch <- line.String()
+                    line.Reset()
+                } else {
+                    line.WriteByte(b)
+                }
+            }
+            if err != nil {
+                if line.Len() > 0 {
+                    ch <- line.String()
+                }
+                return
+            }
+        }
+    }()
+    return ch, nil
+}
 ```
 
 ### 10.6 Stdio Bridge Protocol
 
-The bridge sits between Hermes (which speaks MCP over stdio) and the container (which also speaks MCP over stdio via `docker exec`). The bridge:
+The bridge sits between the TAG process (Hermes) and the container (via `docker exec`).  Concurrency is handled by goroutines and channels instead of threads.
 
-1. Opens a `docker exec -i <container_id> <mcp-entrypoint>` subprocess.
-2. Forwards raw bytes from Hermes's stdin to the exec process's stdin.
-3. Intercepts each complete JSON-RPC message from the exec process's stdout.
-4. Before forwarding a `tools/call` response back to Hermes, increments the quota counter and checks the limit.
-5. Forwards the (possibly replaced) message to Hermes's stdout.
+1. Launches `docker exec -i <containerID> <mcp-entrypoint>` via `os/exec.CommandContext` with `cmd.SysProcAttr{Setpgid: true}` so SIGKILL reaches the whole process group.
+2. Two goroutines (`upstream` → container, `downstream` → Hermes) run concurrently via `golang.org/x/sync/errgroup`.
+3. The downstream goroutine intercepts each complete `tools/call` request, checks/increments the quota, and either forwards the frame or returns a synthetic MCP error without touching the container.
+4. `Content-Length: <N>\r\n\r\n<N bytes of JSON>` framing is handled by `readFrame`/`writeFrame`; malformed frames are logged to the audit file and converted to MCP error responses.
 
-The MCP stdio framing is: `Content-Length: <N>\r\n\r\n<N bytes of JSON>`. The bridge MUST buffer input correctly and MUST NOT split or merge frames.
+```go
+// internal/mcp/host/bridge.go
+package mcphost
 
-```python
-class McpStdioBridge:
-    """
-    Transparent proxy between Hermes and a containerized MCP server.
-    Intercepts tools/call requests to enforce quota before forwarding.
-    """
+import (
+    "bufio"
+    "context"
+    "database/sql"
+    "encoding/json"
+    "fmt"
+    "io"
+    "strconv"
+    "strings"
+    "sync"
+)
 
-    def __init__(self, config: HostedServerConfig, container_id: str, db_path: Path):
-        self.config = config
-        self.container_id = container_id
-        self.db_path = db_path
-        self._quota_lock = threading.Lock()
+// McpStdioBridge is a transparent proxy between Hermes and a containerized MCP server.
+// Quota enforcement runs in the bridge goroutine; no external locking is needed beyond
+// the per-bridge quotaMu which guards the SQLite BEGIN IMMEDIATE transaction.
+type McpStdioBridge struct {
+    cfg         HostedServerConfig
+    containerID string
+    db          *sql.DB
+    quotaMu     sync.Mutex
+}
 
-    def _read_frame(self, stream) -> Optional[bytes]:
-        """Read one Content-Length-framed JSON-RPC message."""
-        header = b""
-        while not header.endswith(b"\r\n\r\n"):
-            byte = stream.read(1)
-            if not byte:
-                return None
-            header += byte
-        for line in header.split(b"\r\n"):
-            if line.lower().startswith(b"content-length:"):
-                length = int(line.split(b":", 1)[1].strip())
-                return stream.read(length)
-        return None
+// readFrame reads one Content-Length-framed JSON-RPC message from r.
+func readFrame(r *bufio.Reader) ([]byte, error) {
+    var contentLength int
+    for {
+        line, err := r.ReadString('\n')
+        if err != nil {
+            return nil, fmt.Errorf("read MCP header: %w", err)
+        }
+        line = strings.TrimRight(line, "\r\n")
+        if line == "" {
+            break // blank line terminates headers
+        }
+        if strings.HasPrefix(strings.ToLower(line), "content-length:") {
+            val := strings.TrimSpace(line[len("content-length:"):])
+            var err error
+            contentLength, err = strconv.Atoi(val)
+            if err != nil {
+                return nil, fmt.Errorf("invalid Content-Length %q: %w", val, err)
+            }
+        }
+    }
+    if contentLength == 0 {
+        return nil, fmt.Errorf("missing or zero Content-Length header")
+    }
+    body := make([]byte, contentLength)
+    if _, err := io.ReadFull(r, body); err != nil {
+        return nil, fmt.Errorf("read MCP body: %w", err)
+    }
+    return body, nil
+}
 
-    def _write_frame(self, stream, payload: bytes) -> None:
-        frame = f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
-        stream.write(frame)
-        stream.flush()
+// writeFrame writes one Content-Length-framed JSON-RPC message to w.
+func writeFrame(w io.Writer, payload []byte) error {
+    if _, err := fmt.Fprintf(w, "Content-Length: %d\r\n\r\n", len(payload)); err != nil {
+        return err
+    }
+    _, err := w.Write(payload)
+    return err
+}
 
-    def _check_and_increment_quota(self, tool_name: str) -> tuple[bool, int, Optional[int]]:
-        """
-        Returns (allowed, calls_used_after, calls_limit).
-        Thread-safe via _quota_lock.
-        """
-        import sqlite3
-        with self._quota_lock:
-            conn = sqlite3.connect(str(self.db_path), timeout=5)
-            conn.execute("PRAGMA journal_mode=WAL")
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                now_iso = _utc_now()
-                # Find or create rolling window row
-                row = conn.execute(
-                    """
-                    SELECT id, calls_used, calls_limit, window_end_at
-                    FROM mcp_host_quota_usage
-                    WHERE server_name = ? AND tool_name IS NULL
-                      AND window_end_at > ?
-                    ORDER BY window_start_at DESC LIMIT 1
-                    """,
-                    (self.config.name, now_iso)
-                ).fetchone()
+// checkAndIncrementQuota is concurrency-safe via quotaMu + SQLite WAL BEGIN IMMEDIATE.
+// Returns (allowed, callsUsedAfter, callsLimit).
+func (b *McpStdioBridge) checkAndIncrementQuota(ctx context.Context, toolName string) (bool, int64, *int64, error) {
+    b.quotaMu.Lock()
+    defer b.quotaMu.Unlock()
 
-                if row is None:
-                    # Start new rolling window
-                    window_secs = self.config.quota_window_secs or 3600
-                    window_end = _add_seconds(now_iso, window_secs)
-                    conn.execute(
-                        """
-                        INSERT INTO mcp_host_quota_usage
-                          (server_name, tool_name, window_start_at, window_end_at,
-                           calls_used, calls_limit)
-                        VALUES (?, NULL, ?, ?, 1, ?)
-                        """,
-                        (self.config.name, now_iso, window_end, self.config.quota_calls_limit)
-                    )
-                    conn.commit()
-                    return True, 1, self.config.quota_calls_limit
+    tx, err := b.db.BeginTx(ctx, nil) // store layer sets PRAGMA journal_mode=WAL + BEGIN IMMEDIATE
+    if err != nil {
+        return false, 0, nil, err
+    }
+    defer tx.Rollback() //nolint:errcheck
 
-                row_id, calls_used, calls_limit, _ = row
-                if calls_limit is not None and calls_used >= calls_limit:
-                    conn.commit()
-                    return False, calls_used, calls_limit
-
-                new_count = calls_used + 1
-                conn.execute(
-                    "UPDATE mcp_host_quota_usage SET calls_used = ? WHERE id = ?",
-                    (new_count, row_id)
-                )
-                conn.commit()
-                return True, new_count, calls_limit
-            finally:
-                conn.close()
+    // Rolling-window query + upsert — identical SQL logic to the original design.
+    // Full implementation lives in internal/mcp/host/quota.go; placeholder here.
+    _ = tx.Commit()
+    return true, 0, nil, nil
+}
 ```
 
 ### 10.7 Version Resolution from MCP Registry
 
-```python
-def resolve_version_from_registry(server_name: str, version: str) -> str:
-    """
-    If version == 'latest', query the MCP registry and return the concrete tag.
-    If version is already a semver string, validate it is published and return as-is.
-    Raises ValueError with an actionable message on failure.
-    """
-    import httpx  # lazy import — only when mcp host add is invoked
+`httpx` is replaced by the standard `net/http` client.  Retries use `cenkalti/backoff/v4`.  The HTTP client is dialed through `internal/netguard` (connect-time IP-pin + redirect-revalidation) to prevent SSRF.
 
-    REGISTRY_BASE = "https://registry.modelcontextprotocol.io"
-    # Map short names to registry reverse-domain names
-    name_map = {
-        "notion": "io.modelcontextprotocol/notion",
-        "playwright": "io.modelcontextprotocol/playwright",
-        "postgres": "io.modelcontextprotocol/postgres",
+```go
+// internal/mcp/host/registry.go
+package mcphost
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "net/url"
+
+    "github.com/cenkalti/backoff/v4"
+)
+
+const registryBase = "https://registry.modelcontextprotocol.io"
+
+// ResolveVersion queries the MCP registry for a concrete version tag.
+// If version == "latest", returns the entry marked isLatest.
+// All HTTP calls are dialed through the internal/netguard SSRF-safe dialer.
+// 5xx responses are retried with exponential backoff; 4xx errors are permanent.
+func ResolveVersion(ctx context.Context, client *http.Client, serverName, version string) (string, error) {
+    registryName := serverNameToRegistryName(serverName)
+    encoded := url.PathEscape(registryName)
+
+    var data registryVersionsResponse
+    op := func() error {
+        req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+            fmt.Sprintf("%s/v0.1/servers/%s/versions", registryBase, encoded), nil)
+        if err != nil {
+            return backoff.Permanent(err)
+        }
+        if version != "latest" {
+            q := req.URL.Query()
+            q.Set("version", version)
+            req.URL.RawQuery = q.Encode()
+        }
+        resp, err := client.Do(req)
+        if err != nil {
+            return err // network error — retryable
+        }
+        defer resp.Body.Close()
+        if resp.StatusCode >= 500 {
+            return fmt.Errorf("registry returned %d", resp.StatusCode) // retryable
+        }
+        if resp.StatusCode != http.StatusOK {
+            return backoff.Permanent(fmt.Errorf("registry %d for %s", resp.StatusCode, serverName))
+        }
+        return json.NewDecoder(resp.Body).Decode(&data)
     }
-    registry_name = name_map.get(server_name, server_name)
-    encoded = registry_name.replace("/", "%2F")
 
-    try:
-        with httpx.Client(timeout=10) as client:
-            resp = client.get(
-                f"{REGISTRY_BASE}/v0.1/servers/{encoded}/versions",
-                params={"version": version} if version != "latest" else {}
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPError as exc:
-        raise ValueError(
-            f"MCP registry lookup failed for {server_name!r}: {exc}\n"
-            f"Check your network connection or specify --image explicitly."
-        ) from exc
+    bo := backoff.WithContext(backoff.NewExponentialBackOff(), ctx)
+    if err := backoff.Retry(op, bo); err != nil {
+        return "", fmt.Errorf("MCP registry lookup for %q: %w\nSpecify --image to bypass registry.", serverName, err)
+    }
 
-    servers = data.get("servers", [])
-    if not servers:
-        raise ValueError(
-            f"No versions found for {server_name!r} in MCP registry.\n"
-            f"Use --image to specify a container image directly."
-        )
-
-    if version == "latest":
-        # Find the entry with isLatest=True in _meta
-        for entry in servers:
-            if entry.get("_meta", {}).get("isLatest", False):
-                return entry["version"]
-        # Fallback: return the first entry (registry sorts newest-first)
-        return servers[0]["version"]
-    else:
-        for entry in servers:
-            if entry["version"] == version:
-                return version
-        raise ValueError(
-            f"Version {version!r} not found for {server_name!r} in MCP registry.\n"
-            f"Available: {[e['version'] for e in servers[:5]]}"
-        )
+    if len(data.Servers) == 0 {
+        return "", fmt.Errorf("no versions found for %q; use --image to specify a container image directly", serverName)
+    }
+    if version == "latest" {
+        for _, e := range data.Servers {
+            if e.Meta.IsLatest {
+                return e.Version, nil
+            }
+        }
+        return data.Servers[0].Version, nil
+    }
+    for _, e := range data.Servers {
+        if e.Version == version {
+            return version, nil
+        }
+    }
+    avail := make([]string, 0, min(5, len(data.Servers)))
+    for _, e := range data.Servers[:min(5, len(data.Servers))] {
+        avail = append(avail, e.Version)
+    }
+    return "", fmt.Errorf("version %q not found for %q; available: %v", version, serverName, avail)
+}
 ```
 
 ### 10.8 Integration Points
 
-**controller.py additions:**
+**`internal/cli/cmd_mcp_host.go` — CLI handlers** (registered under `tag mcp host` via go-chi/chi v5 + huma v2):
 
-```python
-def cmd_mcp_host_add(cfg, args):
-    """tag mcp host add <name> [flags]"""
-    from tag.mcp_host import (
-        HostedServerConfig, resolve_version_from_registry,
-        resolve_image, docker_start, capture_contract_snapshot,
-        register_hosted_server, write_audit_event,
-    )
-    # ... implementation delegates to mcp_host.py functions
+```go
+// All handler functions call into internal/mcp/host with zero init() side effects.
+// The binary's startup cost is unaffected until a `tag mcp host` subcommand is invoked.
 
-def cmd_mcp_host_list(cfg, args):
-    """tag mcp host list [--json]"""
-    ...
-
-def cmd_mcp_host_logs(cfg, args):
-    """tag mcp host logs <name> [--tail N] [--follow]"""
-    ...
-
-def cmd_mcp_host_remove(cfg, args):
-    """tag mcp host remove <name>"""
-    ...
-
-def cmd_mcp_host_inspect(cfg, args):
-    """tag mcp host inspect <name> [--json] [--diff <other-version>]"""
-    ...
-
-def cmd_mcp_host_start(cfg, args):
-    """tag mcp host start <name>"""
-    ...
-
-def cmd_mcp_host_stop(cfg, args):
-    """tag mcp host stop <name>"""
-    ...
+func CmdMcpHostAdd(cfg *config.Config, args AddArgs) error {
+    return mcphost.Add(context.Background(), cfg, args)
+}
+func CmdMcpHostList(cfg *config.Config, args ListArgs) error   { ... }
+func CmdMcpHostLogs(cfg *config.Config, args LogsArgs) error   { ... }
+func CmdMcpHostRemove(cfg *config.Config, args RemoveArgs) error { ... }
+func CmdMcpHostInspect(cfg *config.Config, args InspectArgs) error { ... }
+func CmdMcpHostStart(cfg *config.Config, args StartArgs) error { ... }
+func CmdMcpHostStop(cfg *config.Config, args StopArgs) error   { ... }
 ```
 
-**Hermes session startup hook:**
+**Hermes session startup hook** (`internal/runtime/session.go`), before spawning the Hermes process:
 
-In the existing `run_hermes()` function in `controller.py`, after loading profile config and before spawning the Hermes process, add:
-
-```python
-# PRD-079: verify contract hashes for all hosted MCP servers in this profile
-if profile_config.get("mcp", {}).get("hosted_servers"):
-    from tag.mcp_host import verify_all_contract_hashes
-    violations = verify_all_contract_hashes(
-        profile_config["mcp"]["hosted_servers"],
-        conn,
-        allow_drift=os.environ.get("MCP_HOST_ALLOW_DRIFT") == "1",
-    )
-    if violations:
-        for v in violations:
-            print(f"ERROR: Contract hash mismatch for {v.server_name}@{v.version}", file=sys.stderr)
-            print(f"  Expected: {v.expected_hash}", file=sys.stderr)
-            print(f"  Got:      {v.actual_hash}", file=sys.stderr)
-        sys.exit(1)
+```go
+// PRD-079: verify contract hashes for all hosted MCP servers in this profile.
+if len(profileCfg.MCP.HostedServers) > 0 {
+    allowDrift := os.Getenv("MCP_HOST_ALLOW_DRIFT") == "1"
+    violations, err := mcphost.VerifyAllContractHashes(ctx, db, profileCfg.MCP.HostedServers, allowDrift)
+    if err != nil {
+        return fmt.Errorf("contract hash verification: %w", err)
+    }
+    for _, v := range violations {
+        fmt.Fprintf(os.Stderr, "ERROR: Contract hash mismatch for %s@%s\n  Expected: %s\n  Got:      %s\n",
+            v.ServerName, v.Version, v.ExpectedHash, v.ActualHash)
+    }
+    if len(violations) > 0 {
+        return fmt.Errorf("contract hash mismatch — set MCP_HOST_ALLOW_DRIFT=1 or re-pin with: tag mcp host add")
+    }
+}
 ```
 
-**Audit log writer:**
+**Audit log writer** (`internal/mcp/host/audit.go`):
 
-```python
-def write_audit_event(event: str, **kwargs) -> None:
-    """Append a structured event to the audit JSONL log. Non-blocking."""
-    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-    record = {"timestamp": _utc_now(), "event": event, **kwargs}
-    try:
-        with open(AUDIT_LOG, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, separators=(",", ":")) + "\n")
-    except OSError:
-        pass  # Never crash the agent session due to audit log failures
+```go
+var auditLog = filepath.Join(os.Getenv("HOME"), ".tag", "runtime", "mcp-host-audit.jsonl")
+
+// WriteAuditEvent appends a structured event to the audit JSONL log.
+// Best-effort: errors are silently discarded so an audit failure never crashes
+// the agent session. The write is a single os.File.Write call and is atomic
+// on POSIX for payloads under the filesystem's atomic-write limit (~4 KB).
+func WriteAuditEvent(event string, fields map[string]any) {
+    record := map[string]any{
+        "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+        "event":     event,
+    }
+    for k, v := range fields {
+        record[k] = v
+    }
+    b, err := json.Marshal(record)
+    if err != nil {
+        return
+    }
+    b = append(b, '\n')
+    _ = os.MkdirAll(filepath.Dir(auditLog), 0o700)
+    f, err := os.OpenFile(auditLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+    if err != nil {
+        return
+    }
+    defer f.Close()
+    _, _ = f.Write(b)
+}
 ```
 
 ---
 
 ## 11. Security Considerations
 
-1. **Secret handling**: Secrets passed via `--secret KEY=<keychain-ref>` are fetched from the OS keychain using `keyring.get_password(service, account)` at container start time. The resolved secret value exists only in the process environment of the container start subprocess and is never written to disk, SQLite, or the audit log. The keychain reference name (not the value) is stored in `mcp_hosted_servers.keychain_refs`.
+1. **Secret handling**: Secrets passed via `--secret KEY=<keychain-ref>` are fetched from the OS keychain using `zalando/go-keyring` (`keyring.Get(service, account)`) at container start time. The resolved secret value exists only in the environment map passed to `DockerStart` or the Modal request and is never written to disk, SQLite, or the audit log. The keychain reference name (not the value) is stored in `mcp_hosted_servers.keychain_refs`.
 
 2. **Image provenance**: TAG does not verify image signatures or digests by default. Users who require image provenance SHOULD specify images with `@sha256:<digest>` notation (e.g., `--image ghcr.io/mcp/notion@sha256:abc123`). A future feature may add `cosign verify` as an optional gate.
 
@@ -895,98 +988,110 @@ def write_audit_event(event: str, **kwargs) -> None:
 
 ## 12. Testing Strategy
 
+All tests use the Go standard `testing` package plus `github.com/stretchr/testify/assert` and `github.com/stretchr/testify/require`.  HTTP interactions are mocked with `net/http/httptest`.  There are no pytest markers; integration tests are gated by the `//go:build integration` build tag and skipped when `DOCKER_AVAILABLE != "1"`.
+
 ### 12.1 Unit Tests
 
 ```
-tests/test_mcp_host.py::test_compute_contract_hash_deterministic
-    - Same tool list in different order → same hash
-    - Extra fields in tool dict → ignored (only name/description/inputSchema hashed)
-    - Empty description → treated as empty string not omitted
+internal/mcp/host/contract_test.go
+    TestComputeContractHash_Deterministic
+        - Same tool list in different order → same hash
+        - Extra fields in raw map → ignored (only name/description/inputSchema hashed)
+        - Empty description → treated as empty string, not omitted
 
-tests/test_mcp_host.py::test_compute_contract_hash_sensitivity
-    - Change one tool name → different hash
-    - Change one description → different hash
-    - Add one tool → different hash
-    - Change inputSchema field type → different hash
+    TestComputeContractHash_Sensitivity
+        - Change one tool name → different hash
+        - Change one description → different hash
+        - Add one tool → different hash
+        - Change inputSchema field type → different hash
 
-tests/test_mcp_host.py::test_quota_enforcement_under_limit
-    - 99 calls with limit=100 → all allowed, calls_used=99
+internal/mcp/host/quota_test.go
+    TestQuotaEnforcement_UnderLimit
+        - 99 calls with limit=100 → all allowed, calls_used=99
 
-tests/test_mcp_host.py::test_quota_enforcement_at_limit
-    - 100th call with limit=100 → allowed (boundary), calls_used=100
+    TestQuotaEnforcement_AtLimit
+        - 100th call with limit=100 → allowed (boundary), calls_used=100
 
-tests/test_mcp_host.py::test_quota_enforcement_over_limit
-    - 101st call with limit=100 → blocked, returns MCP error JSON
+    TestQuotaEnforcement_OverLimit
+        - 101st call with limit=100 → blocked, returns MCP error JSON with code -32099
 
-tests/test_mcp_host.py::test_quota_rolling_window_reset
-    - Advance mock clock past window_end_at → new window starts with calls_used=0
+    TestQuotaRollingWindowReset
+        - Advance mock clock past window_end_at → new window starts with calls_used=0
 
-tests/test_mcp_host.py::test_resolve_version_latest_selects_is_latest
-    - Mock registry response with isLatest=True on entry → returns that version
+internal/mcp/host/registry_test.go
+    TestResolveVersion_LatestSelectsIsLatest
+        - httptest.NewServer returns JSON with isLatest=true on one entry → that version returned
 
-tests/test_mcp_host.py::test_resolve_version_not_found
-    - Version not in registry response → raises ValueError with available list
+    TestResolveVersion_NotFound
+        - Version absent in registry response → error message includes available list
 
-tests/test_mcp_host.py::test_secret_not_stored_in_sqlite
-    - After docker_start with --secret, sqlite row has keychain_ref not secret value
+internal/mcp/host/secret_test.go
+    TestSecret_NotStoredInSQLite
+        - After DockerStart with keychain ref, SQLite row stores ref name, not resolved value
 
-tests/test_mcp_host.py::test_audit_log_write_on_os_error
-    - AUDIT_LOG path unwriteable → write_audit_event does not raise
+internal/mcp/host/audit_test.go
+    TestWriteAuditEvent_OSError
+        - auditLog path unwriteable → WriteAuditEvent does not panic or return error
 
-tests/test_mcp_host.py::test_import_isolation
-    - `import tag.controller` does not import modal, docker, or keyring
-    - Verified via sys.modules assertion
+internal/mcp/host/bridge_test.go
+    TestMcpStdioFrame_ReadWriteRoundtrip
+        - Content-Length framing: encode and decode roundtrip is lossless via bytes.Buffer
 
-tests/test_mcp_host.py::test_mcp_stdio_frame_read_write_roundtrip
-    - Content-Length framing: encode and decode roundtrip is lossless
+    TestContractHashMismatch_ReturnsViolation
+        - VerifyAllContractHashes with mismatched stored hash → returns ContractViolation slice
 
-tests/test_mcp_host.py::test_contract_hash_mismatch_raises
-    - verify_all_contract_hashes with mismatched hash → returns ContractViolation
+internal/cli/cmd_mcp_host_test.go
+    TestInitIsolation
+        - Import the mcphost package in a subprocess test; assert no Docker/Modal/keyring
+          calls occur before a cmd_mcp_host_* handler is explicitly invoked.
+          Verified by intercepting os/exec calls with a test hook.
 ```
 
 ### 12.2 Integration Tests
 
-Integration tests require Docker daemon. Marked with `@pytest.mark.integration` and skipped when `DOCKER_AVAILABLE != "1"`.
+Integration tests require a running Docker daemon.  They carry `//go:build integration` and are excluded from `go test ./...`; CI runs them via `go test -tags=integration ./internal/mcp/host/...` when `DOCKER_AVAILABLE=1`.
 
 ```
-tests/test_mcp_host_integration.py::test_docker_start_stop_cycle
-    - Start a lightweight MCP container (e.g., mcp-server-echo image)
-    - Verify container is listed by docker ps
-    - Stop and verify container is removed
+internal/mcp/host/docker_integration_test.go  // go:build integration
 
-tests/test_mcp_host_integration.py::test_contract_snapshot_captured_on_add
-    - tag mcp host add <test-server> → contract snapshot row exists in SQLite
+    TestDockerStartStopCycle
+        - Start a lightweight MCP container (mcp-server-echo image)
+        - Verify container is listed by `docker ps`
+        - Stop and verify container is removed
 
-tests/test_mcp_host_integration.py::test_contract_mismatch_blocks_session
-    - Manually corrupt snapshot hash in SQLite
-    - Run verify_all_contract_hashes → returns violation
-    - Exit code check confirms non-zero
+    TestContractSnapshotCapturedOnAdd
+        - tag mcp host add <test-server> → mcp_contract_snapshots row exists in SQLite
 
-tests/test_mcp_host_integration.py::test_logs_streaming
-    - Start container, request --tail 5 --follow
-    - Send a tool call through the bridge
-    - Assert log line appears within 1 s
+    TestContractMismatchBlocksSession
+        - Manually corrupt contract_hash in SQLite
+        - Run VerifyAllContractHashes → returns ContractViolation; caller exits non-zero
 
-tests/test_mcp_host_integration.py::test_quota_blocks_call_via_bridge
-    - Configure quota_calls_limit=3
-    - Make 4 tool calls through bridge
-    - 4th call receives MCP error without hitting container
+    TestLogsStreaming
+        - Start container, call DockerLogs with tail=5, follow=true
+        - Pump a tool call through the bridge; assert log line arrives within 1 s
+
+    TestQuotaBlocksCallViaBridge
+        - Configure QuotaCallsLimit=3
+        - Send 4 tool calls through the bridge
+        - 4th call receives MCP error response; container never receives the call
 ```
 
-### 12.3 Performance Tests
+### 12.3 Performance Tests (Go Benchmarks)
 
 ```
-tests/test_mcp_host_perf.py::test_bridge_latency_overhead
-    - 100 tool call roundtrips through bridge vs. direct container exec
-    - Assert: median overhead < 5 ms, p99 overhead < 20 ms
+internal/mcp/host/bench_test.go
 
-tests/test_mcp_host_perf.py::test_quota_check_write_latency
-    - 1000 sequential _check_and_increment_quota calls
-    - Assert: median < 1 ms per call (SQLite WAL, single writer)
+    BenchmarkBridgeLatencyOverhead
+        - 100 tool-call roundtrips through McpStdioBridge vs. direct container exec
+        - Assert: median overhead < 5 ms, p99 overhead < 20 ms
 
-tests/test_mcp_host_perf.py::test_audit_log_write_throughput
-    - 10000 sequential write_audit_event calls
-    - Assert: total wall time < 5 s (< 0.5 ms/write)
+    BenchmarkQuotaCheckWriteLatency
+        - 1000 sequential checkAndIncrementQuota calls against an in-memory SQLite DB
+        - Assert: median < 1 ms per call (WAL, single goroutine writer)
+
+    BenchmarkAuditLogWriteThroughput
+        - 10 000 sequential WriteAuditEvent calls to a temp file
+        - Assert: total wall time < 5 s (< 0.5 ms/write)
 ```
 
 ---
@@ -1004,7 +1109,7 @@ tests/test_mcp_host_perf.py::test_audit_log_write_throughput
 | AC-07 | `tag mcp host list --json` emits valid JSON array to stdout; stderr is empty. | `json.loads(stdout)` assertion |
 | AC-08 | `tag mcp host logs notion --tail 20` emits 20 or fewer lines of container log to stdout within 2 s. | Timing assertion |
 | AC-09 | `tag mcp host remove notion` exits 0 and the container is no longer present in `docker ps -a` output. | Integration test + `docker ps` check |
-| AC-10 | `import tag.controller` does not import `modal`, `docker`, or `keyring` in a fresh Python process. | `sys.modules` unit test |
+| AC-10 | Importing the `internal/mcp/host` package in a subprocess test does not trigger any Docker, Modal, or keyring I/O before a `CmdMcpHost*` handler is explicitly called. | `TestInitIsolation` subprocess test with `os/exec` hook interceptor |
 | AC-11 | `--secret NOTION_TOKEN=my-keychain-ref` stores `{"NOTION_TOKEN": "my-keychain-ref"}` in `keychain_refs` column and the actual token is never written to disk or SQLite. | SQL assertion + filesystem scan |
 | AC-12 | Every `tools/call` proxied by the bridge generates an `mcp_host_call_log` row with `latency_ms` populated. | SQL count assertion |
 | AC-13 | The audit JSONL file gains one entry per bridge event (start, stop, call, quota_hit). | File line count assertion |
@@ -1020,15 +1125,21 @@ tests/test_mcp_host_perf.py::test_audit_log_write_throughput
 
 | Dependency | Type | Version | Notes |
 |------------|------|---------|-------|
-| `docker` CLI | External tool | >= 24.0 | Must be in `$PATH`. Python `docker` SDK is NOT used. |
-| `modal` Python SDK | Optional Python dep | >= 0.64 | Lazy-imported only when `--backend modal` is used. Added to `pyproject.toml` as optional extra `[modal]`. |
-| `keyring` | Optional Python dep | >= 24.0 | Lazy-imported only when `--secret` flag is used. Added to `pyproject.toml` as optional extra `[secrets]`. |
-| `httpx` | Python dep | already in project | Used for MCP registry version resolution. Already present. |
-| PRD-028 (sandbox) | Internal | current | `mcp_host.py` reuses `sandbox.py`'s `_utc_now()`, `AUDIT_LOG` path conventions, and the `open_db()` migration pattern from `controller.py`. |
+| `docker` CLI | External tool | >= 24.0 | Must be in `$PATH`. The `docker/docker` moby client SDK is NOT used; all operations go through `os/exec`. |
+| `github.com/modelcontextprotocol/go-sdk` | Go module | v1.6.1 | MCP protocol 2025-11-25 framing for the stdio bridge. Pin this version. |
+| `modernc.org/sqlite` | Go module | current project pin | Pure-Go SQLite (CGO_ENABLED=0), FTS5 built-in. Already used project-wide. Single-writer discipline via `gofrs/flock` + WAL. |
+| `cenkalti/backoff/v4` | Go module | v4 | Exponential retry for MCP registry HTTP calls and Modal REST API. Already in project. |
+| `go.opentelemetry.io/otel` | Go module | current project pin | Hosted server events emitted as OTel spans when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (PRD-013). Already in project. |
+| `go-chi/chi` v5 + `danielgtaylor/huma` v2 | Go modules | current project pins | CLI handler routing and request/response schema. Already in project. |
+| `invopop/jsonschema` | Go module | current project pin | JSON schema generation for huma v2 handler structs. Already in project. |
+| `zalando/go-keyring` | Go module | latest | OS keychain access. Compiled in but called only when `--secret` is used; zero init() side effects. Added to `go.mod`. |
+| `net/http` (stdlib) | Go stdlib | — | MCP registry version resolution and Modal REST API client. Replaces `httpx`. No new dependency. |
+| `internal/netguard` | Internal package | current | SSRF-safe dialer (connect-time IP-pin + redirect-revalidation) wrapping `net/http` clients for registry and Modal calls. |
+| PRD-028 (sandbox) | Internal | current | `internal/mcp/host` reuses UTC-time helpers and audit log path conventions from `internal/sandbox`. |
 | PRD-014 (MCP registry) | Internal | current | Version resolution queries the same MCP registry endpoints defined in PRD-014. |
-| PRD-013 (tracing) | Internal | current | Hosted server events are emitted as OTel spans using `tracing.py` if `OTEL_EXPORTER_OTLP_ENDPOINT` is set. |
-| PRD-034 (secret scanning) | Internal | current | Pattern detection for `--env` secret warnings reuses `security.py` patterns. |
-| MCP Registry API | External service | v0.1 | `https://registry.modelcontextprotocol.io` — used for version resolution. Handle 500s gracefully; fall back to user-specified `--image`. |
+| PRD-013 (tracing) | Internal | current | OTel spans for hosted server events via `internal/tracing`. |
+| PRD-034 (secret scanning) | Internal | current | Pattern detection for `--env` secret warnings reuses patterns in `internal/store` (secret scanner). |
+| MCP Registry API | External service | v0.1 | `https://registry.modelcontextprotocol.io` — used for version resolution. 5xx responses are retried; fall back to `--image` on permanent failure. |
 
 ---
 
@@ -1057,27 +1168,27 @@ tests/test_mcp_host_perf.py::test_audit_log_write_throughput
 
 | Day | Deliverable |
 |-----|-------------|
-| 1-2 | SQLite DDL migration (`_migrate_prd_079_tables`), `HostedServerConfig` / `ContractSnapshot` / `QuotaState` dataclasses, `compute_contract_hash()` with full unit test coverage |
-| 3-4 | Docker backend: `docker_start`, `docker_stop`, `docker_logs`, `_docker_pull` — all via subprocess; `cmd_mcp_host_add` and `cmd_mcp_host_remove` in controller.py; audit log writer |
-| 5-6 | `McpStdioBridge` — Content-Length frame parser, request forwarder, quota intercept logic; `cmd_mcp_host_list --json`; `cmd_mcp_host_logs --follow` |
-| 7 | Contract snapshot capture and `verify_all_contract_hashes`; integration into `run_hermes()` session startup hook |
-| 8 | `cmd_mcp_host_inspect --diff`; `--secret` flag with keyring integration; `--env` secret pattern warning from `security.py` |
+| 1-2 | SQLite DDL migration (`migrate079Tables` in `internal/store/migrations/prd079_mcp_host.go`); `HostedServerConfig`, `ContractSnapshot`, `QuotaState` Go structs in `internal/mcp/host/types.go`; `ComputeContractHash` in `contract.go` with full unit test coverage (`contract_test.go`) |
+| 3-4 | Docker backend: `DockerStart`, `DockerStop`, `DockerLogs`, `dockerPull` — all via `os/exec.CommandContext` in `docker.go`; `CmdMcpHostAdd` and `CmdMcpHostRemove` wired in `internal/cli/cmd_mcp_host.go`; `WriteAuditEvent` in `audit.go` |
+| 5-6 | `McpStdioBridge` in `bridge.go` — `readFrame`/`writeFrame` Content-Length parser, goroutine-based forwarder, quota intercept logic in `quota.go`; `CmdMcpHostList --json`; `CmdMcpHostLogs --follow` streaming via channel |
+| 7 | Contract snapshot capture and `VerifyAllContractHashes`; integration into `internal/runtime/session.go` session startup hook before Hermes spawn |
+| 8 | `CmdMcpHostInspect --diff`; `--secret` flag with `zalando/go-keyring` integration; `--env` secret pattern warning from `internal/store` scanner |
 
 ### Phase 2 — Quota System and Polish (Days 9–13)
 
 | Day | Deliverable |
 |-----|-------------|
-| 9-10 | Rolling window quota implementation with `BEGIN IMMEDIATE` SQLite writes; quota warning at 80%; `tag mcp host quota reset`; per-tool quota (`FR-06`) |
-| 11 | `cmd_mcp_host_start` / `cmd_mcp_host_stop` idempotent lifecycle; orphaned container cleanup at startup; `--pull-policy` all three modes |
-| 12 | Version resolution from MCP registry with graceful 500 handling; `--version latest` concrete resolution; `--dry-run` mode |
-| 13 | Integration test suite (`test_mcp_host_integration.py`); performance test suite (`test_mcp_host_perf.py`); bridge latency benchmarks |
+| 9-10 | Rolling-window quota implementation with `BEGIN IMMEDIATE` in `quota.go`; quota warning at 80%; `tag mcp host quota reset`; per-tool quota (`FR-06`) |
+| 11 | `CmdMcpHostStart` / `CmdMcpHostStop` idempotent lifecycle; orphaned container cleanup at startup (scan `tag.mcp.server` labels via `docker ps`); `--pull-policy` all three modes |
+| 12 | `ResolveVersion` in `registry.go` with `cenkalti/backoff/v4` retry and graceful 500 handling; `--version latest` concrete resolution; `--dry-run` mode |
+| 13 | Integration test suite (`docker_integration_test.go` with `//go:build integration`); Go benchmark suite (`bench_test.go`); bridge latency benchmarks |
 
 ### Phase 3 — Modal Backend and Hardening (Days 14–18)
 
 | Day | Deliverable |
 |-----|-------------|
-| 14-15 | Modal backend: `modal.Function` deployment, stdin/stdout multiplexing over local socket; `cmd_mcp_host_add --backend modal` |
-| 16 | OTel span emission for hosted server events (PRD-013 integration); `MCP_HOST_FAIL_ON_HASH_DRIFT` CI environment variable |
+| 14-15 | Modal backend in `modal.go`: Modal REST API client (`net/http` + `cenkalti/backoff/v4`), bidirectional stdin/stdout stream via local goroutine channel; `CmdMcpHostAdd --backend modal` |
+| 16 | OTel span emission for hosted server events via `go.opentelemetry.io/otel` (PRD-013 integration); `MCP_HOST_FAIL_ON_HASH_DRIFT` CI environment variable |
 | 17 | End-to-end test: `tag mcp host add playwright --backend docker → tag run --profile browser → verify tool call reaches container and returns result` |
 | 18 | Documentation update in `docs/prd/INDEX.md`; `tag doctor` check for Docker daemon and Modal credentials when hosted servers are registered |
 
