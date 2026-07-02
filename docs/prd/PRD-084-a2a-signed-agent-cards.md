@@ -1,10 +1,12 @@
 # PRD-084: A2A Signed Agent Cards (`tag agent-card sign`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P2
 **Estimated Effort:** M (5-8 days)
 **Category:** Multi-Agent Protocols
-**Affects:** `agent_card.py + controller.py`
+**Affects:** `internal/agent/card + internal/cli`
 **Depends on:** PRD-081 (A2A agent card publication), PRD-086 (ANP identity layer / W3C DID), PRD-082 (multi-agent team primitives)
 **Inspired by:** A2A v1.0 Agent Card spec, RFC 8785 JSON Canonicalization, W3C Verifiable Credentials, OpenID Connect signed JWTs
 
@@ -16,7 +18,7 @@ PRD-081 introduced `tag agent-card publish` to expose a TAG agent's capabilities
 
 A2A Signed Agent Cards (`tag agent-card sign`) adds a JSON Web Signature (JWS, RFC 7515) envelope to the Agent Card, using the agent's identity key (Ed25519 by default) to sign the RFC 8785 canonicalized JSON payload. The resulting signed card is both human-readable (the original JSON is base64url-encoded in the JWS payload) and verifiable by any A2A-compatible agent that holds or can discover the signer's public key. Signature verification is integrated into `tag agent-card verify` and the multi-agent team coordination layer (PRD-082) so that team members verify each other's cards before accepting task delegation.
 
-The design follows the A2A v1.0 specification's `securitySchemes` extension for agent identity, W3C Verifiable Credentials' approach to linked-data signing, and OpenID Connect's signed JWTs for identity assertions. The implementation uses Python's `cryptography` library for Ed25519 operations and RFC 8785's `jcs` (JSON Canonicalization Scheme) for deterministic serialization.
+The design follows the A2A v1.0 specification's `securitySchemes` extension for agent identity, W3C Verifiable Credentials' approach to linked-data signing, and OpenID Connect's signed JWTs for identity assertions. The implementation uses Go's standard-library `crypto/ed25519` for signing operations, `github.com/lestrrat-go/jwx/v2` for JWS/JWK envelopes, and an RFC 8785 JSON Canonicalization Scheme (JCS) encoder for deterministic serialization. The signing/verification code compiles into the single static `tag` binary (`CGO_ENABLED=0`).
 
 ---
 
@@ -139,7 +141,7 @@ Options:
 | FR-05 | `tag agent-card verify` decodes the JWS, extracts the public key (from `kid` header or `--public-key-path`), verifies the Ed25519 signature, and prints OK or INVALID. |
 | FR-06 | Verification failure exits with code 1 and prints the error reason (tampered payload / unknown key / expired). |
 | FR-07 | `tag agent-card rotate-key` backs up the current keypair to `~/.tag/keys/agent/backup/TIMESTAMP/`, generates a new keypair, and re-signs the current card. |
-| FR-08 | PRD-082 team `join` operation calls `agent_card.verify_signed_card()` before accepting a card from a remote agent; rejects unsigned cards in `--strict` mode. |
+| FR-08 | PRD-082 team `join` operation calls `card.VerifySignedCard()` (package `internal/agent/card`) before accepting a card from a remote agent; rejects unsigned cards in `--strict` mode. |
 | FR-09 | `tag agent-card show-key --format jwk` outputs the public key as a JSON Web Key. |
 | FR-10 | The signed card file embeds the public key in a `x-public-key` JWS header extension for self-contained verification without a separate key lookup. |
 
@@ -150,8 +152,8 @@ Options:
 | ID | Requirement |
 |----|------------|
 | NFR-01 | Private key file permissions enforced at write time: mode 0600; warn if world-readable at startup. |
-| NFR-02 | `cryptography` library (≥ 41.0) is the only dependency for crypto operations; no OpenSSL CLI wrapping. |
-| NFR-03 | JWS verification is constant-time (use `cryptography`'s `Ed25519PublicKey.verify` which is inherently constant-time). |
+| NFR-02 | Crypto operations use only Go stdlib (`crypto/ed25519`, `crypto/ecdsa`, `crypto/x509`) plus `github.com/lestrrat-go/jwx/v2` for JWS/JWK; no OpenSSL CLI wrapping or cgo. |
+| NFR-03 | JWS verification is constant-time (stdlib `ed25519.Verify` is inherently constant-time). |
 | NFR-04 | No private key material appears in log output, error messages, or `tag agent-card show-key` output. |
 | NFR-05 | All signing operations complete in < 100ms including JCS canonicalization. |
 
@@ -159,14 +161,18 @@ Options:
 
 ## 9. Technical Design
 
-### 9.1 Target files
+### 9.1 Target packages
 
-| File | Change |
+| Package / File | Change |
 |------|--------|
-| `src/tag/agent_card.py` | Add `AgentCardSigner`, `AgentCardVerifier`, `KeyManager` classes |
-| `src/tag/controller.py` | Add `keygen`, `sign`, `verify`, `rotate-key`, `show-key` to `cmd_agent_card` |
+| `internal/agent/card/signer.go` | Add `Signer`, `Verifier`, `KeyManager` types |
+| `internal/agent/card/keystore.go` | modernc.org/sqlite key registry (`agent_identity_keys`) |
+| `internal/cli/agentcard.go` | Wire `keygen`, `sign`, `verify`, `rotate-key`, `show-key` subcommands (via chi/huma-shared handlers reused by the CLI) |
+| `internal/server/wellknown.go` | Optionally serve the JWS-signed card at `/.well-known/agent.json` (chi + huma) |
 
-### 9.2 SQLite DDL
+The `/.well-known/agent.json` publish server (PRD-081) is a chi router with a huma v2 API (spec-first, OpenAPI 3.1). When `--signed` is set, the well-known handler returns the JWS compact serialization with `Content-Type: application/jose` (or the JSON card with a detached signature link). No streaming is required here; SSE (`tmaxmax/go-sse`) is unused for this feature.
+
+### 9.2 SQLite DDL (modernc.org/sqlite)
 
 ```sql
 CREATE TABLE IF NOT EXISTS agent_identity_keys (
@@ -181,106 +187,228 @@ CREATE TABLE IF NOT EXISTS agent_identity_keys (
 );
 ```
 
-### 9.3 Python core
+### 9.3 Go core
 
-```python
-from __future__ import annotations
-import base64
-import json
-from pathlib import Path
-from typing import Optional
+```go
+package card
 
-try:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-        Ed25519PrivateKey, Ed25519PublicKey
-    )
-    from cryptography.hazmat.primitives.serialization import (
-        Encoding, PublicFormat, PrivateFormat, NoEncryption, load_pem_private_key, load_pem_public_key
-    )
-    from cryptography.exceptions import InvalidSignature
-    HAS_CRYPTO = True
-except ImportError:
-    HAS_CRYPTO = False
+import (
+	"crypto/ed25519"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
 
-def _jcs_canonicalize(obj: dict) -> bytes:
-    """RFC 8785 JSON Canonicalization Scheme — sorted keys, no extra whitespace."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+// jcsCanonicalize implements RFC 8785 JSON Canonicalization Scheme:
+// lexicographically sorted object keys, minimal separators, no insignificant
+// whitespace. encoding/json already escapes and sorts map keys; for structs
+// we round-trip through a map to guarantee deterministic key ordering.
+func jcsCanonicalize(card map[string]any) ([]byte, error) {
+	// json.Marshal sorts map[string]any keys and emits compact output.
+	return json.Marshal(card)
+}
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+func b64url(data []byte) string {
+	return base64.RawURLEncoding.EncodeToString(data)
+}
 
-def _b64url_decode(s: str) -> bytes:
-    pad = 4 - len(s) % 4
-    return base64.urlsafe_b64decode(s + "=" * (pad % 4))
+func b64urlDecode(s string) ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(s)
+}
 
-class KeyManager:
-    def __init__(self, key_path: Optional[str] = None) -> None:
-        self.key_dir = Path(key_path or "~/.tag/keys/agent/").expanduser()
+// KeyManager loads and generates the agent's Ed25519 identity keypair.
+type KeyManager struct {
+	KeyDir string // defaults to ~/.tag/keys/agent
+}
 
-    def keygen(self, key_id: str = "default") -> Ed25519PublicKey:
-        if not HAS_CRYPTO:
-            raise RuntimeError("pip install cryptography to use agent card signing")
-        self.key_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        priv = Ed25519PrivateKey.generate()
-        priv_pem = priv.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
-        pub_pem = priv.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
-        priv_path = self.key_dir / "private_key.pem"
-        pub_path = self.key_dir / "public_key.pem"
-        priv_path.write_bytes(priv_pem)
-        priv_path.chmod(0o600)
-        pub_path.write_bytes(pub_pem)
-        pub_path.chmod(0o644)
-        return priv.public_key()
+func NewKeyManager(keyPath string) (*KeyManager, error) {
+	if keyPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		keyPath = filepath.Join(home, ".tag", "keys", "agent")
+	}
+	return &KeyManager{KeyDir: keyPath}, nil
+}
 
-    def load_private(self) -> Ed25519PrivateKey:
-        return load_pem_private_key((self.key_dir / "private_key.pem").read_bytes(), password=None)
+// Keygen generates an Ed25519 keypair and persists it as PEM files
+// (private_key.pem mode 0600, public_key.pem mode 0644).
+func (km *KeyManager) Keygen() (ed25519.PublicKey, error) {
+	if err := os.MkdirAll(km.KeyDir, 0o700); err != nil {
+		return nil, err
+	}
+	pub, priv, err := ed25519.GenerateKey(nil) // crypto/rand
+	if err != nil {
+		return nil, err
+	}
+	privDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	pubDER, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, err
+	}
+	privPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER})
+	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER})
+	if err := os.WriteFile(filepath.Join(km.KeyDir, "private_key.pem"), privPEM, 0o600); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(km.KeyDir, "public_key.pem"), pubPEM, 0o644); err != nil {
+		return nil, err
+	}
+	return pub, nil
+}
 
-    def load_public(self) -> Ed25519PublicKey:
-        return load_pem_public_key((self.key_dir / "public_key.pem").read_bytes())
+func (km *KeyManager) LoadPrivate() (ed25519.PrivateKey, error) {
+	raw, err := os.ReadFile(filepath.Join(km.KeyDir, "private_key.pem"))
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		return nil, errors.New("private_key.pem: no PEM block")
+	}
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	priv, ok := key.(ed25519.PrivateKey)
+	if !ok {
+		return nil, errors.New("private key is not Ed25519")
+	}
+	return priv, nil
+}
 
-class AgentCardSigner:
-    def __init__(self, key_manager: KeyManager) -> None:
-        self.km = key_manager
+func (km *KeyManager) LoadPublic() (ed25519.PublicKey, error) {
+	raw, err := os.ReadFile(filepath.Join(km.KeyDir, "public_key.pem"))
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		return nil, errors.New("public_key.pem: no PEM block")
+	}
+	key, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	pub, ok := key.(ed25519.PublicKey)
+	if !ok {
+		return nil, errors.New("public key is not Ed25519")
+	}
+	return pub, nil
+}
 
-    def sign(self, card: dict, key_id: str = "default") -> str:
-        if not HAS_CRYPTO:
-            raise RuntimeError("pip install cryptography to use agent card signing")
-        priv = self.km.load_private()
-        pub = self.km.load_public()
-        pub_b64 = _b64url(pub.public_bytes(Encoding.Raw, PublicFormat.Raw))
-        header = {"alg": "EdDSA", "kid": key_id, "x-public-key": pub_b64}
-        header_b64 = _b64url(json.dumps(header, separators=(",", ":")).encode())
-        payload_bytes = _jcs_canonicalize(card)
-        payload_b64 = _b64url(payload_bytes)
-        signing_input = f"{header_b64}.{payload_b64}".encode()
-        signature = priv.sign(signing_input)
-        sig_b64 = _b64url(signature)
-        return f"{header_b64}.{payload_b64}.{sig_b64}"
+type jwsHeader struct {
+	Alg         string `json:"alg"`
+	Kid         string `json:"kid"`
+	PublicKeyB64 string `json:"x-public-key"`
+}
 
-class AgentCardVerifier:
-    def verify(self, jws: str, public_key_path: Optional[str] = None) -> dict:
-        if not HAS_CRYPTO:
-            raise RuntimeError("pip install cryptography to use agent card signing")
-        parts = jws.strip().split(".")
-        if len(parts) != 3:
-            raise ValueError("Not a valid JWS compact serialization")
-        header_b64, payload_b64, sig_b64 = parts
-        header = json.loads(_b64url_decode(header_b64))
-        pub_b64 = header.get("x-public-key", "")
-        if public_key_path:
-            pub = load_pem_public_key(Path(public_key_path).read_bytes())
-        elif pub_b64:
-            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey as _K
-            pub = Ed25519PublicKey.from_public_bytes(_b64url_decode(pub_b64))
-        else:
-            raise ValueError("No public key available for verification")
-        signing_input = f"{header_b64}.{payload_b64}".encode()
-        try:
-            pub.verify(_b64url_decode(sig_b64), signing_input)
-        except InvalidSignature:
-            raise ValueError("Signature verification FAILED — card may be tampered")
-        return json.loads(_b64url_decode(payload_b64))
+// Signer produces a JWS compact serialization of an agent card.
+type Signer struct{ KM *KeyManager }
+
+func (s *Signer) Sign(card map[string]any, keyID string) (string, error) {
+	priv, err := s.KM.LoadPrivate()
+	if err != nil {
+		return "", err
+	}
+	pub, err := s.KM.LoadPublic()
+	if err != nil {
+		return "", err
+	}
+	header := jwsHeader{Alg: "EdDSA", Kid: keyID, PublicKeyB64: b64url(pub)}
+	headerJSON, err := json.Marshal(header)
+	if err != nil {
+		return "", err
+	}
+	payloadBytes, err := jcsCanonicalize(card)
+	if err != nil {
+		return "", err
+	}
+	headerB64 := b64url(headerJSON)
+	payloadB64 := b64url(payloadBytes)
+	signingInput := headerB64 + "." + payloadB64
+	sig := ed25519.Sign(priv, []byte(signingInput))
+	return signingInput + "." + b64url(sig), nil
+}
+
+// Verifier verifies a JWS-signed agent card and returns the embedded card.
+type Verifier struct{}
+
+func (v *Verifier) Verify(jws string, publicKeyPath string) (map[string]any, error) {
+	parts := strings.Split(strings.TrimSpace(jws), ".")
+	if len(parts) != 3 {
+		return nil, errors.New("not a valid JWS compact serialization")
+	}
+	headerB64, payloadB64, sigB64 := parts[0], parts[1], parts[2]
+
+	headerJSON, err := b64urlDecode(headerB64)
+	if err != nil {
+		return nil, err
+	}
+	var header jwsHeader
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
+		return nil, err
+	}
+	// Reject alg confusion / alg:none downgrade attacks.
+	if header.Alg != "EdDSA" && header.Alg != "ES256" {
+		return nil, fmt.Errorf("unsupported or disallowed alg %q", header.Alg)
+	}
+
+	var pub ed25519.PublicKey
+	switch {
+	case publicKeyPath != "":
+		km := &KeyManager{KeyDir: filepath.Dir(publicKeyPath)}
+		if pub, err = km.LoadPublic(); err != nil {
+			return nil, err
+		}
+	case header.PublicKeyB64 != "":
+		raw, derr := b64urlDecode(header.PublicKeyB64)
+		if derr != nil {
+			return nil, derr
+		}
+		pub = ed25519.PublicKey(raw)
+	default:
+		return nil, errors.New("no public key available for verification")
+	}
+
+	sig, err := b64urlDecode(sigB64)
+	if err != nil {
+		return nil, err
+	}
+	signingInput := []byte(headerB64 + "." + payloadB64)
+	if !ed25519.Verify(pub, signingInput, sig) {
+		return nil, errors.New("signature verification FAILED — card may be tampered")
+	}
+
+	payload, err := b64urlDecode(payloadB64)
+	if err != nil {
+		return nil, err
+	}
+	var card map[string]any
+	if err := json.Unmarshal(payload, &card); err != nil {
+		return nil, err
+	}
+	return card, nil
+}
 ```
+
+> **Note on JCS:** `encoding/json` sorts `map[string]any` keys and emits compact
+> output, which covers most RFC 8785 requirements. For full-fidelity number
+> formatting and Unicode normalization, wrap it with a dedicated JCS encoder or
+> use `jwx/v2`'s canonicalization helpers before signing. Production signing/
+> verification should prefer `jwx/v2`'s `jws.Sign`/`jws.Verify` with a `jwk.Key`
+> built from the loaded Ed25519 key; the hand-rolled code above documents the
+> exact wire format.
 
 ---
 
@@ -298,11 +426,13 @@ class AgentCardVerifier:
 
 ## 11. Testing Strategy
 
+Go `testing` package with table-driven tests (`go test ./internal/agent/card/...`); crypto benchmarks via `testing.B`.
+
 | Layer | Tests |
 |-------|-------|
-| Unit | `_jcs_canonicalize` determinism; `AgentCardSigner.sign` produces verifiable JWS; `AgentCardVerifier.verify` rejects tampered payload |
-| Security | `alg:none` rejection; modified payload bytes fail verification; wrong key fails verification |
-| Integration | Full round-trip: keygen → sign → verify; key rotation → re-sign → verify with new key |
+| Unit | `jcsCanonicalize` determinism; `Signer.Sign` produces a verifiable JWS; `Verifier.Verify` rejects a tampered payload |
+| Security | `alg:none`/`alg` confusion rejection; flipped payload byte fails verification; wrong key fails verification |
+| Integration | Full round-trip: `Keygen` → `Sign` → `Verify`; key rotation → re-sign → verify with new key; `httptest` server exercises the `/.well-known/agent.json` `--signed` handler |
 
 ---
 
@@ -325,7 +455,12 @@ class AgentCardVerifier:
 |-----------|--------|
 | PRD-081 A2A agent card publication | Base Agent Card format being signed |
 | PRD-082 multi-agent team primitives | Card verification integration point |
-| `cryptography` (≥ 41.0) | Ed25519 key generation and JWS signing |
+| Go stdlib `crypto/ed25519`, `crypto/x509`, `encoding/json` | Ed25519 key generation, PEM/PKCS8 handling, canonical JSON |
+| `github.com/lestrrat-go/jwx/v2` | JWS compact serialization + JWK output (`show-key --format jwk`) |
+| `github.com/go-chi/chi/v5` + `github.com/danielgtaylor/huma/v2` | `/.well-known/agent.json` publish server (from PRD-081) |
+| `modernc.org/sqlite` | Pure-Go SQLite key registry (`agent_identity_keys`) |
+
+**Module:** `github.com/tag-agent/tag` · **Go:** 1.24+ · **Build:** `CGO_ENABLED=0` · **Release:** GoReleaser + cosign + SLSA.
 
 ---
 

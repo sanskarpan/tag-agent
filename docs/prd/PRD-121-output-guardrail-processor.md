@@ -1,11 +1,13 @@
 # PRD-121: Output Guardrail Processor (`tag guardrail output`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Security/Guardrails
-**Affects:** `guardrails.py + controller.py`
-**Depends on:** PRD-124 (GuardrailResult dataclass), PRD-034 (secret scanning), PRD-013 (agent tracing — span instrumentation)
+**Affects:** `internal/agent (output guardrail middleware chain) + internal/store (audit log)`
+**Depends on:** PRD-124 (GuardrailResult type), PRD-034 (secret scanning), PRD-013 (agent tracing — span instrumentation)
 **Inspired by:** Guardrails AI output validators, LlamaGuard, Nemo Guardrails output rails, AWS Bedrock Guardrails
 
 ---
@@ -14,9 +16,9 @@
 
 Agent outputs can contain harmful, policy-violating, or sensitive content: generated code that is insecure, outputs that contain PII or credentials, responses that violate business rules, or content that fails safety classifiers. Without a structured post-processing layer, these outputs flow directly to downstream consumers — users, databases, APIs — without any opportunity for detection or remediation.
 
-Output Guardrail Processor (`tag guardrail output`) introduces a composable output validation pipeline: a chain of `OutputGuardrail` implementations that inspect every agent output before it is returned to the caller. Each guardrail is a typed Python class that receives the output string and returns a `GuardrailResult` (PRD-124) indicating pass/block/rewrite. The pipeline short-circuits on any block result and can optionally rewrite the output using a remediation model.
+Output Guardrail Processor (`tag guardrail output`) introduces a composable output validation pipeline modeled as a **middleware chain wrapped around the hand-rolled agent loop** (`internal/agent`). Each guardrail is a Go type implementing the `OutputGuardrail` interface; the chain inspects every agent response before it is returned to the caller. Every guardrail returns a typed `Decision` (a `GuardrailResult`, PRD-124) indicating pass/block/rewrite, gated in the same style as the tool permission service (`internal/tool`). The chain short-circuits on the first block decision and can optionally rewrite the output using a remediation model behind the `internal/llm` provider interface.
 
-The design is inspired by Guardrails AI's output validators (regex, PII detection, JSON schema validation, topic filtering), AWS Bedrock Guardrails' output filters (profanity, PII, topic denial, grounding), and Nemo Guardrails' output rails (fact-checking, output filtering flows). TAG's implementation is local-first and extensible: built-in guardrails cover the most common cases, and custom guardrails can be added as Python classes.
+The design is inspired by Guardrails AI's output validators (regex, PII detection, JSON schema validation, topic filtering), AWS Bedrock Guardrails' output filters (profanity, PII, topic denial, grounding), and Nemo Guardrails' output rails (fact-checking, output filtering flows). TAG's implementation is local-first: built-in guardrails cover the most common cases and are compiled into the static binary as Go interface implementations registered in a slice/map. **Extensibility note:** because TAG ships as a single static Go binary, custom guardrails are NOT dynamic user-supplied code plugins. Regex- and config-declared guardrails port directly; arbitrary custom logic is expressed as (a) compiled-in Go `OutputGuardrail` implementations, (b) shell/HTTP hooks, or (c) MCP tools — matching GO_MIGRATION_PLAN decision #6.
 
 ---
 
@@ -40,13 +42,13 @@ When an agent is expected to return JSON, there is no automatic validation that 
 
 | ID | Goal |
 |----|------|
-| G1 | `OutputGuardrailPipeline` executes a list of `OutputGuardrail` instances in order, short-circuiting on the first `block` result. |
+| G1 | `OutputChain` executes the registered slice of `OutputGuardrail` implementations in order, short-circuiting on the first `block` decision. |
 | G2 | Built-in output guardrails: PII detector, secret scanner, JSON schema validator, topic filter, profanity filter, toxicity classifier. |
 | G3 | `GuardrailResult.action == "rewrite"` triggers an LLM-based remediation call to fix the output before returning. |
 | G4 | All guardrail decisions logged to the `guardrail_events` SQLite table for auditability. |
 | G5 | `tag guardrail output list` shows all configured output guardrails for a profile. |
 | G6 | `tag guardrail output test --input TEXT` dry-runs the output pipeline against a test string. |
-| G7 | Output guardrail pipeline integrable with `cmd_run` in `controller.py` as a post-processing hook. |
+| G7 | Output guardrail chain integrable with the agent loop (`internal/agent`) as post-response middleware. |
 
 ## 3.1 Non-Goals
 
@@ -125,16 +127,16 @@ Options:
 
 | ID | Requirement |
 |----|------------|
-| FR-01 | `OutputGuardrailPipeline.process(output: str) -> GuardrailResult` executes guardrails in priority order; returns first non-pass result or final pass. |
-| FR-02 | PII guardrail: detect names (NER), emails (regex), phone numbers (regex), SSNs (regex), credit card numbers (Luhn check); return `block` with `PII_DETECTED` reason. |
-| FR-03 | Secret guardrail: reuse PRD-034 `SecretScanner`; return `block` with `SECRET_DETECTED` reason. |
-| FR-04 | JSON schema guardrail: parse output as JSON; validate against provided JSON Schema (jsonschema library); return `block` with `SCHEMA_INVALID` reason on failure. |
-| FR-05 | Topic filter guardrail: compute embedding cosine similarity between output and each forbidden topic embedding; block if similarity > threshold. |
-| FR-06 | Rewrite action: call remediation model with `"Rewrite the following to comply with policy: {output}"` system prompt; return the rewritten output. |
-| FR-07 | All guardrail decisions written to `guardrail_events` table: profile, guardrail_type, action, reason, input_hash, output_hash, timestamp. |
-| FR-08 | `cmd_run` in `controller.py` calls `OutputGuardrailPipeline.process(output)` after each agent call; if `blocked`, return a sanitized error message to the caller. |
-| FR-09 | `tag guardrail output test` runs the pipeline on the provided `--input` and prints each guardrail's result (pass/block/rewrite) with reason. |
-| FR-10 | `tag guardrail output add` persists a new `output_guardrail_configs` SQLite row; `list` queries and renders it. |
+| FR-01 | `OutputChain.Process(ctx context.Context, resp *Response) (Decision, error)` executes the registered `OutputGuardrail` slice in priority order; returns the first non-pass `Decision` or a final pass. |
+| FR-02 | PII guardrail: detect names (NER), emails (RE2 regexp), phone numbers (RE2 regexp), SSNs (RE2 regexp), credit card numbers (Luhn check); return a block `Decision` with `PII_DETECTED` reason. |
+| FR-03 | Secret guardrail: reuse the PRD-034 secret scanner; return a block `Decision` with `SECRET_DETECTED` reason. |
+| FR-04 | JSON schema guardrail: `json.Unmarshal` the output, then validate against a provided JSON Schema (schema authored/validated with `invopop/jsonschema`); return a block `Decision` with `SCHEMA_INVALID` reason on failure. |
+| FR-05 | Topic filter guardrail: compute embedding cosine similarity between output and each forbidden-topic embedding (embeddings via the `internal/llm` Embedder interface); block if similarity > threshold. |
+| FR-06 | Rewrite action: call the remediation model through the `internal/llm` provider interface (`Complete`) with a `"Rewrite the following to comply with policy: {output}"` system prompt; return the rewritten output. |
+| FR-07 | All guardrail decisions written to the `guardrail_events` table (`internal/store`, `modernc.org/sqlite`): profile, guardrail_type, action, reason, input_hash, output_hash, timestamp. |
+| FR-08 | The agent loop in `internal/agent` invokes `OutputChain.Process` as post-response middleware after each turn; a block `Decision` maps to a `continue|compact|stop` outcome (stop) and a sanitized error is returned to the caller — expressed as a `Decision`/`error` return, not a panic. |
+| FR-09 | `tag guardrail output test` runs the chain on the provided `--input` and prints each guardrail's `Decision` (pass/block/rewrite) with reason. |
+| FR-10 | `tag guardrail output add` persists a new `output_guardrail_configs` row via `internal/store`; `list` queries and renders it. |
 
 ---
 
@@ -144,14 +146,16 @@ Options:
 |----|------------|
 | NFR-01 | Non-LLM guardrails (regex, schema) must complete in < 20ms per output. |
 | NFR-02 | LLM-based guardrails (toxicity classifier, topic filter with embedding) must complete in < 2s. |
-| NFR-03 | PII detection must not require network calls (local regex/NER only). |
-| NFR-04 | Guardrail pipeline is thread-safe; concurrent `cmd_run` calls do not produce corrupted audit log entries. |
+| NFR-03 | PII detection must not require network calls (local RE2 regexp/NER only). |
+| NFR-04 | Guardrail chain is goroutine-safe; concurrent agent turns do not produce corrupted audit-log entries (single-writer SQLite via `internal/store`). |
 
 ---
 
 ## 9. Technical Design
 
 ### 9.1 SQLite DDL
+
+Owned by `internal/store` (`modernc.org/sqlite`, pure-Go, CGO_ENABLED=0, single-writer). DDL is unchanged from the original design:
 
 ```sql
 CREATE TABLE IF NOT EXISTS output_guardrail_configs (
@@ -181,64 +185,146 @@ CREATE INDEX IF NOT EXISTS idx_guardrail_events_profile
   ON guardrail_events(profile, created_at DESC);
 ```
 
-### 9.2 Python core
+### 9.2 Go core (`internal/agent`)
 
-```python
-from __future__ import annotations
-import dataclasses
-import re
-from typing import List, Optional
-from tag.guardrail_result import GuardrailResult, GuardrailAction
+Guardrails are Go interfaces (replacing Python ABCs/subclasses); the registry is a `[]OutputGuardrail` slice ordered by severity. `Decision` carries the tripwire/blocking semantics as a value type — blocking is a returned `Decision`, never a panic. The chain is invoked as output middleware around the hand-rolled agent loop and returns a `continue|compact|stop` outcome to the loop.
 
-@dataclasses.dataclass
-class OutputGuardrail:
-    guardrail_type: str
-    action: GuardrailAction
-    config: dict
+```go
+package agent
 
-    def check(self, output: str) -> GuardrailResult:
-        raise NotImplementedError
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"sort"
 
-class PIIGuardrail(OutputGuardrail):
-    EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-    SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
-    PHONE_RE = re.compile(r"\b(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b")
+	"github.com/tag/internal/store"
+)
 
-    def check(self, output: str) -> GuardrailResult:
-        for pattern_name, pattern in [("email", self.EMAIL_RE), ("SSN", self.SSN_RE), ("phone", self.PHONE_RE)]:
-            if pattern.search(output):
-                return GuardrailResult(action=self.action, reason=f"PII_DETECTED:{pattern_name}", guardrail=self.guardrail_type)
-        return GuardrailResult(action=GuardrailAction.PASS, guardrail=self.guardrail_type)
+// Action mirrors PRD-124 GuardrailResult actions.
+type Action string
 
-class SecretGuardrail(OutputGuardrail):
-    def check(self, output: str) -> GuardrailResult:
-        from tag.secret_scanner import SecretScanner
-        findings = SecretScanner().scan_text(output)
-        if findings:
-            return GuardrailResult(action=self.action, reason=f"SECRET_DETECTED:{findings[0].type}", guardrail=self.guardrail_type)
-        return GuardrailResult(action=GuardrailAction.PASS, guardrail=self.guardrail_type)
+const (
+	ActionPass    Action = "pass"
+	ActionBlock   Action = "block"
+	ActionRewrite Action = "rewrite"
+	ActionWarn    Action = "warn"
+)
 
-class JSONSchemaGuardrail(OutputGuardrail):
-    def check(self, output: str) -> GuardrailResult:
-        import json
-        try:
-            import jsonschema
-            obj = json.loads(output.strip())
-            jsonschema.validate(obj, self.config.get("schema", {}))
-            return GuardrailResult(action=GuardrailAction.PASS, guardrail=self.guardrail_type)
-        except (json.JSONDecodeError, Exception) as e:
-            return GuardrailResult(action=self.action, reason=f"SCHEMA_INVALID:{str(e)[:100]}", guardrail=self.guardrail_type)
+// Decision is the typed result of a guardrail (PRD-124 GuardrailResult).
+type Decision struct {
+	Action    Action
+	Reason    string // e.g. "PII_DETECTED:email"
+	Guardrail string
+	Rewritten string // set when Action == ActionRewrite
+}
 
-class OutputGuardrailPipeline:
-    def __init__(self, guardrails: List[OutputGuardrail]) -> None:
-        self.guardrails = sorted(guardrails, key=lambda g: {"high": 0, "medium": 1, "low": 2}.get(getattr(g, "severity", "high"), 1))
+// OutputGuardrail is the interface every output guardrail implements
+// (Go interface in place of a Python ABC). Registered implementations
+// are compiled into the binary.
+type OutputGuardrail interface {
+	Name() string
+	Severity() string // "high" | "medium" | "low"
+	Process(ctx context.Context, resp *Response) (Decision, error)
+}
 
-    def process(self, output: str, run_id: Optional[str] = None) -> GuardrailResult:
-        for guardrail in self.guardrails:
-            result = guardrail.check(output)
-            if result.action != GuardrailAction.PASS:
-                return result
-        return GuardrailResult(action=GuardrailAction.PASS, guardrail="pipeline")
+// --- PII (RE2 regexp; no backreferences/lookahead needed here) ---
+
+var (
+	reEmail = regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
+	reSSN   = regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)
+	rePhone = regexp.MustCompile(`\b(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b`)
+)
+
+type PIIGuardrail struct {
+	action   Action
+	severity string
+}
+
+func (g *PIIGuardrail) Name() string     { return "pii" }
+func (g *PIIGuardrail) Severity() string  { return g.severity }
+
+func (g *PIIGuardrail) Process(_ context.Context, resp *Response) (Decision, error) {
+	for _, p := range []struct {
+		name string
+		re   *regexp.Regexp
+	}{{"email", reEmail}, {"SSN", reSSN}, {"phone", rePhone}} {
+		if p.re.MatchString(resp.Text) {
+			return Decision{Action: g.action, Reason: "PII_DETECTED:" + p.name, Guardrail: g.Name()}, nil
+		}
+	}
+	return Decision{Action: ActionPass, Guardrail: g.Name()}, nil
+}
+
+// --- Secret (reuses PRD-034 scanner) ---
+
+type SecretGuardrail struct {
+	action   Action
+	severity string
+	scanner  SecretScanner // PRD-034
+}
+
+func (g *SecretGuardrail) Name() string    { return "secret" }
+func (g *SecretGuardrail) Severity() string { return g.severity }
+
+func (g *SecretGuardrail) Process(_ context.Context, resp *Response) (Decision, error) {
+	if findings := g.scanner.ScanText(resp.Text); len(findings) > 0 {
+		return Decision{Action: g.action, Reason: "SECRET_DETECTED:" + findings[0].Type, Guardrail: g.Name()}, nil
+	}
+	return Decision{Action: ActionPass, Guardrail: g.Name()}, nil
+}
+
+// --- JSON schema (invopop/jsonschema-authored schema + explicit validation) ---
+
+type JSONSchemaGuardrail struct {
+	action   Action
+	severity string
+	schema   *jsonschema.Schema
+}
+
+func (g *JSONSchemaGuardrail) Name() string    { return "json-schema" }
+func (g *JSONSchemaGuardrail) Severity() string { return g.severity }
+
+func (g *JSONSchemaGuardrail) Process(_ context.Context, resp *Response) (Decision, error) {
+	var obj any
+	if err := json.Unmarshal([]byte(resp.Text), &obj); err != nil {
+		return Decision{Action: g.action, Reason: fmt.Sprintf("SCHEMA_INVALID:%.100s", err), Guardrail: g.Name()}, nil
+	}
+	if err := g.schema.Validate(obj); err != nil {
+		return Decision{Action: g.action, Reason: fmt.Sprintf("SCHEMA_INVALID:%.100s", err), Guardrail: g.Name()}, nil
+	}
+	return Decision{Action: ActionPass, Guardrail: g.Name()}, nil
+}
+
+// --- Chain / middleware around the agent loop ---
+
+type OutputChain struct {
+	guardrails []OutputGuardrail
+	store      *store.DB
+}
+
+func NewOutputChain(gs []OutputGuardrail, db *store.DB) *OutputChain {
+	rank := map[string]int{"high": 0, "medium": 1, "low": 2}
+	sort.SliceStable(gs, func(i, j int) bool { return rank[gs[i].Severity()] < rank[gs[j].Severity()] })
+	return &OutputChain{guardrails: gs, store: db}
+}
+
+// Process runs guardrails in priority order, short-circuiting on the first
+// non-pass Decision. Every decision is appended to guardrail_events.
+func (c *OutputChain) Process(ctx context.Context, resp *Response, runID string) (Decision, error) {
+	for _, g := range c.guardrails {
+		d, err := g.Process(ctx, resp)
+		if err != nil {
+			return Decision{}, err
+		}
+		_ = c.store.AppendGuardrailEvent(ctx, "output", runID, d)
+		if d.Action != ActionPass {
+			return d, nil
+		}
+	}
+	return Decision{Action: ActionPass, Guardrail: "chain"}, nil
+}
 ```
 
 ---
@@ -257,9 +343,10 @@ class OutputGuardrailPipeline:
 
 | Layer | Tests |
 |-------|-------|
-| Unit | `PIIGuardrail` email/SSN/phone detection; `JSONSchemaGuardrail` pass/fail on known pairs |
-| Integration | Full pipeline: PII in output → block → audit log entry |
-| Security | Encoded PII detection; rewrite output re-validated |
+| Unit | Table-driven `go test` for `PIIGuardrail` email/SSN/phone detection; `JSONSchemaGuardrail` pass/fail on known pairs |
+| Benchmark | `testing.B` for chain latency on a 1000-token output (NFR-01 < 20ms non-LLM) |
+| Integration | Full chain: PII in output → block `Decision` → `guardrail_events` audit row |
+| Security | Encoded PII detection; rewritten output re-run through the chain |
 
 ---
 
@@ -279,9 +366,11 @@ class OutputGuardrailPipeline:
 
 | Dependency | Reason |
 |-----------|--------|
-| PRD-124 GuardrailResult dataclass | Shared result type |
-| PRD-034 secret scanning | `SecretScanner` reuse |
-| `jsonschema` (optional) | JSON schema validation |
+| PRD-124 GuardrailResult type (`Decision`) | Shared result type |
+| PRD-034 secret scanning | Secret scanner reuse |
+| `invopop/jsonschema` | JSON schema authoring/validation |
+| `modernc.org/sqlite` (via `internal/store`) | Audit-log persistence |
+| `internal/llm` provider interface | Remediation model for rewrite action + topic-filter embeddings |
 
 ---
 
@@ -301,8 +390,8 @@ class OutputGuardrailPipeline:
 
 | Phase | Work | Days |
 |-------|------|------|
-| 1 | `GuardrailResult`, `PIIGuardrail`, `SecretGuardrail`, unit tests | 2 |
-| 2 | `JSONSchemaGuardrail`, `OutputGuardrailPipeline`, audit log | 2 |
-| 3 | CLI commands, rewrite action, `cmd_run` integration | 2 |
+| 1 | `Decision`, `OutputGuardrail` interface, `PIIGuardrail`, `SecretGuardrail`, table-driven unit tests | 2 |
+| 2 | `JSONSchemaGuardrail`, `OutputChain`, `internal/store` audit log | 2 |
+| 3 | CLI commands (`internal/cli`), rewrite action via `internal/llm`, agent-loop middleware integration | 2 |
 | 4 | Integration tests, documentation | 1 |
 

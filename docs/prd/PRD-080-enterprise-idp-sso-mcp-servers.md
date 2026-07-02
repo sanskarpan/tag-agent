@@ -1,10 +1,12 @@
 # PRD-080: Enterprise IdP SSO Across MCP Servers (`tag mcp sso`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P3
 **Estimated Effort:** XL (4-8 weeks)
 **Category:** MCP Ecosystem & Tool Connectivity
-**Affects:** `mcp_auth.py` (new), `src/tag/controller.py` (new `cmd_mcp_sso_*` handlers)
+**Affects:** `internal/mcp` (new `sso.go`, `sso_adapters*.go`), `internal/cli` (new `mcp_sso.go` cobra handlers), `internal/store` (new `sso.go`), `internal/config` (new `sso.go`), `internal/credentials` (SSO keychain helpers)
 **Depends on:** PRD-013 (agent tracing/observability), PRD-028 (sandbox code execution), PRD-034 (secret scanning), PRD-014 (MCP server registry), PRD-040 (notification hooks), PRD-041 (OTel span/cost attribution)
 **Inspired by:** Okta SSO, Azure AD SAML/OIDC, WorkOS enterprise SSO
 
@@ -16,7 +18,7 @@ Enterprise teams deploying TAG across multiple engineers face an identity proble
 
 Enterprise Identity Providers — Okta, Azure Active Directory, Google Workspace, and platforms like WorkOS that federate them — already solve this problem for web applications via OIDC (OpenID Connect) and SAML 2.0. The organization's IdP becomes the single authority for user identity, group membership, and access policy. Applications trust the IdP's tokens rather than maintaining their own user stores. Revocation is instantaneous: disabling a user in Okta immediately revokes access to all connected applications. Group-based access policies mean that adding a developer to the "backend-engineers" group automatically grants the right tool scopes on every MCP server that respects that group.
 
-This PRD introduces `tag mcp sso`: a subsystem in `mcp_auth.py` that integrates TAG with enterprise IdPs using OIDC and SAML 2.0 token exchange. When a user runs `tag mcp sso login`, TAG performs a browser-based OIDC authorization code flow (with PKCE) against the configured IdP. The resulting ID token and access token are stored in the OS keychain. When TAG starts an MCP server session, `mcp_auth.py` exchanges the IdP token for a server-specific access token using the OAuth 2.0 Token Exchange flow (RFC 8693), propagating verified user identity to the MCP server without the user ever touching per-server credentials. Per-server scope mapping is derived from IdP group membership: the `sso_scope_maps` SQLite table maps IdP groups to MCP server scope lists, enabling fine-grained, centrally-managed access control.
+This PRD introduces `tag mcp sso`: a subsystem in `internal/mcp` that integrates TAG with enterprise IdPs using OIDC and SAML 2.0 token exchange. When a user runs `tag mcp sso login`, TAG performs a browser-based OIDC authorization code flow (with PKCE) against the configured IdP via `github.com/coreos/go-oidc/v3` + `golang.org/x/oauth2`. The resulting ID token and access token are stored in the OS keychain via `github.com/zalando/go-keyring`. When TAG starts an MCP server session, `internal/mcp` exchanges the IdP token for a server-specific access token using the OAuth 2.0 Token Exchange flow (RFC 8693), propagating verified user identity to the MCP server without the user ever touching per-server credentials. The go-sdk's Enterprise Managed Auth support (`github.com/modelcontextprotocol/go-sdk v1.6.1`) injects the exchanged token into per-user MCP client sessions. Per-server scope mapping is derived from IdP group membership: the `sso_scope_maps` SQLite table (via `modernc.org/sqlite`) maps IdP groups to MCP server scope lists, enabling fine-grained, centrally-managed access control.
 
 The feature targets three use cases: (1) enterprise teams wanting centralized identity management and audit trails for MCP tool usage; (2) platform engineers who need to enforce least-privilege scopes on MCP servers based on team/role membership; and (3) individual developers in organizations that mandate SSO and cannot use per-server API keys due to compliance policy. The design follows the MCP OAuth 2.1 discovery chain established in the cluster research context: 401 → Protected Resource Metadata (PRM) → Authorization Server metadata → token exchange. The `resource` parameter (RFC 8707) is mandatory in every token request, and PKCE S256 is mandatory for all flows.
 
@@ -45,17 +47,17 @@ TAG's tracing subsystem (PRD-013) records tool call spans with server name, tool
 | ID | Goal |
 |----|------|
 | G1 | `tag mcp sso configure --idp okta --tenant my-org.okta.com` writes a validated SSO configuration to `~/.tag/sso_config.yaml` and tests IdP connectivity. |
-| G2 | `tag mcp sso login` performs a browser-based OIDC authorization code flow with PKCE S256, stores tokens in the OS keychain via `keyring`, and prints token expiry. |
+| G2 | `tag mcp sso login` performs a browser-based OIDC authorization code flow with PKCE S256 (via `golang.org/x/oauth2`), stores tokens in the OS keychain via `go-keyring`, and prints token expiry. |
 | G3 | `tag mcp sso status` displays the current SSO session state: IdP, tenant, authenticated user (`sub`, `email`), token expiry, and per-server exchange status. |
 | G4 | `tag mcp sso logout` revokes the IdP refresh token (if the IdP supports RFC 7009 token revocation), removes all SSO tokens from the keychain, and clears per-server exchanged tokens. |
-| G5 | At MCP server session start, `mcp_auth.py` detects SSO configuration, silently performs RFC 8693 token exchange to obtain a server-scoped access token, and injects it into the MCP server connection without user intervention. |
+| G5 | At MCP server session start, `internal/mcp` detects SSO configuration via `config.SSOConfigured()`, silently performs RFC 8693 token exchange to obtain a server-scoped access token, and injects it into the go-sdk MCP client session via an `http.RoundTripper` auth transport — without user intervention. |
 | G6 | Per-server scope mapping from IdP groups is stored in the `sso_scope_maps` table and applied at token exchange time, so group membership from the IdP token controls which OAuth scopes are requested per server. |
 | G7 | Support Okta (OIDC), Azure AD (OIDC and SAML 2.0 via OIDC bridge), and Google Workspace (OIDC) as first-class IdP targets with provider-specific discovery and metadata parsing. |
 | G8 | The `sso_audit_log` SQLite table records every SSO event (login, logout, token exchange, exchange failure, scope escalation attempt) with IdP subject, server name, scopes granted, and timestamp. |
 | G9 | `tag mcp sso scope map --server io.github.acme/db-mcp --group data-engineers --scopes read:query,write:query` manages scope mappings without editing YAML by hand. |
-| G10 | When the IdP access token expires, `mcp_auth.py` silently refreshes using the stored refresh token; if refresh fails (revoked, expired), it emits a notification (PRD-040) and blocks tool calls on the affected server until re-login. |
+| G10 | When the IdP access token expires, `internal/mcp` silently refreshes using the stored refresh token via `golang.org/x/oauth2`'s `TokenSource`; if refresh fails (revoked, expired), it emits a notification (PRD-040) and blocks tool calls on the affected server until re-login. |
 | G11 | `tag mcp sso token show --server <name>` displays the decoded claims of the exchanged token for a specific server (redacting the raw token; showing only `sub`, `email`, `groups`, `scope`, `exp`). |
-| G12 | Zero SSO-related code executes when SSO is not configured. All imports are deferred; `mcp_auth.py` is not imported at TAG startup unless `sso_config.yaml` exists. |
+| G12 | Zero SSO-related work executes when SSO is not configured. `config.SSOConfigured()` (a single `os.Stat` call) short-circuits all SSO code paths at the call site; the compiled-in package incurs no measurable startup overhead. |
 
 ## 3.1 Non-Goals
 
@@ -347,20 +349,20 @@ SSO Audit Log (last 10 events)
 | FR-03 | `tag mcp sso login` MUST perform PKCE S256 code challenge/verifier generation per RFC 7636, section 4.2. The `code_challenge_method=S256` parameter MUST be present in the authorization request. | P0 |
 | FR-04 | `tag mcp sso login` MUST use a loopback redirect URI (`http://localhost:<port>/callback`) and bind a short-lived HTTP server to capture the authorization code. The port MUST be selected randomly from the ephemeral range (49152-65535) to avoid conflicts. | P0 |
 | FR-05 | `tag mcp sso login` MUST detect headless environments (absence of `DISPLAY` and `SSH_TTY` env vars, or presence of `TAG_HEADLESS=1`) and automatically switch to device code flow (RFC 8628) when headless is detected. | P1 |
-| FR-06 | All tokens (IdP access token, refresh token, per-server exchanged tokens) MUST be stored exclusively in the OS keychain via the `keyring` library (service name: `tag-sso`, account names defined in `KeychainKey` enum). Zero token data MUST be written to disk files, SQLite, or environment variables. | P0 |
-| FR-07 | At MCP server session start, `mcp_auth.py` MUST attempt RFC 8693 token exchange if and only if all three conditions hold: (a) `~/.tag/sso_config.yaml` exists, (b) a valid (non-expired) IdP access token is in the keychain, (c) the MCP server's AS metadata exposes a `token_endpoint` that accepts `urn:ietf:params:oauth:grant-type:token-exchange`. If the server's AS does not support token exchange, `mcp_auth.py` MUST fall back to the existing per-server OAuth flow silently. | P0 |
+| FR-06 | All tokens (IdP access token, refresh token, per-server exchanged tokens) MUST be stored exclusively in the OS keychain via `github.com/zalando/go-keyring` (service name: `tag-sso`; account names defined as constants in `internal/credentials`). Zero token data MUST be written to disk files, SQLite, or environment variables. | P0 |
+| FR-07 | At MCP server session start, `internal/mcp` MUST attempt RFC 8693 token exchange if and only if all three conditions hold: (a) `config.SSOConfigured()` returns true (i.e., `~/.tag/sso_config.yaml` exists), (b) a valid (non-expired) IdP access token is in the keychain, (c) the MCP server's AS metadata exposes a `token_endpoint` that accepts `urn:ietf:params:oauth:grant-type:token-exchange`. If the server's AS does not support token exchange, `internal/mcp` MUST fall back to the existing per-server OAuth flow silently. | P0 |
 | FR-08 | Token exchange requests (RFC 8693) MUST include the `resource` parameter (RFC 8707) set to the MCP server's canonical URI, and the `subject_token_type` set to `urn:ietf:params:oauth:token-type:access_token`. | P0 |
 | FR-09 | Scope selection at token exchange time MUST be computed as the intersection of: (a) scopes supported by the MCP server (from AS metadata), (b) scopes mapped from the user's IdP groups via `sso_scope_maps`, and (c) scopes present in the IdP access token. The system MUST NOT request scopes the user is not entitled to via their groups. | P0 |
-| FR-10 | If the IdP access token has expired and a refresh token is present, `mcp_auth.py` MUST silently refresh the access token before attempting token exchange. If refresh fails (HTTP 400 with `error=invalid_grant`), `mcp_auth.py` MUST raise `SSOSessionExpiredError` and emit a notification via PRD-040 hooks. | P1 |
+| FR-10 | If the IdP access token has expired and a refresh token is present, `internal/mcp` MUST silently refresh the access token via `golang.org/x/oauth2`'s `TokenSource.Token()` before attempting token exchange. If refresh fails (HTTP 400 with `error=invalid_grant`), `internal/mcp` MUST return `*SSOSessionExpiredError` and emit a notification via PRD-040 hooks. | P1 |
 | FR-11 | Every SSO event (login, logout, token exchange, token refresh, exchange failure, revocation attempt, scope escalation attempt) MUST be written to the `sso_audit_log` SQLite table within 500 ms of the event occurring. | P0 |
 | FR-12 | `tag mcp sso logout` MUST attempt RFC 7009 token revocation (`POST` to the IdP's `revocation_endpoint`) for both the access token and refresh token. Revocation failure MUST be logged but MUST NOT block local cleanup. Local keychain entries MUST be deleted regardless of revocation outcome. | P1 |
 | FR-13 | `tag mcp sso scope map` MUST validate that the specified group name is present in the IdP access token's `groups` claim (or comparable claim per IdP) before writing the mapping, or emit a warning if validation cannot be performed offline. | P1 |
 | FR-14 | `tag mcp sso token show` MUST decode and display JWT claims without printing the raw token string. The raw token value MUST be redacted in all CLI output and log output. | P0 |
-| FR-15 | The `mcp_auth.py` module MUST NOT be imported at TAG startup unless `~/.tag/sso_config.yaml` exists. The import MUST be deferred and lazy. | P1 |
+| FR-15 | The SSO code path in `internal/mcp` MUST NOT execute at TAG startup unless `~/.tag/sso_config.yaml` exists. `config.SSOConfigured()` (an `os.Stat` call) MUST be the sole gate; the package is compiled in but incurs zero work when the file is absent. Verified by the NFR-03 startup benchmark. | P1 |
 | FR-16 | For Azure AD, the OIDC discovery URL MUST be constructed as `https://login.microsoftonline.com/<tenant-id>/v2.0/.well-known/openid-configuration` with tenant ID normalization (accept both GUID and `<domain>.onmicrosoft.com`). | P1 |
-| FR-17 | For Google Workspace, the groups claim MUST be obtained via the Google Directory API (using the access token) since Google's OIDC ID token does not include group membership. `mcp_auth.py` MUST call the Directory API at login time and cache the group list in `sso_session_cache`. | P1 |
+| FR-17 | For Google Workspace, the groups claim MUST be obtained via the Google Directory API (using the access token) since Google's OIDC ID token does not include group membership. The `GoogleWorkspaceAdapter.ExtractGroups()` method MUST call the Directory API at login time and cache the group list in `sso_session_cache`. | P1 |
 | FR-18 | `tag mcp sso configure --test` MUST verify IdP connectivity without writing any configuration or performing authentication. Exit code MUST be 0 on success, 1 on connectivity failure. | P1 |
-| FR-19 | JWS signature verification of IdP-issued JWT tokens MUST be performed using the IdP's JWKS endpoint. TAG MUST NOT accept tokens whose signature cannot be verified against the current JWKS. JWKS caching TTL is 5 minutes. | P0 |
+| FR-19 | JWS signature verification of IdP-issued JWT tokens MUST be performed using `github.com/coreos/go-oidc/v3`'s `IDTokenVerifier`, which fetches and caches the IdP's JWKS automatically. TAG MUST NOT accept tokens whose signature cannot be verified. `alg=none` is rejected by the library unconditionally. JWKS remote-key cache TTL is 5 minutes (library default). | P0 |
 | FR-20 | Scope escalation attempts (a tool requesting scopes beyond what the user's group mappings allow) MUST be blocked, logged to `sso_audit_log` with `event_type=scope_escalation`, and reported via notification (PRD-040). | P0 |
 
 ---
@@ -375,32 +377,37 @@ SSO Audit Log (last 10 events)
 | NFR-04 | **Keychain Security** | Zero plaintext token bytes MUST appear in any file in `~/.tag/`, `/tmp/`, or process environment variables at any point during or after the login flow. |
 | NFR-05 | **Token Verification** | JWS signature verification MUST reject tokens with algorithm `none`, `RS256` with mismatched kid, or expired `exp` claims. |
 | NFR-06 | **Audit Log Durability** | `sso_audit_log` writes use WAL mode (shared with `tag.sqlite3`); each write is followed by an explicit `COMMIT`. No audit event MAY be lost on process crash after the event occurs. |
-| NFR-07 | **Concurrency** | Multiple concurrent `tag run` processes (e.g., in a `tag swarm` scenario) MUST each independently hold their own SSO token exchange result; they MUST NOT race on shared keychain writes. Lock via `keyring`'s atomic set semantics. |
-| NFR-08 | **IdP Compatibility** | All three IdPs (Okta, Azure AD, Google Workspace) MUST pass the full integration test suite. Provider-specific quirks MUST be handled in the `IdPAdapter` class hierarchy, not with `if idp == "okta":` conditionals scattered across `mcp_auth.py`. |
+| NFR-07 | **Concurrency** | Multiple concurrent `tag run` goroutines or processes (e.g., in a `tag swarm` scenario) MUST each independently hold their own SSO token exchange result; they MUST NOT race on shared keychain writes. `go-keyring`'s OS-level atomic set semantics provide this guarantee; no additional mutex is required for the keychain layer. In-process concurrent exchanges for different servers run in separate goroutines with no shared mutable state beyond the keychain. |
+| NFR-08 | **IdP Compatibility** | All three IdPs (Okta, Azure AD, Google Workspace) MUST pass the full integration test suite. Provider-specific quirks MUST be handled in the `IdPAdapter` interface implementations (`OktaAdapter`, `AzureADAdapter`, `GoogleWorkspaceAdapter` structs in `internal/mcp`), not with `if idp == "okta"` conditionals in shared code. |
 | NFR-09 | **Error Messages** | All authentication failures MUST produce human-readable error messages that include: the failed operation, the HTTP status (if applicable), the IdP endpoint that failed, and the next action the user should take. |
-| NFR-10 | **Dependency Footprint** | New runtime dependencies are limited to: `keyring` (already a TAG dependency or well-established), `cryptography` (for JWS verification, already common in Python envs), `httpx` (already used in TAG). No new heavyweight dependencies. |
-| NFR-11 | **Secrets in Logs** | The OTel tracing layer (PRD-013) MUST redact token values from any span attributes before export. `mcp_auth.py` MUST never pass raw token strings to `logger.debug/info/warning/error`. |
-| NFR-12 | **Graceful Degradation** | If the IdP is unreachable at session start (network partition), `mcp_auth.py` MUST use the cached (non-expired) exchanged token if available, or raise `SSOIdPUnreachableError` with a clear message. MUST NOT silently fall back to unauthenticated access. |
+| NFR-10 | **Dependency Footprint** | New Go module dependencies are limited to: `github.com/zalando/go-keyring` (OS keychain; pure-Go + OS API), `github.com/coreos/go-oidc/v3` (OIDC provider + JWKS verifier), `golang.org/x/oauth2` (token exchange, PKCE, device flow — already a transitive dependency via go-sdk). No CGO dependencies introduced; `CGO_ENABLED=0` is preserved. |
+| NFR-11 | **Secrets in Logs** | The OTel tracing layer (PRD-013, `go.opentelemetry.io/otel`) MUST redact token values from any span attributes before export. `internal/mcp` MUST never pass raw token strings to `slog` calls or OTel span attributes. |
+| NFR-12 | **Graceful Degradation** | If the IdP is unreachable at session start (network partition), `internal/mcp` MUST use the cached (non-expired) exchanged token from the keychain if available, or return `*SSOIdPUnreachableError` with a clear message. MUST NOT silently fall back to unauthenticated access. |
 
 ---
 
 ## 9. Technical Design
 
-### 9.1 New Files
+### 9.1 New Go Packages
 
-| File | Purpose |
-|------|---------|
-| `src/tag/mcp_auth.py` | Core SSO logic: IdP adapters, PKCE flow, token exchange, scope resolution, keychain I/O |
-| `src/tag/integrations/sso_adapters/okta.py` | Okta-specific OIDC discovery and groups claim parsing |
-| `src/tag/integrations/sso_adapters/azure_ad.py` | Azure AD v2.0 OIDC + tenant normalization |
-| `src/tag/integrations/sso_adapters/google_workspace.py` | Google Workspace OIDC + Directory API groups fetch |
-| `src/tag/integrations/sso_adapters/__init__.py` | `IdPAdapterRegistry`; adapter lookup by `IdPType` enum |
-| `tests/test_mcp_sso.py` | Unit + integration tests |
-| `tests/fixtures/sso/` | Mock OIDC discovery documents, JWKS, token responses for each IdP |
+| Package / File | Purpose |
+|----------------|---------|
+| `internal/mcp/sso.go` | Core SSO logic: PKCE flow, token exchange, scope resolution, session refresh, error types |
+| `internal/mcp/sso_adapters.go` | `IdPAdapter` interface + `AdapterFor()` registry |
+| `internal/mcp/sso_adapters_okta.go` | `OktaAdapter` — OIDC discovery URL, `groups` claim extraction |
+| `internal/mcp/sso_adapters_azure.go` | `AzureADAdapter` — v2.0 discovery URL, tenant GUID normalization |
+| `internal/mcp/sso_adapters_google.go` | `GoogleWorkspaceAdapter` — OIDC + Directory API groups fetch |
+| `internal/mcp/sso_adapters_workos.go` | `WorkOSAdapter` — thin wrapper over any OIDC endpoint WorkOS exposes |
+| `internal/credentials/sso.go` | Keychain helpers wrapping `github.com/zalando/go-keyring`; canonical key constants |
+| `internal/cli/mcp_sso.go` | Cobra subcommands: `configure`, `login`, `logout`, `status`, `scope map`, `token show`, `audit` |
+| `internal/store/sso.go` | SQLite queries for `sso_*` tables via `modernc.org/sqlite` (`database/sql` interface) |
+| `internal/config/sso.go` | `SSOConfig` load/merge via `koanf/v2` + `~/.tag/sso_config.yaml` write via `yaml.v3` + `gofrs/flock` |
+| `internal/mcp/sso_test.go` | Unit + integration tests (`go test` + `testify` + `net/http/httptest`) |
+| `testdata/sso/` | Mock OIDC discovery documents, JWKS, token responses for each IdP |
 
 ### 9.2 SQLite DDL
 
-All tables use the existing `open_db()` context manager and share the WAL-mode `tag.sqlite3` database at `~/.tag/runtime/tag.sqlite3`.
+All tables are created by `internal/store`'s migration runner and share the WAL-mode `tag.sqlite3` database at `~/.tag/runtime/tag.sqlite3`, accessed via `modernc.org/sqlite` (pure-Go, `CGO_ENABLED=0`). The `STRICT` keyword on `sso_audit_log` requires modernc 1.29+ (SQLite 3.37+).
 
 ```sql
 -- SSO session cache: tracks current IdP session metadata (NOT token values)
@@ -468,425 +475,599 @@ CREATE INDEX IF NOT EXISTS idx_sso_audit_subject ON sso_audit_log(subject, creat
 CREATE INDEX IF NOT EXISTS idx_sso_audit_server ON sso_audit_log(server_name, created_at);
 ```
 
-### 9.3 Core Dataclasses
+### 9.3 Core Structs
 
-```python
-# src/tag/mcp_auth.py
+```go
+// internal/mcp/sso.go
 
-from __future__ import annotations
-import enum
-import time
-from dataclasses import dataclass, field
-from typing import Optional
+package mcp
 
-class IdPType(str, enum.Enum):
-    OKTA             = "okta"
-    AZURE_AD         = "azure-ad"
-    GOOGLE_WORKSPACE = "google-workspace"
-    WORKOS           = "workos"
+import "time"
 
-class KeychainKey(str, enum.Enum):
-    """Canonical keyring account names. Service is always 'tag-sso'."""
-    IDP_ACCESS_TOKEN  = "idp-access-token"
-    IDP_REFRESH_TOKEN = "idp-refresh-token"
-    # Per-server keys are constructed as f"server-token:{server_name}"
+// IdPType identifies the enterprise identity provider.
+type IdPType string
 
-@dataclass
-class SSOConfig:
-    idp_type:       IdPType
-    tenant:         str                        # e.g. "acme.okta.com" or Azure tenant GUID
-    client_id:      str
-    redirect_uri:   str = "http://localhost:9753/callback"
-    scopes:         list[str] = field(default_factory=lambda: [
-        "openid", "email", "profile", "groups", "offline_access"
-    ])
-    device_flow:    bool = False
-    discovery_url:  Optional[str] = None       # auto-derived if None
+const (
+    IdPTypeOkta            IdPType = "okta"
+    IdPTypeAzureAD         IdPType = "azure-ad"
+    IdPTypeGoogleWorkspace IdPType = "google-workspace"
+    IdPTypeWorkOS          IdPType = "workos"
+)
 
-@dataclass
-class OIDCMetadata:
-    issuer:                  str
-    authorization_endpoint:  str
-    token_endpoint:          str
-    jwks_uri:                str
-    device_authorization_endpoint: Optional[str] = None
-    revocation_endpoint:     Optional[str] = None
-    token_endpoint_auth_methods_supported: list[str] = field(default_factory=list)
+// Keychain constants. Service is always KeychainService; per-server account
+// keys are constructed as "server-token:<server_name>".
+const (
+    KeychainService    = "tag-sso"
+    KeyIDPAccessToken  = "idp-access-token"
+    KeyIDPRefreshToken = "idp-refresh-token"
+)
 
-@dataclass
-class SSOSession:
-    subject:           str
-    email:             str
-    groups:            list[str]
-    access_token_exp:  int          # Unix epoch
-    refresh_token_exp: Optional[int]
-    idp_type:          IdPType
-    tenant:            str
+// SSOConfig is loaded from ~/.tag/sso_config.yaml (0600; no secrets stored here).
+// koanf/v2 merges env overrides; yaml.v3 writes it back atomically via gofrs/flock.
+type SSOConfig struct {
+    IdPType      IdPType  `yaml:"idp_type"                 koanf:"idp_type"`
+    Tenant       string   `yaml:"tenant"                   koanf:"tenant"`
+    ClientID     string   `yaml:"client_id"                koanf:"client_id"`
+    RedirectURI  string   `yaml:"redirect_uri"             koanf:"redirect_uri"`
+    Scopes       []string `yaml:"scopes"                   koanf:"scopes"`
+    DeviceFlow   bool     `yaml:"device_flow"              koanf:"device_flow"`
+    DiscoveryURL string   `yaml:"discovery_url,omitempty"  koanf:"discovery_url"` // auto-derived if empty
+}
 
-    def is_access_token_valid(self, clock_skew_s: int = 30) -> bool:
-        return int(time.time()) < (self.access_token_exp - clock_skew_s)
+// OIDCMetadata holds the fields parsed from the IdP's OIDC discovery document.
+type OIDCMetadata struct {
+    Issuer                            string   `json:"issuer"`
+    AuthorizationEndpoint             string   `json:"authorization_endpoint"`
+    TokenEndpoint                     string   `json:"token_endpoint"`
+    JWKsURI                           string   `json:"jwks_uri"`
+    DeviceAuthorizationEndpoint       string   `json:"device_authorization_endpoint,omitempty"`
+    RevocationEndpoint                string   `json:"revocation_endpoint,omitempty"`
+    TokenEndpointAuthMethodsSupported []string `json:"token_endpoint_auth_methods_supported,omitempty"`
+}
 
-    def is_refresh_token_valid(self) -> bool:
-        if self.refresh_token_exp is None:
-            return False
-        return int(time.time()) < self.refresh_token_exp
+// SSOSession holds non-sensitive session metadata; no token values stored here.
+type SSOSession struct {
+    Subject         string
+    Email           string
+    Groups          []string
+    AccessTokenExp  time.Time
+    RefreshTokenExp time.Time // zero value if IdP does not issue refresh tokens
+    IdPType         IdPType
+    Tenant          string
+}
 
-@dataclass
-class TokenExchangeResult:
-    server_name:     str
-    server_uri:      str
-    scopes_granted:  list[str]
-    token_exp:       int          # Unix epoch
-    keychain_account: str         # keyring account key for retrieval
+func (s *SSOSession) IsAccessTokenValid(clockSkew time.Duration) bool {
+    return time.Now().Add(clockSkew).Before(s.AccessTokenExp)
+}
 
-@dataclass
-class ScopeMappingPolicy:
-    """Resolved scope policy for a user+server combination."""
-    server_name:      str
-    user_groups:      list[str]
-    mapped_scopes:    list[str]   # union of all group mappings for this server
-    server_scopes:    list[str]   # scopes advertised by the MCP server AS
-    idp_token_scopes: list[str]   # scopes present in the IdP access token
-    effective_scopes: list[str]   # intersection of all three above
+func (s *SSOSession) IsRefreshTokenValid() bool {
+    return !s.RefreshTokenExp.IsZero() && time.Now().Before(s.RefreshTokenExp)
+}
+
+// TokenExchangeResult holds metadata about a completed RFC 8693 exchange; no raw token.
+type TokenExchangeResult struct {
+    ServerName      string
+    ServerURI       string
+    ScopesGranted   []string
+    TokenExp        time.Time
+    KeychainAccount string // go-keyring account key; raw token stored there
+}
+
+// ScopeMappingPolicy is the resolved scope policy for one user+server pair.
+type ScopeMappingPolicy struct {
+    ServerName      string
+    UserGroups      []string
+    MappedScopes    []string // union of all sso_scope_maps rows for this server+groups
+    ServerScopes    []string // scopes advertised by the MCP server AS
+    IdPTokenScopes  []string // scopes present in the IdP access token
+    EffectiveScopes []string // three-way intersection — what gets requested
+}
 ```
 
 ### 9.4 IdP Adapter Interface
 
-```python
-# src/tag/mcp_auth.py (continued)
+```go
+// internal/mcp/sso_adapters.go
 
-import abc
-import httpx
+package mcp
 
-class IdPAdapter(abc.ABC):
-    """Abstract base for IdP-specific OIDC behavior."""
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "net/http"
+)
 
-    def __init__(self, config: SSOConfig):
-        self.config = config
+// IdPAdapter is the interface each enterprise IdP adapter must satisfy.
+// Provider-specific quirks are confined here; shared SSO logic never
+// switches on IdPType directly.
+type IdPAdapter interface {
+    // DiscoveryURL returns the OIDC /.well-known/openid-configuration URL.
+    DiscoveryURL() string
+    // ExtractGroups returns group names for the authenticated user.
+    // Some IdPs (Okta) embed groups in the ID token claim directly.
+    // Others (Google Workspace) require a secondary Directory API call.
+    ExtractGroups(ctx context.Context, idTokenClaims map[string]any, accessToken string, hc *http.Client) ([]string, error)
+    // NormalizeTenant converts any accepted tenant representation to canonical form.
+    NormalizeTenant(tenant string) string
+}
 
-    @abc.abstractmethod
-    def discovery_url(self) -> str:
-        """Return the OIDC discovery document URL for this IdP/tenant."""
-        ...
+// FetchOIDCMetadata fetches and validates the IdP discovery document.
+// Called by all adapters via a shared helper — no per-IdP duplication.
+func FetchOIDCMetadata(ctx context.Context, discoveryURL string, hc *http.Client) (*OIDCMetadata, error) {
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, discoveryURL, nil)
+    if err != nil {
+        return nil, fmt.Errorf("build discovery request: %w", err)
+    }
+    resp, err := hc.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("fetch OIDC metadata from %s: %w", discoveryURL, err)
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("OIDC discovery returned HTTP %d from %s", resp.StatusCode, discoveryURL)
+    }
+    var meta OIDCMetadata
+    if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+        return nil, fmt.Errorf("decode OIDC metadata: %w", err)
+    }
+    if meta.Issuer == "" || meta.AuthorizationEndpoint == "" ||
+        meta.TokenEndpoint == "" || meta.JWKsURI == "" {
+        return nil, fmt.Errorf("OIDC metadata missing required fields (issuer/authorization_endpoint/token_endpoint/jwks_uri)")
+    }
+    return &meta, nil
+}
 
-    @abc.abstractmethod
-    def extract_groups(
-        self,
-        id_token_claims: dict,
-        access_token: str,
-        http: httpx.Client,
-    ) -> list[str]:
-        """Return list of group names for the authenticated user.
+// adapterRegistry maps IdPType to its constructor.
+var adapterRegistry = map[IdPType]func(*SSOConfig) IdPAdapter{
+    IdPTypeOkta:            func(c *SSOConfig) IdPAdapter { return &OktaAdapter{cfg: c} },
+    IdPTypeAzureAD:         func(c *SSOConfig) IdPAdapter { return &AzureADAdapter{cfg: c} },
+    IdPTypeGoogleWorkspace: func(c *SSOConfig) IdPAdapter { return &GoogleWorkspaceAdapter{cfg: c} },
+    IdPTypeWorkOS:          func(c *SSOConfig) IdPAdapter { return &WorkOSAdapter{cfg: c} },
+}
 
-        Some IdPs (Okta) include groups in the token claim directly.
-        Others (Google Workspace) require a secondary API call.
-        """
-        ...
-
-    def normalize_tenant(self, tenant: str) -> str:
-        return tenant  # default: no transformation
-
-    async def fetch_metadata(self, http: httpx.AsyncClient) -> OIDCMetadata:
-        resp = await http.get(self.discovery_url(), timeout=10.0)
-        resp.raise_for_status()
-        doc = resp.json()
-        return OIDCMetadata(
-            issuer=doc["issuer"],
-            authorization_endpoint=doc["authorization_endpoint"],
-            token_endpoint=doc["token_endpoint"],
-            jwks_uri=doc["jwks_uri"],
-            device_authorization_endpoint=doc.get("device_authorization_endpoint"),
-            revocation_endpoint=doc.get("revocation_endpoint"),
-            token_endpoint_auth_methods_supported=doc.get(
-                "token_endpoint_auth_methods_supported", []
-            ),
-        )
+// AdapterFor returns the IdPAdapter for the given SSO config.
+func AdapterFor(cfg *SSOConfig) (IdPAdapter, error) {
+    ctor, ok := adapterRegistry[cfg.IdPType]
+    if !ok {
+        return nil, fmt.Errorf("unsupported IdP type: %q", cfg.IdPType)
+    }
+    return ctor(cfg), nil
+}
 ```
 
 ### 9.5 PKCE and Authorization Code Flow
 
-```python
-# src/tag/mcp_auth.py (continued)
+```go
+// internal/mcp/sso.go (continued)
 
-import base64
-import hashlib
-import os
-import secrets
-import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import (
+    "crypto/rand"
+    "crypto/sha256"
+    "encoding/base64"
+    "fmt"
+    "net"
+    "net/url"
+    "strings"
+)
 
-def _pkce_pair() -> tuple[str, str]:
-    """Return (code_verifier, code_challenge) for PKCE S256."""
-    verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
-    digest = hashlib.sha256(verifier.encode()).digest()
-    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-    return verifier, challenge
-
-def _build_auth_url(
-    metadata: OIDCMetadata,
-    config: SSOConfig,
-    state: str,
-    code_challenge: str,
-    port: int,
-) -> str:
-    params = {
-        "response_type":         "code",
-        "client_id":             config.client_id,
-        "redirect_uri":          f"http://localhost:{port}/callback",
-        "scope":                 " ".join(config.scopes),
-        "state":                 state,
-        "code_challenge":        code_challenge,
-        "code_challenge_method": "S256",
+// pkceS256Pair generates a PKCE (code_verifier, code_challenge) pair using the
+// S256 method (RFC 7636 §4.2). Uses crypto/rand for verifier entropy.
+func pkceS256Pair() (verifier, challenge string, err error) {
+    raw := make([]byte, 32)
+    if _, err = rand.Read(raw); err != nil {
+        return "", "", fmt.Errorf("generate PKCE verifier entropy: %w", err)
     }
-    return metadata.authorization_endpoint + "?" + urllib.parse.urlencode(params)
+    verifier = base64.RawURLEncoding.EncodeToString(raw)
+    sum := sha256.Sum256([]byte(verifier))
+    challenge = base64.RawURLEncoding.EncodeToString(sum[:])
+    return verifier, challenge, nil
+}
+
+// buildAuthURL constructs the OIDC authorization request URL.
+// code_challenge_method is always "S256"; "plain" is never used.
+func buildAuthURL(meta *OIDCMetadata, cfg *SSOConfig, state, codeChallenge string, port int) string {
+    q := url.Values{
+        "response_type":         {"code"},
+        "client_id":             {cfg.ClientID},
+        "redirect_uri":          {fmt.Sprintf("http://localhost:%d/callback", port)},
+        "scope":                 {strings.Join(cfg.Scopes, " ")},
+        "state":                 {state},
+        "code_challenge":        {codeChallenge},
+        "code_challenge_method": {"S256"},
+    }
+    return meta.AuthorizationEndpoint + "?" + q.Encode()
+}
+
+// pickEphemeralPort binds a random OS-assigned port in the ephemeral range and
+// immediately releases the listener, returning the port number for the redirect server.
+func pickEphemeralPort() (int, error) {
+    l, err := net.Listen("tcp", "127.0.0.1:0")
+    if err != nil {
+        return 0, fmt.Errorf("pick loopback port: %w", err)
+    }
+    port := l.Addr().(*net.TCPAddr).Port
+    _ = l.Close()
+    return port, nil
+}
+
+// The loopback redirect handler is a minimal net/http server spun up for the
+// duration of the login flow. It captures the authorization code and state
+// parameters from the redirect URI, verifies state, then shuts itself down.
 ```
 
 ### 9.6 RFC 8693 Token Exchange Algorithm
 
-```python
-# src/tag/mcp_auth.py (continued)
+```go
+// internal/mcp/sso.go (continued)
 
-import keyring
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "io"
+    "net/http"
+    "net/url"
+    "strings"
+    "time"
 
-async def exchange_token_for_server(
-    server_name: str,
-    server_uri: str,
-    token_endpoint: str,
-    client_id: str,
-    policy: ScopeMappingPolicy,
-    http: httpx.AsyncClient,
-) -> TokenExchangeResult:
-    """
-    Perform RFC 8693 token exchange: trade IdP access token for
-    a server-scoped access token.
+    keyring "github.com/zalando/go-keyring"
+)
 
-    The `resource` parameter (RFC 8707) is MANDATORY and set to `server_uri`.
-    """
-    if not policy.effective_scopes:
-        raise ScopeEscalationError(
-            f"No scopes authorized for {server_name} given current group membership"
-        )
-
-    idp_access_token = keyring.get_password("tag-sso", KeychainKey.IDP_ACCESS_TOKEN)
-    if not idp_access_token:
-        raise SSOSessionExpiredError("No IdP access token in keychain. Run `tag mcp sso login`.")
-
-    payload = {
-        "grant_type":          "urn:ietf:params:oauth:grant-type:token-exchange",
-        "client_id":           client_id,
-        "subject_token":       idp_access_token,
-        "subject_token_type":  "urn:ietf:params:oauth:token-type:access_token",
-        "requested_token_type":"urn:ietf:params:oauth:token-type:access_token",
-        "resource":            server_uri,   # RFC 8707 — MANDATORY
-        "scope":               " ".join(policy.effective_scopes),
+// exchangeTokenForServer performs RFC 8693 token exchange: trades the IdP access
+// token for a server-scoped access token. The `resource` parameter (RFC 8707)
+// is mandatory and set to serverURI. Identity is propagated via context.Context.
+func exchangeTokenForServer(
+    ctx context.Context,
+    serverName, serverURI, tokenEndpoint, clientID string,
+    policy *ScopeMappingPolicy,
+    hc *http.Client,
+) (*TokenExchangeResult, error) {
+    if len(policy.EffectiveScopes) == 0 {
+        return nil, &ScopeEscalationError{ServerName: serverName,
+            Detail: "no scopes authorized for current group membership"}
     }
 
-    resp = await http.post(token_endpoint, data=payload, timeout=15.0)
+    idpAccessToken, err := keyring.Get(KeychainService, KeyIDPAccessToken)
+    if err != nil || idpAccessToken == "" {
+        return nil, &SSOSessionExpiredError{Detail: "no IdP access token in keychain — run `tag mcp sso login`"}
+    }
 
-    if resp.status_code == 400:
-        err = resp.json()
-        if err.get("error") == "unsupported_grant_type":
-            raise TokenExchangeNotSupportedError(server_name)
-        raise TokenExchangeError(server_name, err.get("error"), err.get("error_description"))
+    form := url.Values{
+        "grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
+        "client_id":            {clientID},
+        "subject_token":        {idpAccessToken},
+        "subject_token_type":   {"urn:ietf:params:oauth:token-type:access_token"},
+        "requested_token_type": {"urn:ietf:params:oauth:token-type:access_token"},
+        "resource":             {serverURI}, // RFC 8707 — MANDATORY
+        "scope":                {strings.Join(policy.EffectiveScopes, " ")},
+    }
 
-    resp.raise_for_status()
-    token_resp = resp.json()
+    req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint,
+        strings.NewReader(form.Encode()))
+    if err != nil {
+        return nil, fmt.Errorf("build token-exchange request: %w", err)
+    }
+    req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-    issued_token = token_resp["access_token"]
-    exp = int(time.time()) + int(token_resp.get("expires_in", 3600))
-    keychain_account = f"server-token:{server_name}"
-    keyring.set_password("tag-sso", keychain_account, issued_token)
+    resp, err := hc.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("token exchange POST to %s: %w", tokenEndpoint, err)
+    }
+    defer resp.Body.Close()
+    body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 
-    return TokenExchangeResult(
-        server_name=server_name,
-        server_uri=server_uri,
-        scopes_granted=token_resp.get("scope", "").split(),
-        token_exp=exp,
-        keychain_account=keychain_account,
-    )
+    if resp.StatusCode == http.StatusBadRequest {
+        var oauthErr struct {
+            Error       string `json:"error"`
+            Description string `json:"error_description"`
+        }
+        _ = json.Unmarshal(body, &oauthErr)
+        if oauthErr.Error == "unsupported_grant_type" {
+            return nil, &TokenExchangeNotSupportedError{ServerName: serverName}
+        }
+        return nil, &TokenExchangeError{ServerName: serverName,
+            Code: oauthErr.Error, Detail: oauthErr.Description}
+    }
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("token exchange HTTP %d for %s", resp.StatusCode, serverName)
+    }
+
+    var tokenResp struct {
+        AccessToken string `json:"access_token"`
+        ExpiresIn   int    `json:"expires_in"`
+        Scope       string `json:"scope"`
+    }
+    if err := json.Unmarshal(body, &tokenResp); err != nil {
+        return nil, fmt.Errorf("decode token response: %w", err)
+    }
+
+    ttl := time.Duration(tokenResp.ExpiresIn) * time.Second
+    if tokenResp.ExpiresIn == 0 {
+        ttl = time.Hour
+    }
+    keychainAccount := "server-token:" + serverName
+    if err := keyring.Set(KeychainService, keychainAccount, tokenResp.AccessToken); err != nil {
+        return nil, fmt.Errorf("store exchanged token in keychain: %w", err)
+    }
+
+    return &TokenExchangeResult{
+        ServerName:      serverName,
+        ServerURI:       serverURI,
+        ScopesGranted:   strings.Fields(tokenResp.Scope),
+        TokenExp:        time.Now().Add(ttl),
+        KeychainAccount: keychainAccount,
+    }, nil
+}
 ```
 
 ### 9.7 Scope Resolution Algorithm
 
-```python
-# src/tag/mcp_auth.py (continued)
+```go
+// internal/store/sso.go
 
-from tag.controller import open_db
+package store
 
-def resolve_scope_policy(
-    server_name: str,
-    user_groups: list[str],
-    server_supported_scopes: list[str],
-    idp_token_scopes: list[str],
-) -> ScopeMappingPolicy:
-    """
-    Compute effective scopes for a token exchange as the three-way intersection:
-      effective = mapped_scopes ∩ server_supported_scopes ∩ idp_token_scopes
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "sort"
+    "strings"
 
-    mapped_scopes = UNION of all scope entries in sso_scope_maps
-                    where idp_group IN user_groups AND server_name = server_name
-    """
-    with open_db() as db:
-        placeholders = ",".join("?" * len(user_groups))
-        rows = db.execute(
-            f"""
-            SELECT scopes FROM sso_scope_maps
-            WHERE server_name = ? AND idp_group IN ({placeholders})
-            """,
-            [server_name, *user_groups],
-        ).fetchall()
+    "tag/internal/mcp"
+)
 
-    mapped: set[str] = set()
-    for row in rows:
-        for s in row["scopes"].split(","):
-            mapped.add(s.strip())
+// ResolveScopePolicy computes the effective scope set for a token exchange as the
+// three-way intersection:
+//
+//   effective = mappedScopes ∩ serverScopes ∩ idpTokenScopes
+//
+// mappedScopes = UNION of sso_scope_maps rows where
+//                 server_name = serverName AND idp_group IN userGroups.
+//
+// Called from internal/mcp before every RFC 8693 exchange. DB access is via
+// modernc.org/sqlite's database/sql driver; the context carries a deadline so
+// a slow DB does not stall MCP session startup.
+func ResolveScopePolicy(
+    ctx context.Context,
+    db *sql.DB,
+    serverName string,
+    userGroups, serverScopes, idpScopes []string,
+) (*mcp.ScopeMappingPolicy, error) {
+    if len(userGroups) == 0 {
+        return &mcp.ScopeMappingPolicy{ServerName: serverName, UserGroups: userGroups}, nil
+    }
 
-    server_set = set(server_supported_scopes)
-    idp_set    = set(idp_token_scopes)
-    effective  = sorted(mapped & server_set & idp_set)
+    ph := strings.Repeat("?,", len(userGroups))
+    ph = ph[:len(ph)-1]
+    query := `SELECT scopes FROM sso_scope_maps WHERE server_name = ? AND idp_group IN (` + ph + `)`
 
-    return ScopeMappingPolicy(
-        server_name=server_name,
-        user_groups=user_groups,
-        mapped_scopes=sorted(mapped),
-        server_scopes=server_supported_scopes,
-        idp_token_scopes=idp_token_scopes,
-        effective_scopes=effective,
-    )
+    args := make([]any, 0, 1+len(userGroups))
+    args = append(args, serverName)
+    for _, g := range userGroups {
+        args = append(args, g)
+    }
+
+    rows, err := db.QueryContext(ctx, query, args...)
+    if err != nil {
+        return nil, fmt.Errorf("query sso_scope_maps: %w", err)
+    }
+    defer rows.Close()
+
+    mapped := make(map[string]struct{})
+    for rows.Next() {
+        var scopes string
+        if err := rows.Scan(&scopes); err != nil {
+            return nil, err
+        }
+        for _, s := range strings.Split(scopes, ",") {
+            mapped[strings.TrimSpace(s)] = struct{}{}
+        }
+    }
+    if err := rows.Err(); err != nil {
+        return nil, err
+    }
+
+    serverSet := setOf(serverScopes)
+    idpSet    := setOf(idpScopes)
+    var effective []string
+    for s := range mapped {
+        if _, inServer := serverSet[s]; inServer {
+            if _, inIdP := idpSet[s]; inIdP {
+                effective = append(effective, s)
+            }
+        }
+    }
+    sort.Strings(effective)
+
+    return &mcp.ScopeMappingPolicy{
+        ServerName:      serverName,
+        UserGroups:      userGroups,
+        MappedScopes:    sortedKeys(mapped),
+        ServerScopes:    serverScopes,
+        IdPTokenScopes:  idpScopes,
+        EffectiveScopes: effective,
+    }, nil
+}
+
+func setOf(ss []string) map[string]struct{} {
+    m := make(map[string]struct{}, len(ss))
+    for _, s := range ss {
+        m[s] = struct{}{}
+    }
+    return m
+}
 ```
 
 ### 9.8 JWS Signature Verification
 
-```python
-# src/tag/mcp_auth.py (continued)
+Rather than hand-rolling RSA key reconstruction and signature verification, the Go stack delegates entirely to `github.com/coreos/go-oidc/v3`. The library fetches and caches JWKS automatically from the IdP's discovery document, enforces algorithm restrictions (rejects `alg=none` unconditionally), validates `exp`/`iss`/`aud`, and performs `kid`-matched signature verification. Access token claims (for group extraction on IdPs that embed them) are parsed with `github.com/golang-jwt/jwt/v5` using the same go-oidc-managed key set.
 
-import functools
-import time as _time
-from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
-from cryptography.hazmat.backends import default_backend
+```go
+// internal/mcp/sso.go (continued)
 
-@functools.lru_cache(maxsize=8)
-def _fetch_jwks_cached(jwks_uri: str, cache_bust: int) -> dict:
-    """cache_bust = int(time.time()) // 300  (5-minute TTL)"""
-    resp = httpx.get(jwks_uri, timeout=10.0)
-    resp.raise_for_status()
-    return resp.json()
+import (
+    "context"
+    "fmt"
+    "time"
 
-def fetch_jwks(jwks_uri: str) -> dict:
-    return _fetch_jwks_cached(jwks_uri, int(_time.time()) // 300)
+    "github.com/coreos/go-oidc/v3/oidc"
+)
 
-def verify_jwt(token: str, jwks: dict, expected_issuer: str, expected_audience: str | None = None) -> dict:
-    """
-    Verify JWS signature and return decoded claims.
-    Rejects: alg=none, expired tokens, issuer mismatch, audience mismatch.
-    Uses `cryptography` library for RSA public key reconstruction from JWKS.
-    """
-    import json as _json
-    header_b64, payload_b64, sig_b64 = token.split(".")
-    header = _json.loads(_b64_decode(header_b64))
+// ssoVerifier wraps a go-oidc Provider + IDTokenVerifier per IdP issuer.
+// One instance is created per SSOConfig and reused across all login/exchange
+// operations — the library manages JWKS cache refresh internally (5-minute TTL).
+type ssoVerifier struct {
+    provider *oidc.Provider
+    verifier *oidc.IDTokenVerifier
+}
 
-    if header.get("alg") == "none":
-        raise JWSVerificationError("Algorithm 'none' is not permitted")
+// newSSOVerifier initialises an oidc.Provider by fetching the discovery document
+// from issuerURL. go-oidc then owns JWKS fetching, caching, and kid-matching.
+func newSSOVerifier(ctx context.Context, issuerURL, clientID string) (*ssoVerifier, error) {
+    provider, err := oidc.NewProvider(ctx, issuerURL)
+    if err != nil {
+        return nil, fmt.Errorf("init OIDC provider for %s: %w", issuerURL, err)
+    }
+    v := provider.Verifier(&oidc.Config{
+        ClientID:                   clientID,
+        Now:                        time.Now,
+        InsecureSkipSignatureCheck: false, // always enforce
+    })
+    return &ssoVerifier{provider: provider, verifier: v}, nil
+}
 
-    kid = header.get("kid")
-    alg = header.get("alg", "RS256")
-
-    # Find matching key in JWKS
-    key_data = next(
-        (k for k in jwks.get("keys", []) if k.get("kid") == kid),
-        None,
-    )
-    if key_data is None:
-        raise JWSVerificationError(f"No JWKS key found for kid={kid!r}")
-
-    # Reconstruct RSA public key and verify signature
-    # (full implementation uses cryptography.hazmat.primitives.serialization)
-    _verify_rsa_signature(header_b64 + "." + payload_b64, sig_b64, key_data, alg)
-
-    claims = _json.loads(_b64_decode(payload_b64))
-
-    if claims.get("iss") != expected_issuer:
-        raise JWSVerificationError(
-            f"Issuer mismatch: expected {expected_issuer!r}, got {claims.get('iss')!r}"
-        )
-    if int(_time.time()) > claims.get("exp", 0):
-        raise JWSVerificationError("Token has expired")
-    if expected_audience and claims.get("aud") != expected_audience:
-        raise JWSVerificationError(
-            f"Audience mismatch: expected {expected_audience!r}"
-        )
-    return claims
+// VerifyIDToken verifies a raw ID token string and extracts its claims.
+// Rejects: alg=none (go-oidc enforces this), expired exp, issuer mismatch,
+// audience mismatch, kid not found in JWKS.
+// Returns the decoded claims map for group extraction by the IdP adapter.
+func (sv *ssoVerifier) VerifyIDToken(ctx context.Context, rawIDToken string) (map[string]any, error) {
+    token, err := sv.verifier.Verify(ctx, rawIDToken)
+    if err != nil {
+        return nil, fmt.Errorf("ID token verification: %w", err)
+    }
+    var claims map[string]any
+    if err := token.Claims(&claims); err != nil {
+        return nil, fmt.Errorf("extract ID token claims: %w", err)
+    }
+    return claims, nil
+}
 ```
 
 ### 9.9 Audit Log Writer
 
-```python
-# src/tag/mcp_auth.py (continued)
+```go
+// internal/store/sso.go (continued)
 
-from tag.controller import open_db
+import (
+    "context"
+    "database/sql"
+    "fmt"
+)
 
-def audit(
-    event_type: str,
-    outcome: str,
-    *,
-    subject: str | None = None,
-    email: str | None = None,
-    server_name: str | None = None,
-    scopes_requested: str | None = None,
-    scopes_granted: str | None = None,
-    error_code: str | None = None,
-    error_detail: str | None = None,
-    idp_type: str | None = None,
-    tenant: str | None = None,
-) -> None:
-    """Write a single row to sso_audit_log. Called on every SSO event."""
-    with open_db() as db:
-        db.execute(
-            """
-            INSERT INTO sso_audit_log
-              (event_type, subject, email, server_name, scopes_requested,
-               scopes_granted, outcome, error_code, error_detail, idp_type, tenant)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (event_type, subject, email, server_name, scopes_requested,
-             scopes_granted, outcome, error_code, error_detail, idp_type, tenant),
-        )
-        db.commit()
+// AuditSSOEvent holds the safe metadata for one SSO audit row.
+// Token values are never included — callers must not pass them.
+type AuditSSOEvent struct {
+    EventType       string // login|logout|exchange|refresh|revocation|scope_escalation|exchange_failure
+    Subject         string // IdP sub claim (empty before login completes)
+    Email           string
+    ServerName      string // empty for login/logout/refresh events
+    ScopesRequested string // space-separated; populated for exchange events
+    ScopesGranted   string // may differ from requested after intersection
+    Outcome         string // success|failure|blocked
+    ErrorCode       string // OAuth error code if Outcome=failure
+    ErrorDetail     string // human-readable error detail
+    IdPType         string
+    Tenant          string
+}
+
+// AuditSSO writes one row to sso_audit_log. Uses the existing *sql.DB connection
+// (modernc.org/sqlite WAL mode); each call issues a single INSERT and relies on
+// SQLite's implicit per-statement commit in autocommit mode.
+// This is called on every SSO event and must complete within 500 ms (FR-11).
+func AuditSSO(ctx context.Context, db *sql.DB, e AuditSSOEvent) error {
+    _, err := db.ExecContext(ctx, `
+        INSERT INTO sso_audit_log
+          (event_type, subject, email, server_name, scopes_requested,
+           scopes_granted, outcome, error_code, error_detail, idp_type, tenant)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        e.EventType, e.Subject, e.Email, e.ServerName, e.ScopesRequested,
+        e.ScopesGranted, e.Outcome, e.ErrorCode, e.ErrorDetail, e.IdPType, e.Tenant,
+    )
+    if err != nil {
+        return fmt.Errorf("write sso_audit_log: %w", err)
+    }
+    return nil
+}
 ```
 
 ### 9.10 Integration Into MCP Server Session Startup
 
-The existing MCP server connection code in `controller.py` calls a hook point at session initialization. `mcp_auth.py` is invoked here:
+The go-sdk client (`github.com/modelcontextprotocol/go-sdk v1.6.1`) accepts a custom `http.RoundTripper` that injects the `Authorization` header into every MCP request. The SSO layer provides this transport. `internal/mcp` exposes `GetMCPAuthToken` which is called once per session; the resulting token is wrapped in an `authRoundTripper` and passed to the go-sdk client constructor.
 
-```python
-# src/tag/controller.py  (sketch of modified section)
+```go
+// internal/mcp/client.go (modified section)
 
-async def _get_mcp_auth_headers(server_name: str, server_uri: str) -> dict[str, str]:
-    """
-    Return Authorization header for MCP server connection.
-    Prefers SSO token exchange if configured; falls back to per-server OAuth token;
-    falls back to empty dict if neither is configured.
-    """
-    sso_config_path = pathlib.Path.home() / ".tag" / "sso_config.yaml"
-    if not sso_config_path.exists():
-        return await _get_per_server_oauth_token(server_name)  # existing flow
+package mcp
 
-    # Lazy import — only when SSO is configured
-    from tag.mcp_auth import get_or_exchange_server_token, SSOSessionExpiredError, \
-        TokenExchangeNotSupportedError
+import (
+    "context"
+    "errors"
+    "fmt"
+    "net/http"
 
-    try:
-        token = await get_or_exchange_server_token(server_name, server_uri)
-        return {"Authorization": f"Bearer {token}"}
-    except TokenExchangeNotSupportedError:
-        return await _get_per_server_oauth_token(server_name)
-    except SSOSessionExpiredError as exc:
-        from tag.notifications import notify
-        notify(f"SSO session expired for {server_name}: {exc}. Run `tag mcp sso login`.")
-        raise
+    "tag/internal/config"
+    "tag/internal/store"
+)
+
+// authRoundTripper injects a Bearer token into every outbound MCP HTTP request.
+type authRoundTripper struct {
+    token string
+    base  http.RoundTripper
+}
+
+func (a *authRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+    r2 := r.Clone(r.Context())
+    r2.Header.Set("Authorization", "Bearer "+a.token)
+    return a.base.RoundTrip(r2)
+}
+
+// GetMCPAuthToken returns the Bearer token to use for an MCP server session.
+// Prefers RFC 8693 SSO exchange when configured; falls back to per-server
+// OAuth; returns empty string if neither is active.
+// Zero SSO work runs when config.SSOConfigured() is false (FR-15, NFR-03).
+func GetMCPAuthToken(ctx context.Context, serverName, serverURI string, db *store.DB) (string, error) {
+    if !config.SSOConfigured() {
+        return store.GetPerServerOAuthToken(ctx, db, serverName)
+    }
+
+    token, err := GetOrExchangeServerToken(ctx, serverName, serverURI, db)
+    if err == nil {
+        return token, nil
+    }
+
+    var notSupported *TokenExchangeNotSupportedError
+    if errors.As(err, &notSupported) {
+        // MCP server's AS does not advertise token-exchange; use per-server OAuth.
+        return store.GetPerServerOAuthToken(ctx, db, serverName)
+    }
+
+    var expired *SSOSessionExpiredError
+    if errors.As(err, &expired) {
+        notifySSOExpired(ctx, serverName) // PRD-040 notification hook
+        return "", fmt.Errorf("SSO session expired for %s — run `tag mcp sso login`: %w", serverName, err)
+    }
+
+    return "", err
+}
 ```
 
+The go-sdk's Enterprise Managed Auth path (`mcp.WithHTTPClient`) is the injection point: `mcp.NewClient(..., mcp.WithHTTPClient(&http.Client{Transport: &authRoundTripper{token: tok, base: http.DefaultTransport}}))`. For stdio-transport MCP servers the token is passed as an environment variable per the MCP auth spec.
+
 ### 9.11 SSO Config File Format (`~/.tag/sso_config.yaml`)
+
+Loaded by `internal/config/sso.go` via `koanf/v2` + `gopkg.in/yaml.v3`; written atomically with `gofrs/flock` + `os.Rename`. Permissions enforced to `0600` on write. No secrets stored here — they are keychain-only.
 
 ```yaml
 # ~/.tag/sso_config.yaml
@@ -946,7 +1127,7 @@ mappings:
 
 ## 10. Security Considerations
 
-1. **Zero plaintext token storage.** All token values (IdP access tokens, refresh tokens, exchanged server tokens) are stored exclusively in the OS keychain via `keyring`. The `keyring` library uses macOS Keychain, Windows Credential Manager, or libsecret on Linux. No token byte ever touches a file, the SQLite database, an environment variable, or a log line. The `audit` function explicitly accepts only non-sensitive metadata, not token values.
+1. **Zero plaintext token storage.** All token values (IdP access tokens, refresh tokens, exchanged server tokens) are stored exclusively in the OS keychain via `github.com/zalando/go-keyring`, which uses macOS Keychain Services, Windows Credential Manager, or libsecret on Linux. No token byte ever touches a file, the SQLite database, an environment variable, or a log line. `AuditSSO` in `internal/store` explicitly accepts only non-sensitive metadata, not token values.
 
 2. **PKCE S256 mandatory for all flows.** The authorization code flow always uses PKCE S256 (RFC 7636 section 4.2). The `code_challenge_method=plain` variant is explicitly rejected. This prevents authorization code interception attacks even if the loopback redirect is race-conditioned by another local process.
 
@@ -956,7 +1137,7 @@ mappings:
 
 5. **Scope intersection enforces least privilege.** The `resolve_scope_policy` function computes a three-way intersection. No code path allows scopes to be granted that are not simultaneously present in the user's IdP group mappings, the MCP server's supported scope list, and the IdP access token's own scope claim. A scope escalation attempt is blocked, audited, and reported.
 
-6. **JWS verification with JWKS caching.** Tokens are verified against the IdP's JWKS endpoint before any claims are trusted. The `alg=none` algorithm is explicitly rejected. JWKS are cached for 5 minutes to limit network calls, but each login and exchange operation fetches fresh JWKS by busting the cache key. `kid` mismatch causes rejection.
+6. **JWS verification with JWKS caching.** Tokens are verified via `github.com/coreos/go-oidc/v3`'s `IDTokenVerifier` against the IdP's JWKS endpoint before any claims are trusted. The library unconditionally rejects `alg=none`. JWKS are cached internally for ~5 minutes to limit network calls; `kid` mismatch triggers an immediate re-fetch before rejection.
 
 7. **Audit log integrity.** The `sso_audit_log` table uses `STRICT` mode (SQLite 3.37+), enforcing declared column types. Each row is committed immediately. The table has no `DELETE` or `UPDATE` permission granted in application code — `audit()` only calls `INSERT`. Deletion requires direct SQLite access.
 
@@ -968,60 +1149,64 @@ mappings:
 
 11. **Headless environment token isolation.** In device code flow (headless), the `user_code` and verification URI are printed to stdout only. They are never logged to the audit log or written to any file. The `device_code` value (which carries higher trust than `user_code`) is stored only in process memory until the exchange completes.
 
-12. **Tracing redaction.** The OTel span emitted by `exchange_token_for_server` sets attributes `sso.server_name`, `sso.scopes_granted`, `sso.subject`, and `sso.outcome`. It explicitly does NOT set `sso.token` or any raw token attribute. The existing `security.py` redaction layer (PRD-034) covers these spans.
+12. **Tracing redaction.** The OTel span emitted by `exchangeTokenForServer` (`go.opentelemetry.io/otel`) sets attributes `sso.server_name`, `sso.scopes_granted`, `sso.subject`, and `sso.outcome`. It explicitly does NOT set `sso.token` or any raw token attribute. The OTel span processor in `internal/netguard` (PRD-034) redacts these spans before OTLP export.
 
 ---
 
 ## 11. Testing Strategy
 
-### 11.1 Unit Tests (`tests/test_mcp_sso.py`)
+All tests live in `internal/mcp/sso_test.go` and `internal/store/sso_test.go`. The test runner is `go test ./...` with `github.com/stretchr/testify/assert` and `github.com/stretchr/testify/require`. HTTP-level tests use `net/http/httptest` servers to mock the IdP token endpoint, JWKS endpoint, and MCP AS. SQLite tests use `modernc.org/sqlite` with an in-memory DSN (`file::memory:?cache=shared`).
+
+### 11.1 Unit Tests (`internal/mcp/sso_test.go`)
 
 | Test | Description |
 |------|-------------|
-| `test_pkce_pair_s256` | Verify that `_pkce_pair()` returns a valid S256 code_challenge derived from the verifier: `base64url(sha256(verifier)) == challenge`. |
-| `test_pkce_pair_uniqueness` | Call `_pkce_pair()` 100 times; assert all verifiers are distinct (birthday-paradox collision probability < 1e-38). |
-| `test_scope_intersection_basic` | User in `data-engineers`; mapped scopes `[read:query, write:query]`; server supports `[read:query, admin:query]`; IdP token has `[openid, read:query]`; effective MUST be `[read:query]`. |
-| `test_scope_intersection_empty` | User has no groups; effective scopes MUST be `[]`; `resolve_scope_policy` MUST NOT raise. |
-| `test_scope_escalation_blocked` | `exchange_token_for_server` with empty `effective_scopes` MUST raise `ScopeEscalationError`. |
-| `test_jwt_verify_none_alg_rejected` | Construct a JWT with `alg=none`; `verify_jwt` MUST raise `JWSVerificationError`. |
-| `test_jwt_verify_expired` | Construct a JWT with `exp` in the past; MUST raise `JWSVerificationError`. |
-| `test_jwt_verify_issuer_mismatch` | Construct a JWT with wrong `iss`; MUST raise `JWSVerificationError`. |
-| `test_audit_log_write` | Call `audit(...)` with fixture DB; assert exactly one row inserted with correct fields. |
-| `test_sso_config_file_permissions` | After `cmd_mcp_sso_configure`, assert `sso_config.yaml` has mode `0600`. |
-| `test_no_import_without_config` | Assert `tag.mcp_auth` not in `sys.modules` after importing `tag.controller` when no `sso_config.yaml` exists. |
-| `test_okta_discovery_url` | `OktaAdapter(config).discovery_url()` returns `https://<tenant>/.well-known/openid-configuration`. |
-| `test_azure_ad_tenant_normalization` | Azure AD adapter normalizes `acme.onmicrosoft.com` → GUID lookup; raw GUID passes through unchanged. |
-| `test_google_workspace_groups_api_call` | Mock `httpx.AsyncClient`; assert Directory API call is made with access token in `Authorization` header when `directory_api_enabled=true`. |
-| `test_token_exchange_resource_param` | Mock `httpx.AsyncClient`; call `exchange_token_for_server`; assert `resource=<server_uri>` in POST body. |
-| `test_token_exchange_unsupported_falls_back` | HTTP 400 `unsupported_grant_type` MUST raise `TokenExchangeNotSupportedError`, not `TokenExchangeError`. |
-| `test_keychain_no_disk_writes` | After `exchange_token_for_server`, assert no new files in `~/.tag/` and no token value in SQLite. |
-| `test_scope_map_import_yaml` | Parse a scope policy YAML; assert all rows written to `sso_scope_maps` with correct column values. |
-| `test_jwks_cache_ttl` | Call `fetch_jwks` twice within 5 minutes; assert only one HTTP request made (LRU cache hit). |
-| `test_state_param_csrf` | Simulate callback with wrong `state`; assert login aborts with `SSOStateError`. |
+| `TestPKCES256Pair` | Assert `pkceS256Pair()` produces `base64url(sha256(verifier)) == challenge` for a computed pair. |
+| `TestPKCES256PairUniqueness` | Call `pkceS256Pair()` 100 times; assert all verifiers are distinct. |
+| `TestScopeIntersectionBasic` | User in `data-engineers`; mapped scopes `[read:query, write:query]`; server supports `[read:query, admin:query]`; IdP token has `[openid, read:query]`; `EffectiveScopes` MUST be `[read:query]`. |
+| `TestScopeIntersectionEmpty` | User has no groups; `EffectiveScopes` MUST be `[]`; `ResolveScopePolicy` MUST return nil error. |
+| `TestScopeEscalationBlocked` | `exchangeTokenForServer` with empty `EffectiveScopes` MUST return `*ScopeEscalationError`. |
+| `TestVerifyIDTokenNoneAlgRejected` | Serve a malformed token with `alg=none` from an `httptest.Server` JWKS stub; `VerifyIDToken` MUST return an error wrapping go-oidc's rejection. |
+| `TestVerifyIDTokenExpired` | Serve a well-signed JWT with `exp` in the past; MUST return error. |
+| `TestVerifyIDTokenIssuerMismatch` | Serve a well-signed JWT with wrong `iss`; MUST return error. |
+| `TestAuditLogWrite` | Call `AuditSSO` against in-memory SQLite; assert exactly one row inserted with correct fields via `SELECT`. |
+| `TestSSOConfigFilePermissions` | After `configureCmd` runs, assert `sso_config.yaml` has mode `0600` via `os.Stat`. |
+| `TestSSOConfiguredGate` | Assert `config.SSOConfigured()` returns false when no `sso_config.yaml` exists; assert `GetMCPAuthToken` never calls SSO code (verify via `httptest` request count). |
+| `TestOktaDiscoveryURL` | `OktaAdapter{cfg}.DiscoveryURL()` returns `https://<tenant>/.well-known/openid-configuration`. |
+| `TestAzureADTenantNormalization` | `AzureADAdapter` normalizes `acme.onmicrosoft.com` → expected v2.0 discovery URL; raw GUID passes through unchanged. |
+| `TestGoogleWorkspaceGroupsAPICall` | `httptest.Server` stubs the Directory API; assert call is made with `Authorization: Bearer <token>` when `directory_api_enabled=true`. |
+| `TestTokenExchangeResourceParam` | `httptest.Server` captures the POST body; assert `resource=<server_uri>` is present (RFC 8707). |
+| `TestTokenExchangeUnsupportedGrantType` | `httptest.Server` returns HTTP 400 `unsupported_grant_type`; assert error is `*TokenExchangeNotSupportedError`, not `*TokenExchangeError`. |
+| `TestKeychainNoDiskWrites` | After `exchangeTokenForServer`, assert `~/.tag/` contains no new files and SQLite `sso_server_tokens` has no `token` column (metadata only). |
+| `TestScopePolicyYAMLImport` | Parse `testdata/sso/scope_policy.yaml`; assert all rows written to `sso_scope_maps` in in-memory SQLite. |
+| `TestJWKSCacheTTL` | Intercept `http.Client` transport; call `newSSOVerifier` + `VerifyIDToken` twice within 5 minutes; assert JWKS endpoint hit ≤ 2 times (go-oidc internal caching). |
+| `TestStateParamCSRF` | Simulate loopback callback with mismatched `state`; assert `loginCmd` returns `*SSOStateError`. |
 
 ### 11.2 Integration Tests
 
-Each test requires a sandbox IdP tenant (Okta dev tenant, Azure AD app registration, Google Cloud OAuth client). CI uses environment variables to inject tenant IDs and test credentials.
+Each integration test runs against a real sandbox IdP tenant. CI injects `TAG_TEST_OKTA_TENANT`, `TAG_TEST_AZURE_TENANT`, `TAG_TEST_GOOGLE_CLIENT_ID` etc. via environment variables. These tests are gated behind `//go:build integration` and run in a dedicated CI job.
 
 | Test | Description |
 |------|-------------|
-| `test_okta_full_flow` | `configure → login (device flow) → status → exchange → token show → logout` against Okta dev tenant. |
-| `test_azure_ad_full_flow` | Same flow against Azure AD v2.0 sandbox tenant. |
-| `test_google_workspace_full_flow` | Same flow against Google Workspace dev account with Directory API. |
-| `test_token_refresh_on_expiry` | Inject a short-lived access token (1 minute TTL); sleep until expiry; trigger an MCP server session start; assert refresh happened and exchange succeeded. |
-| `test_revocation_on_logout` | After logout, attempt to use the old refresh token at the IdP's token endpoint; assert HTTP 400 `invalid_grant`. |
-| `test_scope_escalation_in_exchange` | Configure scope map with `read:query` only; attempt to construct a request for `write:query`; assert blocked and audited. |
-| `test_audit_log_completeness` | Run full login→exchange→logout cycle; assert `sso_audit_log` contains exactly: 1 `login`, N `exchange` (one per server), 1 `logout`. |
-| `test_headless_detection` | Set `DISPLAY=""`, `SSH_TTY=""`, `TAG_HEADLESS=1`; assert device flow is automatically selected. |
+| `TestOktaFullFlow` | `configure → login (device flow) → status → exchange → token show → logout` against Okta dev tenant. |
+| `TestAzureADFullFlow` | Same flow against Azure AD v2.0 sandbox tenant. |
+| `TestGoogleWorkspaceFullFlow` | Same flow against Google Workspace dev account with Directory API. |
+| `TestTokenRefreshOnExpiry` | Inject a keychain access token with 1-minute TTL; wait for expiry; trigger `GetMCPAuthToken`; assert `sso_audit_log` has a `refresh/success` row. |
+| `TestRevocationOnLogout` | After `logoutCmd`, POST the old refresh token to the IdP's `revocation_endpoint`; assert HTTP 400 `invalid_grant`. |
+| `TestScopeEscalationInExchange` | Scope map contains `read:query` only; inject a request for `write:query`; assert blocked and `sso_audit_log` has `scope_escalation/blocked`. |
+| `TestAuditLogCompleteness` | Full login→exchange→logout cycle; assert `sso_audit_log` contains exactly 1 `login`, N `exchange`, 1 `logout`. |
+| `TestHeadlessDetection` | Set `DISPLAY=""`, `SSH_TTY=""`, `TAG_HEADLESS=1`; assert device code flow is selected automatically. |
 
 ### 11.3 Performance Tests
 
-| Test | Target | Method |
-|------|--------|--------|
-| Token exchange latency | P95 < 500 ms | Run 50 exchanges against a mock AS with 50 ms artificial latency; assert P95 threshold. |
-| Startup overhead (no SSO) | < 5 ms delta | `time tag --version` vs. `time tag --version` with SSO configured but no active session; Wilcoxon signed-rank test. |
-| Scope resolution throughput | > 10,000 lookups/sec | Benchmark `resolve_scope_policy` with in-memory SQLite; 100 groups, 50 servers. |
-| JWKS cache hit rate | > 95% on repeated exchanges | Run 100 exchanges in 4 minutes; assert `httpx.get` called ≤ 2 times. |
+Use `go test -bench` + `testing.B` for all performance assertions. The P95 latency benchmark uses a histogram over `b.N` iterations.
+
+| Benchmark | Target | Method |
+|-----------|--------|--------|
+| `BenchmarkTokenExchangeP95` | P95 < 500 ms | 50 exchanges against `httptest.Server` with 50 ms artificial `time.Sleep`; collect durations; assert P95. |
+| `BenchmarkStartupOverheadNoSSO` | < 5 ms delta | Measure `GetMCPAuthToken` round-trip when `SSOConfigured()` returns false; assert < 5 ms. |
+| `BenchmarkScopeResolution` | > 10,000 ops/sec | `b.RunParallel` calling `ResolveScopePolicy` on in-memory SQLite with 100 groups, 50 servers. |
+| `BenchmarkJWKSCacheHitRate` | ≥ 95% cache hits | 100 `VerifyIDToken` calls in 4 minutes via `httptest.Server`; assert transport hit count ≤ ceiling. |
 
 ---
 
@@ -1035,17 +1220,17 @@ Each test requires a sandbox IdP tenant (Okta dev tenant, Azure AD app registrat
 | AC-04 | `tag mcp sso login` automatically uses device code flow when `TAG_HEADLESS=1` is set. | Yes — env var injection in test |
 | AC-05 | `tag mcp sso status` displays subject (`sub`), email, groups, and token expiry from the active session. | Yes — parse stdout |
 | AC-06 | `tag mcp sso logout --revoke` sends RFC 7009 revocation POST to the IdP; subsequent use of the refresh token returns HTTP 400 `invalid_grant`. | Yes — integration test |
-| AC-07 | `tag mcp sso logout` removes all keychain entries (access, refresh, all server tokens). `keyring.get_password("tag-sso", ...)` returns `None` for all known keys after logout. | Yes — keyring assertion |
+| AC-07 | `tag mcp sso logout` removes all keychain entries (access, refresh, all server tokens). `keyring.Get("tag-sso", ...)` returns `keyring.ErrNotFound` for all known keys after logout. | Yes — go-keyring assertion in test |
 | AC-08 | When a user in group `data-engineers` connects to `io.github.acme/db-mcp` with scope map `read:query,write:query`, the exchanged token's scope claim contains exactly `read:query write:query` (no more, no less, per intersection). | Yes — token claims assertion |
 | AC-09 | When a user is NOT in any mapped group for a server, token exchange for that server raises `ScopeEscalationError` and writes a `scope_escalation/blocked` row to `sso_audit_log`. | Yes — exception type + DB assertion |
 | AC-10 | Token exchange request includes `resource=<server_uri>` (RFC 8707). Verified by intercepting the HTTP POST body in integration test. | Yes — HTTP request capture |
-| AC-11 | JWTs with `alg=none`, expired `exp`, or mismatched `iss` are rejected by `verify_jwt` with `JWSVerificationError`. | Yes — unit tests |
+| AC-11 | JWTs with `alg=none`, expired `exp`, or mismatched `iss` are rejected by `ssoVerifier.VerifyIDToken` (go-oidc/v3) with a non-nil error. | Yes — unit tests with `httptest` JWKS server |
 | AC-12 | `tag mcp sso token show --server <name>` prints decoded claims including `sub`, `email`, `scope`, `exp`, and does not print the raw token string. | Yes — stdout parse; assert raw token not present |
 | AC-13 | `tag mcp sso scope map --server X --group G --scopes S` writes a row to `sso_scope_maps` and `tag mcp sso scope map list` displays it. | Yes — DB + stdout |
 | AC-14 | `tag mcp sso scope map import --file policy.yaml` correctly inserts all rows from the YAML file and reports the count of mappings added/updated. | Yes — DB row count assertion |
-| AC-15 | `tag run` with no `sso_config.yaml` does not import `tag.mcp_auth` (assert `"tag.mcp_auth" not in sys.modules`). | Yes — `sys.modules` inspection in test |
-| AC-16 | When the IdP access token expires, `mcp_auth.py` silently refreshes and retries token exchange without user intervention. The `sso_audit_log` records a `refresh/success` event. | Yes — integration test with short-lived token |
-| AC-17 | When the refresh token is also expired/revoked, `mcp_auth.py` raises `SSOSessionExpiredError`, emits a notification via PRD-040, and does NOT fall back to unauthenticated access. | Yes — mock IdP returning `invalid_grant` |
+| AC-15 | `tag run` with no `sso_config.yaml` executes zero SSO logic (`config.SSOConfigured()` short-circuits). Verified by `BenchmarkStartupOverheadNoSSO`: `GetMCPAuthToken` with no config completes in < 5 ms, with no outbound HTTP calls (assert via `httptest` transport counter). | Yes — benchmark + HTTP request count assertion |
+| AC-16 | When the IdP access token expires, `internal/mcp` silently refreshes via `golang.org/x/oauth2.TokenSource` and retries token exchange without user intervention. The `sso_audit_log` records a `refresh/success` event. | Yes — `TestTokenRefreshOnExpiry` integration test |
+| AC-17 | When the refresh token is also expired/revoked, `internal/mcp` returns `*SSOSessionExpiredError`, emits a notification via PRD-040, and does NOT fall back to unauthenticated access. | Yes — `httptest.Server` returning `invalid_grant` |
 | AC-18 | The `sso_audit_log` table contains exactly one row per SSO event, with correct `event_type`, `subject`, `outcome`, and `server_name` for login, exchange, and logout in the full-cycle integration test. | Yes — DB row assertions |
 | AC-19 | All three IdP providers (Okta, Azure AD, Google Workspace) pass the full 30-case integration test suite. | Yes — CI matrix |
 | AC-20 | `tag mcp sso audit --sub <sub> --export jsonl` produces a valid JSONL file with one JSON object per row, all having the queried subject. | Yes — parse output |
@@ -1056,19 +1241,24 @@ Each test requires a sandbox IdP tenant (Okta dev tenant, Azure AD app registrat
 
 | Dependency | Type | Notes |
 |-----------|------|-------|
-| `keyring >= 24.0` | Runtime | OS keychain abstraction; already used or easily added. `keyrings.alt` as fallback on headless Linux. |
-| `cryptography >= 42.0` | Runtime | JWS RSA signature verification; widely used in Python ecosystem. |
-| `httpx >= 0.27` | Runtime | Already used in TAG for MCP registry calls (PRD-014). |
-| `PyYAML >= 6.0` | Runtime | Already used in TAG for profile/config YAML. |
-| PRD-013 | Internal | OTel tracing for SSO span emission and redaction. |
-| PRD-034 | Internal | Secret scanner patterns extended with IdP token patterns. |
-| PRD-040 | Internal | Notification hooks for `SSOSessionExpiredError` and scope escalation events. |
+| `github.com/zalando/go-keyring` | Go module | OS keychain abstraction (macOS Keychain Services, Windows Credential Manager, libsecret on Linux). Pure-Go + OS API; no CGO. On headless CI, inject a mock `keyring.Keyring` via the library's test helper or use `keyrings.File` equivalent. |
+| `github.com/coreos/go-oidc/v3` | Go module | OIDC provider, `IDTokenVerifier`, JWKS remote key set with automatic caching. Handles `alg=none` rejection, `exp`/`iss`/`aud` checks. Transitively pulls `golang.org/x/oauth2`. |
+| `golang.org/x/oauth2` | Go module | Authorization code + PKCE flow, device code flow (RFC 8628), token refresh `TokenSource`, RFC 7009 revocation. Already a transitive dependency via go-sdk. |
+| `github.com/modelcontextprotocol/go-sdk v1.6.1` | Go module | MCP client+server; Enterprise Managed Auth and client-credentials support (v1.6). The SSO token is injected via a custom `http.RoundTripper` passed to the SDK client. |
+| `modernc.org/sqlite` | Go module | Pure-Go SQLite driver (`CGO_ENABLED=0`); FTS5 + STRICT table mode built in. Already the TAG state store (shared `tag.sqlite3`). |
+| `github.com/knadh/koanf/v2` | Go module | Config load/merge for `sso_config.yaml`; already a TAG dependency. |
+| `gopkg.in/yaml.v3` | Go module | YAML marshal for atomic config write-back; already a TAG dependency. |
+| `github.com/gofrs/flock` | Go module | File locking for atomic config RMW (shared with other TAG config writers). |
+| `go.opentelemetry.io/otel` | Go module | OTel tracing for SSO exchange spans; already a TAG dependency (PRD-013). |
+| `github.com/stretchr/testify` | Test | `assert` + `require` for all unit and integration tests. |
+| PRD-013 | Internal | OTel tracing; SSO spans emitted and redacted here. |
+| PRD-034 | Internal | Secret scanner extended with Okta (`SSWS ...`), Azure AD (`Bearer eyJ...`), Google OAuth (`ya29....`) token regex patterns. |
+| PRD-040 | Internal | Notification hooks for `*SSOSessionExpiredError` and scope escalation events. |
 | PRD-014 | Internal | MCP server registry provides `server_uri` values for RFC 8707 `resource` parameter. |
 | PRD-041 | Internal | Per-span cost attribution; SSO exchange spans need redaction before OTLP export. |
 | Okta dev tenant | External | Sandbox Okta org for integration tests (free developer account). |
 | Azure AD app registration | External | Azure AD v2.0 app with `oidc` and `groups` permissions for integration tests. |
 | Google Cloud OAuth client | External | OAuth 2.0 client with `openid`, `email`, `profile`, Directory API read scope. |
-| `sqlite3 >= 3.37` | System | Required for `STRICT` table mode in `sso_audit_log`. |
 
 ---
 
@@ -1092,33 +1282,33 @@ Each test requires a sandbox IdP tenant (Okta dev tenant, Azure AD app registrat
 
 ### Phase 1 — Core IdP Integration and Token Storage (2 weeks)
 
-**Days 1–3:** Scaffold `mcp_auth.py` with dataclasses, `IdPAdapter` ABC, `KeychainKey` enum, `SSOConfig`, `SSOSession`, `TokenExchangeResult`, and `ScopeMappingPolicy`. Write `_pkce_pair()`, `_build_auth_url()`, and the loopback redirect server handler. Write all unit tests for these components (FR-01 through FR-06).
+**Days 1–3:** Scaffold `internal/mcp/sso.go` with Go structs (`SSOConfig`, `SSOSession`, `TokenExchangeResult`, `ScopeMappingPolicy`), the `IdPAdapter` interface, keychain key constants, `pkceS256Pair()`, `buildAuthURL()`, and the loopback redirect `net/http` handler. Wire `internal/config/sso.go` (`koanf/v2` load + `yaml.v3` + `gofrs/flock` atomic write). Write `TestPKCES256Pair`, `TestSSOConfiguredGate`, and `TestSSOConfigFilePermissions` (FR-01 through FR-06).
 
-**Days 4–6:** Implement `OktaAdapter`: discovery URL derivation, `extract_groups` from `groups` claim, JWKS fetch and caching, `verify_jwt`. Write integration test against Okta dev tenant. Implement `cmd_mcp_sso_configure` in `controller.py` with OIDC discovery validation and `0600` file write. Write `cmd_mcp_sso_login` browser flow with state + PKCE.
+**Days 4–6:** Implement `OktaAdapter` in `internal/mcp/sso_adapters_okta.go`: `DiscoveryURL()`, `ExtractGroups()` from `groups` claim, `newSSOVerifier` wrapping `go-oidc/v3`. Write `TestOktaDiscoveryURL` and `TestVerifyIDTokenNoneAlgRejected`. Implement `configureCmd` in `internal/cli/mcp_sso.go` (OIDC discovery validation + `0600` file write). Implement `loginCmd` browser flow with state + PKCE. Verify AC-01, AC-02, AC-03.
 
-**Days 7–8:** Implement `cmd_mcp_sso_status` with keychain reads and per-server exchange display. Implement `cmd_mcp_sso_logout` with RFC 7009 revocation. Write `audit()` function and all four SQLite tables (DDL migration in `open_db()`). Verify AC-01 through AC-07.
+**Days 7–8:** Implement `statusCmd` (keychain reads + per-server exchange display) and `logoutCmd` (RFC 7009 revocation via `golang.org/x/oauth2`). Add all four SQLite DDL migrations to `internal/store`'s migration runner. Implement `AuditSSO` in `internal/store/sso.go`. Verify AC-01 through AC-07.
 
-**Days 9–10:** Implement device code flow (RFC 8628) with polling and exponential backoff. Implement `is_headless()` detection. Write headless integration test. Implement `cmd_mcp_sso_token_show` with claim decoding and redaction. Verify AC-03, AC-04, AC-12.
+**Days 9–10:** Implement device code flow (RFC 8628) via `golang.org/x/oauth2/deviceauth` with poll loop + `cenkalti/backoff/v4` exponential backoff. Implement `isHeadless()` env-var detection. Write `TestHeadlessDetection`. Implement `tokenShowCmd` with claim decoding via `jwt/v5` and raw-token redaction. Verify AC-03, AC-04, AC-12.
 
 ### Phase 2 — Azure AD and Google Workspace Adapters (1.5 weeks)
 
-**Days 11–12:** Implement `AzureADAdapter`: tenant GUID normalization, v2.0 discovery URL, groups claim parsing (note: Azure AD requires app manifest change to include `groups` claim; document this prerequisite). Write integration test against Azure AD sandbox.
+**Days 11–12:** Implement `AzureADAdapter` in `internal/mcp/sso_adapters_azure.go`: tenant GUID normalization (accept `<domain>.onmicrosoft.com` or raw GUID), v2.0 discovery URL construction. Document Azure AD `groups` claim app manifest prerequisite. Write `TestAzureADTenantNormalization` and `TestAzureADFullFlow` integration test.
 
-**Days 13–14:** Implement `GoogleWorkspaceAdapter`: OIDC flow + Directory API call for group fetch. Handle `directory_api_enabled=false` gracefully (warn that groups cannot be resolved). Write integration test against Google Cloud OAuth sandbox.
+**Days 13–14:** Implement `GoogleWorkspaceAdapter` in `internal/mcp/sso_adapters_google.go`: OIDC flow + `ExtractGroups()` via Google Directory API HTTP call. Handle `directory_api_enabled=false` gracefully (log warning; treat groups as empty). Write `TestGoogleWorkspaceGroupsAPICall` with `httptest.Server` stub.
 
-**Days 15:** Implement `WorkOSAdapter` as a thin wrapper (any OIDC endpoint WorkOS exposes). Resolve OQ-04. Write smoke test. Run full three-IdP CI matrix.
+**Day 15:** Implement `WorkOSAdapter` as a thin `IdPAdapter` wrapper (any OIDC endpoint WorkOS exposes). Resolve OQ-04. Write smoke test. Run full three-IdP CI matrix job.
 
 ### Phase 3 — Scope Mapping and Token Exchange (1 week)
 
-**Days 16–17:** Implement `resolve_scope_policy()` with three-way intersection and `sso_scope_maps` DB lookups. Write 30+ unit test vectors. Implement `exchange_token_for_server()` with RFC 8693 POST construction and `resource` parameter. Write HTTP request capture test (AC-10).
+**Days 16–17:** Implement `ResolveScopePolicy` in `internal/store/sso.go` with three-way intersection and `sso_scope_maps` DB queries. Write 30+ test vectors for `TestScopeIntersectionBasic` variants. Implement `exchangeTokenForServer` in `internal/mcp/sso.go` with RFC 8693 POST + `resource` parameter. Write `TestTokenExchangeResourceParam` via `httptest.Server` body capture (AC-10).
 
-**Days 18–19:** Implement `cmd_mcp_sso_scope_map` (add/remove/list/import). Write scope policy YAML parser with validation. Implement `_get_mcp_auth_headers()` hook in `controller.py` with lazy `mcp_auth` import and `TokenExchangeNotSupportedError` fallback. Verify AC-08, AC-09, AC-10, AC-13, AC-14, AC-15.
+**Days 18–19:** Implement `scopeMapCmd` (add/remove/list/import) in `internal/cli/mcp_sso.go`. Write scope policy YAML import via `yaml.v3` + `internal/store`. Implement `GetMCPAuthToken` in `internal/mcp/client.go` with `config.SSOConfigured()` gate and `*TokenExchangeNotSupportedError` fallback. Verify AC-08, AC-09, AC-10, AC-13, AC-14, AC-15.
 
-**Day 20:** Implement automatic token refresh (`check_and_refresh_idp_token()`), `SSOSessionExpiredError` → PRD-040 notification, and `SSOIdPUnreachableError` for network partition. Write token expiry integration test. Verify AC-16, AC-17.
+**Day 20:** Implement automatic token refresh via `golang.org/x/oauth2.TokenSource`, `*SSOSessionExpiredError` → PRD-040 notification, and `*SSOIdPUnreachableError` for network partition. Write `TestTokenRefreshOnExpiry` integration test. Verify AC-16, AC-17.
 
 ### Phase 4 — Audit, Observability, Security Hardening (0.5 weeks)
 
-**Days 21–22:** Integrate audit log writes into all event paths. Implement `cmd_mcp_sso_audit` with filtering and CSV/JSONL export. Add OTel span emission with PRD-034 redaction for token attributes. Extend PRD-034 secret scanner with IdP token regex patterns. Run full acceptance criteria verification (AC-01 through AC-20). Write performance benchmarks (token exchange P95, startup overhead). Write final integration test matrix.
+**Days 21–22:** Wire `AuditSSO` calls into all event paths. Implement `auditCmd` (`internal/cli/mcp_sso.go`) with `--since`/`--until`/`--sub`/`--server`/`--event` filters and CSV/JSONL export. Add OTel spans via `go.opentelemetry.io/otel` with PRD-034 redaction in the span processor. Extend PRD-034 secret scanner with Okta/Azure AD/Google token regex patterns. Run `go test -bench ./...` for all performance benchmarks. Run full AC-01 through AC-20 acceptance matrix.
 
 **Total: ~4.5 weeks core implementation + 0.5 weeks buffer = 5 weeks**
 

@@ -1,10 +1,12 @@
 # PRD-117: Playwright MCP Integration (`tag playwright`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Computer Use
-**Affects:** `playwright_tools.py + controller.py`
+**Affects:** `internal/mcp (Playwright MCP client facade) + internal/tool + internal/cli`
 **Depends on:** PRD-073 (live MCP registry sync), PRD-074 (MCP OAuth/PKCE), PRD-028 (sandbox code execution)
 **Inspired by:** Playwright MCP server, Microsoft playwright-mcp, BrowserBase, Stagehand browser automation
 
@@ -132,16 +134,16 @@ Options:
 
 | ID | Requirement |
 |----|------------|
-| FR-01 | `tag playwright setup` runs `pip install playwright`, `playwright install chromium`, and writes a `playwright-mcp` server entry to `cli-config.yaml`. |
-| FR-02 | `tag playwright start` launches the Playwright MCP server as a subprocess, stores the PID and WebSocket URL in `playwright_sessions` SQLite table. |
-| FR-03 | `tag playwright screenshot --url URL` calls the MCP `browser_navigate` then `browser_screenshot` tool, saves the PNG to disk, and attaches it to the current OTel span. |
-| FR-04 | Browser session PID and connection URL persisted in SQLite; subsequent `tag run` calls with the same session ID reuse the running session. |
-| FR-05 | `tag playwright close` sends `browser_close` MCP tool call and removes the session row. |
-| FR-06 | `tag playwright list` queries `playwright_sessions` and shows: session_id, browser, headless, url, pid, started_at. |
-| FR-07 | `--sandbox` mode: launch browser within a PRD-028 sandbox; all filesystem writes go to the sandbox volume. |
-| FR-08 | All MCP tool calls made via Playwright server are wrapped in a `PLAYWRIGHT` span type, with `browser.action` attribute and optional screenshot blob. |
-| FR-09 | `tag playwright eval --js "..."` calls `browser_evaluate` MCP tool and returns the result as JSON. |
-| FR-10 | Session health check: before using a stored session, verify the MCP server process is still running (PID check); restart if dead. |
+| FR-01 | `tag playwright setup` ensures the Playwright MCP server binary is resolvable (default `npx -y @playwright/mcp@latest`), triggers browser-binary download, and writes a `playwright-mcp` server entry into the embedded MCP registry (`internal/mcp/registry`, `go:embed registry.yaml`) / `cli-config.yaml`. No Python/pip is involved: the Go binary shells out to the external `npx` launcher via `os/exec.CommandContext`. |
+| FR-02 | `tag playwright start` launches the Playwright MCP server as an out-of-process child via `os/exec.CommandContext` with `SysProcAttr{Setpgid: true}`, connects to it as an MCP client through the `internal/mcp` go-sdk facade (`CommandTransport`/stdio, or `StreamableHTTP`/SSE for a remote server), and persists the PID and transport endpoint in the `playwright_sessions` SQLite table (`internal/store`, modernc.org/sqlite). |
+| FR-03 | `tag playwright screenshot --url URL` calls the MCP `browser_navigate` then `browser_screenshot` tool via the go-sdk `ClientSession.CallTool`, saves the returned PNG to disk, and attaches it to the current OTel span. |
+| FR-04 | Browser session PID and transport endpoint persisted in SQLite; subsequent `tag run` calls with the same session ID reuse the running session (reconnect the go-sdk client to the existing endpoint). |
+| FR-05 | `tag playwright close` issues the `browser_close` MCP tool call, closes the `ClientSession`, and removes the session row. |
+| FR-06 | `tag playwright list` queries `playwright_sessions` and shows: session_id, browser, headless, endpoint, pid, started_at. |
+| FR-07 | `--sandbox` mode: launch the MCP server / browser through the `internal/sandbox` ladder (landlock+seccomp+nftables → docker → gVisor → firecracker on Linux; degrade to sandbox-exec/Docker Desktop off-Linux); all filesystem writes go to the sandbox volume. |
+| FR-08 | Every tool call routed through the Playwright server is dispatched behind the unified `internal/tool` interface (`Info()`/`Run(ctx, ToolCall)`/`ProviderOptions()`), wrapped in a `PLAYWRIGHT` span type, with a `browser.action` attribute and optional screenshot blob. |
+| FR-09 | `tag playwright eval --js "..."` calls the `browser_evaluate` MCP tool and returns the result marshaled with `encoding/json`. |
+| FR-10 | Session health check: before reusing a stored session, verify the MCP server process group is still alive (`syscall.Kill(pid, 0)` on Unix); restart via FR-02 if dead. |
 
 ---
 
@@ -149,16 +151,26 @@ Options:
 
 | ID | Requirement |
 |----|------------|
-| NFR-01 | Playwright MCP server subprocess supervised via `subprocess.Popen`; SIGTERM on `tag playwright close`. |
-| NFR-02 | Screenshots stored in `~/.tag/screenshots/` with session-scoped subdirectory; auto-pruned after 30 days. |
+| NFR-01 | Playwright MCP server child supervised via `os/exec.CommandContext` with `Setpgid: true`; on `tag playwright close` (or ctx cancel) the whole process group is signalled (`syscall.Kill(-pgid, SIGTERM)`) so `npx`-spawned node children are not orphaned. |
+| NFR-02 | Screenshots stored in `~/.tag/screenshots/` with session-scoped subdirectory (mode 0700); auto-pruned after 30 days. |
 | NFR-03 | Headless mode is the default; `--headed` requires user confirmation in non-interactive sessions. |
-| NFR-04 | `playwright install` output suppressed unless `--verbose`; only final status shown. |
+| NFR-04 | Browser-binary download output suppressed unless `--verbose`; only final status shown. |
 
 ---
 
 ## 9. Technical Design
 
-### 9.1 SQLite DDL
+### 9.1 Architecture
+
+TAG does **not** implement a browser driver. The Playwright MCP server is an existing out-of-process MCP server (`@playwright/mcp`, launched via `npx`). TAG connects to it **as an MCP client** through the TAG-owned facade in `internal/mcp`, which wraps `github.com/modelcontextprotocol/go-sdk` v1.6.1 (GA; client + server; stdio `CommandTransport` and `StreamableHTTP`/SSE). The MCP protocol version is pinned as a single const in `internal/mcp` (`ProtocolVersion = "2025-11-25"`).
+
+Each Playwright MCP tool (`browser_navigate`, `browser_click`, `browser_screenshot`, `browser_evaluate`, …) is surfaced to the agent through the unified `internal/tool` interface (`Info()`/`Run(ctx, ToolCall)`/`ProviderOptions()`), namespaced `mcp_playwright_<tool>`, with every `Run()` gated by the `internal/tool` permission engine.
+
+If a future variant needs an **in-process, no-Node** path, the direct-driver alternative is `github.com/playwright-community/playwright-go` (bundled driver) or `github.com/chromedp/chromedp` (CDP). The MCP-client path is primary; the direct driver is an out-of-scope fallback noted for the extensibility discussion below.
+
+> **Extensibility note (Plan decision #6):** the dynamic Python-plugin style ("drop a `playwright_tools.py` module") does **not** map to the static Go binary. The only supported extension surfaces are MCP servers (this PRD) plus shell/HTTP hooks. Custom browser tools are added by registering another MCP server, not by loading Go plugins at runtime.
+
+### 9.2 SQLite DDL (`internal/store`, modernc.org/sqlite)
 
 ```sql
 CREATE TABLE IF NOT EXISTS playwright_sessions (
@@ -166,7 +178,7 @@ CREATE TABLE IF NOT EXISTS playwright_sessions (
   browser     TEXT NOT NULL DEFAULT 'chromium',
   headless    INTEGER NOT NULL DEFAULT 1,
   sandbox     INTEGER NOT NULL DEFAULT 0,
-  ws_url      TEXT,
+  endpoint    TEXT,            -- stdio marker or StreamableHTTP URL
   pid         INTEGER,
   status      TEXT NOT NULL DEFAULT 'running',
   created_at  TEXT NOT NULL,
@@ -183,66 +195,111 @@ CREATE TABLE IF NOT EXISTS playwright_screenshots (
 );
 ```
 
-### 9.2 Python core
+### 9.3 Go core
 
-```python
-from __future__ import annotations
-import sqlite3
-import subprocess
-import sys
-import uuid
-from pathlib import Path
-from typing import Optional
+```go
+package playwright // internal/mcp/playwright
 
-class PlaywrightSession:
-    def __init__(self, db_path: str) -> None:
-        self.db_path = db_path
+import (
+	"context"
+	"database/sql"
+	"os/exec"
+	"syscall"
+	"time"
 
-    def start(self, browser: str = "chromium", headless: bool = True,
-              sandbox: bool = False) -> str:
-        session_id = uuid.uuid4().hex[:8]
-        cmd = [sys.executable, "-m", "playwright_mcp.server",
-               f"--browser={browser}"]
-        if headless:
-            cmd.append("--headless")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        now = _utc_now()
-        conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            "INSERT INTO playwright_sessions(id,browser,headless,sandbox,pid,status,created_at,last_used_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (session_id, browser, int(headless), int(sandbox), proc.pid, "running", now, now)
-        )
-        conn.commit()
-        return session_id
+	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
 
-    def close(self, session_id: str) -> None:
-        conn = sqlite3.connect(self.db_path)
-        row = conn.execute("SELECT pid FROM playwright_sessions WHERE id=?", (session_id,)).fetchone()
-        if row and row[0]:
-            import signal, os
-            try:
-                os.kill(row[0], signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        conn.execute("UPDATE playwright_sessions SET status='closed' WHERE id=?", (session_id,))
-        conn.commit()
+// isoUTC matches the timestamp format used across the store for byte-parity:
+// microsecond precision with a "+00:00" offset.
+func isoUTC() string { return time.Now().UTC().Format("2006-01-02T15:04:05.000000+00:00") }
 
-    def is_alive(self, session_id: str) -> bool:
-        conn = sqlite3.connect(self.db_path)
-        row = conn.execute("SELECT pid FROM playwright_sessions WHERE id=?", (session_id,)).fetchone()
-        if not row or not row[0]:
-            return False
-        import os
-        try:
-            os.kill(row[0], 0)
-            return True
-        except ProcessLookupError:
-            return False
+// Manager owns Playwright MCP client sessions and their persistence.
+type Manager struct {
+	db  *sql.DB       // internal/store handle (single writer, flock + atomic RMW)
+	mcp *mcp.Client   // TAG-owned go-sdk client facade (internal/mcp)
+}
 
-def _utc_now() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
+type Session struct {
+	ID       string
+	Browser  string
+	Headless bool
+	Sandbox  bool
+	PID      int
+	cmd      *exec.Cmd
+	client   *mcp.ClientSession
+}
+
+// Start launches the out-of-process Playwright MCP server and connects to it.
+func (m *Manager) Start(ctx context.Context, browser string, headless, sandbox bool) (*Session, error) {
+	id := uuid.NewString()[:8]
+
+	args := []string{"-y", "@playwright/mcp@latest", "--browser=" + browser}
+	if headless {
+		args = append(args, "--headless")
+	}
+	cmd := exec.CommandContext(ctx, "npx", args...)
+	// Own the process group so npx-spawned node children die with us (NFR-01).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// go-sdk stdio transport over the child's stdin/stdout.
+	transport := &mcp.CommandTransport{Command: cmd}
+	cs, err := m.mcp.Connect(ctx, transport, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	now := isoUTC()
+	if _, err := m.db.ExecContext(ctx,
+		`INSERT INTO playwright_sessions
+		   (id,browser,headless,sandbox,pid,status,created_at,last_used_at)
+		 VALUES (?,?,?,?,?,?,?,?)`,
+		id, browser, b2i(headless), b2i(sandbox), cmd.Process.Pid, "running", now, now,
+	); err != nil {
+		return nil, err
+	}
+	return &Session{ID: id, Browser: browser, Headless: headless, Sandbox: sandbox,
+		PID: cmd.Process.Pid, cmd: cmd, client: cs}, nil
+}
+
+// Close issues browser_close, drops the client, and kills the process group.
+func (m *Manager) Close(ctx context.Context, id string) error {
+	var pid int
+	if err := m.db.QueryRowContext(ctx,
+		`SELECT pid FROM playwright_sessions WHERE id=?`, id).Scan(&pid); err != nil {
+		return err
+	}
+	if pid > 0 {
+		_ = syscall.Kill(-pid, syscall.SIGTERM) // whole group; ignore ESRCH
+	}
+	_, err := m.db.ExecContext(ctx,
+		`UPDATE playwright_sessions SET status='closed' WHERE id=?`, id)
+	return err
+}
+
+// IsAlive checks whether the MCP server process group is still running.
+func IsAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	return syscall.Kill(pid, 0) == nil // ESRCH => dead
+}
+
+func b2i(b bool) int { if b { return 1 }; return 0 }
+```
+
+`Screenshot` navigates and captures via the go-sdk client, then persists + attaches to the OTel span:
+
+```go
+func (s *Session) Screenshot(ctx context.Context, url string) (*mcp.CallToolResult, error) {
+	if _, err := s.client.CallTool(ctx, &mcp.CallToolParams{
+		Name: "browser_navigate", Arguments: map[string]any{"url": url},
+	}); err != nil {
+		return nil, err
+	}
+	return s.client.CallTool(ctx, &mcp.CallToolParams{Name: "browser_screenshot"})
+}
 ```
 
 ---
@@ -262,9 +319,10 @@ def _utc_now() -> str:
 
 | Layer | Tests |
 |-------|-------|
-| Unit | Session start/close/is_alive; PID health check on dead process |
-| Integration | Full flow: setup → start → navigate → screenshot → close |
-| Security | Sandbox mode cannot write to host filesystem |
+| Unit | Table-driven `go test` for session start/close/IsAlive; PID/process-group health check on a dead process; against a fake in-process MCP server (go-sdk `mcp.Server` over an in-memory transport) so no real browser is needed |
+| Integration | Full flow: setup → start → navigate → screenshot → close, asserting process-group teardown leaves no orphaned node children |
+| Benchmark | `testing.B` for screenshot capture latency (Success Metrics target < 2s) |
+| Security | Sandbox mode (`internal/sandbox` ladder) cannot write to host filesystem |
 
 ---
 
@@ -284,9 +342,13 @@ def _utc_now() -> str:
 
 | Dependency | Reason |
 |-----------|--------|
-| `playwright-mcp` PyPI package | MCP server implementation |
-| PRD-073 MCP registry sync | MCP server configuration infrastructure |
-| PRD-028 sandbox execution | Sandbox browser mode |
+| `@playwright/mcp` (external, launched via `npx`) | Out-of-process Playwright MCP server TAG connects to as a client |
+| `github.com/modelcontextprotocol/go-sdk` v1.6.1 | GA MCP client (stdio `CommandTransport` + StreamableHTTP/SSE); protocol pin `2025-11-25` |
+| `github.com/google/uuid` | Session IDs |
+| `modernc.org/sqlite` (via `internal/store`) | Session + screenshot persistence (pure-Go, no CGO) |
+| `github.com/playwright-community/playwright-go` **or** `github.com/chromedp/chromedp` | Optional in-process/no-Node direct-driver fallback (out of scope for v1) |
+| PRD-073 MCP registry sync | MCP server configuration infrastructure (`internal/mcp/registry`) |
+| PRD-028 sandbox execution | Sandbox browser mode (`internal/sandbox` ladder) |
 | PRD-041 OTel cost attribution | Screenshot span attachment |
 
 ---
@@ -307,8 +369,8 @@ def _utc_now() -> str:
 
 | Phase | Work | Days |
 |-------|------|------|
-| 1 | `playwright setup`, session management SQLite DDL | 1 |
-| 2 | `PlaywrightSession` start/close/health-check | 2 |
+| 1 | `playwright setup`, session management SQLite DDL (`internal/store`) | 1 |
+| 2 | `internal/mcp/playwright` `Manager` start/close/health-check over the go-sdk client facade | 2 |
 | 3 | Screenshot capture + span attachment | 1 |
 | 4 | CLI commands, sandbox mode, integration tests | 2 |
 

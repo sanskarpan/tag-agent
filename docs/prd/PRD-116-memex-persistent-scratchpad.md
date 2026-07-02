@@ -1,10 +1,12 @@
 # PRD-116: MemEx Persistent Scratchpad (`tag scratchpad`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P2
 **Estimated Effort:** S (3-5 days)
 **Category:** Computer Use
-**Affects:** `scratchpad.py + controller.py`
+**Affects:** `internal/memory (Scratchpad) + internal/agent (auto-injection) + internal/cli (scratchpad command group)`
 **Depends on:** PRD-065 (automatic post-run memory extraction), PRD-067 (hierarchical memory tiers)
 **Inspired by:** Vannevar Bush's Memex, MemGPT external scratchpad, LangMem working memory, AgentOps session scratchpad
 
@@ -119,7 +121,7 @@ Note types:
 | FR-01 | `tag scratchpad write` inserts a row into `scratchpad_entries` with type, text, tags (comma-separated), and current session_id. |
 | FR-02 | `tag scratchpad read` queries entries filtered by type and tags; returns ordered by created_at DESC. |
 | FR-03 | Session ID defaults to the current active session (read from `~/.tag/state/current_session`); `--session` overrides. |
-| FR-04 | Auto-injection: `cmd_run` in `controller.py` queries the last 10 scratchpad entries for the current session and prepends a "Working memory:" block to the system prompt. |
+| FR-04 | Auto-injection: the agent loop in `internal/agent` queries the last 10 scratchpad entries for the current session at session start and prepends a "Working memory:" block to the system prompt. |
 | FR-05 | `tag scratchpad export --format markdown` renders entries as `## Type\n- text (tags)` grouped by type. |
 | FR-06 | `tag scratchpad promote <id>` calls PRD-065 memory extraction with the entry text as the source fact; removes entry from scratchpad. |
 | FR-07 | `tag scratchpad clear` soft-deletes all entries for the session (sets `deleted_at`). |
@@ -144,6 +146,8 @@ Note types:
 
 ### 9.1 SQLite DDL
 
+DB-neutral DDL; targets `modernc.org/sqlite` (pure-Go, CGO_ENABLED=0) in the single `tag.sqlite3` store owned by `internal/store`. Writes go through the single-writer + `gofrs/flock` atomic read-modify-write path.
+
 ```sql
 CREATE TABLE IF NOT EXISTS scratchpad_entries (
   id          TEXT PRIMARY KEY,
@@ -159,59 +163,144 @@ CREATE INDEX IF NOT EXISTS idx_scratchpad_session_type
   ON scratchpad_entries(session_id, type, created_at DESC);
 ```
 
-### 9.2 Python core
+### 9.2 Go core (`internal/memory`)
 
-```python
-from __future__ import annotations
-import sqlite3
-import uuid
-from datetime import datetime, timezone
-from typing import List, Optional
+The Python `Scratchpad` class maps 1:1 to a Go struct holding the shared `*sql.DB` store handle (the same `modernc.org/sqlite` connection used by the rest of `internal/memory`). This is a clean mechanical port with no capability loss. Entry types are a small validated set of string constants; JSON is not involved in the storage path (rows map directly to a struct).
 
-VALID_TYPES = frozenset({"hypothesis", "finding", "todo", "note"})
+```go
+package memory
 
-class Scratchpad:
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self.conn = conn
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+	"time"
 
-    def write(self, session_id: str, text: str, note_type: str = "note",
-              tags: Optional[str] = None) -> str:
-        if note_type not in VALID_TYPES:
-            raise ValueError(f"Invalid type: {note_type}. Must be one of {VALID_TYPES}")
-        entry_id = uuid.uuid4().hex[:8]
-        now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            "INSERT INTO scratchpad_entries(id,session_id,type,text,tags,created_at) VALUES(?,?,?,?,?,?)",
-            (entry_id, session_id, note_type, text, tags, now)
-        )
-        self.conn.commit()
-        return entry_id
+	"github.com/google/uuid"
+)
 
-    def read(self, session_id: str, note_type: Optional[str] = None,
-             tags: Optional[str] = None, limit: int = 50) -> List[dict]:
-        where = ["session_id=?", "deleted_at IS NULL"]
-        params: list = [session_id]
-        if note_type:
-            where.append("type=?"); params.append(note_type)
-        rows = self.conn.execute(
-            f"SELECT * FROM scratchpad_entries WHERE {' AND '.join(where)} ORDER BY created_at DESC LIMIT ?",
-            params + [limit]
-        ).fetchall()
-        if tags:
-            tag_set = set(tags.split(","))
-            rows = [r for r in rows if r["tags"] and tag_set & set(r["tags"].split(","))]
-        return [dict(r) for r in rows]
+// NoteType is a validated scratchpad entry type.
+type NoteType string
 
-    def build_context_summary(self, session_id: str, max_entries: int = 10) -> str:
-        entries = self.read(session_id, limit=max_entries)
-        if not entries:
-            return ""
-        lines = ["Working memory (scratchpad):"]
-        for e in entries:
-            tag_str = f" [{e['tags']}]" if e.get("tags") else ""
-            lines.append(f"  [{e['type']}]{tag_str} {e['text'][:100]}")
-        return "\n".join(lines)
+const (
+	Hypothesis NoteType = "hypothesis"
+	Finding    NoteType = "finding"
+	Todo       NoteType = "todo"
+	Note       NoteType = "note"
+)
+
+func (t NoteType) valid() bool {
+	switch t {
+	case Hypothesis, Finding, Todo, Note:
+		return true
+	default:
+		return false
+	}
+}
+
+// Entry is a single scratchpad row.
+type Entry struct {
+	ID        string    `json:"id"`
+	SessionID string    `json:"session_id"`
+	Type      NoteType  `json:"type"`
+	Text      string    `json:"text"`
+	Tags      string    `json:"tags,omitempty"` // comma-separated
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// Scratchpad is the per-session working-memory buffer. It holds the shared
+// store handle; all access goes through the single-writer store contract.
+type Scratchpad struct {
+	db *sql.DB
+}
+
+func NewScratchpad(db *sql.DB) *Scratchpad { return &Scratchpad{db: db} }
+
+// Write inserts a note; returns the short entry id.
+func (s *Scratchpad) Write(ctx context.Context, sessionID, text string, t NoteType, tags string) (string, error) {
+	if !t.valid() {
+		return "", fmt.Errorf("invalid type %q: must be one of hypothesis|finding|todo|note", t)
+	}
+	id := uuid.NewString()[:8]
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO scratchpad_entries(id,session_id,type,text,tags,created_at) VALUES(?,?,?,?,?,?)`,
+		id, sessionID, string(t), text, nullIfEmpty(tags), now)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// ReadOpts filters a Read query.
+type ReadOpts struct {
+	Type  NoteType // "" = any
+	Tags  []string // OR-match; nil = any
+	Limit int
+}
+
+// Read returns entries ordered by created_at DESC.
+func (s *Scratchpad) Read(ctx context.Context, sessionID string, opts ReadOpts) ([]Entry, error) {
+	where := []string{"session_id = ?", "deleted_at IS NULL"}
+	args := []any{sessionID}
+	if opts.Type != "" {
+		where = append(where, "type = ?")
+		args = append(args, string(opts.Type))
+	}
+	limit := opts.Limit
+	if limit == 0 {
+		limit = 50
+	}
+	q := fmt.Sprintf(
+		`SELECT id, session_id, type, text, COALESCE(tags,''), created_at
+		   FROM scratchpad_entries WHERE %s ORDER BY created_at DESC LIMIT ?`,
+		strings.Join(where, " AND "))
+	rows, err := s.db.QueryContext(ctx, q, append(args, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Entry
+	for rows.Next() {
+		var e Entry
+		var created string
+		if err := rows.Scan(&e.ID, &e.SessionID, &e.Type, &e.Text, &e.Tags, &created); err != nil {
+			return nil, err
+		}
+		e.CreatedAt, _ = time.Parse(time.RFC3339, created)
+		if len(opts.Tags) > 0 && !tagsIntersect(e.Tags, opts.Tags) {
+			continue // FR-08: OR-match tag filter, done in Go
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// BuildContextSummary renders the auto-injection block (FR-04, G4).
+func (s *Scratchpad) BuildContextSummary(ctx context.Context, sessionID string, maxEntries int) (string, error) {
+	if maxEntries == 0 {
+		maxEntries = 10
+	}
+	entries, err := s.Read(ctx, sessionID, ReadOpts{Limit: maxEntries})
+	if err != nil || len(entries) == 0 {
+		return "", err
+	}
+	var b strings.Builder
+	b.WriteString("Working memory (scratchpad):\n")
+	for _, e := range entries {
+		tagStr := ""
+		if e.Tags != "" {
+			tagStr = fmt.Sprintf(" [%s]", e.Tags)
+		}
+		fmt.Fprintf(&b, "  [%s]%s %s\n", e.Type, tagStr, truncate(e.Text, 100))
+	}
+	return b.String(), nil
+}
 ```
+
+Helpers `nullIfEmpty`, `tagsIntersect`, and `truncate` are small unexported utilities; `truncate` is rune-aware to avoid splitting a multi-byte character at the 100-char cap.
 
 ---
 
@@ -226,10 +315,13 @@ class Scratchpad:
 
 ## 11. Testing Strategy
 
+Go `testing`, table-driven, against an in-memory `modernc.org/sqlite` store; §4 latency targets measured with `testing.B`.
+
 | Layer | Tests |
 |-------|-------|
-| Unit | `write/read` round-trip; type validation; tag filtering; `build_context_summary` token count |
+| Unit | `Write`/`Read` round-trip; `NoteType.valid()` type validation; OR-match tag filtering; `BuildContextSummary` token/length bounds |
 | Integration | Full session: write 10 entries, read back, export, promote to memory |
+| Benchmark | `testing.B` for the < 10ms write / < 20ms read targets in §4 |
 
 ---
 

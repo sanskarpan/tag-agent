@@ -1,10 +1,12 @@
 # PRD-086: ANP Identity Layer: W3C DID-Based Decentralized Agent Identity (`tag identity`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P3
 **Estimated Effort:** XL (4-8 weeks)
 **Category:** Multi-Agent Interoperability Protocols
-**Affects:** `anp_identity.py`
+**Affects:** `internal/anp/identity` (Go package)
 **Depends on:** PRD-028 (Sandbox Code Execution), PRD-034 (Secret Scanning), PRD-013 (Agent Tracing / Observability), PRD-027 (Eval Framework), PRD-074 (MCP OAuth PKCE / Device Flow), PRD-078 (HITL Tool Approval Audit Trail)
 **GitHub Issue:** #347
 **Inspired by:** ANP (Agent Network Protocol), W3C DID Core spec (W3C Recommendation 2022), ION on Bitcoin, did:wba HTTP Message Signatures (RFC 9421)
@@ -19,7 +21,7 @@ The W3C Decentralized Identifier (DID) specification (https://www.w3.org/TR/did-
 
 The Agent Network Protocol (ANP) uses DID as the foundational trust layer for agent-to-agent authentication. ANP's did:wba (DID Web-Based Authentication) method extends did:web with RFC 9421 HTTP Message Signatures — allowing an agent to prove control of its DID private key by signing HTTP requests, and then exchange that proof for a short-lived JWT Bearer token for subsequent API interactions. This approach provides strong authentication without requiring agents to share secrets in advance and without centralizing identity management.
 
-This PRD specifies `anp_identity.py` — a new TAG module that gives each TAG profile its own W3C DID, manages the associated Ed25519 key pairs in the TAG keystore, publishes DID Documents for did:web profiles, enables local did:key generation for offline use, implements the ANP did:wba HTTP Message Signature authentication handshake, and provides the `tag identity` CLI surface for all identity lifecycle operations. The module is the cryptographic foundation for all future ANP interoperability work in TAG (task delegation, federated agent discovery, cross-network trust chains).
+This PRD specifies `internal/anp/identity` — a new Go package in the TAG single-static-binary harness that gives each TAG profile its own W3C DID, manages the associated Ed25519 key pairs in the TAG keystore, publishes DID Documents for did:web profiles, enables local did:key generation for offline use, implements the ANP did:wba HTTP Message Signature authentication handshake, and provides the `tag identity` CLI surface for all identity lifecycle operations. The module is the cryptographic foundation for all future ANP interoperability work in TAG (task delegation, federated agent discovery, cross-network trust chains).
 
 This feature is rated Difficulty 5/5 because it requires careful implementation of W3C DID Core, RFC 8785 JSON Canonicalization, RFC 9421 HTTP Message Signatures, and Ed25519 key management — all of which have subtle correctness requirements. It is rated Impact 2/5 because ANP adoption in the broader ecosystem is nascent as of mid-2026, and the immediate user-facing value is primarily infrastructure that unblocks future high-impact protocol integrations. Teams building federated multi-agent pipelines will find it essential; single-user deployments will not need it.
 
@@ -37,7 +39,7 @@ The A2A, ACP, ANP, and MCP protocols all define different discovery patterns. AN
 
 ### 2.3 Key Material Is Currently Unmanaged
 
-TAG already generates Ed25519 signing keys for some security operations (secret scanning, sandbox attestations). However, these keys are ephemeral, per-operation, and not associated with a persistent profile identity. There is no keystore, no key rotation policy, no revocation mechanism, and no standard way to export a public key for external verification. Any future cryptographic protocol (ANP did:wba, Verifiable Credentials, signed agent cards) requires a principled key management layer. Building this layer piecemeal inside individual protocol modules would create divergence and security inconsistencies. `anp_identity.py` establishes that layer once, correctly, and shares it across all consumers.
+TAG already generates Ed25519 signing keys for some security operations (secret scanning, sandbox attestations). However, these keys are ephemeral, per-operation, and not associated with a persistent profile identity. There is no keystore, no key rotation policy, no revocation mechanism, and no standard way to export a public key for external verification. Any future cryptographic protocol (ANP did:wba, Verifiable Credentials, signed agent cards) requires a principled key management layer. Building this layer piecemeal inside individual protocol packages would create divergence and security inconsistencies. The `internal/anp/identity` package establishes that layer once, correctly, and shares it across all consumers.
 
 ---
 
@@ -66,7 +68,7 @@ TAG already generates Ed25519 signing keys for some security operations (secret 
 | NG3 | did:peer, did:ethr, did:sov, or other DID methods beyond did:web and did:key. |
 | NG4 | Verifiable Credentials issuance or presentation — DIDs are the identity layer; VCs are an application layer on top. Future PRD. |
 | NG5 | Universal DID Resolver integration (uniresolver.io) — resolving non-did:web/did:key DIDs from external parties is out of scope for v1. |
-| NG6 | Hardware security module (HSM) or OS keychain integration — key material is protected at rest by the SQLite database encryption layer (existing security.py AES-256-GCM). HSM is a future upgrade. |
+| NG6 | Hardware security module (HSM) or OS keychain integration — key material is protected at rest by the SQLite database encryption layer (existing `internal/security` AES-256-GCM). HSM is a future upgrade. |
 | NG7 | Multi-key ceremony or threshold signing — single Ed25519 key per profile identity is sufficient for v1. |
 | NG8 | Automatic DID Document publication to external did:web hosts (GitHub Pages, Cloudflare) — users who want external hosting must export and deploy manually. |
 
@@ -82,7 +84,7 @@ TAG already generates Ed25519 signing keys for some security operations (secret 
 | HTTP Message Signature correctness | Passes ANP did:wba conformance test suite (20 cases) | Integration test against conformance harness |
 | DID resolution cache hit rate | > 80% for repeated resolutions of same DID within TTL window | SQLite query on `anp_did_cache` hit/miss counters |
 | Key rotation correctness | Old key proofs rejected, new key proofs accepted after rotation | Integration test: sign with old key post-rotation, verify = FAIL |
-| CLI command p95 latency (local ops) | < 200 ms | pytest-benchmark suite |
+| CLI command p95 latency (local ops) | < 200 ms | `go test -bench` benchmark suite |
 | `tag identity verify` false positive rate | 0% on tampered documents | Fuzz test: 1000 random bit-flip mutations of valid signed docs |
 
 ---
@@ -346,19 +348,19 @@ local-dev  did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2Qt...  did:key   1            
 | FR-04 | Each DID Document MUST include at minimum: `id`, `@context`, `verificationMethod` (one entry), `authentication` (referencing the verification method), `assertionMethod` (referencing the verification method), and `service` (ANP endpoint). |
 | FR-05 | Verification method entries MUST use type `Ed25519VerificationKey2020` with `publicKeyMultibase` encoding (multibase prefix `z`, base58btc-encoded 32-byte raw public key). |
 | FR-06 | Every locally-owned DID Document MUST be self-signed using a `DataIntegrityProof` with cryptosuite `eddsa-jcs-2022`. The signing process MUST: (1) remove the `proof` field from the document, (2) JCS-canonicalize the document per RFC 8785, (3) sign the canonical bytes with Ed25519, (4) encode the signature as base58btc with multibase prefix `z`, (5) attach as `proof.proofValue`. |
-| FR-07 | JCS canonicalization MUST sort JSON object keys by UTF-16 code unit comparison (RFC 8785 Section 3.2.3), NOT by simple byte comparison. Numbers MUST be serialized per IEEE 754 / ECMAScript rules (no trailing `.0`, no unnecessary exponents). The `rfc8785` package (Trail of Bits, zero dependencies) is the canonical implementation. |
-| FR-08 | Private keys MUST be stored in `anp_identity_keys` table in `tag.sqlite3`, encrypted at rest using AES-256-GCM via `security.py`'s existing encryption helpers. The plaintext private key MUST NOT appear in any log, trace span, or SQLite row outside the `key_ciphertext` column. |
+| FR-07 | JCS canonicalization MUST sort JSON object keys by UTF-16 code unit comparison (RFC 8785 Section 3.2.3), NOT by simple byte comparison. Numbers MUST be serialized per IEEE 754 / ECMAScript rules (no trailing `.0`, no unnecessary exponents). The `github.com/gowebpki/jcs` package (the reference Go RFC 8785 implementation) is the canonical implementation; it MUST be pinned and its output validated against the RFC 8785 test vectors in CI. |
+| FR-08 | Private keys MUST be stored in the `anp_identity_keys` table in `tag.sqlite3` (via `modernc.org/sqlite`), encrypted at rest using AES-256-GCM via the `internal/security` package's existing encryption helpers. The plaintext private key MUST NOT appear in any log, trace span, or SQLite row outside the `key_ciphertext` column. |
 | FR-09 | `tag identity resolve did:web:<domain>:<path>` MUST construct the resolution URL as `https://<domain>/<path-components>/did.json` where colon separators are converted to `/`. If path is absent, the URL is `https://<domain>/.well-known/did.json`. |
 | FR-10 | Resolved DID Documents MUST be cached in the `anp_did_cache` SQLite table with a TTL (default: 3600 seconds). Cache entries MUST be keyed by the full DID string. `--no-cache` forces a fresh network fetch and updates the cache entry. |
 | FR-11 | `tag identity verify` MUST return exit code 0 on valid signature, exit code 2 on invalid signature, exit code 1 on resolution failure or missing proof. It MUST NOT emit the raw document bytes to stdout on failure to prevent using `verify` as an accidental resolver proxy. |
 | FR-12 | `tag identity rotate --profile <name>` MUST generate a new Ed25519 key pair, increment the `key_version` in `anp_did_registry`, and update the DID Document with the new verification method. The old key MUST be retained in the database with `retired_at` timestamp and MUST be listed in the DID Document with `revoked` metadata for the duration of `--keep-old-for`. |
-| FR-13 | The TAG API server (existing `api.py`) MUST serve the did:web DID Document at `GET /.well-known/did.json?profile=<name>` and at `GET /agents/<name>/did.json`. The response MUST set `Content-Type: application/did+json` and `Cache-Control: max-age=3600`. |
+| FR-13 | The TAG API server (existing `internal/server`, built on `net/http` + `go-chi/chi` + `huma`) MUST serve the did:web DID Document at `GET /.well-known/did.json?profile=<name>` and at `GET /agents/<name>/did.json`. The response MUST set `Content-Type: application/did+json` and `Cache-Control: max-age=3600`. |
 | FR-14 | `tag identity sign --purpose authentication` MUST produce a `DataIntegrityProof` with `proofPurpose: "authentication"`. The proof MUST include `challenge` and `domain` fields if the document being signed contains a `challenge` or `domain` field, for replay-attack resistance. |
 | FR-15 | The ANP did:wba outbound request signing MUST use RFC 9421 HTTP Message Signatures. The `Signature-Input` header MUST include the full DID URL (including fragment) as the `keyid` parameter: e.g., `keyid="did:web:example.com:agents:coder#key-1"`. The signed components MUST include at minimum: `@method`, `@target-uri`, `@authority`, `content-type`, `content-digest`, and `date`. |
 | FR-16 | `tag identity list` MUST query `anp_did_registry` and display all profiles with DID records. Output MUST include DID string, method, key version, and creation timestamp. |
 | FR-17 | All `tag identity` subcommands MUST support `--json` for machine-readable output. JSON output schema MUST be stable across patch releases. |
 | FR-18 | `tag identity export --profile <name> --output <path>` MUST write a valid JSON-LD DID Document to the specified path. If the file exists, the command MUST prompt for overwrite confirmation unless `--force` is set. |
-| FR-19 | When a DID is created, a structured trace span MUST be emitted via `tracing.py` (PRD-013) with span name `anp_identity.create`, attributes `did.method`, `did.profile`, `did.key_version`, and `did.created_at`. No private key material MUST appear in trace attributes. |
+| FR-19 | When a DID is created, a structured trace span MUST be emitted via `internal/tracing` (PRD-013) with span name `anp_identity.create`, attributes `did.method`, `did.profile`, `did.key_version`, and `did.created_at`. No private key material MUST appear in trace attributes. |
 | FR-20 | `tag identity create` MUST be idempotent within the same profile+method combination if `--force` is NOT set: re-running with the same inputs produces an error message and exit code 1 rather than overwriting the existing identity. |
 
 ---
@@ -367,15 +369,15 @@ local-dev  did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2Qt...  did:key   1            
 
 | ID | Requirement |
 |----|-------------|
-| NFR-01 | **Cryptographic correctness:** Ed25519 operations MUST use the `cryptography` library (PyCA, v43+), not any other Python Ed25519 implementation. Test vectors from RFC 8032 MUST be verified in CI. |
-| NFR-02 | **Key material never in logs:** The module MUST be audited to ensure no Ed25519 private key bytes pass through Python `logging`, `print`, or the OpenTelemetry span attribute layer. This is enforced by a static analysis rule in CI (grep for `private_key` near log calls). |
-| NFR-03 | **W3C DID Core conformance:** Generated DID Documents MUST pass the W3C DID Core conformance test suite at the "Core Properties" level. CI MUST include a conformance check using the `did-resolver` npm package or equivalent Python validator. |
-| NFR-04 | **RFC 8785 test vector pass rate:** The JCS implementation MUST pass all 42 normative test vectors published at https://www.rfc-editor.org/rfc/rfc8785#appendix-B. This is verified by a dedicated unit test file `tests/test_jcs_vectors.py`. |
-| NFR-05 | **Resolution timeout:** `tag identity resolve` MUST timeout network fetches after 10 seconds (configurable via `identity.resolve_timeout_seconds` in `cli-config.yaml`). A timeout MUST return exit code 1 with a descriptive error, not a Python stack trace. |
-| NFR-06 | **SQLite WAL compatibility:** All reads and writes to `anp_did_registry`, `anp_identity_keys`, and `anp_did_cache` MUST use the existing `open_db()` helper and MUST respect WAL mode. No module-level connection caching that bypasses WAL checkpointing. |
+| NFR-01 | **Cryptographic correctness:** Ed25519 operations MUST use the Go standard library `crypto/ed25519`, not any third-party Ed25519 implementation. Test vectors from RFC 8032 MUST be verified in CI via `go test`. |
+| NFR-02 | **Key material never in logs:** The package MUST be audited to ensure no Ed25519 private key bytes pass through the structured logger (`log/slog`), `fmt.Print*`, or the OpenTelemetry span attribute layer. This is enforced by a CI lint rule (custom `go vet`/`ast`-based analyzer, or `ripgrep` for `privateKey`/`seed` near log calls). |
+| NFR-03 | **W3C DID Core conformance:** Generated DID Documents MUST pass the W3C DID Core conformance test suite at the "Core Properties" level. CI MUST include a conformance check using the `did-resolver` npm package or an equivalent Go validator built on `github.com/nuts-foundation/go-did`. |
+| NFR-04 | **RFC 8785 test vector pass rate:** The JCS implementation MUST pass all 42 normative test vectors published at https://www.rfc-editor.org/rfc/rfc8785#appendix-B. This is verified by a dedicated Go test file `internal/anp/identity/jcs_vectors_test.go`. |
+| NFR-05 | **Resolution timeout:** `tag identity resolve` MUST timeout network fetches after 10 seconds (configurable via `identity.resolve_timeout_seconds` in `cli-config.yaml`, loaded through `koanf`), enforced with a `context.WithTimeout` on the `net/http` request. A timeout MUST return exit code 1 with a descriptive error, not a Go panic / stack trace. |
+| NFR-06 | **SQLite WAL compatibility:** All reads and writes to `anp_did_registry`, `anp_identity_keys`, and `anp_did_cache` MUST use the existing `OpenDB()` helper (over `modernc.org/sqlite`) and MUST respect WAL mode. No package-level `*sql.DB` caching that bypasses WAL checkpointing. |
 | NFR-07 | **did:key offline operation:** Creating and resolving did:key DIDs MUST require no network access whatsoever. The entire operation MUST be completable in an air-gapped environment. |
 | NFR-08 | **Backward compatibility of DID Documents:** Once a DID Document is published for a profile, the `id` field MUST NOT change across key rotations. Key rotation updates only the `verificationMethod`, `authentication`, and `assertionMethod` fields. |
-| NFR-09 | **CLI startup latency:** Importing `anp_identity` MUST not add more than 50 ms to `tag` CLI startup time on a cold Python process. Heavy imports (`cryptography`, `rfc8785`) MUST be lazy-loaded inside function bodies, not at module level. |
+| NFR-09 | **CLI startup latency:** The `internal/anp/identity` package MUST not add more than 50 ms to `tag` CLI startup time. Because Go links everything into the single static binary, there is no runtime import cost; instead, package-level `init()` functions and eager global initialization (e.g. opening the DB, regex compilation, DID resolver setup) MUST be avoided — such work MUST be deferred to first use inside command handlers. |
 | NFR-10 | **Secure deletion of old key material:** When `tag identity rotate --prune` removes an old key, the `key_ciphertext` column for that row MUST be overwritten with null or a sentinel value before the row is deleted, to prevent SQLite page-level recovery of the ciphertext. |
 
 ---
@@ -384,9 +386,15 @@ local-dev  did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2Qt...  did:key   1            
 
 ### 10.1 New Files
 
-- **`src/tag/anp_identity.py`** — All DID and ANP identity logic. Exposed to `controller.py` via `cmd_identity()`. Zero circular imports with other TAG modules.
-- **`tests/test_anp_identity.py`** — Unit and integration tests.
-- **`tests/test_jcs_vectors.py`** — RFC 8785 test vector verification (standalone, no TAG dependencies).
+- **`internal/anp/identity/identity.go`** — All DID and ANP identity logic (types, key management, signing, resolution). Exposed to the command layer via an `Identity` service struct. Zero import cycles with other TAG packages.
+- **`internal/anp/identity/didkey.go`** — did:key derivation and local resolution.
+- **`internal/anp/identity/didweb.go`** — did:web construction and HTTP resolution.
+- **`internal/anp/identity/proof.go`** — JCS + Ed25519 `DataIntegrityProof` sign/verify.
+- **`internal/anp/identity/httpsig.go`** — RFC 9421 HTTP Message Signatures for ANP did:wba.
+- **`internal/anp/identity/store.go`** — `modernc.org/sqlite`-backed key/registry/cache store.
+- **`cmd/tag/identity.go`** — Cobra/`urfave/cli` subcommand wiring for `tag identity`.
+- **`internal/anp/identity/identity_test.go`** — Unit and integration tests (`go test`).
+- **`internal/anp/identity/jcs_vectors_test.go`** — RFC 8785 test vector verification (standalone, no TAG dependencies).
 
 ### 10.2 SQLite DDL
 
@@ -453,596 +461,769 @@ CREATE TABLE IF NOT EXISTS anp_auth_tokens (
 CREATE INDEX IF NOT EXISTS idx_aat_profile ON anp_auth_tokens(profile, remote_did);
 ```
 
-### 10.3 Core Python Dataclasses
+### 10.3 Core Go Types
 
-```python
-# src/tag/anp_identity.py
+Structs use `encoding/json` tags matching the JSON-LD field names. JSON Schemas for the
+public wire types are generated with `github.com/invopop/jsonschema` and surfaced through
+the `huma` OpenAPI 3.1 spec. Optional fields use pointers (or `omitempty`) so that absent
+values are omitted from the canonical JSON rather than serialized as `null`.
 
-from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Literal, Optional
-import datetime
+```go
+// internal/anp/identity/identity.go
+package identity
 
+import "time"
 
-DIDMethod = Literal["did:web", "did:key"]
-ProofPurpose = Literal["authentication", "assertionMethod", "capabilityInvocation"]
+type DIDMethod string
 
+const (
+    MethodWeb DIDMethod = "did:web"
+    MethodKey DIDMethod = "did:key"
+)
 
-@dataclass
-class VerificationMethod:
-    id: str                          # Full DID URL with fragment, e.g. did:web:...:coder#key-1
-    type: str                        # "Ed25519VerificationKey2020"
-    controller: str                  # The DID that controls this key
-    public_key_multibase: str        # Base58btc multibase, prefix 'z'
+type ProofPurpose string
 
+const (
+    PurposeAuthentication      ProofPurpose = "authentication"
+    PurposeAssertionMethod     ProofPurpose = "assertionMethod"
+    PurposeCapabilityInvocation ProofPurpose = "capabilityInvocation"
+)
 
-@dataclass
-class DIDService:
-    id: str                          # Fragment identifier, e.g. did:...:coder#anp-endpoint
-    type: str                        # "ANPEndpoint" | "A2AEndpoint" | "LinkedDomains"
-    service_endpoint: str            # HTTPS URL
+type VerificationMethod struct {
+    ID                 string `json:"id"`                 // Full DID URL with fragment, e.g. did:web:...:coder#key-1
+    Type               string `json:"type"`               // "Ed25519VerificationKey2020"
+    Controller         string `json:"controller"`         // The DID that controls this key
+    PublicKeyMultibase string `json:"publicKeyMultibase"` // Base58btc multibase, prefix 'z'
+}
 
+type DIDService struct {
+    ID              string `json:"id"`              // Fragment identifier, e.g. did:...:coder#anp-endpoint
+    Type            string `json:"type"`            // "ANPEndpoint" | "A2AEndpoint" | "LinkedDomains"
+    ServiceEndpoint string `json:"serviceEndpoint"` // HTTPS URL
+}
 
-@dataclass
-class DataIntegrityProof:
-    type: str = "DataIntegrityProof"
-    cryptosuite: str = "eddsa-jcs-2022"
-    created: str = ""                # ISO-8601 UTC
-    verification_method: str = ""    # Full DID URL to the signing key
-    proof_purpose: ProofPurpose = "assertionMethod"
-    proof_value: str = ""            # Base58btc multibase Ed25519 signature
-    challenge: Optional[str] = None  # For authentication proofs
-    domain: Optional[str] = None     # For authentication proofs
+type DataIntegrityProof struct {
+    Type               string       `json:"type"`               // "DataIntegrityProof"
+    Cryptosuite        string       `json:"cryptosuite"`        // "eddsa-jcs-2022"
+    Created            string       `json:"created"`            // ISO-8601 UTC
+    VerificationMethod string       `json:"verificationMethod"` // Full DID URL to the signing key
+    ProofPurpose       ProofPurpose `json:"proofPurpose"`       // assertionMethod | authentication | ...
+    ProofValue         string       `json:"proofValue"`         // Base58btc multibase Ed25519 signature
+    Challenge          string       `json:"challenge,omitempty"` // For authentication proofs
+    Domain             string       `json:"domain,omitempty"`    // For authentication proofs
+}
 
+type DIDDocument struct {
+    Context              []string             `json:"@context"`
+    ID                   string               `json:"id"`                   // The full DID string
+    Controller           string               `json:"controller,omitempty"` // Defaults to self (same as id)
+    VerificationMethod   []VerificationMethod `json:"verificationMethod"`
+    Authentication       []string             `json:"authentication"`       // DID URLs
+    AssertionMethod      []string             `json:"assertionMethod"`      // DID URLs
+    CapabilityInvocation []string             `json:"capabilityInvocation,omitempty"`
+    Service              []DIDService         `json:"service,omitempty"`
+    Proof                *DataIntegrityProof  `json:"proof,omitempty"`
+    Created              string               `json:"created,omitempty"`
+    Updated              string               `json:"updated,omitempty"`
+}
 
-@dataclass
-class DIDDocument:
-    context: list[str] = field(default_factory=lambda: [
+// NewDIDDocument returns a document pre-seeded with the required @context entries.
+func NewDIDDocument() *DIDDocument {
+    return &DIDDocument{Context: []string{
         "https://www.w3.org/ns/did/v1",
         "https://w3id.org/security/suites/ed25519-2020/v1",
-    ])
-    id: str = ""                     # The full DID string
-    controller: Optional[str] = None # Defaults to self (same as id)
-    verification_method: list[VerificationMethod] = field(default_factory=list)
-    authentication: list[str] = field(default_factory=list)     # DID URLs
-    assertion_method: list[str] = field(default_factory=list)   # DID URLs
-    capability_invocation: list[str] = field(default_factory=list)
-    service: list[DIDService] = field(default_factory=list)
-    proof: Optional[DataIntegrityProof] = None
-    created: str = ""
-    updated: str = ""
+    }}
+}
 
-    def to_json_ld(self) -> dict:
-        """Serialize to JSON-LD dict suitable for JCS canonicalization."""
-        ...
+// MarshalCanonical serializes the document (minus any proof) to RFC 8785 JCS bytes.
+func (d *DIDDocument) MarshalCanonical() ([]byte, error) { /* jcs.Transform(json.Marshal(d)) */ }
 
-    @classmethod
-    def from_json_ld(cls, data: dict) -> "DIDDocument":
-        """Deserialize from JSON-LD dict."""
-        ...
+// DIDIdentity is the complete identity record stored in the database.
+type DIDIdentity struct {
+    RowID           string
+    Profile         string
+    DID             string
+    Method          DIDMethod
+    Domain          string // empty for did:key
+    DIDPath         string // empty for did:key
+    KeyVersion      int
+    Document        *DIDDocument
+    ServiceEndpoint string
+    CreatedAt       time.Time
+    UpdatedAt       time.Time
+}
 
+// KeyRecord is a key pair record; the private key is available only after decryption.
+type KeyRecord struct {
+    RowID              string
+    Profile            string
+    DID                string
+    KeyID              string
+    KeyVersion         int
+    PublicKeyMultibase string
+    // Private key: decrypted on demand, never held as a field.
+    Algorithm string
+    CreatedAt time.Time
+    RetiredAt *time.Time // nil if active
+    Revoked   bool
+}
 
-@dataclass
-class DIDIdentity:
-    """Complete identity record stored in the database."""
-    row_id: str
-    profile: str
-    did: str
-    method: DIDMethod
-    domain: Optional[str]
-    did_path: Optional[str]
-    key_version: int
-    did_document: DIDDocument
-    service_endpoint: Optional[str]
-    created_at: datetime.datetime
-    updated_at: datetime.datetime
-
-
-@dataclass
-class KeyRecord:
-    """Key pair record (private key available only after decryption)."""
-    row_id: str
-    profile: str
-    did: str
-    key_id: str
-    key_version: int
-    public_key_multibase: str
-    # Private key: decrypted on demand, never stored as attribute
-    algorithm: str
-    created_at: datetime.datetime
-    retired_at: Optional[datetime.datetime]
-    revoked: bool
-
-
-@dataclass
-class ResolutionResult:
-    did: str
-    did_document: DIDDocument
-    did_document_metadata: dict
-    resolution_metadata: dict     # includes "contentType", "duration_ms", "from_cache"
+type ResolutionResult struct {
+    DID                  string
+    Document             *DIDDocument
+    DocumentMetadata     map[string]any
+    ResolutionMetadata   map[string]any // includes "contentType", "durationMs", "fromCache"
+}
 ```
 
 ### 10.4 Core Algorithms
 
 #### 10.4.1 did:key Generation
 
-```python
-# src/tag/anp_identity.py
+```go
+// internal/anp/identity/didkey.go
+package identity
 
-import base64
-import hashlib
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import (
-    Encoding, PublicFormat, PrivateFormat, NoEncryption,
+import (
+    "crypto/ed25519"
+    "crypto/rand"
+    "fmt"
+    "strings"
+
+    "github.com/mr-tron/base58" // base58btc (Bitcoin alphabet)
 )
 
-# Multicodec prefix for Ed25519 public key: 0xed01 (varint-encoded)
-ED25519_MULTICODEC_PREFIX = bytes([0xed, 0x01])
-MULTIBASE_BASE58BTC_PREFIX = "z"
+// Multicodec prefix for Ed25519 public key: 0xed01 (varint-encoded).
+var ed25519MulticodecPrefix = []byte{0xed, 0x01}
 
+const multibaseBase58BTCPrefix = "z"
 
-def _base58_encode(data: bytes) -> str:
-    """Base58btc encoding (Bitcoin alphabet)."""
-    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    n = int.from_bytes(data, "big")
-    result = []
-    while n > 0:
-        n, remainder = divmod(n, 58)
-        result.append(alphabet[remainder])
-    # Leading zero bytes
-    for byte in data:
-        if byte == 0:
-            result.append(alphabet[0])
-        else:
-            break
-    return "".join(reversed(result))
+// GenerateEd25519Keypair generates an Ed25519 key pair.
+// Returns the private key and the raw 32-byte public key.
+func GenerateEd25519Keypair() (ed25519.PrivateKey, ed25519.PublicKey, error) {
+    pub, priv, err := ed25519.GenerateKey(rand.Reader)
+    if err != nil {
+        return nil, nil, fmt.Errorf("generate ed25519 key: %w", err)
+    }
+    return priv, pub, nil
+}
 
+// PublicKeyToMultibase encodes a 32-byte Ed25519 public key as a multibase
+// base58btc string: 'z' + base58btc(0xed 0x01 || publicKey).
+func PublicKeyToMultibase(pub ed25519.PublicKey) string {
+    prefixed := append(append([]byte{}, ed25519MulticodecPrefix...), pub...)
+    return multibaseBase58BTCPrefix + base58.Encode(prefixed)
+}
 
-def generate_ed25519_keypair() -> tuple[Ed25519PrivateKey, bytes]:
-    """
-    Generate Ed25519 key pair.
-    Returns (private_key_object, raw_32_byte_public_key).
-    """
-    private_key = Ed25519PrivateKey.generate()
-    public_key_bytes = private_key.public_key().public_bytes(
-        Encoding.Raw, PublicFormat.Raw
-    )  # 32 bytes
-    return private_key, public_key_bytes
+// DeriveDIDKey derives a did:key DID from a 32-byte Ed25519 public key.
+func DeriveDIDKey(pub ed25519.PublicKey) string {
+    return "did:key:" + PublicKeyToMultibase(pub)
+}
 
-
-def public_key_to_multibase(public_key_bytes: bytes) -> str:
-    """
-    Encode a 32-byte Ed25519 public key as multibase base58btc string.
-    Format: 'z' + base58btc(0xed 0x01 + public_key_bytes)
-    """
-    prefixed = ED25519_MULTICODEC_PREFIX + public_key_bytes
-    return MULTIBASE_BASE58BTC_PREFIX + _base58_encode(prefixed)
-
-
-def derive_did_key(public_key_bytes: bytes) -> str:
-    """Derive a did:key DID from a 32-byte Ed25519 public key."""
-    multibase_key = public_key_to_multibase(public_key_bytes)
-    return f"did:key:{multibase_key}"
-
-
-def build_did_web(domain: str, path_components: list[str]) -> str:
-    """
-    Construct a did:web DID.
-    domain: 'agents.mycompany.com'
-    path_components: ['agents', 'coder']  -> did:web:agents.mycompany.com:agents:coder
-    """
-    parts = [domain] + [p.replace("/", ":") for p in path_components]
-    return "did:web:" + ":".join(parts)
+// BuildDIDWeb constructs a did:web DID.
+//   domain: "agents.mycompany.com"
+//   pathComponents: ["agents", "coder"] -> did:web:agents.mycompany.com:agents:coder
+func BuildDIDWeb(domain string, pathComponents []string) string {
+    parts := make([]string, 0, len(pathComponents)+1)
+    parts = append(parts, domain)
+    for _, p := range pathComponents {
+        parts = append(parts, strings.ReplaceAll(p, "/", ":"))
+    }
+    return "did:web:" + strings.Join(parts, ":")
+}
 ```
+
+> Note: Go's `crypto/ed25519.PrivateKey` is a 64-byte value (32-byte seed || 32-byte
+> public key). The raw 32-byte seed persisted to the keystore is obtained via
+> `priv.Seed()`, and rehydrated with `ed25519.NewKeyFromSeed(seed)`.
 
 #### 10.4.2 DID Document Signing (JCS + Ed25519)
 
-```python
-# src/tag/anp_identity.py
+```go
+// internal/anp/identity/proof.go
+package identity
 
-from rfc8785 import dumps as jcs_dumps  # Trail of Bits rfc8785 package
+import (
+    "crypto/ed25519"
+    "crypto/sha256"
+    "encoding/json"
+    "errors"
+    "fmt"
+    "strings"
+    "time"
 
+    "github.com/gowebpki/jcs" // RFC 8785 JSON Canonicalization Scheme
+    "github.com/mr-tron/base58"
+)
 
-def sign_did_document(
-    doc: DIDDocument,
-    private_key: Ed25519PrivateKey,
-    verification_method_id: str,
-    proof_purpose: ProofPurpose = "assertionMethod",
-    challenge: str | None = None,
-    domain: str | None = None,
-) -> DIDDocument:
-    """
-    Apply DataIntegrityProof (eddsa-jcs-2022) to a DID Document.
-
-    Algorithm (per W3C Data Integrity 1.0 + eddsa-jcs-2022 cryptosuite):
-    1. Build the proof options object (without proofValue).
-    2. JCS-canonicalize the proof options -> proof_options_canonical.
-    3. Remove existing proof field from doc; JCS-canonicalize doc -> doc_canonical.
-    4. Compute hash_to_sign = sha256(proof_options_canonical) + sha256(doc_canonical).
-       (The eddsa-jcs-2022 cryptosuite concatenates the two SHA-256 digests.)
-    5. Sign hash_to_sign with Ed25519.
-    6. Attach proof with proofValue = multibase_base58btc(signature).
-    """
-    import datetime
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-
-    proof_options = {
-        "type": "DataIntegrityProof",
-        "cryptosuite": "eddsa-jcs-2022",
-        "created": now,
-        "verificationMethod": verification_method_id,
-        "proofPurpose": proof_purpose,
+// jcsCanonical marshals v to JSON, then applies RFC 8785 canonicalization.
+func jcsCanonical(v any) ([]byte, error) {
+    raw, err := json.Marshal(v)
+    if err != nil {
+        return nil, err
     }
-    if challenge:
-        proof_options["challenge"] = challenge
-    if domain:
-        proof_options["domain"] = domain
+    return jcs.Transform(raw)
+}
 
-    # JCS-canonicalize proof options
-    proof_options_canonical = jcs_dumps(proof_options)
+// SignDIDDocument applies a DataIntegrityProof (eddsa-jcs-2022) to a DID Document.
+//
+// Algorithm (per W3C Data Integrity 1.0 + eddsa-jcs-2022 cryptosuite):
+//  1. Build the proof options object (without proofValue).
+//  2. JCS-canonicalize the proof options -> proofOptionsCanonical.
+//  3. Remove existing proof from doc; JCS-canonicalize doc -> docCanonical.
+//  4. hashToSign = sha256(proofOptionsCanonical) || sha256(docCanonical).
+//     (The eddsa-jcs-2022 cryptosuite concatenates the two SHA-256 digests.)
+//  5. Sign hashToSign with Ed25519.
+//  6. Attach proof with proofValue = multibase base58btc(signature).
+func SignDIDDocument(
+    doc *DIDDocument,
+    priv ed25519.PrivateKey,
+    verificationMethodID string,
+    purpose ProofPurpose,
+    challenge, domain string,
+) (*DIDDocument, error) {
+    now := time.Now().UTC().Format(time.RFC3339)
 
-    # Build document dict without proof
-    doc_dict = doc.to_json_ld()
-    doc_dict.pop("proof", None)
+    // Proof options are canonicalized as a plain map so proofValue is excluded.
+    proofOptions := map[string]any{
+        "type":               "DataIntegrityProof",
+        "cryptosuite":        "eddsa-jcs-2022",
+        "created":            now,
+        "verificationMethod": verificationMethodID,
+        "proofPurpose":       string(purpose),
+    }
+    if challenge != "" {
+        proofOptions["challenge"] = challenge
+    }
+    if domain != "" {
+        proofOptions["domain"] = domain
+    }
 
-    # JCS-canonicalize the document
-    doc_canonical = jcs_dumps(doc_dict)
+    proofOptionsCanonical, err := jcsCanonical(proofOptions)
+    if err != nil {
+        return nil, err
+    }
 
-    # Concatenate SHA-256 hashes (eddsa-jcs-2022 spec)
-    hash_input = (
-        hashlib.sha256(proof_options_canonical).digest()
-        + hashlib.sha256(doc_canonical).digest()
-    )
+    // Canonicalize the document with the proof field cleared.
+    docCopy := *doc
+    docCopy.Proof = nil
+    docCanonical, err := jcsCanonical(&docCopy)
+    if err != nil {
+        return nil, err
+    }
 
-    # Sign
-    signature_bytes = private_key.sign(hash_input)
+    // Concatenate SHA-256 digests (eddsa-jcs-2022 spec).
+    poHash := sha256.Sum256(proofOptionsCanonical)
+    docHash := sha256.Sum256(docCanonical)
+    hashInput := append(poHash[:], docHash[:]...)
 
-    # Encode as multibase base58btc
-    proof_value = MULTIBASE_BASE58BTC_PREFIX + _base58_encode(signature_bytes)
+    sig := ed25519.Sign(priv, hashInput)
 
-    proof = DataIntegrityProof(
-        created=now,
-        verification_method=verification_method_id,
-        proof_purpose=proof_purpose,
-        proof_value=proof_value,
-        challenge=challenge,
-        domain=domain,
-    )
-    doc.proof = proof
-    return doc
+    doc.Proof = &DataIntegrityProof{
+        Type:               "DataIntegrityProof",
+        Cryptosuite:        "eddsa-jcs-2022",
+        Created:            now,
+        VerificationMethod: verificationMethodID,
+        ProofPurpose:       purpose,
+        ProofValue:         multibaseBase58BTCPrefix + base58.Encode(sig),
+        Challenge:          challenge,
+        Domain:             domain,
+    }
+    return doc, nil
+}
 
+// VerifyDIDDocumentProof verifies the DataIntegrityProof on a DID Document.
+// Returns (true, nil) if valid, (false, nil) if the signature does not verify,
+// and a non-nil error on a missing or malformed proof.
+func VerifyDIDDocumentProof(doc *DIDDocument) (bool, error) {
+    if doc.Proof == nil {
+        return false, errors.New("DID Document has no 'proof' field")
+    }
+    proof := doc.Proof
+    if proof.Cryptosuite != "eddsa-jcs-2022" {
+        return false, fmt.Errorf("unsupported cryptosuite: %s", proof.Cryptosuite)
+    }
+    if !strings.HasPrefix(proof.ProofValue, multibaseBase58BTCPrefix) {
+        return false, errors.New("proofValue must be multibase base58btc (prefix 'z')")
+    }
 
-def verify_did_document_proof(doc_dict: dict) -> bool:
-    """
-    Verify a DataIntegrityProof on a DID Document dict.
-    Returns True if valid, False if invalid.
-    Raises ValueError on missing or malformed proof.
-    """
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-    from cryptography.exceptions import InvalidSignature
+    sig, err := base58.Decode(proof.ProofValue[len(multibaseBase58BTCPrefix):])
+    if err != nil {
+        return false, fmt.Errorf("decode proofValue: %w", err)
+    }
 
-    proof = doc_dict.get("proof")
-    if not proof:
-        raise ValueError("DID Document has no 'proof' field")
-    if proof.get("cryptosuite") != "eddsa-jcs-2022":
-        raise ValueError(f"Unsupported cryptosuite: {proof.get('cryptosuite')}")
+    // Rebuild proof options without proofValue.
+    proofOptions := map[string]any{
+        "type":               proof.Type,
+        "cryptosuite":        proof.Cryptosuite,
+        "created":            proof.Created,
+        "verificationMethod": proof.VerificationMethod,
+        "proofPurpose":       string(proof.ProofPurpose),
+    }
+    if proof.Challenge != "" {
+        proofOptions["challenge"] = proof.Challenge
+    }
+    if proof.Domain != "" {
+        proofOptions["domain"] = proof.Domain
+    }
 
-    proof_value_multibase = proof.get("proofValue", "")
-    if not proof_value_multibase.startswith(MULTIBASE_BASE58BTC_PREFIX):
-        raise ValueError("proofValue must be multibase base58btc (prefix 'z')")
+    proofOptionsCanonical, err := jcsCanonical(proofOptions)
+    if err != nil {
+        return false, err
+    }
 
-    # Decode signature
-    signature_bytes = _base58_decode(proof_value_multibase[1:])
+    docCopy := *doc
+    docCopy.Proof = nil
+    docCanonical, err := jcsCanonical(&docCopy)
+    if err != nil {
+        return false, err
+    }
 
-    # Reconstruct proof options (without proofValue)
-    proof_options = {k: v for k, v in proof.items() if k != "proofValue"}
+    poHash := sha256.Sum256(proofOptionsCanonical)
+    docHash := sha256.Sum256(docCanonical)
+    hashInput := append(poHash[:], docHash[:]...)
 
-    # Reconstruct document without proof
-    doc_no_proof = {k: v for k, v in doc_dict.items() if k != "proof"}
-
-    proof_options_canonical = jcs_dumps(proof_options)
-    doc_canonical = jcs_dumps(doc_no_proof)
-
-    hash_input = (
-        hashlib.sha256(proof_options_canonical).digest()
-        + hashlib.sha256(doc_canonical).digest()
-    )
-
-    # Resolve the verification method's public key
-    vm_id = proof.get("verificationMethod", "")
-    public_key_bytes = _resolve_public_key_from_did_doc(doc_dict, vm_id)
-
-    public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
-    try:
-        public_key.verify(signature_bytes, hash_input)
-        return True
-    except InvalidSignature:
-        return False
+    // The verificationMethod MUST reference a key in this document (key-confusion guard).
+    pub, err := resolvePublicKeyFromDoc(doc, proof.VerificationMethod)
+    if err != nil {
+        return false, err
+    }
+    return ed25519.Verify(pub, hashInput, sig), nil
+}
 ```
 
 #### 10.4.3 RFC 9421 HTTP Message Signatures (ANP did:wba)
 
-```python
-# src/tag/anp_identity.py
+```go
+// internal/anp/identity/httpsig.go
+package identity
 
-import base64
-import email.utils
-import hashlib
-import time
-from urllib.parse import urlparse
+import (
+    "context"
+    "crypto/ed25519"
+    "crypto/sha256"
+    "encoding/base64"
+    "encoding/json"
+    "fmt"
+    "io"
+    "net/http"
+    "net/url"
+    "strings"
+    "time"
 
+    "github.com/google/uuid"
+)
 
-def build_anp_signed_request(
-    method: str,
-    url: str,
-    body: bytes,
-    content_type: str,
-    profile_did: str,
-    key_id: str,               # Full DID URL with fragment
-    private_key: Ed25519PrivateKey,
-) -> dict[str, str]:
-    """
-    Build HTTP headers for an ANP did:wba authenticated request.
+// BuildANPSignedRequest builds HTTP headers for an ANP did:wba authenticated request.
+//
+// Implements RFC 9421 HTTP Message Signatures with the signed components:
+// @method, @target-uri, @authority, content-type, content-digest, date.
+//
+// Returns a header map to merge into the outgoing request. The keyid parameter
+// carries the full DID URL (with fragment), e.g. "did:web:example.com:agents:coder#key-1".
+func BuildANPSignedRequest(
+    method, rawURL string,
+    body []byte,
+    contentType string,
+    keyID string, // full DID URL with fragment
+    priv ed25519.PrivateKey,
+) (map[string]string, error) {
+    // Content-Digest: sha-256=:<base64>:
+    sum := sha256.Sum256(body)
+    contentDigest := "sha-256=:" + base64.StdEncoding.EncodeToString(sum[:]) + ":"
 
-    Implements RFC 9421 HTTP Message Signatures with the following
-    signed components: @method, @target-uri, @authority,
-    content-type, content-digest, date.
+    // Date: RFC 7231 HTTP-date (Go's http.TimeFormat is RFC 1123 GMT).
+    dateStr := time.Now().UTC().Format(http.TimeFormat)
 
-    Returns a dict of headers to merge into the outgoing request.
-    """
-    # Content-Digest: sha-256=:<base64>=
-    digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
-    content_digest = f'sha-256=:{digest}:'
+    parsed, err := url.Parse(rawURL)
+    if err != nil {
+        return nil, fmt.Errorf("parse url: %w", err)
+    }
+    authority := parsed.Host
 
-    # Date: RFC 7231 HTTP-date
-    date_str = email.utils.formatdate(usegmt=True)
-
-    parsed = urlparse(url)
-    authority = parsed.netloc
-    target_uri = url
-
-    # Signature-Input components (RFC 9421 Section 2)
-    sig_params = (
-        f'("@method" "@target-uri" "@authority" '
-        f'"content-type" "content-digest" "date")'
-        f';keyid="{key_id}";alg="ed25519";created={int(time.time())}'
+    // Signature-Input components (RFC 9421 Section 2).
+    sigParams := fmt.Sprintf(
+        `("@method" "@target-uri" "@authority" "content-type" "content-digest" "date")`+
+            `;keyid="%s";alg="ed25519";created=%d`,
+        keyID, time.Now().Unix(),
     )
-    signature_input = f'sig1={sig_params}'
+    signatureInput := "sig1=" + sigParams
 
-    # Build the signature base string (RFC 9421 Section 2.5)
-    sig_base_lines = [
-        f'"@method": {method.upper()}',
-        f'"@target-uri": {target_uri}',
-        f'"@authority": {authority}',
-        f'"content-type": {content_type}',
-        f'"content-digest": {content_digest}',
-        f'"date": {date_str}',
-        f'"@signature-params": {sig_params}',
-    ]
-    sig_base = "\n".join(sig_base_lines)
+    // Signature base string (RFC 9421 Section 2.5).
+    sigBase := strings.Join([]string{
+        `"@method": ` + strings.ToUpper(method),
+        `"@target-uri": ` + rawURL,
+        `"@authority": ` + authority,
+        `"content-type": ` + contentType,
+        `"content-digest": ` + contentDigest,
+        `"date": ` + dateStr,
+        `"@signature-params": ` + sigParams,
+    }, "\n")
 
-    # Sign
-    sig_bytes = private_key.sign(sig_base.encode("utf-8"))
-    sig_b64 = base64.b64encode(sig_bytes).decode()
-    signature_header = f'sig1=:{sig_b64}:'
+    sig := ed25519.Sign(priv, []byte(sigBase))
+    signatureHeader := "sig1=:" + base64.StdEncoding.EncodeToString(sig) + ":"
 
-    return {
-        "Content-Type": content_type,
-        "Content-Digest": content_digest,
-        "Date": date_str,
-        "Signature-Input": signature_input,
-        "Signature": signature_header,
+    return map[string]string{
+        "Content-Type":    contentType,
+        "Content-Digest":  contentDigest,
+        "Date":            dateStr,
+        "Signature-Input": signatureInput,
+        "Signature":       signatureHeader,
+    }, nil
+}
+
+// ANPWBAAuthenticate executes the ANP did:wba authentication handshake.
+//
+//  1. Build a signed HTTP POST to tokenEndpoint.
+//  2. Body is a JSON object: {"did": profileDID, "nonce": <uuid>}.
+//  3. Send with RFC 9421 signature headers.
+//  4. Parse the JWT Bearer token from the 200 response.
+//  5. Cache the token in anp_auth_tokens.
+//
+// Returns the JWT Bearer token string. The *http.Client SHOULD use the repo's
+// internal/netguard SSRF-safe dialer.
+func (s *Identity) ANPWBAAuthenticate(
+    ctx context.Context,
+    profile, remoteDID, tokenEndpoint string,
+    priv ed25519.PrivateKey,
+    keyID string,
+) (string, error) {
+    profileDID, err := s.store.ProfileDID(ctx, profile)
+    if err != nil {
+        return "", err
+    }
+    body, _ := json.Marshal(map[string]string{"did": profileDID, "nonce": uuid.NewString()})
+
+    headers, err := BuildANPSignedRequest(http.MethodPost, tokenEndpoint, body, "application/json", keyID, priv)
+    if err != nil {
+        return "", err
     }
 
+    ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+    defer cancel()
+    req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint, strings.NewReader(string(body)))
+    if err != nil {
+        return "", err
+    }
+    for k, v := range headers {
+        req.Header.Set(k, v)
+    }
 
-async def anp_wba_authenticate(
-    profile: str,
-    remote_did: str,
-    remote_token_endpoint: str,
-    private_key: Ed25519PrivateKey,
-    key_id: str,
-) -> str:
-    """
-    Execute the ANP did:wba authentication handshake.
+    resp, err := s.httpClient.Do(req)
+    if err != nil {
+        return "", err
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK {
+        raw, _ := io.ReadAll(resp.Body)
+        return "", fmt.Errorf("did:wba auth failed: %s: %s", resp.Status, raw)
+    }
 
-    1. Build a signed HTTP POST to remote_token_endpoint.
-    2. The body is a JSON object: {"did": profile_did, "nonce": <uuid4>}.
-    3. Send with RFC 9421 signature headers.
-    4. Parse the JWT Bearer token from the 200 response.
-    5. Cache the token in anp_auth_tokens.
-
-    Returns the JWT Bearer token string.
-    """
-    import httpx, json, uuid
-
-    body_data = {"did": _get_profile_did(profile), "nonce": str(uuid.uuid4())}
-    body = json.dumps(body_data, separators=(",", ":")).encode()
-    content_type = "application/json"
-
-    headers = build_anp_signed_request(
-        method="POST",
-        url=remote_token_endpoint,
-        body=body,
-        content_type=content_type,
-        profile_did=body_data["did"],
-        key_id=key_id,
-        private_key=private_key,
-    )
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(remote_token_endpoint, content=body, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        token = data["access_token"]
-
-    _cache_auth_token(profile, remote_did, remote_token_endpoint, token, data.get("expires_in", 3600))
-    return token
+    var out struct {
+        AccessToken string `json:"access_token"`
+        ExpiresIn   int    `json:"expires_in"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+        return "", err
+    }
+    expires := out.ExpiresIn
+    if expires == 0 {
+        expires = 3600
+    }
+    if err := s.store.CacheAuthToken(ctx, profile, remoteDID, tokenEndpoint, out.AccessToken, expires); err != nil {
+        return "", err
+    }
+    return out.AccessToken, nil
+}
 ```
+
+> Concurrency note: where the original design used `asyncio`/`httpx.AsyncClient`,
+> the Go implementation uses a shared `*http.Client` and per-call `context.Context`
+> deadlines. Fan-out over multiple remote endpoints (e.g. batch resolution) uses
+> `golang.org/x/sync/errgroup` rather than `asyncio.gather`.
 
 ### 10.5 did:web Resolution Algorithm
 
-```python
-def resolve_did_web(did: str, timeout: float = 10.0) -> dict:
-    """
-    Resolve a did:web DID to its DID Document.
+```go
+// internal/anp/identity/didweb.go
+package identity
 
-    did:web resolution rules (did:web spec Section 3.1):
-      1. Remove 'did:web:' prefix.
-      2. Split remaining string on ':'.
-      3. First component is the domain (percent-decode it).
-      4. Remaining components are URL path segments.
-      5. If no path: URL = https://<domain>/.well-known/did.json
-      6. If path present: URL = https://<domain>/<path>/did.json
-         where each ':' in path becomes '/'
-    """
-    import httpx
-    from urllib.parse import unquote
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "net/url"
+    "strings"
+)
 
-    assert did.startswith("did:web:"), f"Not a did:web DID: {did}"
-    remainder = did[len("did:web:"):]
-    parts = remainder.split(":")
-    domain = unquote(parts[0])
+// ResolveDIDWeb resolves a did:web DID to its DID Document.
+//
+// did:web resolution rules (did:web spec Section 3.1):
+//  1. Strip the "did:web:" prefix.
+//  2. Split the remainder on ':'.
+//  3. First component is the domain (percent-decoded).
+//  4. Remaining components are URL path segments.
+//  5. If no path: URL = https://<domain>/.well-known/did.json
+//  6. If path present: URL = https://<domain>/<path>/did.json
+//     where each ':' in the path becomes '/'.
+func (s *Identity) ResolveDIDWeb(ctx context.Context, did string) (*DIDDocument, error) {
+    if !strings.HasPrefix(did, "did:web:") {
+        return nil, fmt.Errorf("not a did:web DID: %s", did)
+    }
+    parts := strings.Split(strings.TrimPrefix(did, "did:web:"), ":")
 
-    if len(parts) == 1:
-        url = f"https://{domain}/.well-known/did.json"
-    else:
-        path = "/".join(unquote(p) for p in parts[1:])
-        url = f"https://{domain}/{path}/did.json"
+    domain, err := url.PathUnescape(parts[0])
+    if err != nil {
+        return nil, fmt.Errorf("decode domain: %w", err)
+    }
 
-    response = httpx.get(url, timeout=timeout, headers={"Accept": "application/did+json, application/json"})
-    response.raise_for_status()
-    doc = response.json()
+    // HTTPS-only, except http://localhost for local testing (see Security §5).
+    scheme := "https"
+    if isLocalhost(domain) {
+        scheme = "http"
+    }
 
-    # Validate that document 'id' matches the resolved DID
-    if doc.get("id") != did:
-        raise ValueError(
-            f"DID Document 'id' mismatch: expected '{did}', got '{doc.get('id')}'"
-        )
-    return doc
+    var target string
+    if len(parts) == 1 {
+        target = fmt.Sprintf("%s://%s/.well-known/did.json", scheme, domain)
+    } else {
+        segs := make([]string, 0, len(parts)-1)
+        for _, p := range parts[1:] {
+            dec, err := url.PathUnescape(p)
+            if err != nil {
+                return nil, fmt.Errorf("decode path segment: %w", err)
+            }
+            segs = append(segs, dec)
+        }
+        target = fmt.Sprintf("%s://%s/%s/did.json", scheme, domain, strings.Join(segs, "/"))
+    }
+
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+    if err != nil {
+        return nil, err
+    }
+    req.Header.Set("Accept", "application/did+json, application/json")
+
+    resp, err := s.httpClient.Do(req) // client carries the 10s timeout / netguard dialer
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("resolve %s: status %s", target, resp.Status)
+    }
+
+    var doc DIDDocument
+    if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+        return nil, fmt.Errorf("decode DID document: %w", err)
+    }
+
+    // The document 'id' MUST match the requested DID (id-binding, see Security §4).
+    if doc.ID != did {
+        return nil, fmt.Errorf("DID Document 'id' mismatch: expected %q, got %q", did, doc.ID)
+    }
+    return &doc, nil
+}
 ```
 
-### 10.6 Key Encryption / Decryption (Delegated to security.py)
+### 10.6 Key Encryption / Decryption (Delegated to internal/security)
 
-```python
-# In anp_identity.py — delegates to existing security.py helpers
+The store delegates AES-256-GCM to the existing `internal/security` package
+(`EncryptValue`/`DecryptValue`). Persistence uses `database/sql` with the
+`modernc.org/sqlite` (pure-Go, CGO_ENABLED=0) driver.
 
-from tag.security import encrypt_value, decrypt_value  # AES-256-GCM, existing API
+```go
+// internal/anp/identity/store.go
+package identity
 
+import (
+    "context"
+    "crypto/ed25519"
+    "database/sql"
+    "fmt"
+    "time"
 
-def _store_private_key(
-    conn,
-    profile: str,
-    did: str,
-    key_id: str,
-    key_version: int,
-    public_key_multibase: str,
-    private_key: Ed25519PrivateKey,
-) -> str:
-    """Encrypt and persist a private key. Returns the row uuid."""
-    import uuid, base64
-    from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
+    "github.com/google/uuid"
 
-    raw_seed = private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
-    ciphertext_b64, nonce_b64 = encrypt_value(raw_seed)  # existing security.py helper
+    "github.com/tag-agent/tag/internal/security" // AES-256-GCM helpers
+)
 
-    row_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO anp_identity_keys
+// StorePrivateKey encrypts and persists a private key. Returns the row uuid.
+func (s *Store) StorePrivateKey(
+    ctx context.Context,
+    profile, did, keyID string,
+    keyVersion int,
+    publicKeyMultibase string,
+    priv ed25519.PrivateKey,
+) (string, error) {
+    // Ed25519 seed is the raw 32 bytes; keep it in a []byte we can zero after use.
+    seed := priv.Seed()
+    defer zeroBytes(seed) // wipe plaintext seed from memory (see Security §2)
+
+    ciphertextB64, nonceB64, err := security.EncryptValue(seed)
+    if err != nil {
+        return "", fmt.Errorf("encrypt key: %w", err)
+    }
+
+    rowID := uuid.NewString()
+    _, err = s.db.ExecContext(ctx,
+        `INSERT INTO anp_identity_keys
            (id, profile, did, key_id, key_version, public_key_multibase,
             key_ciphertext, key_nonce, algorithm, created_at, retired_at, revoked)
-           VALUES (?,?,?,?,?,?,?,?,'Ed25519',?,NULL,0)""",
-        (row_id, profile, did, key_id, key_version, public_key_multibase,
-         ciphertext_b64, nonce_b64,
-         datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")),
+         VALUES (?,?,?,?,?,?,?,?,'Ed25519',?,NULL,0)`,
+        rowID, profile, did, keyID, keyVersion, publicKeyMultibase,
+        ciphertextB64, nonceB64, time.Now().UTC().Format(time.RFC3339),
     )
-    conn.commit()
-    return row_id
+    if err != nil {
+        return "", err
+    }
+    return rowID, nil
+}
 
-
-def _load_private_key(conn, profile: str, key_version: int | None = None) -> Ed25519PrivateKey:
-    """Load and decrypt the active private key for a profile."""
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as _Ed25519
-
-    query = """SELECT key_ciphertext, key_nonce FROM anp_identity_keys
+// LoadPrivateKey loads and decrypts a private key for a profile. If keyVersion is
+// nil, the active (non-retired, non-revoked) key with the highest version is used.
+func (s *Store) LoadPrivateKey(ctx context.Context, profile string, keyVersion *int) (ed25519.PrivateKey, error) {
+    var (
+        row  *sql.Row
+        cipherText, nonce string
+    )
+    if keyVersion != nil {
+        row = s.db.QueryRowContext(ctx,
+            `SELECT key_ciphertext, key_nonce FROM anp_identity_keys
+               WHERE profile = ? AND key_version = ? LIMIT 1`, profile, *keyVersion)
+    } else {
+        row = s.db.QueryRowContext(ctx,
+            `SELECT key_ciphertext, key_nonce FROM anp_identity_keys
                WHERE profile = ? AND retired_at IS NULL AND revoked = 0
-               ORDER BY key_version DESC LIMIT 1"""
-    if key_version is not None:
-        query = query.replace("retired_at IS NULL AND revoked = 0",
-                              f"key_version = {int(key_version)}")
+               ORDER BY key_version DESC LIMIT 1`, profile)
+    }
+    if err := row.Scan(&cipherText, &nonce); err != nil {
+        if err == sql.ErrNoRows {
+            return nil, fmt.Errorf("no active key found for profile %q", profile)
+        }
+        return nil, err
+    }
 
-    row = conn.execute(query, (profile,)).fetchone()
-    if not row:
-        raise KeyError(f"No active key found for profile '{profile}'")
+    seed, err := security.DecryptValue(cipherText, nonce)
+    if err != nil {
+        return nil, fmt.Errorf("decrypt key: %w", err)
+    }
+    defer zeroBytes(seed)
+    return ed25519.NewKeyFromSeed(seed), nil
+}
 
-    raw_seed = decrypt_value(row[0], row[1])  # existing security.py helper
-    return _Ed25519.from_private_bytes(raw_seed)
+// zeroBytes overwrites b in place to limit the lifetime of plaintext key material.
+func zeroBytes(b []byte) {
+    for i := range b {
+        b[i] = 0
+    }
+}
 ```
 
-### 10.7 Integration with Existing TAG API Server (api.py)
+### 10.7 Integration with Existing TAG API Server (internal/server)
 
-Add two routes to the existing `api.py` FastAPI application:
+Register two routes on the existing `internal/server` router (`go-chi/chi` v5, with
+`huma` describing the operations for the OpenAPI 3.1 spec). Both return the raw
+DID Document JSON with the did+json content type. Because the response is a
+canonical JSON-LD document (not a schema-shaped struct), these are registered as
+raw `chi` handlers mounted alongside the huma API rather than typed huma
+operations.
 
-```python
-# In api.py — additions only
+```go
+// internal/server/didweb.go
+package server
 
-@app.get("/.well-known/did.json")
-async def well_known_did(profile: str = Query(...)):
-    """Serve DID Document for did:web resolution."""
-    from tag.anp_identity import get_did_document_json
-    doc = get_did_document_json(profile)
-    if not doc:
-        raise HTTPException(404, detail=f"No DID registered for profile '{profile}'")
-    return Response(
-        content=doc,
-        media_type="application/did+json",
-        headers={"Cache-Control": "max-age=3600"},
+import (
+    "net/http"
+
+    "github.com/go-chi/chi/v5"
+)
+
+// RegisterDIDRoutes mounts the did:web well-known endpoints on the chi router.
+func RegisterDIDRoutes(r chi.Router, svc *identity.Identity) {
+    r.Get("/.well-known/did.json", func(w http.ResponseWriter, req *http.Request) {
+        writeDIDDoc(w, req, svc, req.URL.Query().Get("profile"))
+    })
+    r.Get("/agents/{profile}/did.json", func(w http.ResponseWriter, req *http.Request) {
+        writeDIDDoc(w, req, svc, chi.URLParam(req, "profile"))
+    })
+}
+
+func writeDIDDoc(w http.ResponseWriter, req *http.Request, svc *identity.Identity, profile string) {
+    doc, err := svc.DIDDocumentJSON(req.Context(), profile) // []byte, canonical JSON
+    if err != nil || doc == nil {
+        http.Error(w, `{"error":"no DID registered for profile"}`, http.StatusNotFound)
+        return
+    }
+    w.Header().Set("Content-Type", "application/did+json")
+    w.Header().Set("Cache-Control", "max-age=3600")
+    _, _ = w.Write(doc)
+}
+```
+
+### 10.8 Command Wiring (`tag identity`)
+
+The `tag identity` command group is wired with `spf13/cobra`. Each subcommand
+constructs the `identity.Identity` service (DB handle + HTTP client) lazily inside
+its `RunE` so that no work happens at binary init (NFR-09). Errors are returned as
+`error`; the root command maps them to process exit codes (0 / 1 / 2 per FR-11).
+
+```go
+// cmd/tag/identity.go
+package main
+
+import "github.com/spf13/cobra"
+
+func newIdentityCmd(app *App) *cobra.Command {
+    cmd := &cobra.Command{
+        Use:   "identity",
+        Short: "Manage W3C DID identities for TAG profiles",
+    }
+    cmd.AddCommand(
+        newIdentityCreateCmd(app),  // create
+        newIdentityShowCmd(app),    // show
+        newIdentityResolveCmd(app), // resolve
+        newIdentityVerifyCmd(app),  // verify
+        newIdentityRotateCmd(app),  // rotate
+        newIdentityExportCmd(app),  // export
+        newIdentitySignCmd(app),    // sign
+        newIdentityListCmd(app),    // list
     )
+    return cmd
+}
 
-
-@app.get("/agents/{profile}/did.json")
-async def agent_did(profile: str):
-    """Alternate resolution URL for did:web."""
-    return await well_known_did(profile=profile)
-```
-
-### 10.8 Controller Integration (cmd_identity)
-
-```python
-# In controller.py — new cmd_identity() dispatch function
-
-def cmd_identity(args):
-    """Dispatch handler for `tag identity` subcommands."""
-    from tag import anp_identity
-
-    subcmd = args.subcommand  # create | show | resolve | verify | rotate | export | sign | list
-
-    if subcmd == "create":
-        return anp_identity.cmd_identity_create(args)
-    elif subcmd == "show":
-        return anp_identity.cmd_identity_show(args)
-    elif subcmd == "resolve":
-        return anp_identity.cmd_identity_resolve(args)
-    elif subcmd == "verify":
-        return anp_identity.cmd_identity_verify(args)
-    elif subcmd == "rotate":
-        return anp_identity.cmd_identity_rotate(args)
-    elif subcmd == "export":
-        return anp_identity.cmd_identity_export(args)
-    elif subcmd == "sign":
-        return anp_identity.cmd_identity_sign(args)
-    elif subcmd == "list":
-        return anp_identity.cmd_identity_list(args)
-    else:
-        raise SystemExit(f"Unknown identity subcommand: {subcmd}")
+// Example subcommand: lazily builds the service, returns typed errors.
+func newIdentityCreateCmd(app *App) *cobra.Command {
+    var opts identity.CreateOptions
+    cmd := &cobra.Command{
+        Use:   "create",
+        Short: "Create a new W3C DID and key pair for a profile",
+        RunE: func(cmd *cobra.Command, _ []string) error {
+            svc, err := app.Identity(cmd.Context()) // opens DB, builds HTTP client on first use
+            if err != nil {
+                return err
+            }
+            return svc.Create(cmd.Context(), opts)
+        },
+    }
+    cmd.Flags().StringVar(&opts.Profile, "profile", "", "TAG profile name (required)")
+    cmd.Flags().StringVar(&opts.Method, "method", "", "did:web | did:key (required)")
+    cmd.Flags().StringVar(&opts.Domain, "domain", "", "hostname for did:web")
+    cmd.Flags().StringVar(&opts.Path, "path", "", "URL path components for did:web")
+    cmd.Flags().BoolVar(&opts.Force, "force", false, "overwrite an existing DID")
+    cmd.Flags().BoolVar(&opts.JSON, "json", false, "emit the DID Document as JSON")
+    return cmd
+}
 ```
 
 ---
 
 ## 11. Security Considerations
 
-1. **Private key never in plaintext outside memory:** The 32-byte Ed25519 private key seed MUST exist in plaintext only within the Python process heap during active operations. It MUST be encrypted with AES-256-GCM (delegated to `security.py`) before any SQLite write. Logging, tracing, and error message handlers MUST be audited to ensure no accidental serialization of `Ed25519PrivateKey` objects or raw seed bytes.
+1. **Private key never in plaintext outside memory:** The 32-byte Ed25519 private key seed MUST exist in plaintext only within the process address space during active operations. It MUST be encrypted with AES-256-GCM (delegated to `internal/security`) before any SQLite write. The structured logger (`log/slog`), tracing spans, and error paths MUST be audited to ensure no accidental serialization of `ed25519.PrivateKey` values or raw seed bytes. Key types MUST NOT implement `fmt.Stringer`/`MarshalJSON` in a way that could leak material, and MUST NOT be embedded in `%v`-formatted error messages.
 
-2. **Key material zeroing after use:** After decrypting and using the private key, the raw seed bytes variable MUST be overwritten with zeros using `ctypes.memset` or equivalent before going out of scope. Python's GC does not guarantee timely memory reclamation. Use `bytearray` (mutable) for the seed to enable explicit zeroing.
+2. **Key material zeroing after use:** After decrypting and using the private key, the raw seed slice MUST be overwritten with zeros (see `zeroBytes` in §10.6) before it goes out of scope, via `defer zeroBytes(seed)`. Go's garbage collector may retain and copy heap memory, so zeroing is best-effort defense-in-depth; the seed MUST be kept in a single `[]byte` (not copied into extra strings) to keep the number of live plaintext copies minimal. Note that `ed25519.PrivateKey` itself retains the seed for the object's lifetime, so long-lived key objects MUST NOT be cached beyond the operation that needs them.
 
 3. **Replay attack resistance in proofs:** Authentication proofs for ANP did:wba MUST include a `challenge` (server-issued nonce) and `domain` (intended recipient domain) in the `DataIntegrityProof` to prevent replay attacks. The challenge MUST be single-use: once a proof with a given challenge has been accepted by the remote server, it cannot be reused.
 
@@ -1064,47 +1245,47 @@ def cmd_identity(args):
 
 ## 12. Testing Strategy
 
-### 12.1 Unit Tests (`tests/test_anp_identity.py`)
+### 12.1 Unit Tests (`internal/anp/identity/identity_test.go`)
 
-- **did:key derivation:** Verify that `derive_did_key()` for a known 32-byte public key produces the exact expected DID string. Use the test vector from the did:key specification Section 3.1 (ed25519-x25519 example).
-- **did:web construction:** Parameterized tests for `build_did_web()`:
-  - `("example.com", [])` → `"did:web:example.com"` (resolution: `/.well-known/did.json`)
-  - `("example.com", ["users", "alice"])` → `"did:web:example.com:users:alice"`
-  - `("example.com%3A8080", [])` → percent-encoded port in domain
-- **DID Document serialization round-trip:** Create a `DIDDocument`, call `to_json_ld()`, call `from_json_ld()`, assert all fields equal the original.
-- **DataIntegrityProof sign/verify:** Generate key pair, create minimal DID Document, sign, verify. Assert `verify_did_document_proof()` returns `True`. Flip one byte in `proof.proofValue`, assert returns `False`.
-- **Tamper detection:** Modify a field in the document body after signing (e.g., change `id`). Assert `verify_did_document_proof()` returns `False`.
-- **JCS field ordering:** Build a dict with keys in non-alphabetical order, assert `jcs_dumps()` output has keys in UTF-16 code unit order. Use the RFC 8785 Appendix B.1 test vector.
-- **Key encryption round-trip:** Call `_store_private_key()` and `_load_private_key()` on a test in-memory SQLite DB. Assert the recovered key produces identical signatures as the original.
-- **Key rotation:** Create key v1, rotate to v2, assert `_load_private_key()` returns v2 key. Assert v1 key row has non-null `retired_at`. Assert v1 key still loadable by explicit `key_version=1` for the overlap window.
-- **Profile name validation:** Assert that profile names containing `:`, `/`, or `..` raise `ValueError` during DID construction.
+- **did:key derivation:** Verify that `DeriveDIDKey()` for a known 32-byte public key produces the exact expected DID string. Use the test vector from the did:key specification Section 3.1 (ed25519-x25519 example).
+- **did:web construction:** Table-driven tests (`t.Run` over cases) for `BuildDIDWeb()`:
+  - `("example.com", nil)` → `"did:web:example.com"` (resolution: `/.well-known/did.json`)
+  - `("example.com", []string{"users", "alice"})` → `"did:web:example.com:users:alice"`
+  - `("example.com%3A8080", nil)` → percent-encoded port in domain
+- **DID Document serialization round-trip:** Build a `DIDDocument`, `json.Marshal` then `json.Unmarshal`, assert `reflect.DeepEqual` (or `google/go-cmp`) with the original.
+- **DataIntegrityProof sign/verify:** Generate key pair, build a minimal DID Document, sign, verify. Assert `VerifyDIDDocumentProof()` returns `true`. Flip one byte in `proof.proofValue`, assert `false`.
+- **Tamper detection:** Modify a field in the document body after signing (e.g. change `id`). Assert `VerifyDIDDocumentProof()` returns `false`.
+- **JCS field ordering:** Marshal a struct/map with keys in non-alphabetical order, assert `jcs.Transform` output has keys in UTF-16 code unit order. Use the RFC 8785 Appendix B.1 test vector.
+- **Key encryption round-trip:** Call `StorePrivateKey()` and `LoadPrivateKey()` against an in-memory SQLite DB (`modernc.org/sqlite`, `file::memory:?cache=shared`). Assert the recovered key produces identical signatures to the original.
+- **Key rotation:** Create key v1, rotate to v2, assert `LoadPrivateKey(nil)` returns the v2 key. Assert the v1 row has a non-null `retired_at`. Assert v1 is still loadable via explicit `keyVersion=1` during the overlap window.
+- **Profile name validation:** Assert that profile names containing `:`, `/`, or `..` return an error during DID construction.
 
-### 12.2 RFC 8785 Test Vectors (`tests/test_jcs_vectors.py`)
+### 12.2 RFC 8785 Test Vectors (`internal/anp/identity/jcs_vectors_test.go`)
 
-- Load all 42 normative test vectors from RFC 8785 Appendix B as a pytest parametrize fixture.
-- For each vector: call `rfc8785.dumps(input_dict)`, assert output bytes match the expected bytes exactly.
-- This test file has zero dependencies on TAG internals and runs in under 1 second.
+- Embed all 42 normative RFC 8785 Appendix B test vectors (via `//go:embed testdata/rfc8785/*`) and drive a table-driven test.
+- For each vector: call `jcs.Transform(input)`, assert output bytes match the expected bytes exactly (`bytes.Equal`).
+- This test file has zero dependencies on TAG internals and runs in well under 1 second (`go test ./internal/anp/identity -run TestJCSVectors`).
 
 ### 12.3 Integration Tests
 
-- **did:web resolution (mocked HTTP):** Use `respx` to mock `https://example.com/.well-known/did.json`. Call `resolve_did_web("did:web:example.com")`. Assert the returned document matches the mock response. Assert `id` mismatch raises `ValueError`.
-- **did:web resolution cache:** Resolve the same DID twice. Assert the second call reads from `anp_did_cache` (mock HTTP is not called the second time). Assert `--no-cache` bypasses cache.
-- **TTL expiry:** Insert a cache entry with `ttl_seconds=1`, wait 2 seconds, assert next resolve fetches fresh from network.
-- **ANP did:wba handshake (mocked):** Mock the remote token endpoint. Call `anp_wba_authenticate()`. Assert the outbound request has valid `Signature-Input` and `Signature` headers. Assert the token is persisted to `anp_auth_tokens`. Assert that a second call within TTL returns the cached token without a new network request.
-- **RFC 9421 signature verification (interop):** Use the `http-message-signatures` Python reference implementation to verify the headers produced by `build_anp_signed_request()`.
-- **API server DID endpoint:** Start a test FastAPI instance with `httpx.AsyncClient`. Call `GET /.well-known/did.json?profile=test-profile`. Assert `Content-Type: application/did+json` and body matches stored DID Document.
+- **did:web resolution (mocked HTTP):** Use `net/http/httptest.Server` to serve `/.well-known/did.json`. Point the service's `httpClient` at it and call `ResolveDIDWeb(ctx, "did:web:<host>")`. Assert the returned document matches. Assert an `id` mismatch returns an error.
+- **did:web resolution cache:** Resolve the same DID twice. Assert the second call reads from `anp_did_cache` (the httptest handler's hit counter is unchanged). Assert `--no-cache` bypasses the cache.
+- **TTL expiry:** Insert a cache entry with `ttl_seconds=1`, advance time (inject a `Clock` or sleep), assert the next resolve fetches fresh from the server.
+- **ANP did:wba handshake (mocked):** Mock the token endpoint with `httptest.Server`. Call `ANPWBAAuthenticate()`. Assert the inbound request carried valid `Signature-Input` and `Signature` headers. Assert the token is persisted to `anp_auth_tokens`. Assert a second call within TTL returns the cached token without a new request.
+- **RFC 9421 signature verification (interop):** Verify the headers produced by `BuildANPSignedRequest()` against a Go RFC 9421 verifier (e.g. `github.com/common-fate/httpsig` or `github.com/yaronf/httpsign`) to confirm cross-implementation correctness.
+- **API server DID endpoint:** Mount `RegisterDIDRoutes` on a `chi` router served via `httptest.Server`. `GET /.well-known/did.json?profile=test-profile`. Assert `Content-Type: application/did+json` and body matches the stored DID Document.
 
-### 12.4 Performance Tests
+### 12.4 Performance Tests (Go benchmarks)
 
-- **did:key creation:** Benchmark `create_did_key(profile)` including SQLite write. Target: p99 < 100 ms.
-- **JCS canonicalization throughput:** Benchmark `jcs_dumps()` on a 100-field document. Target: > 10,000 calls/second.
-- **Verification throughput:** Benchmark `verify_did_document_proof()` on a pre-signed document. Target: > 1,000 verifications/second (Ed25519 batch verification is not required in v1).
+- **did:key creation:** `BenchmarkCreateDIDKey` including SQLite write. Target: p99 < 100 ms (report via `-benchtime` + `testing.B`).
+- **JCS canonicalization throughput:** `BenchmarkJCS` on a 100-field document. Target: > 10,000 ops/second.
+- **Verification throughput:** `BenchmarkVerify` on a pre-signed document. Target: > 1,000 verifications/second (Ed25519 batch verification is not required in v1). Run with `go test -bench . -benchmem`.
 
 ### 12.5 Security Tests
 
-- **Bit-flip fuzz:** Generate 1,000 random single-bit flips in a valid signed DID Document (targeting the document body, not the proof value). Assert all produce `verify = False`. Target: 0 false positives.
-- **Proof value corruption:** Replace `proofValue` with a random 64-byte Ed25519 signature over different data. Assert `verify = False`.
-- **Key oracle gate:** Assert that `tag identity sign` without `--yes` prompts for confirmation on a non-TTY by checking exit code and stderr.
+- **Bit-flip fuzz:** A Go fuzz target (`FuzzVerifyTamper`, `go test -fuzz`) that flips bits in a valid signed DID Document body (not the proof value) and asserts `VerifyDIDDocumentProof()` returns `false`. Also run a deterministic 1,000-mutation table test in CI. Target: 0 false positives.
+- **Proof value corruption:** Replace `proofValue` with a random 64-byte Ed25519 signature over different data. Assert `VerifyDIDDocumentProof()` returns `false`.
+- **Key oracle gate:** Assert that `tag identity sign` without `--yes` on a non-TTY (stdin not a terminal) exits 1, by asserting the command's returned error and stderr text.
 
 ---
 
@@ -1119,17 +1300,17 @@ def cmd_identity(args):
 | AC-05 | Modifying any field in the DID Document body and rerunning `tag identity verify` exits 2 and prints `Result: VERIFICATION FAILED`. |
 | AC-06 | `tag identity resolve did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK` completes without network access and produces a correct DID Document derived from the embedded public key. |
 | AC-07 | `tag identity rotate --profile coder` generates a new key, increments `key_version` to 2, produces an updated DID Document signed with the new key, and sets `retired_at` on the old key row in `anp_identity_keys`. |
-| AC-08 | After rotation, a signature produced with the old key fails `verify_did_document_proof()` when the DID Document has been updated to reference only the new key. |
+| AC-08 | After rotation, a signature produced with the old key fails `VerifyDIDDocumentProof()` when the DID Document has been updated to reference only the new key. |
 | AC-09 | `tag identity export --profile coder --output /tmp/did.json` writes a file that, when placed at `https://agents.example.com/.well-known/did.json`, allows `tag identity resolve did:web:agents.example.com:agents:coder` to succeed and pass `verify`. |
 | AC-10 | `GET /.well-known/did.json?profile=coder` on the TAG API server returns `Content-Type: application/did+json`, `Cache-Control: max-age=3600`, and a body identical to the document returned by `tag identity show --profile coder --format json`. |
 | AC-11 | `tag identity list` displays all profiles with DIDs in tabular form, with correct DID string, method, key version, and created date for each. |
-| AC-12 | All 42 RFC 8785 test vectors pass in `tests/test_jcs_vectors.py` with zero failures. |
-| AC-13 | `build_anp_signed_request()` output passes verification by the `http-message-signatures` reference library for all test cases in the ANP did:wba conformance suite. |
-| AC-14 | `tag identity resolve <did>` called twice for the same DID within TTL window makes exactly one network request (confirmed by `respx` call count assertion). |
+| AC-12 | All 42 RFC 8785 test vectors pass in `internal/anp/identity/jcs_vectors_test.go` with zero failures (`go test ./internal/anp/identity -run TestJCSVectors`). |
+| AC-13 | `BuildANPSignedRequest()` output passes verification by a Go RFC 9421 reference verifier for all test cases in the ANP did:wba conformance suite. |
+| AC-14 | `tag identity resolve <did>` called twice for the same DID within TTL window makes exactly one network request (confirmed by an `httptest.Server` request-count assertion). |
 | AC-15 | `tag identity create --profile coder --method did:web` run a second time without `--force` exits 1 with error message `"DID already exists for profile 'coder'. Use --force to overwrite."` |
-| AC-16 | Importing `anp_identity` in a fresh Python process adds less than 50 ms to startup time (verified by `python -X importtime` and `time python -c "import tag.anp_identity"`). |
+| AC-16 | The `internal/anp/identity` package adds less than 50 ms to `tag` startup: it declares no `init()` functions and performs no eager global initialization (verified by inspection and a `time tag identity --help` measurement against a baseline build). |
 | AC-17 | `tag identity sign --profile coder --input payload.json` without `--yes` in a non-interactive context exits 1 with a message prompting for explicit confirmation. |
-| AC-18 | The `anp_did_registry`, `anp_identity_keys`, `anp_did_cache`, and `anp_auth_tokens` tables are created automatically by `open_db()` on first use, with no manual migration step required. |
+| AC-18 | The `anp_did_registry`, `anp_identity_keys`, `anp_did_cache`, and `anp_auth_tokens` tables are created automatically by `OpenDB()` on first use, with no manual migration step required. |
 
 ---
 
@@ -1137,15 +1318,21 @@ def cmd_identity(args):
 
 | Dependency | Type | Version | Notes |
 |------------|------|---------|-------|
-| `cryptography` | Python package (existing) | >= 43.0.0 | Ed25519 key generation, signing, verification. Already in TAG dependencies for `security.py`. |
-| `rfc8785` | Python package (new) | >= 0.1.2 | Trail of Bits JCS canonicalization. Zero dependencies. **Do not use `jcs` (Anders Rundgren) package** — it has a known bug with Number serialization under Python 3.12+. |
-| `httpx` | Python package (existing) | >= 0.27.0 | HTTP client for did:web resolution and ANP handshake. Already used by `api.py` and `hermes_bridge.py`. |
-| `base58` | Python package (new) | >= 2.1.1 | Base58btc encoding for multibase. Alternative: inline the 20-line alphabet implementation (preferred to avoid dependency for such a small function). |
-| `respx` | Python package (dev/test) | >= 0.21.0 | HTTP mocking in tests. Already used by existing test suite. |
-| PRD-013 | Internal PRD | — | Agent Tracing / Observability: span emission for identity operations. |
-| PRD-028 | Internal PRD | — | Sandbox: key operations run outside sandbox; document this explicitly in `anp_identity.py` module docstring. |
-| PRD-034 | Internal PRD | — | Secret Scanning: ensure `anp_identity_keys.key_ciphertext` column is never included in profile exports scanned by secret scanner. Add exclusion rule in `security.py`. |
-| PRD-074 | Internal PRD | — | MCP OAuth / PKCE: ANP did:wba is an alternative auth method to OAuth; both must coexist in outbound request pipeline. Coordination needed on `Authorization` header management. |
+| `crypto/ed25519`, `crypto/sha256`, `crypto/x509` | Go stdlib | Go 1.24+ | Ed25519 key generation, signing, verification, and SHA-256 hashing. No external dependency; CGO_ENABLED=0. |
+| `github.com/gowebpki/jcs` | Go module (new) | latest | RFC 8785 JSON Canonicalization Scheme (JCS). Reference Go implementation. Validated against the 42-vector suite in CI. **Confirm number-serialization correctness against the vectors before pinning.** |
+| `net/http` (+ `internal/netguard`) | Go stdlib | Go 1.24+ | HTTP client for did:web resolution and the ANP handshake, using the repo's SSRF-safe dialer. Replaces `httpx`. |
+| `github.com/mr-tron/base58` | Go module (new) | >= 1.2.0 | Base58btc encoding for multibase. Alternative: inline a ~20-line encoder (preferred to avoid a dependency for such a small function). |
+| `github.com/lestrrat-go/jwx/v2` | Go module (new) | v2.x | JWS / JWK / DID-JWT verification for the ANP did:wba JWT Bearer token issued by remote servers. |
+| `modernc.org/sqlite` | Go module (existing) | latest | Pure-Go SQLite driver (CGO_ENABLED=0) for the DID registry, key store, cache, and token tables. |
+| `github.com/go-chi/chi/v5` + `github.com/danielgtaylor/huma/v2` | Go module (existing) | v5 / v2 | API server routing and OpenAPI 3.1 for the did:web well-known endpoints. Replaces FastAPI/uvicorn. |
+| `github.com/invopop/jsonschema` | Go module (new) | latest | Generates JSON Schema for the public DID types (replaces pydantic model schemas). |
+| `github.com/spf13/cobra` | Go module (existing) | latest | `tag identity` command tree. |
+| `github.com/google/uuid` | Go module (new/existing) | latest | UUID row IDs and did:wba nonces. |
+| `net/http/httptest` | Go stdlib (dev/test) | Go 1.24+ | HTTP mocking in tests. Replaces `respx`. |
+| PRD-013 | Internal PRD | — | Agent Tracing / Observability: span emission for identity operations (`internal/tracing`). |
+| PRD-028 | Internal PRD | — | Sandbox: key operations run outside sandbox; document this explicitly in the `internal/anp/identity` package doc comment. |
+| PRD-034 | Internal PRD | — | Secret Scanning: ensure `anp_identity_keys.key_ciphertext` is never included in profile exports scanned by the secret scanner. Add an exclusion rule in `internal/security`. |
+| PRD-074 | Internal PRD | — | MCP OAuth / PKCE: ANP did:wba is an alternative auth method to OAuth; both must coexist in the outbound request pipeline. Coordination needed on `Authorization` header management. |
 | W3C DID Core | External spec | 2022-07-19 | https://www.w3.org/TR/did-core/ — normative conformance target for DID Document structure. |
 | did:web spec | External spec | 2023-02-14 | https://w3c-ccg.github.io/did-method-web/ — normative conformance target for did:web resolution. |
 | did:key spec | External spec | 2023-02-10 | https://w3c-ccg.github.io/did-method-key/ — normative conformance target for did:key derivation. |
@@ -1162,7 +1349,7 @@ def cmd_identity(args):
 | OQ-01 | Should `tag identity create --method did:web` automatically start the TAG API server on a public port, or should we document a manual Nginx/Caddy config? The UX of requiring users to self-host HTTPS is a significant barrier. | Platform team | Before Phase 1 complete |
 | OQ-02 | The ANP did:wba spec requires the remote server to issue a `challenge` nonce before the client signs. The current `anp_wba_authenticate()` design assumes a single-roundtrip flow. Does the ANP conformance test suite require the two-step challenge-response flow? | Protocol research | Before Phase 2 start |
 | OQ-03 | Should `tag identity rotate --keep-old-for` default to 3600 seconds or to 0 (immediate revocation)? Keeping old keys available is friendly to long-running sessions but creates a window where both old and new key proofs are valid. | Security team | Phase 2 design review |
-| OQ-04 | The `rfc8785` package (Trail of Bits) is preferred over `jcs` (Anders Rundgren) due to Python 3.12 number serialization behavior. Has this been verified against the full 42-vector test suite in Python 3.13 (the planned minimum for TAG v1.0)? | Engineering | Before PR merge |
+| OQ-04 | `github.com/gowebpki/jcs` is the presumed JCS implementation. Has its number-serialization behavior been verified against the full 42-vector RFC 8785 test suite under Go 1.24+? If any vector fails, evaluate `github.com/cyberphone/json-canonicalization` or a vendored implementation before pinning. | Engineering | Before PR merge |
 | OQ-05 | Did:key documents are derived from the public key and are stateless — there is no "update" operation. This means key rotation is incompatible with did:key (the DID would change). Should `tag identity rotate` be blocked for did:key profiles, or should it silently create a new DID? | Protocol design | Phase 1 design review |
 | OQ-06 | The W3C DID Core spec defines `created` and `updated` as DID Document metadata (in `didDocumentMetadata`), not as fields inside the document itself. Some implementations embed them directly in the document. Which approach does the ANP ecosystem expect? | Protocol research | Before Phase 1 complete |
 | OQ-07 | ANP is described as "community (not yet under Linux Foundation as of June 2026)." Is the spec stable enough to build production implementations against, or should this PRD be marked as experimental pending spec stabilization? | Product | Immediate |
@@ -1176,10 +1363,10 @@ def cmd_identity(args):
 
 ### Phase 1: Foundation (Days 1-10)
 
-- [ ] SQLite DDL migration: create `anp_did_registry`, `anp_identity_keys`, `anp_did_cache`, `anp_auth_tokens` tables in `open_db()` bootstrap sequence.
-- [ ] Core cryptography: `generate_ed25519_keypair()`, `public_key_to_multibase()`, `derive_did_key()`, `build_did_web()`.
-- [ ] Key storage: `_store_private_key()`, `_load_private_key()` using existing `security.py` AES-256-GCM helpers.
-- [ ] DID Document dataclass: `DIDDocument`, `VerificationMethod`, `DIDService`, `DataIntegrityProof`, `to_json_ld()`, `from_json_ld()`.
+- [ ] SQLite DDL migration: create `anp_did_registry`, `anp_identity_keys`, `anp_did_cache`, `anp_auth_tokens` tables in the `OpenDB()` bootstrap sequence (`modernc.org/sqlite`).
+- [ ] Core cryptography: `GenerateEd25519Keypair()`, `PublicKeyToMultibase()`, `DeriveDIDKey()`, `BuildDIDWeb()`.
+- [ ] Key storage: `StorePrivateKey()`, `LoadPrivateKey()` using existing `internal/security` AES-256-GCM helpers.
+- [ ] DID Document types: `DIDDocument`, `VerificationMethod`, `DIDService`, `DataIntegrityProof`, JSON tags + `MarshalCanonical()`.
 - [ ] `tag identity create` for did:key and did:web.
 - [ ] `tag identity show` for text and JSON formats.
 - [ ] `tag identity list`.
@@ -1188,10 +1375,10 @@ def cmd_identity(args):
 
 ### Phase 2: Signing, Verification, Resolution (Days 11-22)
 
-- [ ] JCS signing: `sign_did_document()` with `eddsa-jcs-2022` cryptosuite, SHA-256 hash concatenation per spec.
-- [ ] Proof verification: `verify_did_document_proof()`.
+- [ ] JCS signing: `SignDIDDocument()` with `eddsa-jcs-2022` cryptosuite, SHA-256 hash concatenation per spec.
+- [ ] Proof verification: `VerifyDIDDocumentProof()`.
 - [ ] `tag identity verify` CLI command with exit code semantics.
-- [ ] did:web HTTP resolution: `resolve_did_web()` with HTTPS enforcement, `id` binding check.
+- [ ] did:web HTTP resolution: `ResolveDIDWeb()` with HTTPS enforcement, `id` binding check.
 - [ ] did:key local resolution: derive DID Document from encoded public key.
 - [ ] `tag identity resolve` CLI command with caching.
 - [ ] Cache TTL logic in `anp_did_cache`.
@@ -1201,10 +1388,10 @@ def cmd_identity(args):
 
 ### Phase 3: ANP did:wba and API Integration (Days 23-32)
 
-- [ ] RFC 9421 HTTP Message Signature builder: `build_anp_signed_request()`.
-- [ ] ANP did:wba authentication handshake: `anp_wba_authenticate()` with token caching.
-- [ ] RFC 9421 interop test with `http-message-signatures` reference library.
-- [ ] TAG API server routes: `/.well-known/did.json` and `/agents/<profile>/did.json`.
+- [ ] RFC 9421 HTTP Message Signature builder: `BuildANPSignedRequest()`.
+- [ ] ANP did:wba authentication handshake: `ANPWBAAuthenticate()` with token caching.
+- [ ] RFC 9421 interop test with a Go reference verifier.
+- [ ] TAG API server routes (chi + huma): `/.well-known/did.json` and `/agents/<profile>/did.json`.
 - [ ] `tag identity export` command.
 - [ ] `tag identity sign` command (with confirmation gate).
 - [ ] Key rotation: `tag identity rotate`, `--keep-old-for`, `--prune`.
@@ -1213,10 +1400,10 @@ def cmd_identity(args):
 
 ### Phase 4: Hardening, Documentation, Performance (Days 33-38)
 
-- [ ] Performance benchmarks: p99 targets for all operations.
-- [ ] Startup time profiling: lazy import validation, target < 50 ms import overhead.
-- [ ] Private key zeroing: `bytearray` + `ctypes.memset` after use.
-- [ ] SQLite file mode enforcement: assert `stat(tag.sqlite3).st_mode & 0o777 == 0o600` in `open_db()` bootstrap.
+- [ ] Performance benchmarks: `go test -bench` p99 targets for all operations.
+- [ ] Startup time profiling: confirm no `init()` / eager globals, target < 50 ms added startup overhead.
+- [ ] Private key zeroing: `defer zeroBytes(seed)` on the decrypted seed slice after use.
+- [ ] SQLite file mode enforcement: assert `os.Stat(tag.sqlite3).Mode().Perm() == 0o600` in `OpenDB()` bootstrap.
 - [ ] CLI help text, man page entries, `tag identity --help` coverage.
 - [ ] Resolve open questions OQ-01 through OQ-08.
 - [ ] Final security review with PRD-034 (secret scanning) exclusion rules.

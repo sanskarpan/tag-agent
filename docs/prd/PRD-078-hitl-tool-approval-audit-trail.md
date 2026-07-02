@@ -1,10 +1,12 @@
 # PRD-078: Human-in-the-Loop Tool Approval with Pause/Resume + Audit Trail (`tag mcp approve`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P3
 **Estimated Effort:** L (2-4 weeks)
 **Category:** MCP Ecosystem & Tool Connectivity
-**Affects:** `controller.py + tool_approval SQLite table`
+**Affects:** `internal/cli/mcp_approve.go + internal/tool/approval.go + tool_approval SQLite table`
 **Depends on:** PRD-013 (agent tracing/observability), PRD-016 (webhook event triggers), PRD-027 (eval framework), PRD-028 (sandbox execution), PRD-034 (secret scanning/security), PRD-040 (notification hooks), PRD-048 (structured tool call spans)
 **Inspired by:** Arcade AI human-in-the-loop, OpenAI Agents SDK guardrails, SOC-2 audit
 
@@ -20,7 +22,7 @@ The design is modeled on Arcade AI's permission intersection model — the effec
 
 The audit trail is the equal partner of the gate mechanism. Every approval decision — approve, deny, or timeout — is appended to the `tool_approval_log` table with: ISO-8601 timestamp, reviewer identity (local username or webhook caller), approval ID, tool name, MCP server, full argument payload SHA-256, a verbatim copy of the argument payload, the decision, and a free-text rationale. This log is append-only, indexed, and can be exported as NDJSON for ingestion into SIEM tools. It satisfies the evidence trail requirements for SOC-2 Type II CC6.1 (logical access controls) and CC7.2 (monitoring of system operations).
 
-The feature is designed to compose cleanly with TAG's existing systems. Approved/denied decisions surface as `tool_approval.*` events in the `events` table (PRD-040 notification hooks). Each approval creates a span child in the active trace (PRD-013 / PRD-048). The approval gate can be driven from CI with `--auto-deny-on-timeout` to prevent runaway agents in automated pipelines. Webhook-driven approval (for Slack bots, PagerDuty integrations, or custom approval portals) is first-class: the gate polls an internal HTTP server or SQLite flag rather than keeping a persistent connection.
+The feature is designed to compose cleanly with TAG's existing systems. Approved/denied decisions surface as `tool_approval.*` events in the `events` table (PRD-040 notification hooks). Each approval creates a span child in the active trace (PRD-013 / PRD-048). The approval gate can be driven from CI with `--auto-deny-on-timeout` to prevent runaway agents in automated pipelines. Webhook-driven approval (for Slack bots, PagerDuty integrations, or custom approval portals) is first-class: the gate blocks on an in-process channel; the embedded HTTP/SSE server receives the POST and sends on that channel to resume the blocked goroutine.
 
 ---
 
@@ -95,7 +97,7 @@ When `tag run` is executed in CI with a broad tool grant, there is no mechanism 
 | U2 | Security engineer | run `tag mcp approve-required add --tool github:push --always` | Every GitHub push from any profile or any user requires human approval, regardless of who initiated the run |
 | U3 | Reviewer | receive a desktop notification that says "TAG: bash call pending approval — coder profile — `rm -rf /tmp/old_build`" | I can evaluate the call and decide whether to approve or deny without watching the terminal |
 | U4 | Reviewer | run `tag mcp approvals list --pending` | I can see all outstanding approvals at a glance, including which profile, which tool, and what arguments are waiting |
-| U5 | Reviewer | run `tag mcp approve abc-123-def` with an optional `--rationale "Confirmed: safe to delete tmp"` | The call is authorized, the agent resumes, and my rationale is persisted in the audit log |
+| U5 | Reviewer | run `tag mcp approve abc-123-def` with an optional `--rationale "Confirmed: safe to delete"` | The call is authorized, the agent resumes, and my rationale is persisted in the audit log |
 | U6 | Reviewer | run `tag mcp approve abc-123-def --deny --rationale "Unsafe path in argument"` | The agent receives a denial, the run fails gracefully with a clear error, and the denial is logged |
 | U7 | Compliance officer | run `tag mcp approvals export --format ndjson --since 2026-01-01` | I get a machine-readable audit log of every approval decision for the year, ready for SIEM ingestion |
 | U8 | DevOps engineer | configure `auto_deny_timeout_seconds: 120` in the profile's approval config | CI pipelines never block indefinitely waiting for a human; they fail loudly after 2 minutes |
@@ -330,6 +332,7 @@ POST /approvals/<approval-id>/approve
 POST /approvals/<approval-id>/deny
 GET  /approvals/pending
 GET  /approvals/<approval-id>
+GET  /approvals/events          (SSE stream of pending-approval events)
 ```
 
 Request body (optional for approve/deny):
@@ -337,7 +340,7 @@ Request body (optional for approve/deny):
 {"rationale": "Approved via Slack bot", "reviewer": "alice@example.com"}
 ```
 
-The `X-Approver` header overrides the `reviewer` field in the body. Response is the logged decision JSON. The server binds to localhost only and requires no authentication in this PRD (see Security Considerations).
+The `X-Approver` header overrides the `reviewer` field in the body. Response is the logged decision JSON. The server binds to localhost only and requires no authentication in this PRD (see Security Considerations). The `/approvals/events` SSE endpoint allows clients to subscribe to pending-approval events with `Last-Event-ID` replay; reconnecting clients do not miss events fired while disconnected.
 
 ---
 
@@ -353,7 +356,7 @@ The `X-Approver` header overrides the `reviewer` field in the body. Response is 
 | FR-06 | If `status` transitions to `denied`, the agent run MUST be terminated with exit code 5 and a human-readable denial reason. | Must |
 | FR-07 | If `status` transitions to `timeout` (auto-deny path), the behavior MUST match a denial: exit code 5, human-readable message. | Must |
 | FR-08 | Every status transition (`pending → approved`, `pending → denied`, `pending → timeout`) MUST append exactly one row to `tool_approval_log`. No UPDATE or DELETE on `tool_approval_log` is ever issued by the application. | Must |
-| FR-09 | `tag mcp approve <id>` MUST record the OS username (`os.getlogin()` or `$USER` env var) as the `reviewer` field in `tool_approval_log`. | Must |
+| FR-09 | `tag mcp approve <id>` MUST record the OS username (`os/user.Current().Username`) as the `reviewer` field in `tool_approval_log`. | Must |
 | FR-10 | The `args_sha256` field in `tool_approval_log` MUST be the SHA-256 of the canonical JSON serialization of the tool argument payload (keys sorted, no whitespace). | Must |
 | FR-11 | The arguments dispatched to the MCP server MUST be byte-for-byte identical to the arguments that were presented for review (captured at gate time). The agent cannot re-generate arguments after approval. | Must |
 | FR-12 | `tag mcp approvals list --pending --json` MUST return results within 200 ms for up to 10,000 log rows. | Must |
@@ -362,9 +365,9 @@ The `X-Approver` header overrides the `reviewer` field in the body. Response is 
 | FR-15 | The webhook approval server MUST bind to `127.0.0.1` only, never `0.0.0.0`. | Must |
 | FR-16 | `tag mcp approve-required remove` MUST remove only the matching rule; running the command with a non-matching tool+profile MUST exit 1 with a descriptive error. | Must |
 | FR-17 | `tag mcp approvals export` MUST produce valid NDJSON with all required fields as specified in §7.7, with one JSON object per line. | Must |
-| FR-18 | Adding or removing an approval rule MUST NOT require restarting an in-progress `tag run`; the agent loop re-checks the rules table on every tool call. | Should |
+| FR-18 | Adding or removing an approval rule MUST NOT require restarting an in-progress `tag run`; the agent loop re-checks the rules cache (TTL 5 s) on every tool call. | Should |
 | FR-19 | `tag mcp approvals list --pending` MUST show the first 200 characters of the argument JSON as a preview column. | Should |
-| FR-20 | When `--auto-deny-on-timeout` is set, the timeout MUST be enforced by a background polling thread within the approval gate, not by the caller waiting on a subprocess. | Must |
+| FR-20 | When `--auto-deny-on-timeout` is set, the timeout MUST be enforced by the `context.WithTimeout` deadline passed to the gate goroutine, not by the caller waiting on a subprocess. | Must |
 | FR-21 | `tool_approval_rules` MUST enforce a UNIQUE constraint on `(tool, mcp_server, profile)` to prevent duplicate rules. Attempting to add a duplicate MUST fail with a descriptive error and exit 1. | Must |
 | FR-22 | `tag mcp approvals show <id>` MUST display the full (untruncated) argument JSON payload. | Must |
 
@@ -377,33 +380,37 @@ The `X-Approver` header overrides the `reviewer` field in the body. Response is 
 | NFR-01 | Approval gate overhead (time added to a tool call that requires approval AND is immediately approved programmatically) MUST be less than 50 ms in the happy path with the reviewer already polling. | < 50 ms |
 | NFR-02 | The `tool_approval_log` table MUST use append-only semantics enforced by a `BEFORE UPDATE` and `BEFORE DELETE` SQLite trigger that raises an error. | Enforced at DB layer |
 | NFR-03 | `tag mcp approvals export` MUST stream rows lazily (no full-table load into memory) for exports exceeding 10,000 rows. | Streaming cursor |
-| NFR-04 | The webhook approval server MUST handle concurrent approve/deny requests without race conditions; all state transitions MUST use `UPDATE ... WHERE status='pending'` with row-count assertion. | Atomic update |
-| NFR-05 | The approval gate MUST work in both blocking mode (agent process waits) and detached mode (agent writes pending record and exits; a separate `tag run --resume` picks it up after approval). | Both modes |
-| NFR-06 | The approval gate MUST be completely inert (zero overhead, zero SQLite queries) when no approval rules are configured. Rules presence check is cached per-session. | Zero overhead |
+| NFR-04 | The webhook approval server MUST handle concurrent approve/deny requests without race conditions; all state transitions MUST use `UPDATE ... WHERE status='pending'` with row-count assertion, and the in-process `Resolve()` call is protected by a mutex. | Atomic update |
+| NFR-05 | The approval gate MUST work in both blocking mode (agent goroutine waits on a channel) and detached mode (agent writes pending record and exits; a separate `tag run --resume` picks it up after approval). | Both modes |
+| NFR-06 | The approval gate MUST be completely inert (zero overhead, zero SQLite queries) when no approval rules are configured. Rules presence check is an in-memory cache lookup per tool call. | Zero overhead |
 | NFR-07 | All approval-related SQLite writes MUST complete within a single transaction to prevent partial state (e.g., pending record created without matching span). | Atomic |
 | NFR-08 | `tool_approval_log` rows MUST be indexed by `(created_at, profile, tool, decision)` to support sub-100 ms export queries with time and filter constraints. | < 100 ms query |
-| NFR-09 | The module implementing approval gate logic (`src/tag/tool_approval.py`) MUST have > 90% line coverage in unit tests. | > 90% |
+| NFR-09 | The Go package implementing approval gate logic (`internal/tool/approval.go`) MUST have > 90% line coverage in unit tests. | > 90% |
 | NFR-10 | Error messages on approval denial MUST include the approval ID, tool name, reviewer, rationale (if set), and a pointer to `tag mcp approvals show <id>` for full detail. | Human-readable |
 
 ---
 
 ## 10. Technical Design
 
-### 10.1 New Files
+### 10.1 New Packages
 
-| File | Purpose |
-|------|---------|
-| `src/tag/tool_approval.py` | Core approval gate logic: rule lookup, pending record creation, blocking poll, timeout enforcement, audit log append |
-| `src/tag/approval_server.py` | Lightweight HTTP server (stdlib `http.server`) for webhook-based approvals |
-| `tests/test_tool_approval.py` | Unit and integration tests for all gate paths |
+| Package / File | Purpose |
+|---|---|
+| `internal/tool/approval.go` | `PermissionService`: rule lookup (with 5 s TTL cache), pending record creation, channel-based blocking gate, `context.Context` timeout/cancellation, audit-log append with optional SHA-256 hash-chaining, SSE notification dispatch |
+| `internal/tool/approval_test.go` | Unit and integration tests for all gate paths |
+| `internal/server/approval.go` | Webhook approval server: `net/http` + `go-chi/chi v5` router; SSE stream of pending-approval events via `tmaxmax/go-sse` with `Last-Event-ID` replay; bound to `127.0.0.1` only |
+| `internal/cli/mcp_approve.go` | Cobra command handlers for `tag mcp approve-required {add,remove,list}`, `tag mcp approvals {list,show,export}`, and `tag mcp approve` |
 
-**Modifications to existing files:**
-- `src/tag/controller.py`: New `cmd_mcp_approve_required`, `cmd_mcp_approvals`, `cmd_mcp_approve` handler functions; new `_migrate_prd_078_tables` migration function; CLI parser additions under `tag mcp` subcommand tree.
-- `src/tag/hermes_bridge.py`: Inject `ApprovalGate.check()` call in the tool dispatch path, before the MCP server call is made.
+**Modifications to existing packages:**
+
+- `internal/runtime/dispatch.go`: Inject `PermissionService.Check()` call before the MCP server call is made. `PermissionService` is passed as a pointer and is `nil` when no approval rules are configured; the call-site is a single nil-check with zero overhead in the common case (NFR-06).
+- `internal/store/migrate.go`: Add `migratePRD078Tables(db *sql.DB) error` for the three new SQLite tables, called from the store's schema-migration chain during `store.Open()`.
 
 ### 10.2 SQLite DDL
 
-All three new tables are created in `_migrate_prd_078_tables(conn)` which is called from `open_db()` following the established pattern.
+All three new tables are created in `migratePRD078Tables` inside `internal/store/migrate.go`, called during store initialisation. All DDL executes inside a single transaction (NFR-07). The store uses `modernc.org/sqlite` (pure-Go, `CGO_ENABLED=0`, FTS5 built-in) with WAL mode and a single-writer lock enforced by `gofrs/flock` + `os.Rename` atomic RMW.
+
+The `tool_approval_log` table includes an optional `prev_hash TEXT` column for SHA-256 hash-chaining (using `crypto/sha256`). When `approval.hash_chain: true` is set in profile config, each appended log row stores `SHA-256(canonical-JSON of the previous row)`, creating a tamper-evident chain that strengthens the SOC-2 immutability guarantee beyond what SQLite triggers alone provide. A verifier can walk the chain and detect any modified row by recomputing hashes.
 
 ```sql
 -- Approval gate rules: which tools require human approval
@@ -431,11 +438,11 @@ CREATE TABLE IF NOT EXISTS tool_approval_pending (
     tool         TEXT NOT NULL,           -- tool name at call time
     mcp_server   TEXT,                    -- MCP server name at call time
     profile      TEXT NOT NULL,           -- profile that triggered the call
-    args_json    TEXT NOT NULL,           -- verbatim argument JSON payload
+    args_json    TEXT NOT NULL,           -- verbatim argument JSON payload (frozen at gate entry)
     args_sha256  TEXT NOT NULL,           -- SHA-256 of canonical args (sorted keys, no whitespace)
     status       TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'approved' | 'denied' | 'timeout'
     reviewer     TEXT,                    -- OS username or webhook X-Approver
-    reviewer_source TEXT,                 -- 'cli' | 'webhook' | 'auto'
+    reviewer_source TEXT,                 -- 'cli' | 'webhook' | 'tui' | 'auto'
     rationale    TEXT,                    -- free-text decision reason
     created_at   TEXT NOT NULL,
     decided_at   TEXT,                    -- NULL until decision made
@@ -448,6 +455,7 @@ CREATE INDEX IF NOT EXISTS idx_tap_run     ON tool_approval_pending(run_id, stat
 CREATE INDEX IF NOT EXISTS idx_tap_profile ON tool_approval_pending(profile, tool, status);
 
 -- Append-only audit log: one row per decision event
+-- prev_hash is populated when approval.hash_chain=true in profile config (crypto/sha256).
 CREATE TABLE IF NOT EXISTS tool_approval_log (
     id              TEXT PRIMARY KEY,     -- ULID, e.g. log_01JX9K4XMBA2VEQNRZ7GVF4MB
     approval_id     TEXT NOT NULL,        -- FK to tool_approval_pending.id
@@ -463,6 +471,7 @@ CREATE TABLE IF NOT EXISTS tool_approval_log (
     reviewer        TEXT,
     reviewer_source TEXT NOT NULL DEFAULT 'cli',
     rationale       TEXT,
+    prev_hash       TEXT,                 -- SHA-256 of previous log row; NULL if hash-chain disabled
     created_at      TEXT NOT NULL,        -- approval request creation time
     decided_at      TEXT NOT NULL         -- decision recording time
 );
@@ -484,742 +493,534 @@ BEGIN
 END;
 ```
 
-### 10.3 Core Dataclasses
-
-```python
-# src/tag/tool_approval.py
-from __future__ import annotations
-
-import hashlib
-import json
-import os
-import sqlite3
-import threading
-import time
-import uuid
-from dataclasses import dataclass, field
-from typing import Optional
-
-
-def _ulid(prefix: str) -> str:
-    """Generate a prefixed pseudo-ULID using uuid4 for uniqueness."""
-    return f"{prefix}_{uuid.uuid4().hex[:26].upper()}"
-
-
-def _canonical_args_sha256(args: dict) -> str:
-    """SHA-256 of canonical JSON: keys sorted, no whitespace."""
-    canonical = json.dumps(args, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-@dataclass
-class ApprovalRule:
-    id: str
-    tool: str
-    mcp_server: Optional[str]
-    profile: Optional[str]          # None means --always (global)
-    timeout_seconds: Optional[int]
-    auto_deny_on_timeout: bool
-    notify_channels: list[str]
-    created_at: str
-    created_by: str
-
-
-@dataclass
-class PendingApproval:
-    id: str
-    rule_id: str
-    run_id: str
-    trace_span_id: Optional[str]
-    tool: str
-    mcp_server: Optional[str]
-    profile: str
-    args_json: str
-    args_sha256: str
-    status: str                     # 'pending' | 'approved' | 'denied' | 'timeout'
-    reviewer: Optional[str]
-    reviewer_source: Optional[str]
-    rationale: Optional[str]
-    created_at: str
-    decided_at: Optional[str]
-    expires_at: Optional[str]
-
-
-@dataclass
-class ApprovalDecision:
-    approval_id: str
-    decision: str                   # 'approved' | 'denied' | 'timeout'
-    reviewer: str
-    reviewer_source: str            # 'cli' | 'webhook' | 'auto'
-    rationale: Optional[str]
-    decided_at: str
-```
-
-### 10.4 ApprovalGate Class
-
-```python
-# src/tag/tool_approval.py (continued)
-
-import datetime as dt
-
-
-class ApprovalGate:
-    """
-    Central controller for the HITL approval gate.
-
-    Call ApprovalGate.check(conn, tool, mcp_server, profile, run_id, args)
-    from the hermes_bridge tool dispatch path. The method returns only when
-    a decision is made (approved), raises ApprovalDeniedError on denial, or
-    raises ApprovalTimeoutError if auto-deny fires.
-    """
-
-    POLL_INTERVAL_SECONDS = 0.25
-
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self._conn = conn
-        # Cache: None means "not yet fetched this session"
-        self._rules_cache: Optional[list[ApprovalRule]] = None
-        self._cache_ts: float = 0.0
-        self._cache_ttl: float = 5.0  # seconds; re-read rules every 5s
-
-    def _load_rules(self) -> list[ApprovalRule]:
-        now = time.monotonic()
-        if self._rules_cache is None or (now - self._cache_ts) > self._cache_ttl:
-            rows = self._conn.execute(
-                "SELECT * FROM tool_approval_rules ORDER BY profile NULLS LAST"
-            ).fetchall()
-            self._rules_cache = [
-                ApprovalRule(
-                    id=r["id"],
-                    tool=r["tool"],
-                    mcp_server=r["mcp_server"],
-                    profile=r["profile"],
-                    timeout_seconds=r["timeout_seconds"],
-                    auto_deny_on_timeout=bool(r["auto_deny_on_timeout"]),
-                    notify_channels=json.loads(r["notify_channels"] or "[]"),
-                    created_at=r["created_at"],
-                    created_by=r["created_by"],
-                )
-                for r in rows
-            ]
-            self._cache_ts = now
-        return self._rules_cache
-
-    def match_rule(self, tool: str, mcp_server: Optional[str], profile: str) -> Optional[ApprovalRule]:
-        """Return the most specific matching rule, or None if tool is ungated."""
-        rules = self._load_rules()
-        # Profile-scoped rule takes precedence over global; within same scope, first match wins.
-        profile_match: Optional[ApprovalRule] = None
-        global_match: Optional[ApprovalRule] = None
-        for rule in rules:
-            tool_matches = rule.tool == tool or (
-                mcp_server is not None and rule.tool == f"{mcp_server}:{tool}"
-            )
-            if not tool_matches:
-                continue
-            if rule.mcp_server is not None and rule.mcp_server != mcp_server:
-                continue
-            if rule.profile is None:
-                if global_match is None:
-                    global_match = rule
-            elif rule.profile == profile:
-                if profile_match is None:
-                    profile_match = rule
-        return profile_match or global_match
-
-    def check(
-        self,
-        tool: str,
-        mcp_server: Optional[str],
-        profile: str,
-        run_id: str,
-        args: dict,
-        trace_span_id: Optional[str] = None,
-    ) -> None:
-        """
-        Gate the tool call. Returns normally if approved. Raises on denial.
-        Must be called from the tool dispatch path in hermes_bridge.py before
-        the MCP server call is made.
-        """
-        rule = self.match_rule(tool, mcp_server, profile)
-        if rule is None:
-            return  # Fast path: ungated tool, zero overhead beyond dict lookup
-
-        pending = self._create_pending(rule, tool, mcp_server, profile, run_id, args, trace_span_id)
-        self._fire_notification(pending, rule)
-        self._block_until_decided(pending, rule)
-
-    def _create_pending(
-        self,
-        rule: ApprovalRule,
-        tool: str,
-        mcp_server: Optional[str],
-        profile: str,
-        run_id: str,
-        args: dict,
-        trace_span_id: Optional[str],
-    ) -> PendingApproval:
-        approval_id = _ulid("appr")
-        now_iso = dt.datetime.utcnow().isoformat() + "Z"
-        args_json = json.dumps(args, sort_keys=True, separators=(",", ":"))
-        args_sha256 = _canonical_args_sha256(args)
-        expires_at: Optional[str] = None
-        if rule.timeout_seconds is not None:
-            expires_dt = dt.datetime.utcnow() + dt.timedelta(seconds=rule.timeout_seconds)
-            expires_at = expires_dt.isoformat() + "Z"
-
-        self._conn.execute(
-            """
-            INSERT INTO tool_approval_pending
-              (id, rule_id, run_id, trace_span_id, tool, mcp_server, profile,
-               args_json, args_sha256, status, created_at, expires_at)
-            VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?)
-            """,
-            (approval_id, rule.id, run_id, trace_span_id, tool, mcp_server,
-             profile, args_json, args_sha256, now_iso, expires_at),
-        )
-        # Fire event for PRD-040 notification hooks
-        event_id = _ulid("evt")
-        self._conn.execute(
-            """
-            INSERT INTO events (id, event_type, profile, run_id, payload, created_at)
-            VALUES (?, 'tool_approval.pending', ?, ?, ?, ?)
-            """,
-            (event_id, profile, run_id,
-             json.dumps({"approval_id": approval_id, "tool": tool, "profile": profile}),
-             now_iso),
-        )
-        self._conn.commit()
-        return PendingApproval(
-            id=approval_id, rule_id=rule.id, run_id=run_id,
-            trace_span_id=trace_span_id, tool=tool, mcp_server=mcp_server,
-            profile=profile, args_json=args_json, args_sha256=args_sha256,
-            status="pending", reviewer=None, reviewer_source=None, rationale=None,
-            created_at=now_iso, decided_at=None, expires_at=expires_at,
-        )
-
-    def _block_until_decided(self, pending: PendingApproval, rule: ApprovalRule) -> None:
-        """Poll SQLite until status leaves 'pending'. Enforce timeout if configured."""
-        deadline: Optional[float] = None
-        if rule.timeout_seconds is not None:
-            deadline = time.monotonic() + rule.timeout_seconds
-
-        while True:
-            row = self._conn.execute(
-                "SELECT status, reviewer, reviewer_source, rationale, decided_at "
-                "FROM tool_approval_pending WHERE id = ?",
-                (pending.id,),
-            ).fetchone()
-            if row is None:
-                raise ApprovalGateError(f"Approval record {pending.id} disappeared from DB.")
-
-            status = row["status"]
-            if status == "approved":
-                self._append_log(pending, "approved", row["reviewer"], row["reviewer_source"], row["rationale"], row["decided_at"])
-                return
-            if status in ("denied", "timeout"):
-                self._append_log(pending, status, row["reviewer"], row["reviewer_source"], row["rationale"], row["decided_at"])
-                raise ApprovalDeniedError(pending.id, pending.tool, status, row["rationale"])
-
-            # Check for timeout
-            if deadline is not None and time.monotonic() > deadline:
-                if rule.auto_deny_on_timeout:
-                    self._record_timeout(pending)
-                    raise ApprovalDeniedError(pending.id, pending.tool, "timeout", "Auto-denied: approval timeout expired")
-                else:
-                    raise ApprovalTimeoutError(pending.id, rule.timeout_seconds)
-
-            time.sleep(self.POLL_INTERVAL_SECONDS)
-
-    def _record_timeout(self, pending: PendingApproval) -> None:
-        now_iso = dt.datetime.utcnow().isoformat() + "Z"
-        self._conn.execute(
-            """UPDATE tool_approval_pending
-               SET status='timeout', reviewer='system', reviewer_source='auto',
-                   rationale='Auto-denied: timeout expired', decided_at=?
-               WHERE id=? AND status='pending'""",
-            (now_iso, pending.id),
-        )
-        self._conn.commit()
-
-    def _append_log(
-        self,
-        pending: PendingApproval,
-        decision: str,
-        reviewer: Optional[str],
-        reviewer_source: Optional[str],
-        rationale: Optional[str],
-        decided_at: Optional[str],
-    ) -> None:
-        log_id = _ulid("log")
-        now_iso = dt.datetime.utcnow().isoformat() + "Z"
-        self._conn.execute(
-            """
-            INSERT INTO tool_approval_log
-              (id, approval_id, rule_id, tool, mcp_server, profile, run_id,
-               trace_span_id, args_json, args_sha256, decision, reviewer,
-               reviewer_source, rationale, created_at, decided_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (log_id, pending.id, pending.rule_id, pending.tool, pending.mcp_server,
-             pending.profile, pending.run_id, pending.trace_span_id,
-             pending.args_json, pending.args_sha256, decision,
-             reviewer, reviewer_source or "cli", rationale,
-             pending.created_at, decided_at or now_iso),
-        )
-        self._conn.commit()
-
-    def _fire_notification(self, pending: PendingApproval, rule: ApprovalRule) -> None:
-        """Fire desktop notification if desktop channel is configured."""
-        if "desktop" in rule.notify_channels:
-            try:
-                send_desktop_notification(
-                    title=f"TAG: Approval Required — {pending.tool}",
-                    message=f"Profile: {pending.profile}\nID: {pending.id}\nArgs: {pending.args_json[:120]}",
-                )
-            except Exception:
-                pass  # Never block the gate on notification failures
-
-
-class ApprovalGateError(Exception):
-    pass
-
-
-class ApprovalDeniedError(ApprovalGateError):
-    def __init__(self, approval_id: str, tool: str, decision: str, rationale: Optional[str]):
-        self.approval_id = approval_id
-        self.tool = tool
-        self.decision = decision
-        self.rationale = rationale
-        super().__init__(
-            f"Tool call '{tool}' was {decision} (approval: {approval_id}). "
-            f"Reason: {rationale or '(none)'}. "
-            f"See: tag mcp approvals show {approval_id}"
-        )
-
-
-class ApprovalTimeoutError(ApprovalGateError):
-    def __init__(self, approval_id: str, timeout_seconds: int):
-        self.approval_id = approval_id
-        super().__init__(
-            f"Approval {approval_id} timed out after {timeout_seconds}s. "
-            f"Configure auto_deny_on_timeout=true to auto-deny instead of blocking."
-        )
-```
-
-### 10.5 Integration Point: hermes_bridge.py
-
-The gate is inserted in the tool dispatch path. The exact hook site is the pre-execution callback before any MCP server transport call:
-
-```python
-# src/tag/hermes_bridge.py — in the tool call dispatch function
-# (pseudocode showing where ApprovalGate.check is inserted)
-
-from tag.tool_approval import ApprovalGate, ApprovalDeniedError
-
-_approval_gate: Optional[ApprovalGate] = None
-
-def _get_gate(conn: sqlite3.Connection) -> ApprovalGate:
-    global _approval_gate
-    if _approval_gate is None:
-        _approval_gate = ApprovalGate(conn)
-    return _approval_gate
-
-def dispatch_tool_call(
-    tool_name: str,
-    mcp_server: Optional[str],
-    profile: str,
-    run_id: str,
-    args: dict,
-    conn: sqlite3.Connection,
-    trace_span_id: Optional[str] = None,
-) -> dict:
-    gate = _get_gate(conn)
-    try:
-        gate.check(tool_name, mcp_server, profile, run_id, args, trace_span_id)
-    except ApprovalDeniedError as exc:
-        # Surface as a tool error response so the agent loop handles it gracefully
-        return {"error": str(exc), "approval_denied": True, "exit_code": 5}
-    # ... proceed with actual MCP server call
-```
-
-### 10.6 Webhook Approval Server
-
-```python
-# src/tag/approval_server.py
-
-import json
-import os
-import sqlite3
-import threading
-import datetime as dt
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional
-
-from tag.tool_approval import _ulid
-
-
-class ApprovalHandler(BaseHTTPRequestHandler):
-    """Handles POST /approvals/<id>/approve|deny and GET /approvals[/<id>]."""
-
-    db_path: str = ""  # Set before starting server
-
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=5)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _respond(self, status: int, body: dict) -> None:
-        payload = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def do_GET(self) -> None:
-        parts = self.path.strip("/").split("/")
-        if parts == ["approvals", "pending"]:
-            conn = self._conn()
-            rows = conn.execute(
-                "SELECT * FROM tool_approval_pending WHERE status='pending' ORDER BY created_at DESC LIMIT 50"
-            ).fetchall()
-            conn.close()
-            self._respond(200, {"approvals": [dict(r) for r in rows]})
-        elif len(parts) == 2 and parts[0] == "approvals":
-            approval_id = parts[1]
-            conn = self._conn()
-            row = conn.execute(
-                "SELECT * FROM tool_approval_pending WHERE id=?", (approval_id,)
-            ).fetchone()
-            conn.close()
-            if row is None:
-                self._respond(404, {"error": "Not found"})
-            else:
-                self._respond(200, dict(row))
-        else:
-            self._respond(404, {"error": "Not found"})
-
-    def do_POST(self) -> None:
-        parts = self.path.strip("/").split("/")
-        # POST /approvals/<id>/approve or /deny
-        if len(parts) != 3 or parts[0] != "approvals" or parts[2] not in ("approve", "deny"):
-            self._respond(404, {"error": "Not found"})
-            return
-        approval_id = parts[1]
-        action = parts[2]
-        decision = "approved" if action == "approve" else "denied"
-
-        length = int(self.headers.get("Content-Length", "0"))
-        body: dict = {}
-        if length > 0:
-            body = json.loads(self.rfile.read(length))
-
-        reviewer = (
-            self.headers.get("X-Approver")
-            or body.get("reviewer")
-            or os.environ.get("USER", "webhook")
-        )
-        rationale = body.get("rationale")
-        now_iso = dt.datetime.utcnow().isoformat() + "Z"
-
-        conn = self._conn()
-        rowcount = conn.execute(
-            """UPDATE tool_approval_pending
-               SET status=?, reviewer=?, reviewer_source='webhook', rationale=?, decided_at=?
-               WHERE id=? AND status='pending'""",
-            (decision, reviewer, rationale, now_iso, approval_id),
-        ).rowcount
-        conn.commit()
-        conn.close()
-
-        if rowcount == 0:
-            self._respond(409, {"error": "Approval not found or already decided"})
-        else:
-            self._respond(200, {"approval_id": approval_id, "decision": decision, "reviewer": reviewer})
-
-    def log_message(self, format: str, *args) -> None:  # noqa: A002
-        pass  # Suppress default HTTP server logging
-
-
-def start_approval_server(db_path: str, port: int) -> threading.Thread:
-    """Start the approval webhook server in a daemon thread. Returns the thread."""
-    ApprovalHandler.db_path = db_path
-
-    server = HTTPServer(("127.0.0.1", port), ApprovalHandler)
-
-    def _serve():
-        server.serve_forever()
-
-    thread = threading.Thread(target=_serve, daemon=True, name="approval-server")
-    thread.start()
-    return thread
-```
-
-### 10.7 Migration Function (controller.py)
-
-```python
-def _migrate_prd_078_tables(conn: sqlite3.Connection) -> None:
-    """Create tool_approval tables for PRD-078 (idempotent)."""
-    try:
-        conn.executescript("""
-            -- PRD-078: HITL Tool Approval
-            CREATE TABLE IF NOT EXISTS tool_approval_rules (
-                id                   TEXT PRIMARY KEY,
-                tool                 TEXT NOT NULL,
-                mcp_server           TEXT,
-                profile              TEXT,
-                timeout_seconds      INTEGER,
-                auto_deny_on_timeout INTEGER NOT NULL DEFAULT 0,
-                notify_channels      TEXT NOT NULL DEFAULT '[]',
-                created_at           TEXT NOT NULL,
-                created_by           TEXT NOT NULL,
-                UNIQUE(tool, mcp_server, profile)
-            );
-            CREATE INDEX IF NOT EXISTS idx_tar_profile ON tool_approval_rules(profile, tool);
-            CREATE INDEX IF NOT EXISTS idx_tar_tool    ON tool_approval_rules(tool, mcp_server);
-
-            CREATE TABLE IF NOT EXISTS tool_approval_pending (
-                id              TEXT PRIMARY KEY,
-                rule_id         TEXT NOT NULL,
-                run_id          TEXT NOT NULL,
-                trace_span_id   TEXT,
-                tool            TEXT NOT NULL,
-                mcp_server      TEXT,
-                profile         TEXT NOT NULL,
-                args_json       TEXT NOT NULL,
-                args_sha256     TEXT NOT NULL,
-                status          TEXT NOT NULL DEFAULT 'pending',
-                reviewer        TEXT,
-                reviewer_source TEXT,
-                rationale       TEXT,
-                created_at      TEXT NOT NULL,
-                decided_at      TEXT,
-                expires_at      TEXT,
-                FOREIGN KEY(rule_id) REFERENCES tool_approval_rules(id),
-                FOREIGN KEY(run_id)  REFERENCES runs(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_tap_status  ON tool_approval_pending(status, created_at);
-            CREATE INDEX IF NOT EXISTS idx_tap_run     ON tool_approval_pending(run_id, status);
-            CREATE INDEX IF NOT EXISTS idx_tap_profile ON tool_approval_pending(profile, tool, status);
-
-            CREATE TABLE IF NOT EXISTS tool_approval_log (
-                id              TEXT PRIMARY KEY,
-                approval_id     TEXT NOT NULL,
-                rule_id         TEXT NOT NULL,
-                tool            TEXT NOT NULL,
-                mcp_server      TEXT,
-                profile         TEXT NOT NULL,
-                run_id          TEXT NOT NULL,
-                trace_span_id   TEXT,
-                args_json       TEXT NOT NULL,
-                args_sha256     TEXT NOT NULL,
-                decision        TEXT NOT NULL,
-                reviewer        TEXT,
-                reviewer_source TEXT NOT NULL DEFAULT 'cli',
-                rationale       TEXT,
-                created_at      TEXT NOT NULL,
-                decided_at      TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_tal_decided  ON tool_approval_log(decided_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_tal_profile  ON tool_approval_log(profile, tool, decided_at);
-            CREATE INDEX IF NOT EXISTS idx_tal_decision ON tool_approval_log(decision, decided_at);
-
-            CREATE TRIGGER IF NOT EXISTS trg_tal_no_update
-                BEFORE UPDATE ON tool_approval_log
-            BEGIN
-                SELECT RAISE(FAIL, 'tool_approval_log is append-only: UPDATE is not permitted');
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS trg_tal_no_delete
-                BEFORE DELETE ON tool_approval_log
-            BEGIN
-                SELECT RAISE(FAIL, 'tool_approval_log is append-only: DELETE is not permitted');
-            END;
-        """)
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-```
-
-### 10.8 CLI Handler Sketch (controller.py)
-
-```python
-def cmd_mcp_approve_required(args: argparse.Namespace) -> int:
-    """Handles: tag mcp approve-required {add,remove,list}"""
-    cfg = load_config()
-    conn = open_db(cfg)
-    sub = args.approve_required_subcommand
-
-    if sub == "add":
-        if not args.tool:
-            print_error("--tool is required")
-            return 1
-        if args.profile and args.always:
-            print_error("--profile and --always are mutually exclusive")
-            return 1
-        profile = None if args.always else args.profile
-        rule_id = _ulid("rule")
-        now_iso = dt.datetime.utcnow().isoformat() + "Z"
-        reviewer = os.environ.get("USER", "unknown")
-        tool_raw = args.tool
-        mcp_server = None
-        if ":" in tool_raw:
-            mcp_server, tool_name = tool_raw.split(":", 1)
-        else:
-            tool_name = tool_raw
-        notify_channels = json.dumps(args.notify.split(",") if args.notify else [])
-        try:
-            conn.execute(
-                """INSERT INTO tool_approval_rules
-                   (id, tool, mcp_server, profile, timeout_seconds,
-                    auto_deny_on_timeout, notify_channels, created_at, created_by)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (rule_id, tool_name, mcp_server, profile,
-                 args.timeout, int(args.auto_deny_on_timeout),
-                 notify_channels, now_iso, reviewer),
-            )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            print_error(f"Approval rule already exists for tool='{tool_name}' profile='{profile}'")
-            return 1
-        if args.json:
-            print(json.dumps({"rule_id": rule_id, "tool": tool_name, "profile": profile}))
-        else:
-            scope = f"profile={profile}" if profile else "always (global)"
-            print_success(f"Approval rule created: {rule_id} — tool={tool_name} scope={scope}")
-        return 0
-
-    elif sub == "remove":
-        # Match by (tool, profile) or --rule-id
-        # ... (similar pattern)
-        pass
-
-    elif sub == "list":
-        rows = conn.execute("SELECT * FROM tool_approval_rules ORDER BY created_at").fetchall()
-        if args.json:
-            print(json.dumps([dict(r) for r in rows], indent=2))
-        else:
-            # Tabular output
-            pass
-        return 0
-
-    return 1
-
-
-def cmd_mcp_approve(args: argparse.Namespace) -> int:
-    """Handles: tag mcp approve <approval-id> [--deny] [--rationale TEXT]"""
-    cfg = load_config()
-    conn = open_db(cfg)
-    approval_id = args.approval_id
-    decision = "denied" if args.deny else "approved"
-    reviewer = os.environ.get("USER", "unknown")
-    now_iso = dt.datetime.utcnow().isoformat() + "Z"
-
-    row = conn.execute(
-        "SELECT * FROM tool_approval_pending WHERE id=?", (approval_id,)
-    ).fetchone()
-    if row is None:
-        print_error(f"Approval '{approval_id}' not found.")
-        return 1
-    if row["status"] != "pending":
-        print_error(f"Approval '{approval_id}' is already {row['status']}.")
-        return 2
-    if row["expires_at"] and row["expires_at"] < now_iso:
-        print_error(f"Approval '{approval_id}' has expired.")
-        return 3
-
-    conn.execute(
-        """UPDATE tool_approval_pending
-           SET status=?, reviewer=?, reviewer_source='cli', rationale=?, decided_at=?
-           WHERE id=? AND status='pending'""",
-        (decision, reviewer, args.rationale, now_iso, approval_id),
+### 10.3 Core Go Structs (`internal/tool/approval.go`)
+
+Go structs replace Python `@dataclass` definitions. `encoding/json` is used for serialisation; `invopop/jsonschema` for schema generation; `crypto/sha256` replaces `hashlib`. `encoding/json.Marshal` on a `map[string]any` sorts keys alphabetically by default, producing canonical JSON without a custom serialiser — identical to Python's `json.dumps(sort_keys=True, separators=(",",":"))`.
+
+```go
+package tool
+
+import (
+    "context"
+    "crypto/sha256"
+    "database/sql"
+    "encoding/json"
+    "fmt"
+    "sync"
+    "time"
+)
+
+// canonicalArgsSHA256 returns the SHA-256 hex digest of canonical JSON.
+// json.Marshal on map[string]any sorts keys alphabetically (Go spec), matching
+// Python json.dumps(sort_keys=True, separators=(",",":")):
+func canonicalArgsSHA256(args map[string]any) (string, error) {
+    b, err := json.Marshal(args) // compact, map keys sorted
+    if err != nil {
+        return "", err
+    }
+    sum := sha256.Sum256(b)
+    return fmt.Sprintf("%x", sum), nil
+}
+
+// ApprovalRule is a gate rule loaded from tool_approval_rules and held in the rules cache.
+type ApprovalRule struct {
+    ID                string
+    Tool              string
+    MCPServer         string    // empty = bare tool name, not server-scoped
+    Profile           string    // empty = global (--always)
+    TimeoutSeconds    int       // 0 = wait forever
+    AutoDenyOnTimeout bool
+    NotifyChannels    []string
+    CreatedAt         time.Time
+    CreatedBy         string
+}
+
+// Decision is the resolution of a pending approval, sent on the in-process channel.
+type Decision struct {
+    Outcome        string    // "approved" | "denied" | "timeout"
+    Reviewer       string
+    ReviewerSource string    // "cli" | "webhook" | "tui" | "auto"
+    Rationale      string
+    DecidedAt      time.Time
+}
+
+// pendingApproval is an in-flight gate record, held in PermissionService.pending.
+type pendingApproval struct {
+    ID          string
+    RuleID      string
+    RunID       string
+    TraceSpanID string
+    Tool        string
+    MCPServer   string
+    Profile     string
+    ArgsJSON    string    // canonical JSON frozen at gate entry — dispatched verbatim (FR-11)
+    ArgsSHA256  string
+    CreatedAt   time.Time
+    ExpiresAt   time.Time // zero value if no timeout configured
+    ch          chan Decision // buffered(1); resolved by Resolve() or auto-timeout path
+}
+
+// ApprovalDeniedError is returned by Check() on denial or auto-deny timeout.
+type ApprovalDeniedError struct {
+    ApprovalID string
+    Tool       string
+    Outcome    string // "denied" | "timeout"
+    Rationale  string
+}
+
+func (e *ApprovalDeniedError) Error() string {
+    return fmt.Sprintf(
+        "tool call %q was %s (approval: %s). Reason: %s. See: tag mcp approvals show %s",
+        e.Tool, e.Outcome, e.ApprovalID, e.Rationale, e.ApprovalID,
     )
-    conn.commit()
-    # The ApprovalGate polling loop in the agent process will detect the status change
-    # and append the log row on its next poll cycle.
-    print_success(f"{decision.upper()}: {approval_id} — tool={row['tool']} profile={row['profile']}")
-    return 0
+}
+
+// ApprovalTimeoutError is returned when the deadline fires and auto-deny is not configured.
+type ApprovalTimeoutError struct {
+    ApprovalID     string
+    TimeoutSeconds int
+}
+
+func (e *ApprovalTimeoutError) Error() string {
+    return fmt.Sprintf(
+        "approval %s timed out after %ds. Set auto_deny_on_timeout: true to auto-deny instead of blocking.",
+        e.ApprovalID, e.TimeoutSeconds,
+    )
+}
+```
+
+### 10.4 PermissionService (`internal/tool/approval.go`)
+
+`PermissionService` is the central HITL gate, held as a singleton for the lifetime of `tag run` and injected into the dispatch path. It replaces the Python `ApprovalGate` class.
+
+The key architectural change from Python: **polling is eliminated**. Python's `ApprovalGate._block_until_decided()` called `time.sleep(0.25)` in a loop, checking SQLite every 250 ms. In Go, `Check()` blocks on `<-pend.ch` (a buffered channel of capacity 1). `Resolve()` sends the decision on that channel, unblocking `Check()` in microseconds. The `context.WithTimeout` deadline (when configured) races the channel receive — no goroutine is needed to enforce it. This achieves sub-millisecond resume latency from the moment a decision is delivered.
+
+The rules cache is re-read from SQLite every 5 s (configurable via `ruleTTL`), supporting live rule add/remove without restarting the agent (FR-18).
+
+```go
+// PermissionService is the singleton HITL gate for the lifetime of tag run.
+type PermissionService struct {
+    db            *sql.DB
+    mu            sync.RWMutex
+    rulesCache    []ApprovalRule
+    rulesCachedAt time.Time
+    ruleTTL       time.Duration // default 5s; supports hot-reload (FR-18)
+    pending       map[string]*pendingApproval // keyed by approval ID; protected by mu
+    hashChain     bool // when true, appendLog writes prev_hash (crypto/sha256)
+}
+
+// Check gates a tool call. Returns nil if approved.
+// Returns *ApprovalDeniedError on denial or auto-deny timeout.
+// Returns *ApprovalTimeoutError when timeout fires without auto-deny.
+// Fast path when no rule matches: single in-memory cache lookup, zero DB I/O (NFR-06).
+func (ps *PermissionService) Check(
+    ctx context.Context,
+    tool, mcpServer, profile, runID, spanID string,
+    args map[string]any,
+) error {
+    rule := ps.matchRule(tool, mcpServer, profile) // in-memory cache lookup
+    if rule == nil {
+        return nil // ungated: zero overhead
+    }
+
+    pend, err := ps.createPending(ctx, rule, tool, mcpServer, profile, runID, spanID, args)
+    if err != nil {
+        return fmt.Errorf("approval gate: %w", err)
+    }
+    ps.fireNotification(pend, rule) // desktop notification + SSE event publish
+
+    // Build a deadline context if the rule specifies a timeout.
+    gateCtx := ctx
+    if rule.TimeoutSeconds > 0 {
+        var cancel context.CancelFunc
+        gateCtx, cancel = context.WithTimeout(ctx, time.Duration(rule.TimeoutSeconds)*time.Second)
+        defer cancel()
+    }
+
+    // Block until Resolve() delivers a decision or the deadline fires.
+    // No polling loop; channel send from Resolve() costs ~100 ns.
+    select {
+    case dec := <-pend.ch:
+        ps.appendLog(ctx, pend, dec) // single transaction; optional hash-chain (NFR-07)
+        if dec.Outcome == "approved" {
+            return nil
+        }
+        return &ApprovalDeniedError{
+            ApprovalID: pend.ID, Tool: pend.Tool,
+            Outcome: dec.Outcome, Rationale: dec.Rationale,
+        }
+
+    case <-gateCtx.Done():
+        if rule.AutoDenyOnTimeout {
+            dec := Decision{
+                Outcome: "timeout", Reviewer: "system", ReviewerSource: "auto",
+                Rationale: "Auto-denied: approval timeout expired",
+                DecidedAt: time.Now().UTC(),
+            }
+            ps.recordTimeout(ctx, pend, dec) // UPDATE tool_approval_pending
+            ps.appendLog(ctx, pend, dec)
+            return &ApprovalDeniedError{
+                ApprovalID: pend.ID, Tool: pend.Tool,
+                Outcome: "timeout", Rationale: dec.Rationale,
+            }
+        }
+        return &ApprovalTimeoutError{ApprovalID: pend.ID, TimeoutSeconds: rule.TimeoutSeconds}
+    }
+}
+
+// Resolve delivers a decision to the goroutine blocked in Check().
+// Called by: the approval HTTP server handler (webhook POST), the TUI key-handler,
+// or cmdMCPApprove when running in the same process as the agent.
+// For the out-of-process case (tag mcp approve in a separate terminal), the approval
+// server runs as a goroutine within the agent process and calls Resolve on its behalf.
+func (ps *PermissionService) Resolve(approvalID string, dec Decision) error {
+    ps.mu.Lock()
+    pend, ok := ps.pending[approvalID]
+    ps.mu.Unlock()
+    if !ok {
+        return fmt.Errorf("approval %q not found or already resolved", approvalID)
+    }
+    pend.ch <- dec // unblocks Check(); channel is buffered(1) so this never blocks
+    return nil
+}
+```
+
+`createPending` writes the `tool_approval_pending` row and the `tool_approval.pending` event row inside a single transaction, then adds the `*pendingApproval` (with its channel) to `ps.pending`. `appendLog` writes one row to `tool_approval_log`; when `hashChain=true`, it first queries the latest log row, computes `SHA-256(canonical-JSON of that row)` via `crypto/sha256`, and stores the result in `prev_hash`. `matchRule` implements profile-scoped-over-global precedence, returning the most specific matching rule or `nil` for ungated tools.
+
+### 10.5 Integration Point: `internal/runtime/dispatch.go`
+
+The gate is inserted into the unified tool dispatch path. Both built-in tools and MCP tools use the same `Run()` interface, gated through `PermissionService.Check()`. The MCP call itself uses `github.com/modelcontextprotocol/go-sdk v1.6.1`, protocol version pinned to `2025-11-25`.
+
+```go
+// internal/runtime/dispatch.go
+
+func DispatchToolCall(
+    ctx    context.Context,
+    ps     *tool.PermissionService, // nil when no approval rules are configured
+    name, mcpServer, profile, runID, spanID string,
+    args   map[string]any,
+) (json.RawMessage, error) {
+    if ps != nil {
+        if err := ps.Check(ctx, name, mcpServer, profile, runID, spanID, args); err != nil {
+            // ApprovalDeniedError and ApprovalTimeoutError both map to exit code 5
+            // in the agent loop caller; the error message is human-readable (NFR-10).
+            return nil, err
+        }
+    }
+    // args are the values frozen at gate entry and stored in tool_approval_pending.args_json.
+    // The dispatch layer re-serialises from these same values — the agent cannot substitute
+    // different arguments after approval is granted (FR-11).
+    //
+    // Proceed with MCP server call via go-sdk v1.6.1, protocol 2025-11-25:
+    // client.CallTool(ctx, &mcp.CallToolRequest{Name: name, Arguments: args})
+    // ...
+    return result, nil
+}
+```
+
+### 10.6 Webhook Approval Server (`internal/server/approval.go`)
+
+Replaces Python's `http.server.BaseHTTPRequestHandler` / `threading.Thread` pattern. The server starts as a goroutine within the `tag run` process and shuts down via `context.Context` cancellation when the run completes. It uses `net/http` + `go-chi/chi v5` for routing and `tmaxmax/go-sse` for the SSE event stream, which supports `Last-Event-ID` replay so reconnecting clients do not miss pending-approval events.
+
+```go
+// internal/server/approval.go
+package server
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "os"
+    "time"
+
+    "github.com/go-chi/chi/v5"
+    sse "github.com/tmaxmax/go-sse"
+    "github.com/tag-project/tag/internal/tool"
+)
+
+// ApprovalServer exposes approval endpoints and streams events to SSE subscribers.
+type ApprovalServer struct {
+    ps        *tool.PermissionService
+    sseServer *sse.Server // Last-Event-ID replay for reconnecting clients
+}
+
+// Mount returns the chi router. The caller MUST bind only to 127.0.0.1:<port> (FR-15).
+func (s *ApprovalServer) Mount() http.Handler {
+    r := chi.NewRouter()
+    r.Get("/approvals/events", s.sseServer.ServeHTTP) // SSE: subscribe to pending events
+    r.Get("/approvals/pending", s.listPending)
+    r.Get("/approvals/{id}", s.show)
+    r.Post("/approvals/{id}/approve", s.decide("approved"))
+    r.Post("/approvals/{id}/deny", s.decide("denied"))
+    return r
+}
+
+func (s *ApprovalServer) decide(outcome string) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        id := chi.URLParam(r, "id")
+        var body struct {
+            Rationale string `json:"rationale"`
+            Reviewer  string `json:"reviewer"`
+        }
+        _ = json.NewDecoder(r.Body).Decode(&body)
+
+        reviewer := r.Header.Get("X-Approver")
+        if reviewer == "" { reviewer = body.Reviewer }
+        if reviewer == "" { reviewer = os.Getenv("USER") }
+
+        dec := tool.Decision{
+            Outcome:        outcome,
+            Reviewer:       reviewer,
+            ReviewerSource: "webhook",
+            Rationale:      body.Rationale,
+            DecidedAt:      time.Now().UTC(),
+        }
+        // Resolve() sends on pend.ch, unblocking the Check() goroutine in the agent.
+        // Concurrent approve+deny requests: the first Resolve() drains the channel;
+        // subsequent calls find no entry in ps.pending and return an error (NFR-04).
+        if err := s.ps.Resolve(id, dec); err != nil {
+            http.Error(w, err.Error(), http.StatusConflict) // 409: already decided
+            return
+        }
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]any{
+            "approval_id": id, "decision": outcome, "reviewer": reviewer,
+        })
+    }
+}
+
+// StartApprovalServer starts the server as a goroutine, bound to 127.0.0.1 only (FR-15).
+// Shuts down cleanly when ctx is cancelled (tag run completes or is interrupted).
+func StartApprovalServer(ctx context.Context, ps *tool.PermissionService, port int) {
+    as := &ApprovalServer{ps: ps, sseServer: sse.NewServer()}
+    srv := &http.Server{
+        Addr:    fmt.Sprintf("127.0.0.1:%d", port), // never 0.0.0.0
+        Handler: as.Mount(),
+    }
+    go func() { _ = srv.ListenAndServe() }()
+    go func() { <-ctx.Done(); _ = srv.Shutdown(context.Background()) }()
+}
+```
+
+### 10.7 Migration Function (`internal/store/migrate.go`)
+
+Replaces the Python `_migrate_prd_078_tables(conn)` pattern. Added to the existing migration chain in `internal/store/migrate.go`, called during `store.Open()`. Uses `modernc.org/sqlite` (pure-Go, `CGO_ENABLED=0`). The single-writer contract is enforced by `gofrs/flock` at the store level; no Python process may concurrently open the DB (Phase-3 DB-ownership handoff).
+
+```go
+// internal/store/migrate.go (addition to existing migration chain)
+
+const prd078DDL = `
+    CREATE TABLE IF NOT EXISTS tool_approval_rules ( ... );
+    CREATE INDEX IF NOT EXISTS idx_tar_profile ON tool_approval_rules(profile, tool);
+    CREATE INDEX IF NOT EXISTS idx_tar_tool    ON tool_approval_rules(tool, mcp_server);
+    CREATE TABLE IF NOT EXISTS tool_approval_pending ( ... );
+    -- ... indexes ...
+    CREATE TABLE IF NOT EXISTS tool_approval_log ( ... );
+    -- ... indexes ...
+    CREATE TRIGGER IF NOT EXISTS trg_tal_no_update BEFORE UPDATE ON tool_approval_log
+    BEGIN SELECT RAISE(FAIL, 'tool_approval_log is append-only: UPDATE is not permitted'); END;
+    CREATE TRIGGER IF NOT EXISTS trg_tal_no_delete BEFORE DELETE ON tool_approval_log
+    BEGIN SELECT RAISE(FAIL, 'tool_approval_log is append-only: DELETE is not permitted'); END;
+`
+
+func migratePRD078Tables(db *sql.DB) error {
+    _, err := db.ExecContext(context.Background(), prd078DDL)
+    return err
+}
+```
+
+### 10.8 CLI Handler Sketch (`internal/cli/mcp_approve.go`)
+
+Replaces the Python `argparse`-based `cmd_mcp_approve_required` and `cmd_mcp_approve` functions in `controller.py`. Registered as `cobra` sub-commands under `tag mcp`. Reviewer identity is obtained from `os/user.Current().Username` (replaces Python `os.getlogin()` / `os.environ.get("USER")`). Config is loaded via `knadh/koanf/v2`.
+
+```go
+// internal/cli/mcp_approve.go
+package cli
+
+import (
+    "encoding/json"
+    "fmt"
+    "os/user"
+    "strings"
+    "time"
+
+    "github.com/spf13/cobra"
+    "github.com/tag-project/tag/internal/store"
+    "github.com/tag-project/tag/internal/tool"
+)
+
+func cmdMCPApproveRequiredAdd(cmd *cobra.Command, _ []string) error {
+    toolFlag, _    := cmd.Flags().GetString("tool")
+    profileFlag, _ := cmd.Flags().GetString("profile")
+    alwaysFlag, _  := cmd.Flags().GetBool("always")
+    timeoutSec, _  := cmd.Flags().GetInt("timeout")
+    autoDeny, _    := cmd.Flags().GetBool("auto-deny-on-timeout")
+    notifyStr, _   := cmd.Flags().GetString("notify")
+    asJSON, _      := cmd.Flags().GetBool("json")
+
+    if profileFlag != "" && alwaysFlag {
+        return fmt.Errorf("--profile and --always are mutually exclusive")
+    }
+    profile := profileFlag
+    if alwaysFlag { profile = "" } // NULL in DB
+
+    // Parse "server:tool" form
+    mcpServer, toolName := "", toolFlag
+    if idx := strings.IndexByte(toolFlag, ':'); idx >= 0 {
+        mcpServer, toolName = toolFlag[:idx], toolFlag[idx+1:]
+    }
+
+    var notifyChannels []string
+    if notifyStr != "" {
+        notifyChannels = strings.Split(notifyStr, ",")
+    }
+    notifyJSON, _ := json.Marshal(notifyChannels)
+
+    u, _ := user.Current()
+    ruleID := newULID("rule") // internal/util ULID generator
+
+    db := store.FromContext(cmd.Context())
+    _, err := db.ExecContext(cmd.Context(),
+        `INSERT INTO tool_approval_rules
+           (id, tool, mcp_server, profile, timeout_seconds, auto_deny_on_timeout,
+            notify_channels, created_at, created_by)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+        ruleID, toolName, mcpServer, sqlNull(profile),
+        sqlNullInt(timeoutSec), boolToInt(autoDeny),
+        string(notifyJSON), time.Now().UTC().Format(time.RFC3339), u.Username,
+    )
+    if isSQLiteUniqueViolation(err) {
+        return fmt.Errorf("approval rule already exists for tool=%q profile=%q (exit 1)", toolName, profile)
+    }
+    if err != nil { return err }
+
+    if asJSON {
+        return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{
+            "rule_id": ruleID, "tool": toolName, "mcp_server": mcpServer, "profile": profile,
+        })
+    }
+    scope := fmt.Sprintf("profile=%s", profile)
+    if alwaysFlag { scope = "always (global)" }
+    fmt.Fprintf(cmd.OutOrStdout(), "Approval rule created: %s — tool=%s scope=%s\n", ruleID, toolName, scope)
+    return nil
+}
+
+func cmdMCPApprove(cmd *cobra.Command, args []string) error {
+    approvalID := args[0]
+    denyFlag, _ := cmd.Flags().GetBool("deny")
+    rationale, _ := cmd.Flags().GetString("rationale")
+
+    outcome := "approved"
+    if denyFlag { outcome = "denied" }
+
+    u, _ := user.Current()
+    dec := tool.Decision{
+        Outcome:        outcome,
+        Reviewer:       u.Username,
+        ReviewerSource: "cli",
+        Rationale:      rationale,
+        DecidedAt:      time.Now().UTC(),
+    }
+
+    // Resolve via in-process PermissionService if available (interactive mode).
+    // Otherwise POST to the approval server at approval.webhook_port.
+    // Fallback: UPDATE tool_approval_pending directly and let the agent's
+    // next Resolve() call pick up the decision via SSE notification.
+    ps := tool.PermissionServiceFromContext(cmd.Context())
+    if ps != nil {
+        return ps.Resolve(approvalID, dec)
+    }
+    return resolveViaWebhook(cmd.Context(), approvalID, dec)
+}
 ```
 
 ### 10.9 Config Schema Additions
 
-New keys under the profile config YAML (optional, defaults shown):
+New keys under the profile config YAML, loaded and merged via `knadh/koanf/v2` (replaces direct YAML dict access). Written back atomically via `gopkg.in/yaml.v3` marshal + `gofrs/flock` + `os.Rename`. Defaults shown:
 
 ```yaml
 approval:
-  webhook_port: null          # null = disabled; set to integer to enable webhook server
-  auto_deny_timeout_seconds: null  # null = wait forever (overridable per rule)
-  notify_channels: []         # default notification channels for all approval rules
+  webhook_port: null              # null = disabled; integer = bind approval server on that port
+  auto_deny_timeout_seconds: null # null = wait forever (overridable per rule)
+  notify_channels: []             # default notification channels for all approval rules
+  hash_chain: false               # true = SHA-256 hash-chain tool_approval_log rows (crypto/sha256)
 ```
 
 ---
 
 ## 11. Security Considerations
 
-1. **Localhost-only webhook server.** The approval webhook server MUST bind to `127.0.0.1` only. It must never bind to `0.0.0.0` or a public interface, preventing remote attackers from approving tool calls. This is enforced in `approval_server.py` and verified in integration tests.
+1. **Localhost-only webhook server.** The approval webhook server MUST bind to `127.0.0.1` only (enforced in `StartApprovalServer` via the `Addr` field of `http.Server`). It must never bind to `0.0.0.0` or a public interface, preventing remote attackers from approving tool calls. Verified in integration tests by asserting `srv.Addr` begins with `127.0.0.1:`.
 
-2. **No authentication on the webhook in this PRD.** Since the server is localhost-only, authentication relies on OS-level process isolation. This is documented as a known limitation. Future work: add a shared secret token in the request `Authorization` header.
+2. **No authentication on the webhook in this PRD.** Since the server is localhost-only, authentication relies on OS-level process isolation. This is documented as a known limitation. Future work: add a shared secret token verified in a `chi` middleware on the `Authorization` header.
 
-3. **Append-only audit log integrity.** The `trg_tal_no_update` and `trg_tal_no_delete` SQLite triggers prevent application-layer modification of `tool_approval_log`. An attacker who can write arbitrary SQL to the database can still bypass these triggers; the triggers are not a cryptographic guarantee. For higher assurance environments, consider periodically hashing the log table content and storing the hash externally.
+3. **Append-only audit log integrity.** The `trg_tal_no_update` and `trg_tal_no_delete` SQLite triggers prevent application-layer modification of `tool_approval_log`. An attacker who can issue arbitrary SQL bypasses these triggers; the triggers are not a cryptographic guarantee. When `approval.hash_chain: true` is configured, `appendLog` chains each row's `prev_hash` field via `crypto/sha256` over the canonical JSON of the previous row, making tampering detectable by chain verification without an external store.
 
-4. **Argument payload at gate time is the canonical payload.** The `args_json` and `args_sha256` stored in `tool_approval_pending` at gate entry time are the values passed to the MCP server. The dispatch code must re-read `args_json` from the `tool_approval_pending` row (not from the agent's in-memory state) when arguments must be verified post-approval, preventing TOCTOU substitution.
+4. **Argument payload at gate time is the canonical payload.** The `args_json` and `args_sha256` stored in `tool_approval_pending` at gate entry time are the values passed to the MCP server. The dispatch code in `internal/runtime/dispatch.go` re-serialises from the same frozen `args map[string]any` that was captured before `Check()` was called — the agent cannot substitute different arguments after approval is granted, preventing TOCTOU substitution.
 
-5. **Reviewer identity is OS-level only.** `reviewer` is set from `os.environ.get("USER")` or `os.getlogin()`. This is adequate for single-user workstations and CI environments but is not a strong identity claim in shared-user systems. Teams requiring stronger identity guarantees should gate the `tag` binary itself (e.g., via sudo or a signed CLI wrapper).
+5. **Reviewer identity is OS-level only.** `reviewer` is set from `os/user.Current().Username`. This is adequate for single-user workstations and CI environments but is not a strong identity claim in shared-user systems. Teams requiring stronger identity guarantees should gate the `tag` binary itself (e.g., via sudo or a signed CLI wrapper).
 
 6. **Secrets in argument payloads.** Tool arguments may contain API keys or sensitive values. The `args_json` column stores these verbatim. The `tool_approval_log` table should be included in the same access control perimeter as the rest of the TAG SQLite database (`~/.tag/runtime/tag.sqlite3`). Do not export audit logs to untrusted destinations without redacting sensitive argument fields.
 
 7. **Denial-of-service via approval flood.** A misconfigured or malicious agent could generate thousands of pending approvals per second, filling the `tool_approval_pending` table. A rate limit of at most 10 pending approvals per profile per minute is enforced at the gate layer; calls exceeding this limit are auto-denied with a rate-limit error logged.
 
-8. **Race condition on approve+run.** The `UPDATE ... WHERE status='pending'` pattern with rowcount assertion prevents two concurrent `tag mcp approve` invocations from both succeeding on the same approval. If `rowcount == 0`, the second caller receives exit code 2 ("already decided").
+8. **Race condition on concurrent approve+deny.** The `UPDATE ... WHERE status='pending'` pattern with row-count assertion prevents two concurrent `tag mcp approve` invocations from both succeeding on the same approval. The in-process `Resolve()` path is additionally protected by a mutex and a buffered channel of capacity 1; only the first send succeeds.
 
 ---
 
 ## 12. Testing Strategy
 
-### 12.1 Unit Tests (`tests/test_tool_approval.py`)
+### 12.1 Unit Tests (`internal/tool/approval_test.go`)
+
+Tests use the standard `testing` package + `testify/assert` + `testify/require`. SQLite is opened in-memory (`modernc.org/sqlite`, `file::memory:?cache=shared`) and the migration DDL is applied before each test. Run with `go test ./internal/tool/...`.
 
 | Test | Description |
 |------|-------------|
-| `test_match_rule_profile_scoped` | Gate matches profile-scoped rule and ignores global rule when profile matches |
-| `test_match_rule_global_fallback` | Gate falls back to global rule when no profile-scoped rule matches |
-| `test_match_rule_no_match` | Gate returns `None` for ungated tool; `check()` returns without creating any DB row |
-| `test_create_pending_row` | `check()` creates a `tool_approval_pending` row with correct `args_sha256` |
-| `test_args_sha256_canonical` | SHA-256 of `{"b":1,"a":2}` equals SHA-256 of `{"a":2,"b":1}` |
-| `test_approved_resumes` | `check()` returns normally after DB row status updated to `approved` |
-| `test_denied_raises` | `check()` raises `ApprovalDeniedError` after DB row status set to `denied` |
-| `test_timeout_auto_deny` | Auto-deny fires within 250 ms of deadline when `auto_deny_on_timeout=True` |
-| `test_timeout_blocks` | Without auto-deny, `ApprovalTimeoutError` is raised at deadline |
-| `test_append_log_on_approve` | Approving a pending record appends one row to `tool_approval_log` |
-| `test_append_log_on_deny` | Denying appends one row with `decision='denied'` |
-| `test_log_no_update_trigger` | Attempting `UPDATE tool_approval_log` raises `sqlite3.OperationalError` |
-| `test_log_no_delete_trigger` | Attempting `DELETE FROM tool_approval_log` raises `sqlite3.OperationalError` |
-| `test_duplicate_rule_rejected` | Adding a duplicate (tool, profile) rule exits with code 1, no second DB row created |
-| `test_zero_overhead_ungated` | `check()` on ungated tool executes in < 1 ms (no DB writes) |
-| `test_event_fired_on_pending` | Creating a pending approval fires a `tool_approval.pending` event in the `events` table |
+| `TestMatchRuleProfileScoped` | Gate matches profile-scoped rule and ignores global rule when profile matches |
+| `TestMatchRuleGlobalFallback` | Gate falls back to global rule when no profile-scoped rule matches |
+| `TestMatchRuleNoMatch` | Gate returns `nil` for ungated tool; `Check()` returns without creating any DB row |
+| `TestCreatePendingRow` | `Check()` creates a `tool_approval_pending` row with correct `args_sha256` |
+| `TestArgsSHA256Canonical` | `SHA-256({"b":1,"a":2})` equals `SHA-256({"a":2,"b":1})` (both marshal to same sorted JSON) |
+| `TestApprovedResumes` | `Check()` returns nil after `Resolve()` sends an `approved` Decision on the channel |
+| `TestDeniedReturnsError` | `Check()` returns `*ApprovalDeniedError` after `Resolve()` sends a `denied` Decision |
+| `TestTimeoutAutoDeny` | Auto-deny fires within 250 ms of `context.WithTimeout` deadline when `AutoDenyOnTimeout=true` |
+| `TestTimeoutBlocks` | Without auto-deny, `*ApprovalTimeoutError` is returned at deadline |
+| `TestAppendLogOnApprove` | Approving a pending record appends one row to `tool_approval_log` |
+| `TestAppendLogOnDeny` | Denying appends one row with `decision='denied'` |
+| `TestLogNoUpdateTrigger` | `db.Exec("UPDATE tool_approval_log SET decision='approved' WHERE id='x'")` returns an error containing `"append-only"` |
+| `TestLogNoDeleteTrigger` | `db.Exec("DELETE FROM tool_approval_log WHERE id='x'")` returns an error containing `"append-only"` |
+| `TestDuplicateRuleRejected` | Adding a duplicate `(tool, profile)` rule returns a unique-constraint error; no second DB row created |
+| `TestZeroOverheadUngated` | `Check()` on ungated tool completes in < 1 ms (no DB writes); verified with `testing.B` |
+| `TestEventFiredOnPending` | Creating a pending approval inserts a `tool_approval.pending` event row in the `events` table |
+| `TestHashChain` | When `hashChain=true`, successive log rows have `prev_hash` equal to `SHA-256(canonical-JSON of previous row)` |
 
 ### 12.2 Integration Tests
 
+Integration tests start the full approval server via `net/http/httptest.NewServer`, exercise the `PermissionService` against a real on-disk SQLite file, and invoke Cobra commands directly.
+
 | Test | Description |
 |------|-------------|
-| `test_end_to_end_cli_approve` | Full flow: add rule, start gated run, `tag mcp approve <id>`, verify run completes and log row exists |
-| `test_end_to_end_cli_deny` | Full flow: add rule, start gated run, `tag mcp approve <id> --deny`, verify run exits code 5 and denial logged |
-| `test_webhook_approve` | Start approval server on random port, POST to `/approvals/<id>/approve`, verify agent resumes |
-| `test_webhook_deny` | POST to `/approvals/<id>/deny`, verify agent exit 5 |
-| `test_list_pending_json` | `tag mcp approvals list --pending --json` returns valid JSON within 200 ms for 1,000 pending rows |
-| `test_export_ndjson` | `tag mcp approvals export --format ndjson` produces valid NDJSON with all required fields |
-| `test_export_filtered_by_profile` | `--profile coder` filter returns only rows for coder profile |
-| `test_rule_survives_restart` | Add rule, kill process, relaunch, assert rule present via `tag mcp approve-required list` |
-| `test_args_dispatched_unchanged` | Verify the args JSON dispatched to MCP server equals the `args_json` in the log row, byte-for-byte |
+| `TestEndToEndCLIApprove` | Full flow: add rule, start gated run goroutine, call `cmdMCPApprove`, verify run completes and log row exists |
+| `TestEndToEndCLIDeny` | Full flow: add rule, start gated run goroutine, call `cmdMCPApprove --deny`, verify goroutine returns `*ApprovalDeniedError` and denial logged |
+| `TestWebhookApprove` | Start `ApprovalServer` via `httptest.NewServer`; POST to `/approvals/<id>/approve`; verify agent goroutine resumes |
+| `TestWebhookDeny` | POST to `/approvals/<id>/deny`; verify agent goroutine returns error with exit code 5 |
+| `TestListPendingJSON` | `cmdMCPApprovalsList --pending --json` returns valid JSON within 200 ms for 1,000 pending rows |
+| `TestExportNDJSON` | `cmdMCPApprovalsExport --format ndjson` produces valid NDJSON with all required fields |
+| `TestExportFilteredByProfile` | `--profile coder` filter returns only rows for coder profile |
+| `TestRuleSurvivesRestart` | Add rule, close and reopen store, assert rule present via `cmdMCPApproveRequiredList` |
+| `TestArgsDispatchedUnchanged` | Verify args JSON dispatched to the MCP mock equals `tool_approval_pending.args_json` byte-for-byte |
+| `TestConcurrentResolve` | Two concurrent `Resolve()` calls on the same approval ID: first succeeds, second returns conflict error (NFR-04) |
+| `TestSSEPendingEvent` | SSE client connected to `/approvals/events` receives a `pending-approval` event within 500 ms of `Check()` creating a pending record |
 
-### 12.3 Performance Tests
+### 12.3 Performance Tests (`internal/tool/approval_bench_test.go`)
 
-| Test | Description | Target |
-|------|-------------|--------|
-| `bench_gate_overhead_ungated` | 1,000 ungated tool calls through `check()` | < 1 ms per call |
-| `bench_list_pending_1k` | `tag mcp approvals list --pending` with 1,000 pending rows | < 200 ms |
-| `bench_export_10k` | `tag mcp approvals export` streaming 10,000 log rows | < 2 s |
-| `bench_approve_latency` | Time from `tag mcp approve <id>` to agent resume | < 500 ms |
+| Benchmark | Description | Target |
+|-----------|-------------|--------|
+| `BenchmarkGateOverheadUngated` | 1,000 ungated tool calls through `Check()` | < 1 ms per call |
+| `BenchmarkListPending1k` | `cmdMCPApprovalsList --pending` with 1,000 pending rows | < 200 ms |
+| `BenchmarkExport10k` | `cmdMCPApprovalsExport` streaming 10,000 log rows via cursor | < 2 s |
+| `BenchmarkApproveLatency` | Time from `Resolve()` send to `Check()` return | < 1 ms (channel-based; no poll) |
 
 ---
 
@@ -1232,19 +1033,19 @@ approval:
 | AC-03 | A `tag run` on the `coder` profile that calls `bash` with a gated rule does NOT dispatch the bash call until `status='approved'` in `tool_approval_pending`. | Integration test: assert no MCP call before approval |
 | AC-04 | `tag mcp approve <id>` transitions `tool_approval_pending.status` to `'approved'` and the agent resumes within 500 ms. | Timing assertion in integration test |
 | AC-05 | `tag mcp approve <id> --deny` transitions status to `'denied'`, the run exits with code 5, and `tool_approval_log` has a row with `decision='denied'`. | Integration test |
-| AC-06 | With `--timeout 5 --auto-deny-on-timeout`, a run with no reviewer fires auto-deny within 5.5 seconds and exits code 5. | Integration test with mocked time |
+| AC-06 | With `--timeout 5 --auto-deny-on-timeout`, a run with no reviewer fires auto-deny within 5.5 seconds and exits code 5. | Integration test with `context.WithTimeout` |
 | AC-07 | `tool_approval_log` contains exactly one row per approval decision (not zero, not two). | Assert `COUNT(*) = 1` after each decision in integration tests |
-| AC-08 | `UPDATE tool_approval_log SET decision='approved' WHERE id='x'` raises `sqlite3.OperationalError` containing "append-only". | Unit test |
-| AC-09 | `DELETE FROM tool_approval_log WHERE id='x'` raises `sqlite3.OperationalError` containing "append-only". | Unit test |
+| AC-08 | `db.Exec("UPDATE tool_approval_log SET decision='approved' WHERE id='x'")` returns an error whose message contains `"append-only"`. | Unit test asserting `err.Error()` contains `"append-only"` |
+| AC-09 | `db.Exec("DELETE FROM tool_approval_log WHERE id='x'")` returns an error whose message contains `"append-only"`. | Unit test asserting `err.Error()` contains `"append-only"` |
 | AC-10 | `tag mcp approvals list --pending --json` returns valid JSON array within 200 ms for 1,000 pending rows. | Performance test |
 | AC-11 | `tag mcp approvals export --format ndjson` produces one valid JSON object per line with all fields: `log_id`, `approval_id`, `rule_id`, `tool`, `mcp_server`, `profile`, `run_id`, `args_json`, `args_sha256`, `decision`, `reviewer`, `reviewer_source`, `rationale`, `created_at`, `decided_at`. | Schema validation in integration test |
 | AC-12 | A `POST /approvals/<id>/approve` to the webhook server with a `X-Approver: alice` header records `reviewer='alice'` and `reviewer_source='webhook'` in the log. | Integration test |
-| AC-13 | The `args_sha256` in `tool_approval_log` matches `hashlib.sha256(json.dumps(args, sort_keys=True, separators=(",",":")).encode()).hexdigest()`. | Unit test with known fixture |
-| AC-14 | The arguments received by the MCP server are byte-for-byte identical to `tool_approval_pending.args_json` for the corresponding approval. | Integration test with request capture |
-| AC-15 | An ungated tool call (no matching rule) adds zero rows to `tool_approval_pending` and zero rows to `tool_approval_log`. | Unit test: assert both tables empty after ungated tool call |
+| AC-13 | The `args_sha256` in `tool_approval_log` matches `fmt.Sprintf("%x", sha256.Sum256(jsonBytes))` where `jsonBytes = json.Marshal(args)` (Go's map marshalling sorts keys). | Unit test with known fixture |
+| AC-14 | The arguments received by the MCP server are byte-for-byte identical to `tool_approval_pending.args_json` for the corresponding approval. | Integration test with MCP mock capturing request |
+| AC-15 | An ungated tool call (no matching rule) adds zero rows to `tool_approval_pending` and zero rows to `tool_approval_log`. | Unit test: assert both tables empty after ungated `Check()` |
 | AC-16 | `tag mcp approve-required remove --tool bash --profile coder` removes the rule; subsequent gated runs for `coder/bash` proceed without pausing. | Integration test |
-| AC-17 | Webhook server binds only to `127.0.0.1`, not `0.0.0.0`. | Assert `server.server_address[0] == '127.0.0.1'` in unit test |
-| AC-18 | Adding a duplicate rule (same tool+profile) exits with code 1 and a descriptive error; no second row is created. | Integration test |
+| AC-17 | Webhook server `http.Server.Addr` begins with `127.0.0.1:`, never `0.0.0.0`. | Unit test asserting `srv.Addr` prefix |
+| AC-18 | Adding a duplicate rule (same tool+profile) returns a descriptive error and exits 1; no second row is created. | Integration test |
 
 ---
 
@@ -1252,15 +1053,23 @@ approval:
 
 | Dependency | Type | Notes |
 |------------|------|-------|
-| PRD-013: Agent Tracing / Observability | Upstream | Provides `spans` table and span IDs that the approval gate records in `tool_approval_log.trace_span_id` and `tool_approval_pending.trace_span_id`. Gate creates a child span for the approval wait duration. |
+| PRD-013: Agent Tracing / Observability | Upstream | Provides `spans` table and span IDs recorded in `tool_approval_log.trace_span_id`. Gate creates a child OTel span (`go.opentelemetry.io/otel`) named `tool_approval.gate` with attributes `approval_id`, `tool_name`, `decision`, `duration_ms`. |
 | PRD-016: Webhook Event Triggers | Upstream | The `events` table (populated by this PRD on `tool_approval.pending`) is consumed by PRD-016's webhook dispatcher to fire Slack/HTTP callbacks. |
-| PRD-027: Eval Framework | Upstream | Eval suites can include cases that verify gated profiles pause on target tools; `eval.py` needs to handle `ApprovalDeniedError` gracefully in test runs. |
-| PRD-028: Sandbox Execution | Related | `sandbox.py` and the approval gate may both intercept `bash` calls; the approval gate fires first (pre-dispatch), sandbox restrictions fire at the OS level. Both are orthogonal layers. |
-| PRD-034: Secret Scanning / Security | Related | `security.py` may scan argument payloads for secrets. The approval gate surfaces the full payload to the reviewer, making the argument visible before any secret-containing call executes. |
+| PRD-027: Eval Framework | Upstream | Eval suites can include cases that verify gated profiles pause on target tools; the eval runner must handle `*ApprovalDeniedError` gracefully in test runs. |
+| PRD-028: Sandbox Execution | Related | `internal/runtime/sandbox.go` and the approval gate may both intercept `bash` calls; the approval gate fires first (pre-dispatch in `DispatchToolCall`), sandbox restrictions fire at the OS level. Both are orthogonal layers. |
+| PRD-034: Secret Scanning / Security | Related | `internal/security` may scan argument payloads for secrets. The approval gate surfaces the full payload to the reviewer before any secret-containing call executes. |
 | PRD-040: Notification Hooks | Upstream | `tool_approval.pending` events flow through the PRD-040 notification hook dispatch chain; Slack/email/desktop channels must be configured there. |
-| PRD-048: Structured Tool Call Spans | Related | Approval gate creates a `tool_approval.gate` span as a child of the existing tool call span created by PRD-048. |
-| `stdlib: http.server` | Runtime | Used for the webhook approval server. No new third-party dependencies required. |
-| `stdlib: hashlib, json, threading` | Runtime | Used in `tool_approval.py`. No new third-party dependencies. |
+| PRD-048: Structured Tool Call Spans | Related | Approval gate creates a `tool_approval.gate` OTel span as a child of the existing tool call span created by PRD-048. |
+| `modernc.org/sqlite` | Runtime | Pure-Go SQLite driver (`CGO_ENABLED=0`); FTS5 built-in; single-writer via `gofrs/flock`. Replaces Python `sqlite3`/`aiosqlite`. |
+| `go-chi/chi v5` | Runtime | HTTP router for the approval webhook server. |
+| `tmaxmax/go-sse` | Runtime | Spec-compliant SSE with `Last-Event-ID` replay for streaming pending-approval events to clients. |
+| `crypto/sha256` | stdlib | SHA-256 of canonical argument JSON and optional log row hash-chaining. Replaces Python `hashlib`. |
+| `encoding/json` | stdlib | Canonical JSON serialisation (map keys sorted by default). Replaces Python `json`. |
+| `sync`, `context` | stdlib | Mutex for `pending` map; `context.WithTimeout` for gate deadline. Replaces Python `threading` / `asyncio`. |
+| `os/user` | stdlib | `user.Current().Username` for reviewer identity. Replaces Python `os.getlogin()` / `os.environ.get("USER")`. |
+| `go.opentelemetry.io/otel` | Runtime | OTel spans for approval gate duration (PRD-013/048). |
+| `knadh/koanf/v2` | Runtime | Config loading and profile YAML merge for `approval.*` keys. |
+| `github.com/spf13/cobra` | Runtime | CLI command registration for all `tag mcp approve*` sub-commands. |
 
 ---
 
@@ -1275,7 +1084,7 @@ approval:
 | OQ-5 | Should `tag mcp approvals export` support a **streaming cursor mode** for very large log tables (> 1M rows) via pagination? | Low for initial deployment; high for enterprise | Eng | Phase 2 |
 | OQ-6 | Can the approval gate be **bypassed per-session** with an explicit `--no-approval-gate` flag for power users running trusted local profiles? If yes, does bypassing it require a log entry? | Medium — developer ergonomics vs. security | Product | Phase 1 |
 | OQ-7 | Should the `tool_approval_log` support **external export to SIEM** (Splunk, Datadog, CloudWatch) via an OTel exporter (PRD-041), or is NDJSON file export sufficient for the first iteration? | Medium — enterprise adoption | Product | Phase 2 |
-| OQ-8 | How should the gate behave when `tag run` is invoked with `--non-interactive` (no TTY) and no timeout is configured? Currently it would block forever. Should non-interactive mode force `--auto-deny-on-timeout` with a default of 300 seconds? | High — CI safety | Eng | Phase 1 |
+| OQ-8 | How should the gate behave when `tag run` is invoked with `--non-interactive` (no TTY) and no timeout is configured? Currently it would block forever on the channel. Should non-interactive mode force `--auto-deny-on-timeout` with a default of 300 seconds? | High — CI safety | Eng | Phase 1 |
 
 ---
 
@@ -1285,37 +1094,36 @@ approval:
 
 | Day | Work |
 |-----|------|
-| 1–2 | `_migrate_prd_078_tables()` DDL; `tool_approval.py` dataclasses and `ApprovalGate` skeleton; unit tests for rule matching and SHA-256 canonicalization |
-| 3–4 | `ApprovalGate.check()` full implementation: pending record creation, `events` table integration, blocking poll with timeout, auto-deny path, `_append_log()` audit trail |
-| 5   | `_migrate_prd_078_tables()` integrated into `open_db()`; append-only triggers; trigger enforcement unit tests |
-| 6   | `hermes_bridge.py` integration: inject `gate.check()` into tool dispatch path; integration test verifying MCP call does not fire before approval |
+| 1–2 | `migratePRD078Tables` DDL in `internal/store/migrate.go`; `internal/tool/approval.go` Go structs (`ApprovalRule`, `Decision`, `pendingApproval`, error types) and `PermissionService` skeleton; unit tests for rule matching and `canonicalArgsSHA256` |
+| 3–4 | `PermissionService.Check()` full implementation: `createPending` (single-transaction DB write + event row), channel-based blocking `select`, `context.WithTimeout` deadline, auto-deny path, `appendLog` with optional hash-chain (`crypto/sha256`) |
+| 5   | `migratePRD078Tables` integrated into `store.Open()` migration chain; append-only triggers; trigger enforcement unit tests asserting `err.Error()` contains `"append-only"` |
+| 6   | `internal/runtime/dispatch.go` integration: inject `ps.Check()` call; integration test verifying MCP mock receives no call before `Resolve()` is called |
 
 ### Phase 2 — CLI Commands (Days 7–11)
 
 | Day | Work |
 |-----|------|
-| 7–8 | `cmd_mcp_approve_required` (add/remove/list); argparse wiring under `tag mcp approve-required`; unit + integration tests |
-| 9   | `cmd_mcp_approvals` (list, show, export); `--pending` filter; NDJSON streaming export |
-| 10  | `cmd_mcp_approve` (approve/deny with rationale); exit code handling; reviewer identity capture |
-| 11  | Manual CLI smoke tests; fix edge cases found during testing |
+| 7–8 | `cmdMCPApproveRequiredAdd`, `cmdMCPApproveRequiredRemove`, `cmdMCPApproveRequiredList` in `internal/cli/mcp_approve.go`; cobra wiring under `tag mcp approve-required`; UNIQUE constraint error handling; unit + integration tests |
+| 9   | `cmdMCPApprovalsList`, `cmdMCPApprovalsShow`, `cmdMCPApprovalsExport`; `--pending` filter; lazy NDJSON streaming via `*sql.Rows` cursor (NFR-03) |
+| 10  | `cmdMCPApprove` (approve/deny with rationale); `os/user.Current().Username` reviewer capture; exit code mapping; in-process vs. webhook-POST resolution path |
+| 11  | Manual CLI smoke tests; edge-case fixes |
 
 ### Phase 3 — Webhook Server + Notifications (Days 12–16)
 
 | Day | Work |
 |-----|------|
-| 12–13 | `approval_server.py` implementation; `start_approval_server()` integration into `tag run` startup when `approval.webhook_port` is configured |
-| 14  | PRD-040 notification hook integration for `tool_approval.pending` events; desktop notification in `ApprovalGate._fire_notification()` |
-| 15  | Webhook integration tests (approve/deny via HTTP, X-Approver header, concurrent request race condition) |
-| 16  | Performance benchmarks; ensure zero overhead for ungated tools (NFR-06) |
+| 12–13 | `internal/server/approval.go`: `ApprovalServer` with `go-chi/chi v5` router + `tmaxmax/go-sse` SSE endpoint; `StartApprovalServer` goroutine + context-cancel shutdown; bind assertion `127.0.0.1` |
+| 14  | `StartApprovalServer` wired into `tag run` startup when `approval.webhook_port` is configured (loaded via `koanf/v2`); PRD-040 notification hook integration for `tool_approval.pending` events; desktop notification in `PermissionService.fireNotification()` |
+| 15  | Webhook integration tests via `httptest.NewServer`: approve/deny via HTTP, `X-Approver` header, concurrent request race condition, SSE event delivery |
+| 16  | Performance benchmarks; zero-overhead ungated tool call benchmark (NFR-06) |
 
 ### Phase 4 — Hardening + Docs (Days 17–20)
 
 | Day | Work |
 |-----|------|
-| 17  | Edge case coverage: duplicate rule rejection, expired approval CLI error, non-interactive mode behavior (OQ-8) |
+| 17  | Edge case coverage: duplicate rule rejection, expired approval CLI error, non-interactive mode auto-deny behavior (OQ-8), `--no-approval-gate` bypass flag (OQ-6) |
 | 18  | `tag doctor` check for `tool_approval_rules` table existence and pending approvals count |
-| 19  | Security review: webhook binding assertion, rate-limit implementation (SC-7), argument size handling (OQ-3) |
-| 20  | Final integration test pass; coverage assertion (> 90%); PR review |
+| 19  | Security review: webhook `127.0.0.1` binding assertion test, rate-limit implementation (SC-7), argument size handling (OQ-3), hash-chain verification utility |
+| 20  | Final integration test pass; `go test -coverprofile` assertion (> 90% for `internal/tool/approval.go`); PR review |
 
 **Total estimate:** 20 engineering days (4 weeks for a single developer, ~2 weeks with two developers working Phase 1/2 in parallel with Phase 3/4).
-

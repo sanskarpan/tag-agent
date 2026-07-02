@@ -1,11 +1,13 @@
 # PRD-123: Runtime Guardrail Hooks/Tripwire (`tag guardrail runtime`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Security/Guardrails
-**Affects:** `guardrails.py + controller.py`
-**Depends on:** PRD-124 (GuardrailResult dataclass), PRD-121 (output guardrail processor), PRD-122 (input guardrail validator), PRD-013 (agent tracing — span hooks)
+**Affects:** `internal/runtime/guardrail/runtime.go` + `internal/tool` (permission-gate middleware) + `internal/cli`
+**Depends on:** PRD-124 (GuardrailResult type), PRD-121 (output guardrail processor), PRD-122 (input guardrail validator), PRD-013 (agent tracing — span hooks)
 **Inspired by:** Nemo Guardrails dialogue flow rails, LangGraph interrupt() safety hooks, Guardrails AI validators on tool calls, Anthropic safety layer
 
 ---
@@ -16,7 +18,7 @@ Input guardrails (PRD-122) validate prompts before they reach the model. Output 
 
 Runtime Guardrail Hooks/Tripwire (`tag guardrail runtime`) introduces hooks that intercept agent behavior between steps — specifically at tool call boundaries. A runtime guardrail is associated with a tool name or tool call pattern and executes before or after that tool call: before (pre-hook) to approve or block the call, or after (post-hook) to validate the return value. Runtime guardrails can also be "tripwires" — silent detectors that accumulate evidence of suspicious patterns and trigger a HITL interrupt (PRD-109) or abort when a threshold is met.
 
-The design is inspired by LangGraph's `interrupt()` pattern (pause before risky actions), Nemo Guardrails' action hooks (intercept LLM actions), and the concept of runtime application self-protection (RASP) in traditional security. The implementation hooks into the TAG span system (PRD-013) at the `TOOL` span boundary.
+The design is inspired by LangGraph's `interrupt()` pattern (pause before risky actions), Nemo Guardrails' action hooks (intercept LLM actions), and the concept of runtime application self-protection (RASP) in traditional security. In the Go harness the hooks are implemented as **middleware in the agent loop**: they wrap the unified tool-dispatch interface (`internal/tool`, `Info/Run/ProviderOptions` — the same gate that hosts the rule-based wildcard permission engine) and fire at the `TOOL` span boundary emitted by `internal/obs` (PRD-013). A `RuntimeGuardrail` is a Go interface with `CheckPre`/`CheckPost` methods; the registry composes the configured hooks around every `Run(ctx, ToolCall)`.
 
 ---
 
@@ -140,8 +142,8 @@ Options:
 
 | ID | Requirement |
 |----|------------|
-| FR-01 | At every TOOL span start, the TAG span system calls `RuntimeGuardrailRegistry.check_pre(tool_name, tool_args)`. |
-| FR-02 | `deny-pattern` hook: match `tool_args` JSON against `--pattern` regex; return `block` if matched. |
+| FR-01 | At every TOOL span start (inside the `internal/tool` dispatch middleware), the runtime calls `RuntimeGuardrailRegistry.CheckPre(ctx, toolName, toolArgs)`; the post path calls `CheckPost(ctx, toolName, toolResult)` at span end. |
+| FR-02 | `deny-pattern` hook: marshal `toolArgs` to JSON, match against the `--pattern` regexp (`regexp.Regexp`, `(?i)` case-insensitive, pre-compiled at registry load); return `block` if matched. |
 | FR-03 | `require-approval` hook: return `interrupt` with the configured `--message`; PRD-109 handles the HITL interrupt. |
 | FR-04 | `tripwire` hook: increment a per-session counter for the tool pattern; if counter ≥ threshold within the window, return `interrupt`. |
 | FR-05 | `output-secret-scan` post-hook: scan tool return value for secrets (PRD-034); return `warn` with the detected secret type. |
@@ -149,7 +151,7 @@ Options:
 | FR-07 | `interrupt` action: the workflow is paused via PRD-109 `interrupt()`; on operator approval, the tool call executes normally. |
 | FR-08 | `warn` action: tool call executes normally; a warning is logged to `guardrail_events` and printed to stderr. |
 | FR-09 | All hook decisions (including pass) written to `guardrail_events` with `direction='runtime'`, `tool_name`, `action`, `reason`. |
-| FR-10 | `tag guardrail runtime test --tool "shell_execute" --args '{"command": "rm -rf /tmp"}'` dry-runs all hooks against the mock tool call. |
+| FR-10 | `tag guardrail runtime test --tool "shell_execute" --args '{"command": "rm -rf /tmp"}'` dry-runs all hooks against the mock tool call (no dispatch, no side effects). |
 
 ---
 
@@ -158,15 +160,17 @@ Options:
 | ID | Requirement |
 |----|------------|
 | NFR-01 | Pre-hooks must not add more than 10ms to any tool call dispatch path. |
-| NFR-02 | Tripwire counters persisted in SQLite (not in-memory) to survive process restart. |
-| NFR-03 | Hook registry is loaded once at process start and cached; config changes require process restart. |
-| NFR-04 | Glob pattern matching (`http_*`) must be O(1) using pre-compiled `fnmatch` patterns. |
+| NFR-02 | Tripwire counters persisted in `modernc.org/sqlite` (not in-memory) to survive process restart; increment uses the store's single-writer path. |
+| NFR-03 | Hook registry is loaded once at process start into an immutable in-memory slice and cached; config changes require process restart. |
+| NFR-04 | Tool-name glob matching (`http_*`) uses pre-compiled `gobwas/glob` matchers (the same glob lib used by `internal/obs` pricing) built once at registry load; each match is allocation-free. |
 
 ---
 
 ## 9. Technical Design
 
 ### 9.1 SQLite DDL
+
+Schema is created by the `internal/store` migrator (modernc.org/sqlite, CGO_ENABLED=0). DDL is identical:
 
 ```sql
 CREATE TABLE IF NOT EXISTS runtime_guardrail_configs (
@@ -195,92 +199,134 @@ CREATE TABLE IF NOT EXISTS tripwire_counters (
 );
 ```
 
-### 9.2 Python core
+### 9.2 Go core (`internal/runtime/guardrail`)
 
-```python
-from __future__ import annotations
-import fnmatch
-import json
-import re
-import sqlite3
-from typing import List, Optional
-from tag.guardrail_result import GuardrailResult, GuardrailAction
+The registry loads all enabled configs once at start, pre-compiling each `tool_pattern` into a `glob.Glob` and each deny `pattern` into a `*regexp.Regexp`. `CheckPre`/`CheckPost` run the configured hooks in order and return on the first non-pass result. Tripwire counters go through the shared `internal/store` (modernc.org/sqlite) so they survive restart.
 
-class RuntimeGuardrailRegistry:
-    def __init__(self, conn: sqlite3.Connection, profile: str) -> None:
-        self.conn = conn
-        self.profile = profile
-        self._configs = conn.execute(
-            "SELECT * FROM runtime_guardrail_configs WHERE profile=? AND enabled=1",
-            (profile,)
-        ).fetchall()
+```go
+package guardrail
 
-    def check_pre(self, tool_name: str, tool_args: dict,
-                  session_id: Optional[str] = None) -> GuardrailResult:
-        for cfg in self._configs:
-            if cfg["hook_point"] != "pre":
-                continue
-            if not fnmatch.fnmatch(tool_name, cfg["tool_pattern"]):
-                continue
-            result = self._apply(cfg, tool_name, tool_args, session_id)
-            if result.action != GuardrailAction.PASS:
-                return result
-        return GuardrailResult(action=GuardrailAction.PASS, guardrail="runtime")
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"regexp"
 
-    def check_post(self, tool_name: str, tool_result: str,
-                   session_id: Optional[str] = None) -> GuardrailResult:
-        for cfg in self._configs:
-            if cfg["hook_point"] != "post":
-                continue
-            if not fnmatch.fnmatch(tool_name, cfg["tool_pattern"]):
-                continue
-            if cfg["guardrail_type"] == "output-secret-scan":
-                from tag.secret_scanner import SecretScanner
-                findings = SecretScanner().scan_text(tool_result)
-                if findings:
-                    return GuardrailResult(
-                        action=GuardrailAction(cfg["action"]), guardrail="runtime",
-                        reason=f"SECRET_IN_TOOL_OUTPUT:{findings[0].type}"
-                    )
-        return GuardrailResult(action=GuardrailAction.PASS, guardrail="runtime")
+	"github.com/gobwas/glob"
 
-    def _apply(self, cfg, tool_name: str, tool_args: dict,
-               session_id: Optional[str]) -> GuardrailResult:
-        action = GuardrailAction(cfg["action"])
-        if cfg["guardrail_type"] == "deny-pattern":
-            args_str = json.dumps(tool_args)
-            if cfg["pattern"] and re.search(cfg["pattern"], args_str, re.IGNORECASE):
-                return GuardrailResult(action=action, guardrail="runtime",
-                                       reason=f"DENY_PATTERN:{cfg['pattern'][:50]}")
-        elif cfg["guardrail_type"] == "require-approval":
-            return GuardrailResult(action=action, guardrail="runtime",
-                                   reason="REQUIRE_APPROVAL", message=cfg.get("message"))
-        elif cfg["guardrail_type"] == "tripwire":
-            count = self._increment_tripwire(cfg["id"], session_id or "")
-            if count >= (cfg["threshold"] or 10):
-                msg = (cfg.get("message") or "Tripwire triggered").replace("{{count}}", str(count))
-                return GuardrailResult(action=action, guardrail="runtime",
-                                       reason=f"TRIPWIRE:{count}", message=msg)
-        return GuardrailResult(action=GuardrailAction.PASS, guardrail="runtime")
+	"github.com/tag-agent/tag/internal/store"
+)
 
-    def _increment_tripwire(self, config_id: str, session_id: str) -> int:
-        now = _utc_now()
-        self.conn.execute(
-            "INSERT INTO tripwire_counters(id,session_id,config_id,count,window_start,updated_at) "
-            "VALUES(?,?,?,1,?,?) ON CONFLICT(session_id,config_id) DO UPDATE SET count=count+1,updated_at=?",
-            (f"{config_id}_{session_id}", session_id, config_id, now, now, now)
-        )
-        self.conn.commit()
-        row = self.conn.execute(
-            "SELECT count FROM tripwire_counters WHERE session_id=? AND config_id=?",
-            (session_id, config_id)
-        ).fetchone()
-        return row["count"] if row else 1
+// SecretScanner is satisfied by the PRD-034 scanner; injected to keep this
+// package dependency-light and testable.
+type SecretScanner interface {
+	ScanText(s string) []SecretFinding
+}
+type SecretFinding struct{ Type string }
 
-def _utc_now() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
+type hook struct {
+	cfg     RuntimeConfig      // row from runtime_guardrail_configs
+	toolPat glob.Glob          // pre-compiled tool_pattern
+	denyRe  *regexp.Regexp     // pre-compiled deny pattern (nil unless deny-pattern)
+}
+
+// RuntimeGuardrailRegistry is loaded once and treated as immutable.
+type RuntimeGuardrailRegistry struct {
+	profile string
+	pre     []hook
+	post    []hook
+	tw      *store.TripwireStore
+	scanner SecretScanner
+}
+
+func NewRegistry(ctx context.Context, st *store.Store, profile string, sc SecretScanner) (*RuntimeGuardrailRegistry, error) {
+	cfgs, err := st.LoadRuntimeGuardrailConfigs(ctx, profile) // WHERE profile=? AND enabled=1
+	if err != nil {
+		return nil, err
+	}
+	r := &RuntimeGuardrailRegistry{profile: profile, tw: st.Tripwire(), scanner: sc}
+	for _, c := range cfgs {
+		g, err := glob.Compile(c.ToolPattern)
+		if err != nil {
+			return nil, fmt.Errorf("guardrail %s: bad tool pattern: %w", c.ID, err)
+		}
+		h := hook{cfg: c, toolPat: g}
+		if c.GuardrailType == "deny-pattern" && c.Pattern != "" {
+			if h.denyRe, err = regexp.Compile("(?i)" + c.Pattern); err != nil {
+				return nil, fmt.Errorf("guardrail %s: bad deny regexp: %w", c.ID, err)
+			}
+		}
+		if c.HookPoint == "post" {
+			r.post = append(r.post, h)
+		} else {
+			r.pre = append(r.pre, h)
+		}
+	}
+	return r, nil
+}
+
+func (r *RuntimeGuardrailRegistry) CheckPre(ctx context.Context, toolName string, toolArgs map[string]any, sessionID string) GuardrailResult {
+	for _, h := range r.pre {
+		if !h.toolPat.Match(toolName) {
+			continue
+		}
+		if res := r.apply(ctx, h, toolArgs, sessionID); res.Action != ActionPass {
+			return res
+		}
+	}
+	return Pass("runtime")
+}
+
+func (r *RuntimeGuardrailRegistry) CheckPost(ctx context.Context, toolName, toolResult, sessionID string) GuardrailResult {
+	for _, h := range r.post {
+		if !h.toolPat.Match(toolName) {
+			continue
+		}
+		if h.cfg.GuardrailType == "output-secret-scan" {
+			if f := r.scanner.ScanText(toolResult); len(f) > 0 {
+				res := GuardrailResult{Action: GuardrailAction(h.cfg.Action), Guardrail: "runtime",
+					Reason: "SECRET_IN_TOOL_OUTPUT:" + f[0].Type}
+				return res
+			}
+		}
+	}
+	return Pass("runtime")
+}
+
+func (r *RuntimeGuardrailRegistry) apply(ctx context.Context, h hook, toolArgs map[string]any, sessionID string) GuardrailResult {
+	action := GuardrailAction(h.cfg.Action)
+	switch h.cfg.GuardrailType {
+	case "deny-pattern":
+		if h.denyRe != nil {
+			b, _ := json.Marshal(toolArgs)
+			if h.denyRe.Match(b) {
+				p := h.cfg.Pattern
+				if len(p) > 50 {
+					p = p[:50]
+				}
+				return GuardrailResult{Action: action, Guardrail: "runtime", Reason: "DENY_PATTERN:" + p}
+			}
+		}
+	case "require-approval":
+		msg := h.cfg.Message
+		return GuardrailResult{Action: action, Guardrail: "runtime", Reason: "REQUIRE_APPROVAL", Message: &msg}
+	case "tripwire":
+		count := r.tw.Increment(ctx, h.cfg.ID, sessionID) // atomic UPSERT + read, single-writer store
+		threshold := h.cfg.Threshold
+		if threshold == 0 {
+			threshold = 10
+		}
+		if count >= threshold {
+			msg := strings.ReplaceAll(orDefault(h.cfg.Message, "Tripwire triggered"), "{{count}}", strconv.Itoa(count))
+			return GuardrailResult{Action: action, Guardrail: "runtime",
+				Reason: fmt.Sprintf("TRIPWIRE:%d", count), Message: &msg}
+		}
+	}
+	return Pass("runtime")
+}
 ```
+
+`store.TripwireStore.Increment` performs the `INSERT … ON CONFLICT(session_id,config_id) DO UPDATE SET count=count+1` UPSERT and returns the new count in one round-trip through the single-writer store (the append-only, non-repudiable increment the security section requires). `require-approval` and threshold-crossing `tripwire` results carry `ActionInterrupt`, which the agent loop routes to the PRD-109 HITL interrupt. `block` results are returned to the loop as the tool result (a `GuardrailBlocked` error) so the tool is never dispatched.
 
 ---
 
@@ -320,7 +366,7 @@ def _utc_now() -> str:
 
 | Dependency | Reason |
 |-----------|--------|
-| PRD-124 GuardrailResult | Shared result dataclass |
+| PRD-124 GuardrailResult | Shared result type |
 | PRD-013 agent tracing | TOOL span boundary hooks |
 | PRD-109 HITL interrupt | `interrupt` action implementation |
 | PRD-034 secret scanning | Post-hook secret detection |

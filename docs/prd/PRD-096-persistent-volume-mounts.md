@@ -1,10 +1,11 @@
 # PRD-096: Persistent Volume Mounts Across Sandbox Runs (`tag sandbox volume`)
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
 **Status:** Proposed
 **Priority:** P3
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Sandbox & Execution Environment
-**Affects:** `sandbox.py + sandbox_volumes SQLite`
+**Affects:** `internal/sandbox + sandbox_volumes SQLite (modernc.org/sqlite)`
 **Depends on:** PRD-028 (Sandbox Code Execution), PRD-034 (Secret Scanning / security.py), PRD-013 (Agent Tracing/Observability), PRD-005 (Execution Backend Selection), PRD-094 (Per-Sandbox Egress Firewall), PRD-097 (Sandbox Secrets Vault), PRD-012 (Cost Tracking / Budget), PRD-020 (CI/CD Integration)
 **Inspired by:** Modal volumes, E2B filesystem, Daytona persistent workspace
 **GitHub Issue:** #348
@@ -267,7 +268,7 @@ tag sandbox volume snapshot <volume-name> \
 - `--description <text>`: Optional human-readable description (stored in `sandbox_volume_snapshots.description`).
 - `--json`: Output snapshot record as JSON.
 
-**Behavior:** Performs a full `shutil.copytree` of the volume directory to `~/.tag/volumes/.snapshots/<volume-name>/<snapshot-name>/`. Snapshot creation is **atomic**: written to a temp directory first, then renamed into place. Records the snapshot in `sandbox_volume_snapshots` with `content_hash` (SHA-256 of sorted file paths + sizes as a lightweight fingerprint).
+**Behavior:** Performs a full recursive directory copy of the volume to `~/.tag/volumes/.snapshots/<volume-name>/<snapshot-name>/`. Snapshot creation is **atomic**: written to a temp directory first, then renamed into place. Records the snapshot in `sandbox_volume_snapshots` with `content_hash` (SHA-256 of sorted file paths + sizes as a lightweight fingerprint).
 
 **Output:**
 ```
@@ -371,19 +372,19 @@ tag sandbox volume snapshot delete <volume-name>:<snapshot-name> [--force]
 |----|-------------|
 | FR-01 | `tag sandbox volume create <name>` creates a directory at `~/.tag/volumes/<name>/`, inserts a row in `sandbox_volumes` with `status='active'`, and returns exit code 0. Names not matching `^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$` are rejected with exit code 1 and a descriptive error before any filesystem operations. |
 | FR-02 | `tag sandbox run --volume <name>:<target>` resolves `<name>` against `sandbox_volumes` (by `name` and `status='active'`). If found, the host path `~/.tag/volumes/<name>/` is used as the bind-mount source. If not found, the command errors with: `"Unknown volume '<name>'. Create it first with: tag sandbox volume create <name>"`. |
-| FR-03 | `--volume <name>:<target>:ro` mounts the volume read-only. For the Docker backend, this passes `--mount type=bind,src=<path>,dst=<target>,readonly` to `docker run`. For E2B, pre-sync uploads but post-sync is skipped. For restricted subprocess, the directory is made accessible read-only via OS-level `chmod -w` applied to a temporary copy (or via the bind-mount if available). |
+| FR-03 | `--volume <name>:<target>:ro` mounts the volume read-only. For the Docker backend, this appends a `mount.Mount{Type: mount.TypeBind, Source, Target, ReadOnly: true}` to the container's host config via the docker/moby Go client. For E2B, pre-sync uploads but post-sync is skipped. For the restricted backend, the resolved host path is granted read-only access via a `go-landlock` path rule (read-only ruleset) rather than a writable one. |
 | FR-04 | Multiple `--volume` flags are supported in a single `tag sandbox run` invocation. Each is resolved and mounted independently. Duplicate `<target>` paths in the same invocation are rejected with exit code 1. |
-| FR-05 | `tag sandbox volume snapshot <name> --name <snap>` performs a full `shutil.copytree` to `~/.tag/volumes/.snapshots/<name>/<snap>/`, inserts a row in `sandbox_volume_snapshots`, and records `content_hash` (SHA-256 of `|`-joined `<relative_path>:<size_bytes>` for all files, sorted). Creates `~/.tag/volumes/.snapshots/` if absent. |
+| FR-05 | `tag sandbox volume snapshot <name> --name <snap>` performs a full recursive directory copy (Go `filepath.WalkDir` + `os.MkdirAll`/`io.Copy`, recreating symlinks as symlinks) to `~/.tag/volumes/.snapshots/<name>/<snap>/`, inserts a row in `sandbox_volume_snapshots`, and records `content_hash` (SHA-256 of newline-joined `<relative_path>:<size_bytes>` for all files, sorted). Creates `~/.tag/volumes/.snapshots/` if absent. |
 | FR-06 | Snapshot names must be unique per volume. Attempting to create a snapshot with a name that already exists for that volume returns exit code 1 with the message: `"Snapshot '<snap>' already exists for volume '<name>'. Use a different name or delete the existing snapshot first."` |
-| FR-07 | Per-volume `quota_bytes` is enforced as a **soft** quota: `tag sandbox volume create --size 10G` records `quota_bytes = 10737418240`. A pre-flight size check runs before `tag sandbox run` mounts the volume: if `current_size_bytes >= quota_bytes`, the run is blocked with exit code 1 and message: `"Volume '<name>' is at or above its quota (X GB / Y GB). Free space or increase the quota before running."` The check uses `sum(f.stat().st_size for f in Path(vol_path).rglob('*') if f.is_file())`. |
+| FR-07 | Per-volume `quota_bytes` is enforced as a **soft** quota: `tag sandbox volume create --size 10G` records `quota_bytes = 10737418240`. A pre-flight size check runs before `tag sandbox run` mounts the volume: if `current_size_bytes >= quota_bytes`, the run is blocked with exit code 1 and message: `"Volume '<name>' is at or above its quota (X GB / Y GB). Free space or increase the quota before running."` The check uses a Go directory-size walk (`filepath.WalkDir` accumulating `d.Info().Size()` for regular files, skipping symlinks). |
 | FR-08 | Mounting a volume whose host path contains any file or directory matching the PRD-028 `BLOCKED_VOLUME_PATTERNS` list is blocked. The check scans one level of the volume root directory (not recursively, for performance). Blocked patterns include: `*.env`, `*.key`, `*.pem`, `*.p12`, `*.pfx`, `*secret*`, `*credential*`, `.ssh`, `.aws`, `.gnupg`. Exit code 1 with message: `"Mount blocked: volume '<name>' contains path matching blocked pattern '<pattern>'. Remove sensitive files before mounting."` |
-| FR-09 | `tag sandbox volume restore <name> --snapshot <snap> --confirm` automatically creates a `pre-restore-<ISO8601-UTC>` snapshot of current volume state before overwriting it. The restore copies snapshot contents to a temp directory `~/.tag/volumes/<name>.restore_tmp/` and atomically replaces the live directory via `shutil.move`. If interrupted mid-copy, the temp directory is cleaned up and no data is lost. |
+| FR-09 | `tag sandbox volume restore <name> --snapshot <snap> --confirm` automatically creates a `pre-restore-<ISO8601-UTC>` snapshot of current volume state before overwriting it. The restore copies snapshot contents to a temp directory `~/.tag/volumes/<name>.restore_tmp/` and atomically replaces the live directory via `os.Rename` (atomic on the same filesystem). If interrupted mid-copy, the temp directory is cleaned up and no data is lost. |
 | FR-10 | `tag sandbox volume delete <name> --force --purge-snapshots` removes the volume directory, all snapshot directories under `~/.tag/volumes/.snapshots/<name>/`, sets `sandbox_volumes.status = 'deleted'` and `deleted_at = <now>` (soft delete), and removes all `sandbox_volume_snapshots` rows for this volume. Physical directory deletion is permanent; the SQLite row is soft-deleted for audit purposes. |
 | FR-11 | Concurrent read-only mounts of the same volume across multiple simultaneous `tag sandbox run` invocations are permitted without locking. The `sandbox_run_mounts` table records each active mount. Read-write concurrent mounts of the same volume by more than one run produce a WARNING (not an error) on stderr: `"Warning: volume '<name>' is mounted read-write by run <run_id>. Concurrent writes may cause data corruption."` |
-| FR-12 | Every volume lifecycle event (create, mount-start, mount-end, snapshot, restore, delete) emits an OTEL span via `tracing.py`. Span attributes follow PRD-013 conventions: `tag.volume.name`, `tag.volume.id`, `tag.volume.operation`, `tag.volume.size_bytes`. |
+| FR-12 | Every volume lifecycle event (create, mount-start, mount-end, snapshot, restore, delete) emits an OTEL span via `internal/obs` (using `go.opentelemetry.io/otel` spans). Span attributes follow PRD-013 conventions: `tag.volume.name`, `tag.volume.id`, `tag.volume.operation`, `tag.volume.size_bytes`. |
 | FR-13 | All `tag sandbox volume` subcommands produce `--json` output as a stable JSON schema (documented in Section 9). The schema version is included in every JSON response as `"schema_version": "1"`. |
 | FR-14 | `tag sandbox volume list` reads only from SQLite (`sandbox_volumes` table) and does not scan the filesystem. `size_bytes` is the last-recorded value from the most recent mount-end or snapshot event. A `--refresh-sizes` flag triggers a live filesystem scan and updates `sandbox_volumes.size_bytes`. |
-| FR-15 | The `queue_worker.py` job dispatcher recognizes a `volumes` key in job YAML (list of `"<name>:<target>[:<options>]"` strings) and passes it as the `volume_mounts` argument to `run_in_sandbox()`. This enables persistent volumes in fully autonomous queue-dispatched agent jobs. |
+| FR-15 | The `internal/queue` job dispatcher recognizes a `volumes` key in job YAML (list of `"<name>:<target>[:<options>]"` strings), decoded via koanf v2 + `gopkg.in/yaml.v3` into `[]VolumeMount`, and passes it as the `volumeMounts` argument to the sandbox run call. This enables persistent volumes in fully autonomous queue-dispatched agent jobs. |
 | FR-16 | Volume names are scoped to the local TAG installation (`~/.tag/volumes/`). No two active volumes may share the same name; the `sandbox_volumes` table has a `UNIQUE` constraint on `(name, status)` filtered to `status='active'`. Attempting to create a duplicate name returns exit code 1. |
 | FR-17 | `tag sandbox volume snapshot list <name>` queries `sandbox_volume_snapshots` and lists all snapshots for the volume in reverse chronological order (newest first). |
 | FR-18 | `tag sandbox volume inspect <name>` returns a combined view joining `sandbox_volumes` and `sandbox_volume_snapshots`. If the volume name does not exist in `sandbox_volumes` (or `status = 'deleted'`), exit code 1 with: `"Volume '<name>' not found."` |
@@ -395,14 +396,14 @@ tag sandbox volume snapshot delete <volume-name>:<snapshot-name> [--force]
 | ID | Requirement |
 |----|-------------|
 | NFR-01 | **Mount latency:** For the Docker backend, the end-to-end overhead of resolving a named volume and passing it as a bind mount must add less than 50 ms to container startup time. Measured as the delta between `sandbox_runs.completed_at - sandbox_runs.created_at` for equivalent runs with and without a volume mount. |
-| NFR-02 | **Snapshot throughput:** Snapshot creation (FR-05) must achieve >= 500 MB/s on NVMe SSD for the `shutil.copytree` step. This is achievable since `shutil.copytree` uses `os.sendfile()` on Linux and `fcopyfile()` on macOS. Snapshots of volumes > 1 GB must display a progress bar via Rich `Progress` to avoid appearing frozen. |
-| NFR-03 | **SQLite WAL concurrency:** All reads and writes to `sandbox_volumes` and `sandbox_volume_snapshots` use `open_db()` with WAL mode enabled (consistent with existing TAG SQLite usage). Concurrent readers are never blocked by a single writer. |
-| NFR-04 | **Disk safety on interrupted snapshot:** If snapshot `copytree` is interrupted (SIGINT, process kill, power loss), the incomplete snapshot directory `~/.tag/volumes/.snapshots/<name>/<snap>.tmp/` is left in place but is never renamed to the final path. On next startup, TAG's `cmd_doctor` check identifies and reports orphaned `.tmp` snapshot directories. |
-| NFR-05 | **No mandatory new dependencies:** Volume operations use only Python standard library (`shutil`, `hashlib`, `pathlib`, `os`, `sqlite3`) and existing TAG dependencies. Backend-specific volume APIs (Modal.Volume, E2B filesystem sync) are lazy-imported in `try/except ImportError` blocks. |
+| NFR-02 | **Snapshot throughput:** Snapshot creation (FR-05) must achieve >= 500 MB/s on NVMe SSD for the recursive copy step. This is achievable because the Go `os`/`io.Copy` path uses `copy_file_range`/`sendfile` on Linux (and the platform-optimized copy where available) under the hood for large regular files. Snapshots of volumes > 1 GB must display a progress indicator (a `bubbletea`/`progress` bar, or a simple periodic stderr counter — NOT Python Rich) to avoid appearing frozen. |
+| NFR-03 | **SQLite WAL concurrency:** All reads and writes to `sandbox_volumes` and `sandbox_volume_snapshots` go through the `internal/store` open path (`*sql.DB` over `modernc.org/sqlite`) with WAL mode enabled via `PRAGMA journal_mode=WAL` (consistent with existing TAG SQLite usage). Concurrent readers are never blocked by a single writer. |
+| NFR-04 | **Disk safety on interrupted snapshot:** If the snapshot copy is interrupted (SIGINT, process kill, power loss), the incomplete snapshot directory `~/.tag/volumes/.snapshots/<name>/<snap>.tmp/` is left in place but is never renamed to the final path. On next startup, TAG's `doctor` command (`internal/cli`) identifies and reports orphaned `.tmp` snapshot directories. |
+| NFR-05 | **No mandatory new dependencies:** Volume operations use the Go standard library (`os`, `io`, `crypto/sha256`, `path/filepath`, `database/sql`) plus already-vendored TAG modules. Backend-specific volume APIs (Modal, E2B/firecracker filesystem sync) are compile-time-optional providers (build-tagged provider implementations or out-of-process/HTTP calls), not runtime lazy-imports — Go has no dynamic import. |
 | NFR-06 | **Backward compatibility:** Adding `--volume` to `tag sandbox run` is purely additive. Existing invocations without `--volume` behave identically to pre-PRD-096 behavior. Existing `sandbox_runs` table rows are unaffected; only new `sandbox_run_mounts` rows are added. |
 | NFR-07 | **Audit trail:** Every mount event appends a JSON line to `~/.tag/runtime/sandbox-audit.jsonl` (existing audit log from PRD-028) with fields: `event="volume_mount"`, `volume_id`, `volume_name`, `target_path`, `mode` (`ro`/`rw`), `run_id`, `backend`, `timestamp`. |
-| NFR-08 | **Cross-platform paths:** Volume host paths use `pathlib.Path` throughout. On macOS, `~/.tag/volumes/` resolves to `/Users/<user>/.tag/volumes/`. On Linux, `/home/<user>/.tag/volumes/`. Windows is not a supported platform for v1 (consistent with PRD-028). |
-| NFR-09 | **Quota check performance:** The pre-flight quota check (FR-07) must complete in < 200 ms for volumes up to 50 GB. Use `os.scandir()` with `st_size` from `DirEntry.stat()` (single syscall per entry, no `lstat` overhead) rather than `os.walk()`. |
+| NFR-08 | **Cross-platform paths:** Volume host paths use Go `path/filepath` (cross-platform join/clean) throughout. On macOS, `~/.tag/volumes/` resolves to `/Users/<user>/.tag/volumes/`. On Linux, `/home/<user>/.tag/volumes/`. Windows is not a supported platform for v1 (consistent with PRD-028). |
+| NFR-09 | **Quota check performance:** The pre-flight quota check (FR-07) must complete in < 200 ms for volumes up to 50 GB. Use `os.ReadDir` returning `[]os.DirEntry` and `DirEntry.Info().Size()` (avoiding an extra `lstat` per entry) rather than repeated full-tree stat passes. |
 
 ---
 
@@ -410,12 +411,13 @@ tag sandbox volume snapshot delete <volume-name>:<snapshot-name> [--force]
 
 ### 10.1 New and Modified Files
 
-| File | Change |
+| File / Package | Change |
 |------|--------|
-| `src/tag/sandbox.py` | Add `ensure_volume_schema()`, `VolumeMount`, `SandboxVolume`, `VolumeSnapshot` dataclasses; add `create_volume()`, `delete_volume()`, `snapshot_volume()`, `restore_volume()`, `list_volumes()`, `inspect_volume()`, `resolve_mounts()`, `_check_credential_patterns()`, `_check_quota()`, `_compute_dir_size()`, `_content_hash()` functions; extend `run_in_sandbox()` to accept `volume_mounts: list[VolumeMount]`. |
-| `src/tag/controller.py` | Add `cmd_sandbox_volume_create`, `cmd_sandbox_volume_list`, `cmd_sandbox_volume_inspect`, `cmd_sandbox_volume_snapshot`, `cmd_sandbox_volume_restore`, `cmd_sandbox_volume_delete`, `cmd_sandbox_volume_snapshot_list`, `cmd_sandbox_volume_snapshot_delete` functions; wire into the `tag sandbox volume` subcommand group. |
-| `src/tag/queue_worker.py` | Extend job YAML parsing to recognize `volumes:` list field; pass resolved `VolumeMount` list to `run_in_sandbox()`. |
-| `~/.tag/runtime/tag.sqlite3` | Add `sandbox_volumes`, `sandbox_volume_snapshots`, `sandbox_run_mounts` tables via `ensure_volume_schema()`. |
+| `internal/sandbox` | Add `EnsureVolumeSchema()`, `VolumeMount`, `SandboxVolume`, `VolumeSnapshot` structs; add `CreateVolume()`, `DeleteVolume()`, `SnapshotVolume()`, `RestoreVolume()`, `ListVolumes()`, `InspectVolume()`, `ResolveMounts()`, `checkCredentialPatterns()`, `checkQuota()`, `computeDirSize()`, `contentHash()` functions; extend the `RunInSandbox()` call to accept `volumeMounts []VolumeMount`. |
+| `internal/cli` | Add cobra commands under the `sandbox volume` group: `create`, `list`, `inspect`, `snapshot`, `restore`, `delete`, `snapshot list`, `snapshot delete`; wire into the `tag sandbox volume` command tree. |
+| `internal/queue` | Extend job YAML decoding (koanf v2 + `gopkg.in/yaml.v3`) to recognize the `volumes:` list field; pass the resolved `[]VolumeMount` to the sandbox run call. |
+| `internal/obs` | OTEL span helpers (`go.opentelemetry.io/otel`) for volume lifecycle events. |
+| `~/.tag/runtime/tag.sqlite3` | Add `sandbox_volumes`, `sandbox_volume_snapshots`, `sandbox_run_mounts` tables via `EnsureVolumeSchema()` (DDL executed through `internal/store` over `modernc.org/sqlite`). |
 
 ### 10.2 SQLite DDL
 
@@ -474,371 +476,528 @@ CREATE INDEX IF NOT EXISTS idx_srm_volume_active ON sandbox_run_mounts(volume_id
     WHERE unmounted_at IS NULL;
 ```
 
-### 10.3 Core Dataclasses
+### 10.3 Core Structs
 
-```python
-# src/tag/sandbox.py (additions)
+Structs carry exported fields with `json` tags because every subcommand emits `--json`. Each JSON-emitting struct includes a `SchemaVersion` field pinned to `"1"` (FR-13). `Optional[X]` becomes either a pointer (`*string`) or a zero value; `dict` labels become `map[string]string`.
 
-from __future__ import annotations
-import dataclasses
-import hashlib
-import os
-import shutil
-import sqlite3
-import uuid
-from pathlib import Path
-from typing import Optional
+```go
+// internal/sandbox (additions)
 
+package sandbox
 
-@dataclasses.dataclass
-class VolumeMount:
-    """Parsed representation of a --volume flag value."""
-    source: str          # TAG volume name (no '/') or absolute host path
-    target: str          # Absolute path inside the container
-    mode: str = "rw"     # 'ro' or 'rw'
-    is_named: bool = False   # True if source is a TAG volume name
-    resolved_host_path: Optional[Path] = None  # set after resolve_mounts()
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+)
 
-    @classmethod
-    def parse(cls, spec: str) -> "VolumeMount":
-        """Parse 'source:target[:options]' into a VolumeMount.
+// VolumeMount is the parsed representation of a --volume flag value.
+type VolumeMount struct {
+	SchemaVersion    string `json:"schema_version"` // always "1"
+	Source           string `json:"source"`         // TAG volume name (no '/') or absolute host path
+	Target           string `json:"target"`         // absolute path inside the container
+	Mode             string `json:"mode"`           // "ro" or "rw"
+	IsNamed          bool   `json:"is_named"`       // true if Source is a TAG volume name
+	ResolvedHostPath string `json:"resolved_host_path,omitempty"` // set after ResolveMounts()
+}
 
-        Examples:
-            'my-data:/workspace/data'       -> named, rw
-            'my-data:/workspace/data:ro'    -> named, ro
-            '/host/path:/container/path'    -> host path, rw
-        """
-        parts = spec.split(":")
-        if len(parts) < 2:
-            raise ValueError(
-                f"Invalid volume spec '{spec}': must be 'source:target' or "
-                "'source:target:options'"
-            )
-        source = parts[0]
-        target = parts[1]
-        mode = "rw"
-        if len(parts) >= 3:
-            opts = parts[2].split(",")
-            if "ro" in opts:
-                mode = "ro"
-        is_named = not source.startswith("/")
-        return cls(source=source, target=target, mode=mode, is_named=is_named)
+// ParseVolumeMount parses "source:target[:options]" into a VolumeMount.
+//
+//	"my-data:/workspace/data"      -> named, rw
+//	"my-data:/workspace/data:ro"   -> named, ro
+//	"/host/path:/container/path"   -> host path, rw
+func ParseVolumeMount(spec string) (VolumeMount, error) {
+	parts := strings.Split(spec, ":")
+	if len(parts) < 2 {
+		return VolumeMount{}, fmt.Errorf(
+			"invalid volume spec %q: must be 'source:target' or 'source:target:options'", spec)
+	}
+	source, target := parts[0], parts[1]
+	mode := "rw"
+	if len(parts) >= 3 {
+		for _, opt := range strings.Split(parts[2], ",") {
+			if opt == "ro" {
+				mode = "ro"
+			}
+		}
+	}
+	return VolumeMount{
+		SchemaVersion: "1",
+		Source:        source,
+		Target:        target,
+		Mode:          mode,
+		IsNamed:       !strings.HasPrefix(source, "/"),
+	}, nil
+}
 
+// SandboxVolume is a named persistent volume record from sandbox_volumes.
+type SandboxVolume struct {
+	SchemaVersion  string            `json:"schema_version"` // always "1"
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	Path           string            `json:"path"`
+	QuotaBytes     int64             `json:"quota_bytes"`
+	SizeBytes      int64             `json:"size_bytes"`
+	Status         string            `json:"status"`
+	Labels         map[string]string `json:"labels"`
+	CreatedAt      string            `json:"created_at"`
+	LastMountedAt  *string           `json:"last_mounted_at"`
+	LastModifiedAt *string           `json:"last_modified_at"`
+	DeletedAt      *string           `json:"-"` // internal; omitted from --json (soft-delete audit field)
+	MountCount     int64             `json:"mount_count"`
+}
 
-@dataclasses.dataclass
-class SandboxVolume:
-    """A named persistent volume record from sandbox_volumes."""
-    id: str
-    name: str
-    path: Path
-    quota_bytes: int
-    size_bytes: int
-    status: str
-    labels: dict
-    created_at: str
-    last_mounted_at: Optional[str]
-    last_modified_at: Optional[str]
-    deleted_at: Optional[str]
-    mount_count: int
+// QuotaHuman renders the quota as a human-readable size (e.g. "10.0 GB").
+func (v SandboxVolume) QuotaHuman() string { return humanBytes(v.QuotaBytes) }
 
-    @property
-    def quota_human(self) -> str:
-        return _human_bytes(self.quota_bytes)
+// SizeHuman renders the current size as a human-readable size.
+func (v SandboxVolume) SizeHuman() string { return humanBytes(v.SizeBytes) }
 
-    @property
-    def size_human(self) -> str:
-        return _human_bytes(self.size_bytes)
-
-    def to_dict(self) -> dict:
-        return {
-            "schema_version": "1",
-            "id": self.id,
-            "name": self.name,
-            "path": str(self.path),
-            "quota_bytes": self.quota_bytes,
-            "size_bytes": self.size_bytes,
-            "status": self.status,
-            "labels": self.labels,
-            "created_at": self.created_at,
-            "last_mounted_at": self.last_mounted_at,
-            "last_modified_at": self.last_modified_at,
-            "mount_count": self.mount_count,
-        }
-
-
-@dataclasses.dataclass
-class VolumeSnapshot:
-    """A point-in-time snapshot of a volume."""
-    id: str
-    volume_id: str
-    volume_name: str
-    name: str
-    path: Path
-    size_bytes: int
-    content_hash: Optional[str]
-    description: Optional[str]
-    created_at: str
-    auto_created: bool
-
-    def to_dict(self) -> dict:
-        return {
-            "schema_version": "1",
-            "id": self.id,
-            "volume_id": self.volume_id,
-            "volume_name": self.volume_name,
-            "name": self.name,
-            "path": str(self.path),
-            "size_bytes": self.size_bytes,
-            "content_hash": self.content_hash,
-            "description": self.description,
-            "created_at": self.created_at,
-            "auto_created": self.auto_created,
-        }
+// VolumeSnapshot is a point-in-time snapshot of a volume.
+type VolumeSnapshot struct {
+	SchemaVersion string  `json:"schema_version"` // always "1"
+	ID            string  `json:"id"`
+	VolumeID      string  `json:"volume_id"`
+	VolumeName    string  `json:"volume_name"`
+	Name          string  `json:"name"`
+	Path          string  `json:"path"`
+	SizeBytes     int64   `json:"size_bytes"`
+	ContentHash   *string `json:"content_hash"`
+	Description   *string `json:"description"`
+	CreatedAt     string  `json:"created_at"`
+	AutoCreated   bool    `json:"auto_created"`
+}
 ```
 
 ### 10.4 Core Algorithms
 
 #### Volume Name Validation
 
-```python
-import re
+Regexes are compiled once into package-level vars with `regexp.MustCompile`; the patterns are unchanged. Validators return an `error` instead of raising.
 
-_VOLUME_NAME_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$')
-_SNAPSHOT_NAME_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$')
+```go
+var (
+	volumeNameRE   = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`)
+	snapshotNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
+)
 
-# Blocked path patterns (credential protection, extends PRD-028 blocklist)
-BLOCKED_VOLUME_PATTERNS = [
-    "*.env", "*.key", "*.pem", "*.p12", "*.pfx",
-    "*secret*", "*credential*", "*password*", "*passwd*",
-    ".ssh", ".aws", ".gnupg", ".netrc",
-    "id_rsa", "id_ed25519", "id_ecdsa",
-]
+// blockedVolumePatterns are the credential-protection globs (extends the PRD-028 blocklist).
+var blockedVolumePatterns = []string{
+	"*.env", "*.key", "*.pem", "*.p12", "*.pfx",
+	"*secret*", "*credential*", "*password*", "*passwd*",
+	".ssh", ".aws", ".gnupg", ".netrc",
+	"id_rsa", "id_ed25519", "id_ecdsa",
+}
 
-def _validate_volume_name(name: str) -> None:
-    if not _VOLUME_NAME_RE.match(name):
-        raise ValueError(
-            f"Invalid volume name '{name}'. Names must start with an alphanumeric "
-            "character and contain only [a-zA-Z0-9_-], max 63 characters."
-        )
+func validateVolumeName(name string) error {
+	if !volumeNameRE.MatchString(name) {
+		return fmt.Errorf(
+			"invalid volume name %q: names must start with an alphanumeric "+
+				"character and contain only [a-zA-Z0-9_-], max 63 characters", name)
+	}
+	return nil
+}
 ```
 
 #### Directory Size Computation (fast, NFR-09)
 
-```python
-def _compute_dir_size(path: Path) -> int:
-    """Fast directory size using os.scandir() for O(1) stat calls per entry."""
-    total = 0
-    stack = [path]
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as it:
-                for entry in it:
-                    try:
-                        if entry.is_file(follow_symlinks=False):
-                            total += entry.stat(follow_symlinks=False).st_size
-                        elif entry.is_dir(follow_symlinks=False):
-                            stack.append(Path(entry.path))
-                    except (PermissionError, OSError):
-                        continue
-        except (PermissionError, OSError):
-            continue
-    return total
+```go
+// computeDirSize sums the size of all regular files under root, skipping
+// symlinks and ignoring unreadable entries. Uses filepath.WalkDir, which
+// reads directories via os.ReadDir and exposes fs.DirEntry.Info() (one stat
+// per entry, no extra lstat).
+func computeDirSize(root string) int64 {
+	var total int64
+	_ = filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable dirs/files (permission errors), keep walking
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil // do not follow or count symlinks
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, statErr := d.Info()
+		if statErr != nil {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	return total
+}
 ```
 
 #### Content Hash for Snapshot Fingerprinting
 
-```python
-def _content_hash(path: Path) -> str:
-    """Compute a lightweight fingerprint: SHA-256 of sorted 'relpath:size' pairs."""
-    entries = []
-    for f in sorted(path.rglob("*")):
-        if f.is_file():
-            try:
-                rel = str(f.relative_to(path))
-                size = f.stat().st_size
-                entries.append(f"{rel}:{size}")
-            except (OSError, ValueError):
-                continue
-    digest = hashlib.sha256("\n".join(entries).encode()).hexdigest()
-    return f"sha256:{digest}"
+```go
+// contentHash computes a lightweight fingerprint: SHA-256 over the sorted set
+// of "<relpath>:<size>" lines for all regular files under root.
+func contentHash(root string) (string, error) {
+	var lines []string
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil // skip dirs and symlinks
+		}
+		rel, relErr := filepath.Rel(root, p)
+		if relErr != nil {
+			return nil
+		}
+		info, statErr := d.Info()
+		if statErr != nil {
+			return nil
+		}
+		lines = append(lines, fmt.Sprintf("%s:%d", rel, info.Size()))
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	sort.Strings(lines)
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
 ```
 
 #### Credential Pattern Check (FR-08)
 
-```python
-import fnmatch
+Go note: `filepath.Match` treats the OS path separator specially, and neither `filepath.Match` nor `path.Match` implement Python `fnmatch`'s case-folding. For the "surround" patterns (`*secret*`, `*credential*`, ...) `path.Match` does work for bare filenames (no separators), but to match `fnmatch` semantics exactly we detect the `*x*` form and fall back to a `strings.Contains` check on the inner literal. Entries are read one level deep via `os.ReadDir` (not recursively, for performance).
 
-def _check_credential_patterns(vol_path: Path) -> None:
-    """Scan top level of volume dir for blocked credential patterns."""
-    try:
-        with os.scandir(vol_path) as it:
-            for entry in it:
-                for pattern in BLOCKED_VOLUME_PATTERNS:
-                    if fnmatch.fnmatch(entry.name, pattern):
-                        raise PermissionError(
-                            f"Mount blocked: volume at '{vol_path}' contains "
-                            f"'{entry.name}' matching blocked pattern '{pattern}'. "
-                            "Remove sensitive files before mounting."
-                        )
-    except (FileNotFoundError, OSError):
-        pass  # Empty or inaccessible volume — allow mount; sandbox will see empty dir
+```go
+// checkCredentialPatterns scans the top level of dir for blocked credential
+// patterns and returns an error on the first match.
+func checkCredentialPatterns(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil // empty or inaccessible volume: allow mount; sandbox sees empty dir
+	}
+	for _, e := range entries {
+		name := e.Name()
+		for _, pattern := range blockedVolumePatterns {
+			if matchGlob(name, pattern) {
+				return fmt.Errorf(
+					"mount blocked: volume at %q contains %q matching blocked pattern %q; "+
+						"remove sensitive files before mounting", dir, name, pattern)
+			}
+		}
+	}
+	return nil
+}
+
+// matchGlob mirrors the subset of fnmatch semantics we need. For "*x*" patterns
+// (leading and trailing '*') it does a substring test on the inner literal;
+// otherwise it uses path.Match (safe for bare filenames, which contain no '/').
+func matchGlob(name, pattern string) bool {
+	if len(pattern) >= 2 && strings.HasPrefix(pattern, "*") && strings.HasSuffix(pattern, "*") {
+		return strings.Contains(name, strings.Trim(pattern, "*"))
+	}
+	ok, err := path.Match(pattern, name)
+	return err == nil && ok
+}
 ```
 
 #### Atomic Snapshot Creation (FR-05, NFR-04)
 
-```python
-def _atomic_snapshot(src: Path, dest_parent: Path, snap_name: str) -> Path:
-    """Copy src to dest_parent/snap_name atomically via a .tmp intermediate."""
-    dest_parent.mkdir(parents=True, exist_ok=True)
-    tmp_dest = dest_parent / f"{snap_name}.tmp"
-    final_dest = dest_parent / snap_name
+Go has no `shutil.copytree`, so a small recursive `copyTree` helper walks the source with `filepath.WalkDir`, creating directories with `os.MkdirAll`, copying regular files with `io.Copy`, and recreating symlinks as symlinks via `os.Readlink`/`os.Symlink` (never following them — see §11). The copy is written to `<snap>.tmp` and then `os.Rename`d into place (atomic on the same filesystem).
 
-    if tmp_dest.exists():
-        shutil.rmtree(tmp_dest)  # Clean orphaned tmp from prior interrupted run
-    if final_dest.exists():
-        raise FileExistsError(f"Snapshot '{snap_name}' already exists at {final_dest}")
+```go
+func atomicSnapshot(src, destParent, snapName string) (string, error) {
+	if err := os.MkdirAll(destParent, 0o755); err != nil {
+		return "", err
+	}
+	tmpDest := filepath.Join(destParent, snapName+".tmp")
+	finalDest := filepath.Join(destParent, snapName)
 
-    shutil.copytree(src, tmp_dest, symlinks=True)
-    tmp_dest.rename(final_dest)  # atomic on POSIX when on same filesystem
-    return final_dest
+	_ = os.RemoveAll(tmpDest) // clean orphaned tmp from a prior interrupted run
+	if _, err := os.Stat(finalDest); err == nil {
+		return "", fmt.Errorf("snapshot %q already exists at %s", snapName, finalDest)
+	}
+
+	if err := copyTree(src, tmpDest); err != nil {
+		_ = os.RemoveAll(tmpDest) // leave no partial final; drop the tmp on failure
+		return "", err
+	}
+	if err := os.Rename(tmpDest, finalDest); err != nil { // atomic on same filesystem
+		return "", err
+	}
+	return finalDest, nil
+}
+
+// copyTree recursively copies src into dst, recreating symlinks as symlinks
+// (not following them) and preserving the directory structure.
+func copyTree(src, dst string) error {
+	return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		switch {
+		case d.IsDir():
+			return os.MkdirAll(target, 0o755)
+		case d.Type()&os.ModeSymlink != 0:
+			link, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(link, target) // recreate, do not dereference
+		default:
+			in, err := os.Open(p)
+			if err != nil {
+				return err
+			}
+			defer in.Close()
+			out, err := os.Create(target)
+			if err != nil {
+				return err
+			}
+			defer out.Close()
+			_, err = io.Copy(out, in)
+			return err
+		}
+	})
+}
 ```
 
-#### resolve_mounts() — Core Mount Resolution
+#### ResolveMounts() — Core Mount Resolution
 
-```python
-def resolve_mounts(
-    conn: sqlite3.Connection,
-    mounts: list[VolumeMount],
-    *,
-    volumes_base: Path,
-) -> list[VolumeMount]:
-    """Resolve named volume mounts to host paths; validate credential patterns and quota."""
-    resolved = []
-    seen_targets: set[str] = set()
+Named-volume lookups go through `db.QueryRowContext`; `sql.ErrNoRows` is the "unknown volume" case. `dataclasses.replace` becomes a plain struct-field set, and raised exceptions become returned errors.
 
-    for m in mounts:
-        if m.target in seen_targets:
-            raise ValueError(
-                f"Duplicate mount target '{m.target}': each container path may only "
-                "be mounted once per sandbox run."
-            )
-        seen_targets.add(m.target)
+```go
+func ResolveMounts(ctx context.Context, db *sql.DB, mounts []VolumeMount, volumesBase string) ([]VolumeMount, error) {
+	resolved := make([]VolumeMount, 0, len(mounts))
+	seenTargets := make(map[string]struct{})
 
-        if m.is_named:
-            row = conn.execute(
-                "SELECT id, path, quota_bytes, size_bytes FROM sandbox_volumes "
-                "WHERE name = ? AND status = 'active'",
-                (m.source,),
-            ).fetchone()
-            if row is None:
-                raise ValueError(
-                    f"Unknown volume '{m.source}'. Create it first with: "
-                    f"tag sandbox volume create {m.source}"
-                )
-            vol_id, vol_path_str, quota_bytes, size_bytes = row
-            vol_path = Path(vol_path_str)
+	for _, m := range mounts {
+		if _, dup := seenTargets[m.Target]; dup {
+			return nil, fmt.Errorf(
+				"duplicate mount target %q: each container path may only be mounted once per sandbox run", m.Target)
+		}
+		seenTargets[m.Target] = struct{}{}
 
-            # Credential pattern check
-            _check_credential_patterns(vol_path)
+		if m.IsNamed {
+			var (
+				volID      string
+				volPath    string
+				quotaBytes int64
+				sizeBytes  int64
+			)
+			err := db.QueryRowContext(ctx,
+				`SELECT id, path, quota_bytes, size_bytes FROM sandbox_volumes
+				 WHERE name = ? AND status = 'active'`, m.Source,
+			).Scan(&volID, &volPath, &quotaBytes, &sizeBytes)
+			if err == sql.ErrNoRows {
+				return nil, fmt.Errorf(
+					"unknown volume %q; create it first with: tag sandbox volume create %s", m.Source, m.Source)
+			}
+			if err != nil {
+				return nil, err
+			}
 
-            # Quota pre-flight (for rw mounts)
-            if m.mode == "rw" and size_bytes >= quota_bytes:
-                raise PermissionError(
-                    f"Volume '{m.source}' is at or above its quota "
-                    f"({_human_bytes(size_bytes)} / {_human_bytes(quota_bytes)}). "
-                    "Free space or run: tag sandbox volume create "
-                    f"{m.source} --size <larger>"
-                )
+			// Credential pattern check.
+			if err := checkCredentialPatterns(volPath); err != nil {
+				return nil, err
+			}
 
-            m = dataclasses.replace(m, resolved_host_path=vol_path)
-        else:
-            # Host path mount — apply PRD-028 host-path credential blocklist
-            host_path = Path(m.source)
-            _check_credential_patterns(host_path)
-            m = dataclasses.replace(m, resolved_host_path=host_path)
+			// Quota pre-flight (rw mounts only).
+			if m.Mode == "rw" && sizeBytes >= quotaBytes {
+				return nil, fmt.Errorf(
+					"volume %q is at or above its quota (%s / %s); free space or run: "+
+						"tag sandbox volume create %s --size <larger>",
+					m.Source, humanBytes(sizeBytes), humanBytes(quotaBytes), m.Source)
+			}
 
-        resolved.append(m)
-    return resolved
+			m.ResolvedHostPath = volPath
+		} else {
+			// Host-path mount — apply the PRD-028 host-path credential blocklist.
+			hostPath := filepath.Clean(m.Source)
+			if err := checkCredentialPatterns(hostPath); err != nil {
+				return nil, err
+			}
+			m.ResolvedHostPath = hostPath
+		}
+
+		resolved = append(resolved, m)
+	}
+	return resolved, nil
+}
 ```
 
 ### 10.5 Backend Integration
 
 #### Docker Backend
 
-`_run_docker()` in `sandbox.py` is extended to accept `volume_mounts: list[VolumeMount]`. Each resolved mount becomes a `--mount` argument:
+The Docker runner in `internal/sandbox` is extended to accept `volumeMounts []VolumeMount`. Rather than building `docker run --mount ...` strings via subprocess, it uses the docker/moby Go client (`github.com/docker/docker/client`) and passes typed mount specs (`mount.Mount` from `github.com/docker/docker/api/types/mount`) in the container's `HostConfig`:
 
-```python
-for vm in volume_mounts:
-    readonly = ",readonly" if vm.mode == "ro" else ""
-    docker_cmd += [
-        "--mount",
-        f"type=bind,src={vm.resolved_host_path},dst={vm.target}{readonly}",
-    ]
+```go
+import (
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
+)
+
+func buildMounts(volumeMounts []VolumeMount) []mount.Mount {
+	mounts := make([]mount.Mount, 0, len(volumeMounts))
+	for _, vm := range volumeMounts {
+		mounts = append(mounts, mount.Mount{
+			Type:     mount.TypeBind,
+			Source:   vm.ResolvedHostPath,
+			Target:   vm.Target,
+			ReadOnly: vm.Mode == "ro",
+		})
+	}
+	return mounts
+}
+
+// ... later, when creating the container:
+hostConfig := &container.HostConfig{Mounts: buildMounts(volumeMounts)}
 ```
 
-#### E2B Backend
+#### E2B / microVM Backend
 
-E2B micro-VMs cannot directly access host directories via bind mount. Instead, a pre/post sync pattern is used:
+microVM sandboxes cannot directly access host directories via a bind mount. Where a block device can be attached, the `firecracker-go-sdk` drive API (`AddDrive` / a drive spec on the machine config) attaches a backing device to the microVM. Otherwise, a pre/post file-sync pattern is used — the host directory is walked and files are copied over the guest file API (or a `vsock`/`9p` share). Both sync helpers take a `context.Context` and return an `error`:
 
-```python
-# Pre-run: upload volume contents to E2B sandbox filesystem
-async def _e2b_upload_volume(sbx, vm: VolumeMount) -> None:
-    for local_file in vm.resolved_host_path.rglob("*"):
-        if local_file.is_file():
-            rel = local_file.relative_to(vm.resolved_host_path)
-            remote_path = f"{vm.target}/{rel}"
-            sbx.files.write(remote_path, local_file.read_bytes())
+```go
+// e2bUploadVolume walks the resolved host dir and pushes each regular file into
+// the guest at vm.Target (over the guest file API / vsock share).
+func e2bUploadVolume(ctx context.Context, sbx GuestFS, vm VolumeMount) error {
+	return filepath.WalkDir(vm.ResolvedHostPath, func(p string, d os.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return err
+		}
+		rel, err := filepath.Rel(vm.ResolvedHostPath, p)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		return sbx.Write(ctx, path.Join(vm.Target, rel), data)
+	})
+}
 
-# Post-run (rw mounts only): download modified contents back to host
-async def _e2b_download_volume(sbx, vm: VolumeMount) -> None:
-    if vm.mode == "rw":
-        # List remote files and download changed ones (by size comparison)
-        remote_files = sbx.files.list(vm.target)
-        for rf in remote_files:
-            local_path = vm.resolved_host_path / rf.name
-            content = sbx.files.read(rf.path)
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            local_path.write_bytes(content)
+// e2bDownloadVolume (rw mounts only) pulls modified guest files back to the host.
+func e2bDownloadVolume(ctx context.Context, sbx GuestFS, vm VolumeMount) error {
+	if vm.Mode != "rw" {
+		return nil
+	}
+	remote, err := sbx.List(ctx, vm.Target)
+	if err != nil {
+		return err
+	}
+	for _, rf := range remote {
+		local := filepath.Join(vm.ResolvedHostPath, rf.Name)
+		data, err := sbx.Read(ctx, rf.Path)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(local, data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 ```
 
 #### Modal Backend
 
-When the Modal SDK is available and a `modal.Volume` with the same name exists, TAG uses it directly. Otherwise, falls back to the same pre/post rsync pattern as E2B:
+Modal is an **optional provider**. Go has no dynamic import, so the Python `modal.Volume.from_name` lazy-import becomes a compile-time-optional provider: a `VolumeProvider` interface with a Modal implementation that is either guarded behind a build tag or invoked out-of-process/over HTTP against the Modal API. If the provider is not compiled in (or the named volume is not resolvable), TAG falls back to the same file-sync path as the E2B/microVM backend.
 
-```python
-def _get_modal_volume(name: str):
-    try:
-        import modal
-        return modal.Volume.from_name(name, create_if_missing=False)
-    except Exception:
-        return None  # Fall back to rsync-style sync
+```go
+// VolumeProvider is implemented by optional cloud backends (Modal, ...).
+// The Modal implementation is compiled in behind a build tag; when absent,
+// providerFor returns (nil, false) and callers use the file-sync fallback.
+type VolumeProvider interface {
+	Resolve(ctx context.Context, name string) (handle any, ok bool, err error)
+}
+
+func modalVolume(ctx context.Context, p VolumeProvider, name string) (any, bool) {
+	if p == nil {
+		return nil, false // provider not compiled in -> fall back to file sync
+	}
+	h, ok, err := p.Resolve(ctx, name)
+	if err != nil || !ok {
+		return nil, false
+	}
+	return h, true
+}
 ```
 
-### 10.6 ULID Generation
+#### Restricted Backend
 
-```python
-import time
-import os
+The restricted (in-process/subprocess) backend has no container runtime to enforce mount options, so it uses Linux Landlock (`github.com/landlock-lsm/go-landlock`) to grant the sandboxed process filesystem access scoped to the resolved volume host path — a read-write path rule for `rw` mounts, and a read-only path rule for `ro` mounts — instead of the Python `chmod -w` approach. The read-only concept is preserved at the LSM level.
 
-def _ulid() -> str:
-    """Generate a ULID-like sortable unique ID."""
-    ts = int(time.time() * 1000)
-    rand = os.urandom(10).hex()
-    return f"{ts:013x}{rand}"
+```go
+import "github.com/landlock-lsm/go-landlock/landlock"
+
+func landlockRules(volumeMounts []VolumeMount) []landlock.Rule {
+	var rules []landlock.Rule
+	for _, vm := range volumeMounts {
+		if vm.Mode == "ro" {
+			rules = append(rules, landlock.RODirs(vm.ResolvedHostPath))
+		} else {
+			rules = append(rules, landlock.RWDirs(vm.ResolvedHostPath))
+		}
+	}
+	return rules
+}
+```
+
+### 10.6 Sortable ID Generation
+
+IDs use `github.com/oklog/ulid/v2` — lexicographically sortable, time-ordered, and a good fit for the `vol_`/`snap_`/`mnt_` prefixed primary keys.
+
+```go
+import (
+	"crypto/rand"
+	"time"
+
+	"github.com/oklog/ulid/v2"
+)
+
+// newID returns a sortable ULID with the given prefix, e.g. newID("vol").
+func newID(prefix string) string {
+	id := ulid.MustNew(ulid.Timestamp(time.Now()), ulid.Monotonic(rand.Reader, 0))
+	return prefix + "_" + id.String()
+}
 ```
 
 ### 10.7 Human-Readable Byte Formatting
 
-```python
-def _human_bytes(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.1f} {unit}"
-        n /= 1024
+```go
+func humanBytes(n int64) string {
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	f := float64(n)
+	for i, unit := range units {
+		if f < 1024 || i == len(units)-1 {
+			return fmt.Sprintf("%.1f %s", f, unit)
+		}
+		f /= 1024
+	}
+	return fmt.Sprintf("%.1f TB", f) // unreachable
+}
 ```
 
-### 10.8 Integration with `queue_worker.py`
+### 10.8 Integration with `internal/queue`
 
 Queue job YAML gains a `volumes` key:
 
@@ -856,7 +1015,29 @@ volumes:
 timeout: 7200
 ```
 
-`queue_worker.py:_run_job()` parses `job.get("volumes", [])` into `list[VolumeMount]` and passes to `run_in_sandbox(conn, cmd, volume_mounts=mounts, ...)`.
+The `internal/queue` job runner decodes the job with koanf v2 (using the `gopkg.in/yaml.v3` parser), reads the `volumes` list of `"<name>:<target>[:<options>]"` strings, maps each through `ParseVolumeMount` into `[]VolumeMount`, and passes it to the sandbox run call (`RunInSandbox(ctx, db, cmd, WithVolumeMounts(mounts), ...)`).
+
+```go
+type sandboxJob struct {
+	Command string   `koanf:"command" yaml:"command"`
+	Image   string   `koanf:"image"   yaml:"image"`
+	Backend string   `koanf:"backend" yaml:"backend"`
+	Volumes []string `koanf:"volumes" yaml:"volumes"`
+	Timeout int      `koanf:"timeout" yaml:"timeout"`
+}
+
+func mountsFromJob(j sandboxJob) ([]VolumeMount, error) {
+	mounts := make([]VolumeMount, 0, len(j.Volumes))
+	for _, spec := range j.Volumes {
+		vm, err := ParseVolumeMount(spec)
+		if err != nil {
+			return nil, err
+		}
+		mounts = append(mounts, vm)
+	}
+	return mounts, nil
+}
+```
 
 ---
 
@@ -866,7 +1047,7 @@ timeout: 7200
 
 2. **Read-only enforcement for concurrent swarm mounts:** When `--volume name:/path:ro` is specified, the Docker backend passes `readonly` to the bind-mount options. This is enforced at the container runtime level (Docker daemon), not just by TAG convention. An agent process inside the container cannot escalate to write access on a `ro` mount without a container-escape exploit.
 
-3. **No host path traversal via symlinks in snapshots:** `_atomic_snapshot` uses `shutil.copytree(symlinks=True)`, which copies symlinks as symlinks rather than following them. This prevents a malicious volume from containing a symlink pointing to `/etc/passwd` that gets followed during snapshot, exfiltrating host data into the snapshot store.
+3. **No host path traversal via symlinks in snapshots:** `atomicSnapshot`'s `copyTree` helper recreates symlinks as symlinks (via `os.Readlink` + `os.Symlink`) rather than dereferencing them. This prevents a malicious volume from containing a symlink pointing to `/etc/passwd` that gets followed during snapshot, exfiltrating host data into the snapshot store.
 
 4. **Quota enforcement prevents disk exhaustion:** The pre-flight quota check (FR-07) prevents agent-generated writes from filling the host disk. The soft-quota model means existing data is not deleted, but new sandbox runs mounting the over-quota volume are blocked until the user takes explicit action.
 
@@ -880,7 +1061,7 @@ timeout: 7200
 
 9. **Snapshot directory isolation:** All snapshots are stored under `~/.tag/volumes/.snapshots/` (a dot-prefixed hidden directory), separate from live volume data under `~/.tag/volumes/<name>/`. This separation ensures that an agent process inside a sandbox container with `name` mounted at `/workspace/data` cannot enumerate or access the snapshot store, which is never mounted into sandboxes.
 
-10. **Path canonicalization before pattern matching:** Before applying `BLOCKED_VOLUME_PATTERNS`, all paths are resolved via `Path.resolve()` to eliminate symlink traversal and `..` components that could bypass pattern matching. Example: `~/.tag/volumes/myvolume/../../../home/user/.ssh/` would resolve to `/home/user/.ssh/` and match the `.ssh` block pattern.
+10. **Path canonicalization before pattern matching:** Before applying `blockedVolumePatterns`, all paths are canonicalized via `filepath.Clean` and `filepath.EvalSymlinks` to eliminate symlink traversal and `..` components that could bypass pattern matching. Example: `~/.tag/volumes/myvolume/../../../home/user/.ssh/` would resolve to `/home/user/.ssh/` and match the `.ssh` block pattern.
 
 ---
 
@@ -889,74 +1070,80 @@ timeout: 7200
 ### 12.1 Unit Tests
 
 ```
-tests/test_sandbox_volumes.py
+internal/sandbox/volumes_test.go
 ```
+
+Written with the standard `testing` package, table-driven where a set of inputs share one assertion. Errors are checked via returned `error` values (no exception assertions).
 
 | Test | Coverage |
 |------|----------|
-| `test_volume_name_validation_valid` | All valid name patterns pass `_validate_volume_name()` |
-| `test_volume_name_validation_invalid` | Names with `/`, `..`, spaces, leading `-`, > 63 chars all raise `ValueError` |
-| `test_snapshot_name_validation` | Dots and hyphens allowed in snapshot names; `..` rejected |
-| `test_volume_mount_parse_named_rw` | `VolumeMount.parse("my-data:/workspace")` produces `is_named=True, mode='rw'` |
-| `test_volume_mount_parse_named_ro` | `VolumeMount.parse("my-data:/workspace:ro")` produces `mode='ro'` |
-| `test_volume_mount_parse_host_path` | `VolumeMount.parse("/tmp/foo:/bar")` produces `is_named=False` |
-| `test_volume_mount_parse_duplicate_target` | `resolve_mounts` with two mounts to same target raises `ValueError` |
-| `test_credential_pattern_block_env` | Volume dir containing `secrets.env` raises `PermissionError` |
-| `test_credential_pattern_block_ssh` | Volume dir containing `.ssh/` raises `PermissionError` |
-| `test_credential_pattern_allow_clean` | Volume dir with only `.txt` and `.py` files passes without error |
-| `test_content_hash_deterministic` | Same directory structure always produces the same hash |
-| `test_content_hash_differs_on_change` | Adding one byte to any file changes the hash |
-| `test_compute_dir_size_accuracy` | `_compute_dir_size` returns exact byte count for a synthetic directory tree |
-| `test_compute_dir_size_handles_permission_error` | Unreadable subdirectory is skipped without raising |
-| `test_human_bytes_formatting` | 1024 → `"1.0 KB"`, 1073741824 → `"1.0 GB"`, 0 → `"0.0 B"` |
-| `test_atomic_snapshot_success` | `_atomic_snapshot` creates final directory, removes tmp |
-| `test_atomic_snapshot_no_partial_on_interrupt` | Monkeypatched `copytree` raises mid-copy; only `.tmp` exists, not final |
-| `test_atomic_snapshot_raises_on_duplicate` | Second call with same `snap_name` raises `FileExistsError` |
-| `test_quota_check_blocks_at_limit` | `resolve_mounts` with `size_bytes >= quota_bytes` raises `PermissionError` |
-| `test_quota_check_allows_under_limit` | `resolve_mounts` with `size_bytes < quota_bytes` succeeds |
+| `TestVolumeNameValidationValid` | All valid name patterns pass `validateVolumeName()` (returns nil) |
+| `TestVolumeNameValidationInvalid` | Names with `/`, `..`, spaces, leading `-`, > 63 chars all return a non-nil error (table-driven) |
+| `TestSnapshotNameValidation` | Dots and hyphens allowed in snapshot names; `..` rejected |
+| `TestParseVolumeMountNamedRW` | `ParseVolumeMount("my-data:/workspace")` produces `IsNamed=true, Mode="rw"` |
+| `TestParseVolumeMountNamedRO` | `ParseVolumeMount("my-data:/workspace:ro")` produces `Mode="ro"` |
+| `TestParseVolumeMountHostPath` | `ParseVolumeMount("/tmp/foo:/bar")` produces `IsNamed=false` |
+| `TestResolveMountsDuplicateTarget` | `ResolveMounts` with two mounts to the same target returns an error |
+| `TestCredentialPatternBlockEnv` | Volume dir containing `secrets.env` returns an error |
+| `TestCredentialPatternBlockSSH` | Volume dir containing `.ssh/` returns an error |
+| `TestCredentialPatternAllowClean` | Volume dir with only `.txt` and `.py` files returns nil |
+| `TestContentHashDeterministic` | Same directory structure always produces the same hash |
+| `TestContentHashDiffersOnChange` | Adding one byte to any file changes the hash |
+| `TestComputeDirSizeAccuracy` | `computeDirSize` returns exact byte count for a synthetic directory tree |
+| `TestComputeDirSizeHandlesPermissionError` | Unreadable subdirectory is skipped without error |
+| `TestHumanBytesFormatting` | 1024 → `"1.0 KB"`, 1073741824 → `"1.0 GB"`, 0 → `"0.0 B"` (table-driven) |
+| `TestAtomicSnapshotSuccess` | `atomicSnapshot` creates the final directory and removes the tmp |
+| `TestAtomicSnapshotNoPartialOnInterrupt` | An injected copy failure mid-run leaves no final dir (tmp cleaned up) |
+| `TestAtomicSnapshotErrorsOnDuplicate` | Second call with the same `snapName` returns an error |
+| `TestQuotaCheckBlocksAtLimit` | `ResolveMounts` with `SizeBytes >= QuotaBytes` returns an error |
+| `TestQuotaCheckAllowsUnderLimit` | `ResolveMounts` with `SizeBytes < QuotaBytes` succeeds |
 
 ### 12.2 Integration Tests
 
 ```
-tests/test_sandbox_volumes_integration.py
+internal/sandbox/volumes_integration_test.go
 ```
+
+Backends are injected via Go interfaces (dependency injection) rather than monkeypatching; a fake in-memory backend implements the sandbox-run interface for tests that do not need real Docker. SQLite uses a temp `modernc.org/sqlite` DB.
 
 | Test | Setup | Assert |
 |------|-------|--------|
-| `test_create_and_list` | Call `create_volume(conn, "test-vol", quota_bytes=1GB)` | Row in `sandbox_volumes`; directory at `~/.tag/volumes/test-vol/` |
-| `test_mount_in_docker_run` | Create volume, write file into it, run Docker sandbox reading the file | File content in sandbox stdout |
-| `test_snapshot_and_restore` | Create volume, write file A, snapshot `v1`, write file B, restore `v1`, read dir | Only file A present after restore |
-| `test_concurrent_ro_mounts` | Create volume with 1 MB data; 8 threads each run Docker sandbox with `:ro` | All 8 runs succeed; no data corruption |
-| `test_queue_worker_volume_yaml` | Write queue job YAML with `volumes:` key; dispatch via `_run_job()` | Mounted volume data accessible inside job container |
-| `test_delete_blocked_while_mounted` | Start long-running sandbox with volume mounted; attempt `delete_volume()` | `ValueError` raised; volume still exists |
-| `test_soft_delete_preserves_audit` | Delete a volume; query `sandbox_volumes WHERE status='deleted'` | Row still exists with `deleted_at` set |
-| `test_pre_restore_auto_snapshot` | Restore a volume; list snapshots | `pre-restore-*` snapshot created automatically |
+| `TestCreateAndList` | Call `CreateVolume(ctx, db, "test-vol", WithQuotaBytes(1<<30))` | Row in `sandbox_volumes`; directory at `~/.tag/volumes/test-vol/` |
+| `TestMountInDockerRun` | Create volume, write file into it, run Docker sandbox reading the file | File content in sandbox stdout |
+| `TestSnapshotAndRestore` | Create volume, write file A, snapshot `v1`, write file B, restore `v1`, read dir | Only file A present after restore |
+| `TestConcurrentROMounts` | Create volume with 1 MB data; 8 goroutines each run a Docker sandbox with `:ro` | All 8 runs succeed; no data corruption |
+| `TestQueueWorkerVolumeYAML` | Write queue job YAML with `volumes:` key; dispatch via the `internal/queue` job runner | Mounted volume data accessible inside job container |
+| `TestDeleteBlockedWhileMounted` | Start long-running sandbox with volume mounted; call `DeleteVolume()` | Returns an error; volume still exists |
+| `TestSoftDeletePreservesAudit` | Delete a volume; query `sandbox_volumes WHERE status='deleted'` | Row still exists with `deleted_at` set |
+| `TestPreRestoreAutoSnapshot` | Restore a volume; list snapshots | `pre-restore-*` snapshot created automatically |
 
 ### 12.3 Performance Tests
 
 ```
-tests/test_sandbox_volumes_perf.py
+internal/sandbox/volumes_bench_test.go
 ```
+
+Expressed as Go benchmarks (`func BenchmarkX(b *testing.B)`) and timing tests; thresholds are asserted against `b.Elapsed()` / measured wall time.
 
 | Test | Threshold |
 |------|-----------|
-| `test_snapshot_throughput_1gb` | `shutil.copytree` of 1 GB synthetic data completes in < 2 seconds on NVMe |
-| `test_compute_dir_size_50gb` | `_compute_dir_size` on 50 GB (10,000 files × 5 MB) completes in < 200 ms |
-| `test_sqlite_volume_write_latency` | `INSERT INTO sandbox_volumes` + `COMMIT` in WAL mode < 5 ms (p99 over 100 iterations) |
-| `test_mount_resolution_latency` | `resolve_mounts()` for 4 named volumes < 10 ms (4 SQLite reads + 4 scandir calls) |
+| `BenchmarkSnapshotThroughput1GB` | `copyTree` of 1 GB synthetic data completes in < 2 seconds on NVMe |
+| `BenchmarkComputeDirSize50GB` | `computeDirSize` on 50 GB (10,000 files × 5 MB) completes in < 200 ms |
+| `BenchmarkSQLiteVolumeWriteLatency` | `INSERT INTO sandbox_volumes` via `ExecContext` in WAL mode < 5 ms (p99 over 100 iterations) |
+| `BenchmarkMountResolutionLatency` | `ResolveMounts()` for 4 named volumes < 10 ms (4 SQLite reads + 4 `os.ReadDir` calls) |
 
 ### 12.4 Security Tests
 
 ```
-tests/test_sandbox_volume_security.py
+internal/sandbox/volumes_security_test.go
 ```
 
 | Test | Description |
 |------|-------------|
-| `test_symlink_not_followed_in_snapshot` | Volume contains symlink to `/etc/passwd`; snapshot does not copy `/etc/passwd` contents |
-| `test_path_canonicalization_bypasses_dotdot` | `resolve_mounts` with `source="../../../etc"` raises `ValueError` (not a valid volume name due to regex) |
-| `test_all_blocked_patterns_rejected` | For each pattern in `BLOCKED_VOLUME_PATTERNS`, a volume containing a matching file is blocked |
-| `test_ro_mount_blocks_write_in_container` | Docker run with `:ro` volume; `echo foo > /mounted/file` inside container exits non-zero |
+| `TestSymlinkNotFollowedInSnapshot` | Volume contains symlink to `/etc/passwd`; snapshot recreates the symlink and does not copy `/etc/passwd` contents |
+| `TestPathCanonicalizationBypassesDotDot` | `ResolveMounts` with `Source="../../../etc"` returns an error (not a valid volume name due to regex) |
+| `TestAllBlockedPatternsRejected` | Table-driven over `blockedVolumePatterns`: a volume containing a matching file is blocked for each pattern |
+| `TestROMountBlocksWriteInContainer` | Docker run with `:ro` volume; `echo foo > /mounted/file` inside container exits non-zero |
 
 ---
 
@@ -973,9 +1160,9 @@ tests/test_sandbox_volume_security.py
 | AC-07 | `tag sandbox volume restore my-data --snapshot before-training --confirm` automatically creates a `pre-restore-*` snapshot before overwriting. | `tag sandbox volume snapshot list my-data` shows a `pre-restore-*` entry. |
 | AC-08 | Attempting to mount a volume containing `secrets.env` produces exit code 1 and the message `"Mount blocked: volume 'X' contains 'secrets.env' matching blocked pattern '*.env'."` | Place `secrets.env` in volume dir; run `tag sandbox run --volume X:/data`; assert stderr. |
 | AC-09 | `tag sandbox volume list --json` returns a JSON array where each element has `schema_version: "1"` and fields: `id`, `name`, `path`, `quota_bytes`, `size_bytes`, `status`, `created_at`. | `jq '.[].schema_version' <(tag sandbox volume list --json)` → all `"1"`. |
-| AC-10 | 8 concurrent `tag sandbox run --volume shared-data:/data:ro` invocations all complete successfully with identical stdout, no errors, and no data in `shared-data` modified. | Run 8 processes in parallel via Python `multiprocessing`; assert all exit 0 and volume mtime unchanged. |
+| AC-10 | 8 concurrent `tag sandbox run --volume shared-data:/data:ro` invocations all complete successfully with identical stdout, no errors, and no data in `shared-data` modified. | Launch 8 parallel processes (via `os/exec` from a test, or a shell `for` loop with `&`); assert all exit 0 and volume mtime unchanged. |
 | AC-11 | `tag sandbox volume delete my-data --force --purge-snapshots` removes the host directory, all snapshot directories, and sets `sandbox_volumes.status='deleted'` but preserves the SQLite row. | `ls ~/.tag/volumes/my-data` → no such file; `sqlite3 ... "SELECT status,deleted_at FROM sandbox_volumes WHERE name='my-data'"` → `deleted|<timestamp>`. |
-| AC-12 | A queue job YAML with `volumes: [my-data:/workspace:rw]` dispatched via `queue_worker._run_job()` mounts the named volume into the sandbox. | Write a job that creates a file at `/workspace/output.txt`; after job completion, verify `~/.tag/volumes/my-data/output.txt` exists on host. |
+| AC-12 | A queue job YAML with `volumes: [my-data:/workspace:rw]` dispatched via the `internal/queue` job runner mounts the named volume into the sandbox. | Write a job that creates a file at `/workspace/output.txt`; after job completion, verify `~/.tag/volumes/my-data/output.txt` exists on host. |
 | AC-13 | `tag sandbox volume create my-data` (duplicate name) returns exit code 1 with message `"Volume 'my-data' already exists."` without creating a new directory or row. | Create volume twice; assert second call exit code 1. |
 | AC-14 | Attempting to run `tag sandbox run --volume over-quota-vol:/data` when the volume's `size_bytes >= quota_bytes` returns exit code 1 with a quota exceeded message. | Manually set `size_bytes = quota_bytes` in SQLite; attempt mount; assert error. |
 
@@ -985,21 +1172,27 @@ tests/test_sandbox_volume_security.py
 
 | Dependency | Type | Version / Constraint | Notes |
 |------------|------|---------------------|-------|
-| Python `shutil` | stdlib | >= 3.11 | `copytree`, `move`, `rmtree` — no new dependency |
-| Python `hashlib` | stdlib | >= 3.11 | SHA-256 content hashing |
-| Python `pathlib` | stdlib | >= 3.11 | All path operations |
-| Python `os` (scandir) | stdlib | >= 3.5 | Fast directory size computation |
-| Python `sqlite3` | stdlib | >= 3.11 | WAL-mode database, existing `open_db()` |
-| Python `dataclasses` | stdlib | >= 3.7 | `VolumeMount`, `SandboxVolume`, `VolumeSnapshot` |
-| Docker CLI / Engine API | optional | >= 20.10 | Bind mount support for Docker backend |
-| `e2b` SDK | optional extra | >= 0.17.0 | E2B filesystem sync for cloud backend |
-| `modal` SDK | optional extra | >= 0.63.0 | `modal.Volume.from_name()` for Modal backend |
-| PRD-028 sandbox.py | internal | v1 (existing) | `run_in_sandbox()`, `ensure_schema()`, `BACKENDS` — extended by this PRD |
-| PRD-013 tracing.py | internal | v1 (existing) | OTEL span emission for volume lifecycle events |
-| PRD-034 security.py | internal | v1 (existing) | `BLOCKED_VOLUME_PATTERNS` — extended/referenced |
-| PRD-012 budget.py | internal | v1 (existing) | Quota tracking hooks (future: disk quota → budget alerts) |
-| PRD-020 ci.py | internal | v1 (existing) | `--json` output consumed by CI pipelines |
-| `rich` | existing dep | >= 13.0 | Progress bar for large snapshot operations (NFR-02) |
+| Go `os` / `io` | stdlib | Go >= 1.22 | Recursive copy, `os.Rename`, `os.ReadDir`, `filepath.WalkDir` |
+| Go `crypto/sha256` + `encoding/hex` | stdlib | Go >= 1.22 | Content-hash fingerprinting |
+| Go `path/filepath` | stdlib | Go >= 1.22 | Cross-platform path ops, `filepath.Clean`/`EvalSymlinks` |
+| Go `database/sql` | stdlib | Go >= 1.22 | `*sql.DB`, `QueryContext`/`ExecContext`, `sql.Tx` |
+| Go `regexp` | stdlib | Go >= 1.22 | Name-validation regexes |
+| `modernc.org/sqlite` | vendored | latest | Pure-Go SQLite (CGO_ENABLED=0), WAL via PRAGMA, FTS5 built-in |
+| Docker Engine API (host) | optional | >= 20.10 | Bind-mount support for the Docker backend |
+| `github.com/docker/docker/client` (+ `.../api/types/mount`) | module | moby client | Typed mount specs for the Docker backend (no `docker run` subprocess) |
+| `github.com/firecracker-microvm/firecracker-go-sdk` | optional module | latest | microVM drive attach + guest file sync for the E2B/microVM backend |
+| Modal provider | optional | — | Compile-time-optional `VolumeProvider` (build-tagged) or out-of-process/HTTP call to the Modal API; not a runtime import |
+| `go.opentelemetry.io/otel` | module | latest | OTEL span emission for volume lifecycle events (via `internal/obs`) |
+| `github.com/spf13/cobra` | module | latest | `tag sandbox volume` command group in `internal/cli` |
+| `github.com/knadh/koanf/v2` + `gopkg.in/yaml.v3` | module | latest | Queue job YAML decoding of the `volumes:` list |
+| `github.com/oklog/ulid/v2` | module | latest | Sortable `vol_`/`snap_`/`mnt_` IDs |
+| `github.com/landlock-lsm/go-landlock` | module | latest | Path-scoped read/read-write rules for the restricted backend (Linux) |
+| PRD-028 `internal/sandbox` | internal | v1 (existing) | `RunInSandbox()`, `EnsureSchema()`, backends — extended by this PRD |
+| PRD-013 `internal/obs` | internal | v1 (existing) | OTEL span emission for volume lifecycle events |
+| PRD-034 credential validation | internal | v1 (existing) | `blockedVolumePatterns` in `internal/sandbox`/`internal/credentials` — extended/referenced |
+| PRD-012 budget | internal | v1 (existing) | Quota tracking hooks (future: disk quota → budget alerts) |
+| PRD-020 CI | internal | v1 (existing) | `--json` output consumed by CI pipelines |
+| Progress indicator | Go | — | `bubbletea`/`progress` bar or a simple stderr counter for large snapshots (NFR-02) — replaces Python `rich` |
 
 ---
 
@@ -1009,11 +1202,11 @@ tests/test_sandbox_volume_security.py
 |----|----------|-------|---------------------|
 | OQ-01 | Should the E2B pre/post sync use E2B's native file API (`sbx.files.write`) or `rsync` over SSH? E2B's file API has a ~1 MB/s throughput limit for large volumes; rsync requires the sandbox to have SSH accessible. Need to benchmark both approaches for 1 GB volumes. | Sandbox team | Before implementation start |
 | OQ-02 | Should `quota_bytes` be a hard limit enforced inside the container (via `docker run --storage-opt size=10G`) or only a pre-flight soft check? Hard enforcement requires Docker daemon with `overlay2` storage driver and `dm.basesize` config — not available on all platforms. | Platform team | Sprint 1 |
-| OQ-03 | Should snapshot storage be content-addressed (deduplicated between snapshots that share files) to save disk space? Full `copytree` is simple and correct but expensive for large volumes with small changes. A COW filesystem (btrfs `cp --reflink`, APFS clonefile) could make snapshots near-instant and near-zero-cost. macOS APFS supports `fcopyfile(COPYFILE_CLONE)` already available in Python 3.13's `shutil.copy2`. | Architecture | Sprint 2 |
+| OQ-03 | Should snapshot storage be content-addressed (deduplicated between snapshots that share files) to save disk space? A full recursive copy is simple and correct but expensive for large volumes with small changes. A COW filesystem (btrfs `cp --reflink`, APFS clonefile) could make snapshots near-instant and near-zero-cost. From Go, reflink clones are reachable via the `FICLONE`/`copy_file_range` ioctls on Linux and `clonefile(2)` on macOS APFS (through `golang.org/x/sys/unix`). | Architecture | Sprint 2 |
 | OQ-04 | Should volume names be namespaced by TAG profile (e.g., `coder::my-data`) to prevent accidental cross-profile data sharing in multi-profile installations? Or is global namespace simpler and more useful? | Product | Before CLI design is finalized |
 | OQ-05 | When a Modal sandbox is used and a `modal.Volume` with the same name exists in the user's Modal workspace, should TAG automatically use it (providing true cloud persistence)? This requires `modal auth` credentials at volume-create time. The discovery UX needs design. | Integrations team | Sprint 2 |
 | OQ-06 | Should `tag sandbox volume` support volume templates — pre-populated volumes created from a public URL (e.g., `tag sandbox volume create my-data --from-url s3://bucket/dataset.tar.gz`)? This would enable standard ML benchmark datasets to be instantiated in one command. | Product | Post-v1 |
-| OQ-07 | What is the correct behavior when the host filesystem runs low on disk space (< 1 GB free) during a snapshot? Should TAG fail fast with a clear error, or attempt the snapshot and let `shutil.copytree` fail with `OSError: [Errno 28] No space left on device`? | Engineering | Sprint 1 |
+| OQ-07 | What is the correct behavior when the host filesystem runs low on disk space (< 1 GB free) during a snapshot? Should TAG fail fast with a clear error, or attempt the snapshot and let the recursive copy's `io.Copy` surface a wrapped `ENOSPC` ("no space left on device") error? | Engineering | Sprint 1 |
 | OQ-08 | Should `sandbox_run_mounts.unmounted_at` be set by a cleanup sweep (in case TAG is killed mid-run and the mount record is never closed) or only set synchronously at run completion? A startup sweep that closes stale mount records would fix orphaned entries. | Engineering | Sprint 1 |
 
 ---
@@ -1024,42 +1217,42 @@ tests/test_sandbox_volume_security.py
 
 ### Phase 1 — Core Volume Lifecycle (Days 1–3)
 
-- SQLite DDL: `sandbox_volumes`, `sandbox_volume_snapshots`, `sandbox_run_mounts` tables via `ensure_volume_schema()`.
-- `SandboxVolume`, `VolumeSnapshot`, `VolumeMount` dataclasses.
-- `create_volume()`, `delete_volume()`, `list_volumes()`, `inspect_volume()`.
-- `_validate_volume_name()`, `_compute_dir_size()`, `_human_bytes()`.
-- `cmd_sandbox_volume_create`, `cmd_sandbox_volume_list`, `cmd_sandbox_volume_delete` in `controller.py`.
+- SQLite DDL: `sandbox_volumes`, `sandbox_volume_snapshots`, `sandbox_run_mounts` tables via `EnsureVolumeSchema()` (executed through `internal/store` over `modernc.org/sqlite`).
+- `SandboxVolume`, `VolumeSnapshot`, `VolumeMount` Go structs (json-tagged).
+- `CreateVolume()`, `DeleteVolume()`, `ListVolumes()`, `InspectVolume()` in `internal/sandbox`.
+- `validateVolumeName()`, `computeDirSize()`, `humanBytes()`.
+- `create`, `list`, `delete` cobra subcommands under `sandbox volume` in `internal/cli`.
 - Unit tests for name validation, size computation, SQLite schema.
 
 ### Phase 2 — Snapshot Engine (Days 4–5)
 
-- `_atomic_snapshot()`, `_content_hash()`, `snapshot_volume()`, `restore_volume()`.
+- `atomicSnapshot()` (+ `copyTree()`), `contentHash()`, `SnapshotVolume()`, `RestoreVolume()`.
 - Auto-snapshot on restore (FR-09).
-- `cmd_sandbox_volume_snapshot`, `cmd_sandbox_volume_restore`, `cmd_sandbox_volume_snapshot_list`, `cmd_sandbox_volume_snapshot_delete`.
+- `snapshot`, `restore`, `snapshot list`, `snapshot delete` cobra subcommands in `internal/cli`.
 - Unit tests for atomic snapshot, content hash, duplicate detection.
 - Integration test: snapshot → modify → restore → verify.
 
 ### Phase 3 — Mount Integration (Days 6–8)
 
-- `VolumeMount.parse()`, `resolve_mounts()`.
-- `_check_credential_patterns()`, `_check_quota()`.
-- Extend `_run_docker()` with `--mount` flags for resolved volumes.
-- Extend `run_in_sandbox()` signature with `volume_mounts: list[VolumeMount]`.
+- `ParseVolumeMount()`, `ResolveMounts()`.
+- `checkCredentialPatterns()`, `checkQuota()`.
+- Extend the Docker runner to attach typed `mount.Mount` specs (moby client) for resolved volumes.
+- Extend the `RunInSandbox()` signature with `volumeMounts []VolumeMount`.
 - `sandbox_run_mounts` insert/update on run start/end.
-- Extend `queue_worker.py` to parse `volumes:` YAML key.
+- Extend `internal/queue` to decode the `volumes:` YAML key (koanf + yaml.v3).
 - Integration tests: Docker read-write mount, Docker read-only mount, concurrent ro mounts, credential block, quota block.
 
 ### Phase 4 — Backend Extensions and Polish (Days 9–11)
 
-- E2B pre/post sync (`_e2b_upload_volume`, `_e2b_download_volume`).
-- Modal.Volume integration with rsync fallback.
-- OTEL span emission for all volume lifecycle events (FR-12).
+- E2B/microVM pre/post file sync (`e2bUploadVolume`, `e2bDownloadVolume`) + firecracker drive attach.
+- Modal optional `VolumeProvider` (build-tagged / HTTP) with file-sync fallback.
+- OTEL span emission for all volume lifecycle events (FR-12) via `internal/obs`.
 - `--json` output on all subcommands; JSON schema snapshot test.
-- `cmd_sandbox_volume_inspect` (full detail view).
-- Performance tests: snapshot throughput, dir-size speed, SQLite write latency.
+- `inspect` subcommand (full detail view) in `internal/cli`.
+- Performance tests: snapshot throughput, dir-size speed, SQLite write latency (Go benchmarks).
 - Security tests: symlink safety, path canonicalization, all blocked patterns.
-- Rich progress bar for large snapshot/restore operations (NFR-02).
-- `cmd_doctor` check for orphaned `.tmp` snapshot directories (NFR-04).
+- Go progress indicator (bubbletea/progress or stderr counter) for large snapshot/restore operations (NFR-02).
+- `doctor` command check (`internal/cli`) for orphaned `.tmp` snapshot directories (NFR-04).
 
 ### Milestone: PR Ready for Review — Day 11
 

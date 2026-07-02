@@ -1,10 +1,12 @@
 # PRD-088: Distributed Agent Runtime (gRPC Host/Worker for Cross-Machine Agents) (`tag runtime`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P3
 **Estimated Effort:** XL (4-8 weeks)
 **Category:** Multi-Agent Interoperability Protocols
-**Affects:** `runtime.py`
+**Affects:** `internal/runtime`
 **Depends on:** PRD-013 (agent tracing/observability), PRD-028 (sandbox code execution), PRD-034 (security hardening), PRD-027 (eval framework), PRD-012 (cost tracking/budget), PRD-008 (background task queue)
 **Inspired by:** AutoGen distributed runtime, Ray distributed actors, Celery workers
 
@@ -18,9 +20,9 @@ PRD-088 introduces the **Distributed Agent Runtime**: a gRPC-based host/worker a
 
 The design is explicitly inspired by three mature distributed task systems. **AutoGen's distributed runtime** (v0.4+) separates agent logic from the communication substrate, using gRPC message passing so agents on different hosts can send and receive messages without knowing each other's location. **Ray distributed actors** treat each long-running stateful object (here: a worker's loaded profile context and tool singletons) as a remote actor that can be addressed by stable identity. **Celery workers** pioneered the broker-mediated task queue pattern where workers pull tasks matching their declared capabilities — here translated into gRPC streaming subscriptions rather than AMQP queues, eliminating an external broker dependency entirely.
 
-TAG's SQLite state store (`~/.tag/runtime/tag.sqlite3`) gains two new tables: `runtime_tasks` tracking submitted tasks with their lifecycle state, and `runtime_workers` caching the worker registry seen by each host. The host's gRPC server is implemented in `src/tag/runtime.py` using `grpcio` and a hand-rolled proto that avoids heavy proto compilation toolchains by using `grpcio-reflection` and runtime service descriptors. The CLI surface is `tag runtime host start`, `tag runtime worker start`, `tag runtime status`, and `tag submit --runtime grpc://...`.
+TAG's SQLite state store (`~/.tag/runtime/tag.sqlite3`, via `modernc.org/sqlite`) gains two new tables: `runtime_tasks` tracking submitted tasks with their lifecycle state, and `runtime_workers` caching the worker registry seen by each host. The host's gRPC server lives in package `internal/runtime` (module `github.com/tag-agent/tag`) and is built on `google.golang.org/grpc` with generated stubs from a language-neutral `.proto` service definition (`protoc-gen-go` + `protoc-gen-go-grpc`). The CLI surface is `tag runtime host start`, `tag runtime worker start`, `tag runtime status`, and `tag submit --runtime grpc://...`.
 
-This feature is categorized P3 (nice-to-have) because TAG's primary deployment model — single-user, single-machine — does not require distributed infrastructure. The feature targets platform engineers building internal AI automation pipelines who need to burst agent workloads across a small cluster (2–10 machines) without adopting a full-weight orchestration platform like Ray or Kubernetes. The implementation must not increase startup latency or import overhead for the common single-machine case: all gRPC imports are deferred behind the `tag runtime` subcommand.
+This feature is categorized P3 (nice-to-have) because TAG's primary deployment model — single-user, single-machine — does not require distributed infrastructure. The feature targets platform engineers building internal AI automation pipelines who need to burst agent workloads across a small cluster (2–10 machines) without adopting a full-weight orchestration platform like Ray or Kubernetes. Because TAG ships as a single static Go binary (`CGO_ENABLED=0`), the runtime code is compiled into the same binary and gated behind the `tag runtime` subcommand; there is no separate install extra and no per-command import cost — the gRPC server and client are simply not initialized on the common single-machine path.
 
 ---
 
@@ -77,7 +79,7 @@ The `coder` profile benefits from fast disk I/O and high-memory local MCP filesy
 | Worker connect time | Worker registers with host within 3 seconds of starting | Integration test with subprocess timing |
 | Task dispatch latency | Time from `tag submit` return to worker receiving task | <500 ms at p99 on local LAN | Prometheus histogram |
 | Streaming lag | First streaming event from worker reaches `tag submit` caller | <200 ms after worker emits it | Integration test |
-| gRPC import overhead | `import tag.controller` does not import `grpc` | `sys.modules` assertion in unit test |
+| gRPC init overhead | single-machine `tag run` does not construct a gRPC server/client | benchmark + no-op assertion in `runtime_init_test.go` |
 | Task persistence | Tasks in `runtime_tasks` survive host restart and remain queryable | Integration test: kill host, restart, `tag runtime task get` |
 | Auth rejection | Requests with wrong token rejected with gRPC `UNAUTHENTICATED` status code | Unit test |
 | Prometheus metrics | `curl :9090/metrics` returns counters with correct values after tasks | Integration test |
@@ -351,7 +353,7 @@ tag runtime worker list \
 
 | ID | Requirement |
 |----|-------------|
-| FR-01 | **gRPC service definition:** `runtime.py` must define a `TagRuntimeService` with RPCs: `RegisterWorker(WorkerInfo) → stream WorkerCommand`, `SubmitTask(TaskRequest) → TaskAck`, `StreamTaskEvents(TaskRef) → stream TaskEvent`, `GetTaskResult(TaskRef) → TaskResult`, `CancelTask(TaskRef) → CancelAck`, `GetStatus(StatusRequest) → StatusResponse`, `Heartbeat(HeartbeatRequest) → HeartbeatAck`. All message types are defined as Python dataclasses and serialized to JSON bytes (no `.proto` compilation required). |
+| FR-01 | **gRPC service definition:** `internal/runtime/proto/runtime.proto` must define a `TagRuntimeService` with RPCs: `RegisterWorker(stream WorkerMessage) → stream WorkerCommand` (bidi), `SubmitTask(TaskRequest) → TaskAck`, `StreamTaskEvents(TaskRef) → stream TaskEvent`, `GetTaskResult(TaskRef) → TaskResult`, `CancelTask(TaskRef) → CancelAck`, `GetStatus(StatusRequest) → StatusResponse`, `Heartbeat(HeartbeatRequest) → HeartbeatAck`. Message types are declared as protobuf messages; Go stubs are generated with `protoc-gen-go` + `protoc-gen-go-grpc` and checked in. DTOs that are not on the wire (e.g. internal registry snapshots) are plain Go structs. |
 | FR-02 | **Worker registration:** Workers must call `RegisterWorker` with their ID, declared profiles, concurrency, hostname, and auth token on connect. The host must verify the token, register the worker in `runtime_workers`, and open a server-side streaming channel through which the host pushes `WorkerCommand` messages (task assignments, cancellations, drain instructions). |
 | FR-03 | **Task submission:** `SubmitTask` accepts a `TaskRequest` (profile, prompt, files, env, priority, timeout_seconds) and synchronously writes a row to `runtime_tasks` with status `QUEUED`, returning a `TaskAck` with the assigned `task_id`. Dispatch to a worker is asynchronous and must not block the submit RPC response. |
 | FR-04 | **Affinity dispatch:** The default scheduler selects the worker with the lowest current load ratio (`in_progress / concurrency`) among workers that declared the requested profile. Ties broken by worker registration order (FIFO). If no affinity-matching worker is available, the task stays `QUEUED` until one connects or becomes free. |
@@ -367,11 +369,11 @@ tag runtime worker list \
 | FR-14 | **Prometheus metrics:** The host exposes the following metrics on the metrics port: `tag_runtime_tasks_submitted_total` (counter, labels: profile), `tag_runtime_tasks_completed_total` (counter, labels: profile, status), `tag_runtime_workers_connected` (gauge), `tag_runtime_task_dispatch_latency_seconds` (histogram), `tag_runtime_task_duration_seconds` (histogram, labels: profile). |
 | FR-15 | **Cost attribution:** When a worker emits a `cost` event, the host updates `runtime_tasks.cost_usd` and `runtime_tasks.tokens_in` / `tokens_out`. `tag runtime task get` surfaces these fields. Cost data is also forwarded to the local budget module (PRD-012) on the host via `budget.record_spend`. |
 | FR-16 | **`--files` payload:** Files specified in `tag submit --files` are read locally, base64-encoded, and included in the `TaskRequest.files` field (list of `{name: str, content_b64: str}`). The worker decodes them into a temporary directory and sets the working directory for the agent run. Maximum total file size: 10 MB. |
-| FR-17 | **`--priority` scheduling:** Within a worker's incoming task queue, tasks with higher `priority` values (0–9, default 5) are dispatched before lower-priority ones. The host maintains per-worker priority queues using Python's `heapq`. |
+| FR-17 | **`--priority` scheduling:** Within a worker's incoming task queue, tasks with higher `priority` values (0–9, default 5) are dispatched before lower-priority ones. The host maintains per-worker priority queues using `container/heap` from the Go standard library, guarded by a `sync.Mutex`. |
 | FR-18 | **`tag runtime task cancel` propagation:** If the task is `QUEUED`, it is immediately marked `CANCELED` in SQLite. If `DISPATCHED` or `RUNNING`, the host sends a `CancelCommand` to the holding worker; the worker emits a `status_change: CANCELED` event and terminates the agent subprocess. |
-| FR-19 | **No proto compilation requirement:** The gRPC service uses `grpcio` with `grpc.experimental.aio` and `betterproto` (or raw channel descriptors) so that no `protoc` or `grpc_tools` invocation is required at install time. All message types are Python dataclasses. |
-| FR-20 | **Worker-local TAG execution:** Workers execute tasks by calling the existing `controller.py` agent runner functions (same code path as `tag run`). No separate agent binary or container is required. The worker passes the `profile`, `prompt`, `files` working directory, and `env` overrides to the runner and captures streaming output via the existing Hermes callback mechanism. |
-| FR-21 | **`tag runtime status --watch`:** When `--watch` is specified, the CLI re-polls the host via `GetStatus` every 2 seconds and re-renders the Rich table in-place (using Rich Live). |
+| FR-19 | **Generated stubs, no install-time codegen:** Go stubs are generated from `runtime.proto` at development time (`go generate ./internal/runtime/...`) and committed to the repo, so end users building or downloading the single static binary never run `protoc`. `CGO_ENABLED=0` keeps the binary fully static; the `.proto` file remains the single language-neutral source of truth for the wire contract. |
+| FR-20 | **Worker-local TAG execution:** Workers execute tasks by calling the existing in-process agent runner in `internal/agent` (same code path as `tag run`). No separate agent binary or container is required. The worker passes the `profile`, `prompt`, `files` working directory, and `env` overrides to the runner and captures streaming output via the existing event-callback mechanism (a Go channel of events). |
+| FR-21 | **`tag runtime status --watch`:** When `--watch` is specified, the CLI re-polls the host via `GetStatus` every 2 seconds (a `time.Ticker` loop with `context.Context` cancellation) and re-renders the status table in-place using the existing terminal table renderer. |
 | FR-22 | **Worker drain on SIGTERM:** When a worker receives `SIGTERM` or a `DrainCommand` from the host, it finishes any in-progress task, reports the result, and exits cleanly without accepting new assignments. |
 
 ---
@@ -380,14 +382,14 @@ tag runtime worker list \
 
 | ID | Requirement |
 |----|-------------|
-| NFR-01 | **Zero import overhead on cold path.** `import tag.controller` must not import `grpc`, `betterproto`, or any runtime module. All runtime imports are inside functions decorated with `@_require_grpc` or inside `cmd_runtime_*` and `cmd_submit` handlers. Verified by unit test asserting `'grpc' not in sys.modules`. |
-| NFR-02 | **Startup latency.** `tag runtime host start` must be ready to accept connections within 2 seconds on any machine with Python 3.10+ and `grpcio` installed. Measured from CLI invocation to first successful `grpc_health_probe` response. |
+| NFR-01 | **Zero init overhead on cold path.** The single-machine `tag run` path must never construct a `grpc.Server`, dial a channel, or open a runtime SQLite connection. Runtime wiring is confined to the `internal/runtime` package and only invoked from the `runtime` and `submit --runtime grpc://` cobra subcommands. Verified by a benchmark plus a test that runs a `tag run` and asserts no gRPC listener is opened. |
+| NFR-02 | **Startup latency.** `tag runtime host start` must be ready to accept connections within 2 seconds on any supported platform (the single static Go binary has no interpreter warm-up). Measured from process start to first successful `grpc_health_probe` response against the registered `grpc_health_v1` service. |
 | NFR-03 | **Throughput.** A single host with three workers (each concurrency=2) must sustain 6 simultaneous tasks and successfully complete a batch of 100 sequential tasks without memory growth exceeding 50 MB on the host process. |
 | NFR-04 | **Streaming latency.** Individual `TaskEvent` messages must propagate from worker to a `tag runtime task stream` subscriber in under 200 ms at p99 on a LAN (≤1 ms RTT). |
 | NFR-05 | **SQLite WAL durability.** All task state transitions and event writes use WAL mode (consistent with existing TAG SQLite usage). A host crash mid-transition must not leave the database in an inconsistent state; the next startup reads committed state only. |
 | NFR-06 | **Security.** The auth token must be at least 32 characters. Tokens shorter than 32 characters are rejected at startup with an actionable error. The host must log each auth failure with the source IP but must not log the token itself. |
-| NFR-07 | **Graceful degradation.** If `grpcio` is not installed, `tag submit --runtime grpc://...` must print a clear install instruction (`pip install tag[runtime]`) and exit 1 without a Python traceback. All other `tag` commands are unaffected. |
-| NFR-08 | **Python version compatibility.** `runtime.py` requires Python 3.10+ (for `match` statement on task state transitions and `asyncio.TaskGroup` for concurrent event dispatch). The existing package already requires Python 3.10+. |
+| NFR-07 | **Graceful degradation.** gRPC support is compiled into the single binary, so it is always available — there is no missing-dependency case. If the target host is unreachable, `tag submit --runtime grpc://...` must print a clear connection error (host, port, and the underlying gRPC status) and exit 1 without a Go panic/stack trace. All other `tag` commands are unaffected. |
+| NFR-08 | **Toolchain compatibility.** `internal/runtime` targets Go 1.24+ and builds with `CGO_ENABLED=0` for a fully static binary. Concurrent event dispatch uses goroutines coordinated with `golang.org/x/sync/errgroup`; task state transitions use a typed state enum with a `switch` over allowed transitions. |
 | NFR-09 | **Log structured output.** All host and worker log lines are JSON-structured when `--log-level debug` is set: `{"ts": "<iso>", "level": "...", "event": "...", "task_id": "...", "worker_id": "..."}`. Human-readable by default. |
 | NFR-10 | **TLS recommendation.** When TLS is not configured, the host prints a startup warning: `WARNING: gRPC endpoint is not TLS-protected. Use --tls-cert and --tls-key for production deployments.` |
 | NFR-11 | **Idempotent worker registration.** If a worker reconnects with the same `worker_id`, the host updates the existing registry row rather than creating a duplicate. In-progress task assignments are reconciled based on the worker's reported state. |
@@ -399,14 +401,18 @@ tag runtime worker list \
 
 ### 9.1 New Files
 
-- **`src/tag/runtime.py`** — All host and worker logic: gRPC server, client stubs, dispatch scheduler, task state machine, SQLite integration, Prometheus exporter, and CLI handler functions (`cmd_runtime_host_start`, `cmd_runtime_worker_start`, `cmd_runtime_status`, `cmd_runtime_task_get`, `cmd_runtime_task_cancel`, `cmd_runtime_task_stream`, `cmd_submit_remote`).
-- **`src/tag/runtime_proto.py`** — Message dataclass definitions (no `.proto` file). Handles serialization/deserialization to JSON bytes for gRPC transport.
+- **`internal/runtime/proto/runtime.proto`** — Language-neutral protobuf service + message definitions (the source of truth for the wire contract).
+- **`internal/runtime/proto/runtime.pb.go`, `runtime_grpc.pb.go`** — Generated Go stubs (`protoc-gen-go` + `protoc-gen-go-grpc`), committed to the repo. Regenerated via `go generate`.
+- **`internal/runtime/host.go`** — `TagRuntimeHost`: the gRPC server, dispatch scheduler, task state machine, SQLite integration, metrics registration, and graceful-shutdown handling.
+- **`internal/runtime/worker.go`** — `TagRuntimeWorker`: outbound client, registration/heartbeat loop, task execution bridge, reconnection with backoff.
+- **`internal/runtime/store.go`** — `modernc.org/sqlite`-backed persistence for `runtime_tasks`, `runtime_task_events`, and `runtime_workers`.
+- **`internal/server/runtime_cmd.go`** — Cobra command handlers: `runtimeHostStart`, `runtimeWorkerStart`, `runtimeStatus`, `runtimeTaskGet`, `runtimeTaskCancel`, `runtimeTaskStream`, `submitRemote`.
 
-No new directories required. The `runtime.py` follows the same module pattern as `queue_worker.py` and `kanban.py`.
+No new top-level directories beyond the `internal/runtime` package. It follows the same package pattern as `internal/queue` and `internal/kanban`.
 
 ### 9.2 SQLite DDL
 
-All tables live in the existing `~/.tag/runtime/tag.sqlite3` database, opened via `open_db()`.
+All tables live in the existing `~/.tag/runtime/tag.sqlite3` database, opened via the shared `store.Open()` helper backed by `modernc.org/sqlite` (pure-Go, CGO-free driver registered as `sqlite`). DDL is language-neutral and unchanged by the Go migration.
 
 ```sql
 -- Task registry maintained by the host.
@@ -466,545 +472,629 @@ CREATE TABLE IF NOT EXISTS runtime_workers (
     last_heartbeat_at  TEXT,
     disconnected_at    TEXT,
     tag_version        TEXT,            -- worker's TAG version string
-    python_version     TEXT
+    go_version         TEXT             -- Go toolchain version the worker was built with
 );
 ```
 
-### 9.3 Core Dataclasses (`runtime_proto.py`)
+### 9.3 Wire Contract (`runtime.proto`) and Go Types
 
-```python
-from dataclasses import dataclass, field
-from typing import Any
-import json
-import uuid
-from datetime import datetime, timezone
+Message types are defined once in protobuf; `protoc-gen-go` emits the Go structs and `google.golang.org/protobuf` handles serialization (no hand-rolled JSON codecs). Timestamps use `google.protobuf.Timestamp`; the auth token travels as gRPC metadata, not as a message field.
 
+```proto
+// internal/runtime/proto/runtime.proto
+syntax = "proto3";
+package tag.runtime.v1;
+option go_package = "github.com/tag-agent/tag/internal/runtime/proto;runtimepb";
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+import "google/protobuf/timestamp.proto";
 
+service TagRuntimeService {
+  rpc RegisterWorker(stream WorkerMessage) returns (stream WorkerCommand);
+  rpc SubmitTask(TaskRequest) returns (TaskAck);
+  rpc StreamTaskEvents(TaskRef) returns (stream TaskEvent);
+  rpc GetTaskResult(TaskRef) returns (TaskResult);
+  rpc CancelTask(TaskRef) returns (CancelAck);
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatAck);
+}
 
-@dataclass
-class WorkerInfo:
-    worker_id: str
-    hostname: str
-    profiles: list[str]
-    concurrency: int = 1
-    tag_version: str = ""
-    python_version: str = ""
-    auth_token: str = ""          # stripped before storage
+message WorkerInfo {
+  string worker_id = 1;
+  string hostname = 2;
+  repeated string profiles = 3;
+  int32 concurrency = 4;
+  string tag_version = 5;
+  string go_version = 6;
+}
 
-    def to_bytes(self) -> bytes:
-        d = {k: v for k, v in self.__dict__.items() if k != "auth_token"}
-        return json.dumps(d).encode()
+// Bidi client->host frame: first message is registration, then heartbeats/events.
+message WorkerMessage {
+  oneof kind {
+    WorkerInfo register = 1;
+    HeartbeatRequest heartbeat = 2;
+    TaskEvent event = 3;
+  }
+}
 
-    @classmethod
-    def from_bytes(cls, b: bytes) -> "WorkerInfo":
-        return cls(**json.loads(b))
+message FileBlob { string name = 1; bytes content = 2; }
 
+message TaskRequest {
+  string profile = 1;
+  string prompt = 2;
+  repeated FileBlob files = 3;      // raw bytes; proto handles framing (no base64)
+  map<string, string> env = 4;
+  int32 priority = 5;               // 0-9, default 5
+  int32 timeout_seconds = 6;        // 0 = no timeout
+  string task_id = 7;               // "task-" + first 8 hex of a UUID, assigned at submit
+  google.protobuf.Timestamp submitted_at = 8;
+  string submitter_host = 9;
+}
 
-@dataclass
-class TaskRequest:
-    profile: str
-    prompt: str
-    files: list[dict] = field(default_factory=list)   # [{name, content_b64}]
-    env: dict[str, str] = field(default_factory=dict)
-    priority: int = 5
-    timeout_seconds: int | None = None
-    task_id: str = field(default_factory=lambda: f"task-{uuid.uuid4().hex[:8]}")
-    submitted_at: str = field(default_factory=_now_iso)
-    submitter_host: str = ""
+message TaskAck   { string task_id = 1; TaskStatus status = 2; string message = 3; }
+message TaskRef   { string task_id = 1; bool from_beginning = 2; }
+message CancelAck { string task_id = 1; TaskStatus status = 2; }
 
-    def to_bytes(self) -> bytes:
-        return json.dumps(self.__dict__).encode()
+enum EventType {
+  STATUS_CHANGE = 0;
+  THINKING = 1;
+  TOOL_CALL = 2;
+  TOOL_RESULT = 3;
+  PARTIAL_OUTPUT = 4;
+  FINAL_OUTPUT = 5;
+  COST = 6;
+}
 
-    @classmethod
-    def from_bytes(cls, b: bytes) -> "TaskRequest":
-        return cls(**json.loads(b))
+message TaskEvent {
+  string task_id = 1;
+  EventType event_type = 2;
+  string payload = 3;               // JSON-encoded, event-type-specific fields
+  google.protobuf.Timestamp emitted_at = 4;
+}
 
+message WorkerCommand {
+  enum Command { ASSIGN_TASK = 0; CANCEL_TASK = 1; DRAIN = 2; SHUTDOWN = 3; }
+  Command command = 1;
+  TaskRequest task_request = 2;     // set for ASSIGN_TASK
+  string task_id = 3;               // set for CANCEL_TASK
+  string message = 4;
+}
 
-@dataclass
-class TaskAck:
-    task_id: str
-    status: str = "QUEUED"
-    message: str = ""
+message HeartbeatRequest {
+  string worker_id = 1;
+  int32 in_progress = 2;
+  repeated string task_ids_in_progress = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}
+message HeartbeatAck { bool ok = 1; }
 
+enum TaskStatus { QUEUED = 0; DISPATCHED = 1; RUNNING = 2; COMPLETED = 3; FAILED = 4; CANCELED = 5; }
 
-@dataclass
-class TaskEvent:
-    task_id: str
-    event_type: str         # status_change|thinking|tool_call|tool_result|partial_output|final_output|cost
-    payload: dict[str, Any]
-    emitted_at: str = field(default_factory=_now_iso)
+message StatusRequest  { string profile_filter = 1; }
+message StatusResponse {
+  string host_address = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  repeated WorkerStatus workers = 3;
+  repeated TaskSummary tasks = 4;
+  int32 queue_depth = 5;
+  int32 running = 6;
+  int32 completed_today = 7;
+  int32 failed_today = 8;
+}
+message WorkerStatus { string worker_id = 1; repeated string profiles = 2; int32 concurrency = 3; int32 in_progress = 4; string status = 5; google.protobuf.Timestamp last_heartbeat = 6; }
+message TaskSummary  { string task_id = 1; string profile = 2; TaskStatus status = 3; string worker_id = 4; }
+message TaskResult   { string task_id = 1; TaskStatus status = 2; string output = 3; string error = 4; double cost_usd = 5; int64 tokens_in = 6; int64 tokens_out = 7; }
+```
 
-    def to_bytes(self) -> bytes:
-        return json.dumps(self.__dict__).encode()
+The task state machine lives in Go as a typed enum plus an allowed-transition table, validated with a `switch`:
 
-    @classmethod
-    def from_bytes(cls, b: bytes) -> "TaskEvent":
-        d = json.loads(b)
-        d["payload"] = d.get("payload", {})
-        return cls(**d)
+```go
+// internal/runtime/state.go
+package runtime
 
+import runtimepb "github.com/tag-agent/tag/internal/runtime/proto"
 
-@dataclass
-class WorkerCommand:
-    command: str                    # assign_task|cancel_task|drain|shutdown
-    task_request: TaskRequest | None = None
-    task_id: str | None = None
-    message: str = ""
+// allowedTransitions maps a current status to the set of legal next statuses.
+var allowedTransitions = map[runtimepb.TaskStatus][]runtimepb.TaskStatus{
+    runtimepb.TaskStatus_QUEUED:     {runtimepb.TaskStatus_DISPATCHED, runtimepb.TaskStatus_CANCELED},
+    runtimepb.TaskStatus_DISPATCHED: {runtimepb.TaskStatus_RUNNING, runtimepb.TaskStatus_QUEUED, runtimepb.TaskStatus_CANCELED},
+    runtimepb.TaskStatus_RUNNING:    {runtimepb.TaskStatus_COMPLETED, runtimepb.TaskStatus_FAILED, runtimepb.TaskStatus_CANCELED},
+    // COMPLETED, FAILED, CANCELED are terminal (no entries => no legal transitions).
+}
 
-    def to_bytes(self) -> bytes:
-        d = {
-            "command": self.command,
-            "task_request": self.task_request.__dict__ if self.task_request else None,
-            "task_id": self.task_id,
-            "message": self.message,
+func canTransition(from, to runtimepb.TaskStatus) bool {
+    for _, next := range allowedTransitions[from] {
+        if next == to {
+            return true
         }
-        return json.dumps(d).encode()
+    }
+    return false
+}
 
-    @classmethod
-    def from_bytes(cls, b: bytes) -> "WorkerCommand":
-        d = json.loads(b)
-        if d.get("task_request"):
-            d["task_request"] = TaskRequest(**d["task_request"])
-        return cls(**d)
-
-
-@dataclass
-class HeartbeatRequest:
-    worker_id: str
-    in_progress: int
-    task_ids_in_progress: list[str] = field(default_factory=list)
-    timestamp: str = field(default_factory=_now_iso)
-
-
-@dataclass
-class StatusResponse:
-    host_address: str
-    timestamp: str
-    workers: list[dict]
-    tasks: list[dict]
-    queue_depth: int
-    running: int
-    completed_today: int
-    failed_today: int
-
-
-# Task state machine — allowed transitions
-TASK_TRANSITIONS: dict[str, set[str]] = {
-    "QUEUED":      {"DISPATCHED", "CANCELED"},
-    "DISPATCHED":  {"RUNNING",    "QUEUED",    "CANCELED"},
-    "RUNNING":     {"COMPLETED",  "FAILED",    "CANCELED"},
-    "COMPLETED":   set(),
-    "FAILED":      set(),
-    "CANCELED":    set(),
+func taskID() string { // "task-" + first 8 hex chars of a UUIDv4
+    return "task-" + uuid.NewString()[:8]
 }
 ```
 
 ### 9.4 Host Architecture
 
-The host is an `asyncio`-based gRPC server using `grpc.aio`. The key design decision is using **raw gRPC byte streams** (method type `BIDI_STREAMING` with request serializer `bytes`) rather than compiled proto stubs. This avoids `protoc` and makes the package installable without build tools.
+The host is a standard `google.golang.org/grpc` server implementing the generated `TagRuntimeServiceServer` interface. There is no event loop: each RPC runs in its own goroutine, per-worker command delivery uses a buffered Go channel, and event fan-out uses a slice of subscriber channels guarded by a mutex. Auth is enforced by a `grpc.UnaryServerInterceptor` / `grpc.StreamServerInterceptor` pair (chained with the `otelgrpc` interceptor), so individual handlers do not repeat token checks.
 
-```python
-# src/tag/runtime.py (host core, simplified)
-import asyncio
-import grpc
-import grpc.aio
-from collections import defaultdict
-import heapq
+```go
+// internal/runtime/host.go (host core, simplified)
+package runtime
 
-class TagRuntimeHost:
-    """
-    gRPC server. Uses asyncio.Queue per worker for command dispatch,
-    and asyncio.Queue per task for event fan-out to subscribers.
-    """
+import (
+    "context"
+    "crypto/subtle"
+    "sync"
 
-    def __init__(self, port: int, auth_token: str, db_path: str,
-                 dispatch_strategy: str = "affinity"):
-        self.port = port
-        self.auth_token = auth_token
-        self.db_path = db_path
-        self.dispatch_strategy = dispatch_strategy
+    "google.golang.org/grpc/codes"
+    "google.golang.org/grpc/metadata"
+    "google.golang.org/grpc/status"
 
-        # worker_id → asyncio.Queue[WorkerCommand]
-        self._worker_queues: dict[str, asyncio.Queue] = {}
-        # worker_id → WorkerInfo
-        self._worker_info: dict[str, WorkerInfo] = {}
-        # task_id → asyncio.Queue[TaskEvent | None]  (None = stream closed)
-        self._task_event_queues: dict[str, list[asyncio.Queue]] = defaultdict(list)
-        # per-profile priority queue: list of (-priority, submitted_at, task_id)
-        self._dispatch_queue: list[tuple] = []
-        self._queue_lock = asyncio.Lock()
+    runtimepb "github.com/tag-agent/tag/internal/runtime/proto"
+)
 
-    async def _validate_token(self, context: grpc.aio.ServicerContext) -> bool:
-        meta = dict(context.invocation_metadata())
-        auth = meta.get("authorization", "")
-        if not auth.startswith("Bearer ") or auth[7:] != self.auth_token:
-            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Invalid auth token")
-            return False
-        return True
+type workerState struct {
+    info       *runtimepb.WorkerInfo
+    cmds       chan *runtimepb.WorkerCommand // buffered per-worker command queue
+    inProgress int
+    healthy    bool
+}
 
-    async def register_worker(self, request_iterator, context):
-        """BIDI_STREAMING: worker sends WorkerInfo once, then HeartbeatRequests.
-        Host sends WorkerCommand messages."""
-        if not await self._validate_token(context):
+type TagRuntimeHost struct {
+    runtimepb.UnimplementedTagRuntimeServiceServer
+
+    port      int
+    authToken string
+    store     *Store // modernc.org/sqlite-backed persistence
+    strategy  string // "affinity" | "round-robin" | "least-loaded"
+
+    mu       sync.Mutex
+    workers  map[string]*workerState                // worker_id -> state
+    subs     map[string][]chan *runtimepb.TaskEvent // task_id -> event subscribers
+    dispatch *taskHeap                              // container/heap, priority-ordered
+}
+
+// authInterceptor validates the bearer token once for every RPC.
+func (h *TagRuntimeHost) authInterceptor(ctx context.Context) error {
+    md, _ := metadata.FromIncomingContext(ctx)
+    var got string
+    if v := md.Get("authorization"); len(v) == 1 {
+        got, _ = strings.CutPrefix(v[0], "Bearer ")
+    }
+    // constant-time comparison (equivalent of Python hmac.compare_digest)
+    if subtle.ConstantTimeCompare([]byte(got), []byte(h.authToken)) != 1 {
+        return status.Error(codes.Unauthenticated, "invalid auth token")
+    }
+    return nil
+}
+
+// RegisterWorker is a bidi stream: the worker sends a WorkerInfo frame, then
+// heartbeats/events; the host pushes WorkerCommand messages. Two goroutines are
+// coordinated with errgroup — one draining the command channel to the stream,
+// one receiving worker frames — both cancelled when the stream context ends.
+func (h *TagRuntimeHost) RegisterWorker(stream runtimepb.TagRuntimeService_RegisterWorkerServer) error {
+    ctx := stream.Context()
+    first, err := stream.Recv()
+    if err != nil {
+        return err
+    }
+    info := first.GetRegister()
+    if info == nil {
+        return status.Error(codes.InvalidArgument, "first frame must be WorkerInfo")
+    }
+    ws := h.onWorkerConnect(info)
+    defer h.onWorkerDisconnect(info.WorkerId)
+
+    g, gctx := errgroup.WithContext(ctx)
+    g.Go(func() error { // send commands
+        for {
+            select {
+            case <-gctx.Done():
+                return gctx.Err()
+            case cmd := <-ws.cmds:
+                if err := stream.Send(cmd); err != nil {
+                    return err
+                }
+            }
+        }
+    })
+    g.Go(func() error { return h.recvWorkerMessages(gctx, info.WorkerId, stream) })
+    return g.Wait()
+}
+
+// dispatchLoop continuously matches queued tasks to available workers.
+// Runs as a goroutine started at host boot; exits on ctx cancellation.
+func (h *TagRuntimeHost) dispatchLoop(ctx context.Context) {
+    ticker := time.NewTicker(100 * time.Millisecond)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
             return
+        case <-ticker.C:
+            for h.tryDispatchNext(ctx) { // keep dispatching while progress is made
+            }
+        }
+    }
+}
 
-        info_bytes = await request_iterator.__anext__()
-        info = WorkerInfo.from_bytes(info_bytes)
-        await self._on_worker_connect(info)
+func (h *TagRuntimeHost) tryDispatchNext(ctx context.Context) bool {
+    h.mu.Lock()
+    defer h.mu.Unlock()
+    if h.dispatch.Len() == 0 {
+        return false
+    }
+    top := h.dispatch.Peek() // highest priority, FIFO on ties
+    wid := h.selectWorker(top.profile)
+    if wid == "" {
+        return false
+    }
+    heap.Pop(h.dispatch)
+    req := h.store.LoadTaskRequest(ctx, top.taskID)
+    h.workers[wid].cmds <- &runtimepb.WorkerCommand{
+        Command:     runtimepb.WorkerCommand_ASSIGN_TASK,
+        TaskRequest: req,
+    }
+    h.transitionTask(ctx, top.taskID, runtimepb.TaskStatus_DISPATCHED, wid)
+    return true
+}
 
-        cmd_queue = self._worker_queues[info.worker_id]
-        try:
-            # Fan out: simultaneously send commands and receive heartbeats/events
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(self._send_commands(cmd_queue, context))
-                tg.create_task(self._recv_worker_messages(
-                    info.worker_id, request_iterator))
-        except* Exception:
-            pass
-        finally:
-            await self._on_worker_disconnect(info.worker_id)
-
-    async def _dispatch_loop(self):
-        """Continuously tries to match queued tasks to available workers."""
-        while True:
-            await asyncio.sleep(0.1)
-            async with self._queue_lock:
-                if not self._dispatch_queue:
-                    continue
-                task_id = await self._try_dispatch_next()
-                if task_id:
-                    pass  # dispatched; loop again immediately
-
-    async def _try_dispatch_next(self) -> str | None:
-        """Pop highest-priority task and send to best-matching worker."""
-        from tag.runtime_proto import TASK_TRANSITIONS
-        # Find best worker for the top task
-        if not self._dispatch_queue:
-            return None
-        _, _, task_id, profile = self._dispatch_queue[0]
-        worker_id = self._select_worker(profile)
-        if worker_id is None:
-            return None
-        heapq.heappop(self._dispatch_queue)
-        cmd = WorkerCommand(
-            command="assign_task",
-            task_request=await self._load_task_request(task_id),
-        )
-        self._worker_queues[worker_id].put_nowait(cmd)
-        await self._transition_task(task_id, "DISPATCHED", worker_id=worker_id)
-        return task_id
-
-    def _select_worker(self, profile: str) -> str | None:
-        """Affinity: pick lowest-loaded worker that supports the profile."""
-        candidates = [
-            (info.in_progress / info.concurrency, wid)
-            for wid, info in self._worker_info.items()
-            if profile in info.profiles
-            and info.status == "HEALTHY"
-            and self._worker_info[wid].in_progress < info.concurrency
-        ]
-        if not candidates:
-            return None
-        return min(candidates)[1]
+// selectWorker (affinity): lowest load ratio among healthy workers with the profile.
+func (h *TagRuntimeHost) selectWorker(profile string) string {
+    best, bestRatio := "", 2.0
+    for wid, ws := range h.workers {
+        if !ws.healthy || ws.inProgress >= int(ws.info.Concurrency) {
+            continue
+        }
+        if !slices.Contains(ws.info.Profiles, profile) {
+            continue
+        }
+        if r := float64(ws.inProgress) / float64(ws.info.Concurrency); r < bestRatio {
+            best, bestRatio = wid, r
+        }
+    }
+    return best // "" if no candidate
+}
 ```
 
 ### 9.5 Worker Architecture
 
-The worker runs a single `asyncio` coroutine that maintains a bidirectional stream to the host, receives `WorkerCommand` messages, and executes tasks by invoking the existing TAG agent controller.
+The worker maintains a bidirectional stream to the host, receives `WorkerCommand` messages, and executes tasks by invoking the existing in-process TAG agent runner. Concurrency is bounded by a buffered channel used as a semaphore; the reconnection loop uses `cenkalti/backoff/v4`. The token is attached once to the outgoing context with `metadata.AppendToOutgoingContext`.
 
-```python
-# src/tag/runtime.py (worker core, simplified)
-import asyncio
-import tempfile
-import base64
-from pathlib import Path
+```go
+// internal/runtime/worker.go (worker core, simplified)
+package runtime
 
-class TagRuntimeWorker:
-    def __init__(self, host: str, worker_id: str, profiles: list[str],
-                 concurrency: int, auth_token: str, heartbeat_interval: int = 10):
-        self.host = host          # "host:50051"
-        self.worker_id = worker_id
-        self.profiles = profiles
-        self.concurrency = concurrency
-        self.auth_token = auth_token
-        self.heartbeat_interval = heartbeat_interval
-        self._semaphore: asyncio.Semaphore | None = None
-        self._in_progress: set[str] = set()
+import (
+    "context"
+    "os"
+    "path/filepath"
+    "sync"
+    "time"
 
-    async def run(self):
-        """Main loop with exponential-backoff reconnection."""
-        self._semaphore = asyncio.Semaphore(self.concurrency)
-        backoff = 5
-        while True:
-            try:
-                await self._connect_and_serve()
-                backoff = 5  # reset on clean disconnect
-            except Exception as exc:
-                import logging
-                logging.warning(f"Worker disconnected ({exc}), retrying in {backoff}s")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+    "github.com/cenkalti/backoff/v4"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
+    "google.golang.org/grpc/metadata"
 
-    async def _connect_and_serve(self):
-        import grpc.aio
-        creds = grpc.local_channel_credentials()  # insecure for now
-        async with grpc.aio.insecure_channel(self.host) as channel:
-            stub = channel  # raw byte stub
-            metadata = [("authorization", f"Bearer {self.auth_token}")]
+    runtimepb "github.com/tag-agent/tag/internal/runtime/proto"
+    "github.com/tag-agent/tag/internal/agent"
+)
 
-            # Send initial WorkerInfo, then heartbeats
-            async def request_gen():
-                yield WorkerInfo(
-                    worker_id=self.worker_id,
-                    hostname=_hostname(),
-                    profiles=self.profiles,
-                    concurrency=self.concurrency,
-                ).to_bytes()
-                while True:
-                    await asyncio.sleep(self.heartbeat_interval)
-                    yield HeartbeatRequest(
-                        worker_id=self.worker_id,
-                        in_progress=len(self._in_progress),
-                        task_ids_in_progress=list(self._in_progress),
-                    ).to_bytes()
+type TagRuntimeWorker struct {
+    host      string // "host:50051"
+    workerID  string
+    profiles  []string
+    conc      int
+    authToken string
+    hbEvery   time.Duration
 
-            async for cmd_bytes in stub.RegisterWorker(
-                request_gen(), metadata=metadata
-            ):
-                cmd = WorkerCommand.from_bytes(cmd_bytes)
-                if cmd.command == "assign_task" and cmd.task_request:
-                    asyncio.create_task(
-                        self._execute_task(stub, cmd.task_request, metadata)
-                    )
-                elif cmd.command == "cancel_task" and cmd.task_id:
-                    await self._cancel_task(cmd.task_id)
-                elif cmd.command in ("drain", "shutdown"):
-                    break
+    sem        chan struct{}       // buffered to `conc`; acts as a semaphore
+    mu         sync.Mutex
+    inProgress map[string]context.CancelFunc // task_id -> cancel (for CancelTask)
+}
 
-    async def _execute_task(self, channel, req: TaskRequest, metadata):
-        """Run the TAG agent for the task and stream events back."""
-        async with self._semaphore:
-            self._in_progress.add(req.task_id)
-            workdir = None
-            try:
-                # Decode uploaded files into a temp directory
-                workdir = tempfile.mkdtemp(prefix=f"tag-task-{req.task_id}-")
-                for f in req.files:
-                    fpath = Path(workdir) / f["name"]
-                    fpath.write_bytes(base64.b64decode(f["content_b64"]))
+// Run reconnects with exponential backoff (base 5s, max 60s, jitter).
+func (w *TagRuntimeWorker) Run(ctx context.Context) error {
+    w.sem = make(chan struct{}, w.conc)
+    bo := backoff.NewExponentialBackOff()
+    bo.InitialInterval, bo.MaxInterval = 5*time.Second, 60*time.Second
+    return backoff.RetryNotify(
+        func() error { return w.connectAndServe(ctx) },
+        backoff.WithContext(bo, ctx),
+        func(err error, d time.Duration) {
+            slog.Warn("worker disconnected, retrying", "err", err, "in", d)
+        },
+    )
+}
 
-                await self._emit_event(channel, metadata, TaskEvent(
-                    task_id=req.task_id,
-                    event_type="status_change",
-                    payload={"from": "DISPATCHED", "to": "RUNNING"},
-                ))
+func (w *TagRuntimeWorker) connectAndServe(ctx context.Context) error {
+    conn, err := grpc.NewClient(w.host,
+        grpc.WithTransportCredentials(insecure.NewCredentials()), // TLS wired via creds when configured
+        grpc.WithChainStreamInterceptor(otelgrpc.StreamClientInterceptor()),
+    )
+    if err != nil {
+        return err
+    }
+    defer conn.Close()
 
-                # Bridge into existing TAG agent runner
-                from tag.controller import run_agent_for_runtime
-                async for event in run_agent_for_runtime(
-                    profile=req.profile,
-                    prompt=req.prompt,
-                    workdir=workdir,
-                    env=req.env,
-                    timeout=req.timeout_seconds,
-                ):
-                    await self._emit_event(channel, metadata, TaskEvent(
-                        task_id=req.task_id,
-                        event_type=event["type"],
-                        payload=event["data"],
-                    ))
+    client := runtimepb.NewTagRuntimeServiceClient(conn)
+    ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+w.authToken)
+    stream, err := client.RegisterWorker(ctx)
+    if err != nil {
+        return err
+    }
 
-            except Exception as exc:
-                await self._emit_event(channel, metadata, TaskEvent(
-                    task_id=req.task_id,
-                    event_type="status_change",
-                    payload={"from": "RUNNING", "to": "FAILED", "error": str(exc)},
-                ))
-            finally:
-                self._in_progress.discard(req.task_id)
-                if workdir:
-                    import shutil
-                    shutil.rmtree(workdir, ignore_errors=True)
+    // Send registration frame, then heartbeats on a ticker in a goroutine.
+    if err := stream.Send(&runtimepb.WorkerMessage{Kind: &runtimepb.WorkerMessage_Register{
+        Register: &runtimepb.WorkerInfo{
+            WorkerId: w.workerID, Hostname: hostname(),
+            Profiles: w.profiles, Concurrency: int32(w.conc),
+        }}}); err != nil {
+        return err
+    }
+    go w.heartbeatLoop(ctx, stream)
+
+    for {
+        cmd, err := stream.Recv()
+        if err != nil {
+            return err // triggers backoff reconnect
+        }
+        switch cmd.Command {
+        case runtimepb.WorkerCommand_ASSIGN_TASK:
+            go w.executeTask(ctx, stream, cmd.TaskRequest)
+        case runtimepb.WorkerCommand_CANCEL_TASK:
+            w.cancelTask(cmd.TaskId)
+        case runtimepb.WorkerCommand_DRAIN, runtimepb.WorkerCommand_SHUTDOWN:
+            return nil // clean exit; caller drains in-progress work
+        }
+    }
+}
+
+// executeTask runs the TAG agent for the task and streams events back over the bidi stream.
+func (w *TagRuntimeWorker) executeTask(ctx context.Context, stream runtimepb.TagRuntimeService_RegisterWorkerClient, req *runtimepb.TaskRequest) {
+    w.sem <- struct{}{}          // acquire
+    defer func() { <-w.sem }()   // release
+
+    taskCtx, cancel := context.WithCancel(ctx)
+    if req.TimeoutSeconds > 0 {
+        taskCtx, cancel = context.WithTimeout(ctx, time.Duration(req.TimeoutSeconds)*time.Second)
+    }
+    w.track(req.TaskId, cancel)
+    defer w.untrack(req.TaskId)
+
+    // Decode uploaded files into a temp dir (bytes come straight off the wire).
+    workdir, _ := os.MkdirTemp("", "tag-task-"+req.TaskId+"-")
+    defer os.RemoveAll(workdir)
+    for _, f := range req.Files {
+        _ = os.WriteFile(filepath.Join(workdir, filepath.Base(f.Name)), f.Content, 0o600)
+    }
+
+    w.emit(stream, statusEvent(req.TaskId, "DISPATCHED", "RUNNING"))
+
+    // Bridge into the existing in-process agent runner: it returns a channel of events.
+    events, errc := agent.RunForRuntime(taskCtx, agent.RuntimeJob{
+        Profile: req.Profile, Prompt: req.Prompt, Workdir: workdir, Env: req.Env,
+    })
+    for ev := range events {
+        w.emit(stream, &runtimepb.TaskEvent{
+            TaskId: req.TaskId, EventType: ev.Type, Payload: ev.PayloadJSON,
+        })
+    }
+    if err := <-errc; err != nil {
+        w.emit(stream, failEvent(req.TaskId, err))
+    }
+}
 ```
 
-### 9.6 Integration with `controller.py`
+### 9.6 Integration with `internal/agent`
 
-`controller.py` gains a new async generator function `run_agent_for_runtime` that wraps the existing agent execution path and yields structured event dicts:
+`internal/agent` gains a `RunForRuntime` function that wraps the existing agent execution path and streams structured events over a Go channel. Instead of Python's async generator + sentinel, it returns a receive-only events channel plus a one-shot error channel; the caller ranges over the events channel until it closes, then reads the terminal error. Cancellation and timeout are carried by `context.Context` (set up by the worker), so no separate timeout primitive is needed.
 
-```python
-# In controller.py
-async def run_agent_for_runtime(
-    profile: str,
-    prompt: str,
-    workdir: str,
-    env: dict[str, str],
-    timeout: int | None,
-) -> AsyncGenerator[dict, None]:
-    """
-    Async generator that runs a TAG agent and yields TaskEvent-compatible dicts.
-    Used by runtime workers. Bridges the existing Hermes callback system
-    into an async event stream.
-    """
-    cfg = load_config()
-    profile_cfg = load_profile(cfg, profile)
+```go
+// internal/agent/runtime_bridge.go
+package agent
 
-    event_queue: asyncio.Queue = asyncio.Queue()
+import "context"
 
-    def on_thinking(text: str):
-        event_queue.put_nowait({"type": "thinking", "data": {"text": text}})
+// RuntimeEvent mirrors the runtime TaskEvent shape; PayloadJSON is the
+// event-type-specific body already marshaled to JSON.
+type RuntimeEvent struct {
+    Type        runtimepb.EventType
+    PayloadJSON string
+}
 
-    def on_tool_call(name: str, args: dict):
-        event_queue.put_nowait({"type": "tool_call", "data": {"name": name, "args": args}})
+type RuntimeJob struct {
+    Profile string
+    Prompt  string
+    Workdir string
+    Env     map[string]string
+}
 
-    def on_tool_result(name: str, result: str):
-        event_queue.put_nowait({"type": "tool_result", "data": {"name": name, "result": result}})
+// RunForRuntime runs a TAG agent and emits RuntimeEvents on the returned channel,
+// bridging the existing agent callback hooks into a channel-based event stream.
+// The events channel is closed when the run finishes; the final error (or nil)
+// is delivered exactly once on errc.
+func RunForRuntime(ctx context.Context, job RuntimeJob) (<-chan RuntimeEvent, <-chan error) {
+    events := make(chan RuntimeEvent, 64)
+    errc := make(chan error, 1)
 
-    def on_output(text: str, cost: dict | None = None):
-        event_queue.put_nowait({"type": "final_output", "data": {"output": text}})
-        if cost:
-            event_queue.put_nowait({"type": "cost", "data": cost})
-        event_queue.put_nowait(None)  # sentinel
+    go func() {
+        defer close(events)
+        cfg, err := config.Load()
+        if err != nil {
+            errc <- err
+            return
+        }
+        profileCfg, err := config.LoadProfile(cfg, job.Profile)
+        if err != nil {
+            errc <- err
+            return
+        }
 
-    runner_task = asyncio.create_task(
-        _run_hermes_agent(
-            profile_cfg, prompt, workdir, env,
-            on_thinking=on_thinking,
-            on_tool_call=on_tool_call,
-            on_tool_result=on_tool_result,
-            on_output=on_output,
-        )
+        emit := func(t runtimepb.EventType, payload any) {
+            b, _ := json.Marshal(payload)
+            select {
+            case events <- RuntimeEvent{Type: t, PayloadJSON: string(b)}:
+            case <-ctx.Done():
+            }
+        }
+
+        hooks := AgentHooks{
+            OnThinking:   func(text string) { emit(runtimepb.EventType_THINKING, map[string]string{"text": text}) },
+            OnToolCall:   func(name string, args map[string]any) { emit(runtimepb.EventType_TOOL_CALL, map[string]any{"name": name, "args": args}) },
+            OnToolResult: func(name, result string) { emit(runtimepb.EventType_TOOL_RESULT, map[string]string{"name": name, "result": result}) },
+            OnOutput: func(text string, cost *CostInfo) {
+                emit(runtimepb.EventType_FINAL_OUTPUT, map[string]string{"output": text})
+                if cost != nil {
+                    emit(runtimepb.EventType_COST, cost)
+                }
+            },
+        }
+
+        // ctx carries the deadline/cancellation set up by the worker.
+        errc <- runAgent(ctx, profileCfg, job.Prompt, job.Workdir, job.Env, hooks)
+    }()
+
+    return events, errc
+}
+```
+
+### 9.7 gRPC Service Registration (Generated Stubs)
+
+> **Note (Go reframing):** the original Python design used raw byte-stream handlers specifically to avoid a `protoc` step at install time. That constraint disappears in Go: stubs are generated once at development time and committed, and they compile into the single static binary. The host therefore registers the strongly-typed generated server rather than hand-rolled generic handlers — a net simplification, not a workaround.
+
+Stubs are generated via a `//go:generate` directive and the standard plugins:
+
+```go
+// internal/runtime/proto/gen.go
+//go:generate protoc --go_out=. --go_opt=paths=source_relative \
+//   --go-grpc_out=. --go-grpc_opt=paths=source_relative runtime.proto
+package runtimepb
+```
+
+Server wiring registers the typed service, the health service, and the OTel interceptors:
+
+```go
+// internal/runtime/serve.go
+func (h *TagRuntimeHost) Serve(ctx context.Context, lis net.Listener) error {
+    srv := grpc.NewServer(
+        grpc.ChainUnaryInterceptor(
+            otelgrpc.UnaryServerInterceptor(),
+            h.unaryAuth, // returns codes.Unauthenticated on bad token
+        ),
+        grpc.ChainStreamInterceptor(
+            otelgrpc.StreamServerInterceptor(),
+            h.streamAuth,
+        ),
+        grpc.MaxRecvMsgSize(100<<20), // 100 MB payload cap (NFR-12)
     )
 
-    async with asyncio.timeout(timeout):
-        while True:
-            event = await event_queue.get()
-            if event is None:
-                break
-            yield event
+    runtimepb.RegisterTagRuntimeServiceServer(srv, h)
 
-    await runner_task
-```
+    // Service discovery / liveness via the standard gRPC health protocol.
+    hsrv := health.NewServer()
+    grpc_health_v1.RegisterHealthServer(srv, hsrv)
+    hsrv.SetServingStatus("tag.runtime.v1.TagRuntimeService", grpc_health_v1.HealthCheckResponse_SERVING)
 
-### 9.7 gRPC Service Registration (No `.proto` File)
-
-Rather than generating stubs from a `.proto` file, `runtime.py` uses `grpc`'s generic service API with a `GenericMethodHandler` for each RPC. This is less ergonomic but avoids build-time dependencies:
-
-```python
-def _build_server_handlers() -> list[grpc.ServiceRpcHandlers]:
-    """Register RPCs as raw byte streams using grpc.GenericMethodHandler."""
-    from grpc import unary_unary, unary_stream, stream_unary, stream_stream
-
-    return [
-        grpc.method_service_handler(
-            "tag.runtime.TagRuntimeService",
-            {
-                "RegisterWorker": grpc.stream_stream_rpc_method_handler(
-                    host.register_worker,
-                    request_deserializer=lambda b: b,
-                    response_serializer=lambda b: b,
-                ),
-                "SubmitTask": grpc.unary_unary_rpc_method_handler(
-                    host.submit_task,
-                    request_deserializer=lambda b: b,
-                    response_serializer=lambda b: b,
-                ),
-                "StreamTaskEvents": grpc.unary_stream_rpc_method_handler(
-                    host.stream_task_events,
-                    request_deserializer=lambda b: b,
-                    response_serializer=lambda b: b,
-                ),
-                "GetTaskResult": grpc.unary_unary_rpc_method_handler(
-                    host.get_task_result,
-                    request_deserializer=lambda b: b,
-                    response_serializer=lambda b: b,
-                ),
-                "CancelTask": grpc.unary_unary_rpc_method_handler(
-                    host.cancel_task,
-                    request_deserializer=lambda b: b,
-                    response_serializer=lambda b: b,
-                ),
-                "GetStatus": grpc.unary_unary_rpc_method_handler(
-                    host.get_status,
-                    request_deserializer=lambda b: b,
-                    response_serializer=lambda b: b,
-                ),
-                "Heartbeat": grpc.unary_unary_rpc_method_handler(
-                    host.heartbeat,
-                    request_deserializer=lambda b: b,
-                    response_serializer=lambda b: b,
-                ),
-            }
-        )
-    ]
+    go h.dispatchLoop(ctx)
+    go func() { <-ctx.Done(); srv.GracefulStop() }() // SIGTERM -> graceful drain
+    return srv.Serve(lis)
+}
 ```
 
 ### 9.8 Prometheus Metrics Exporter
 
-The metrics HTTP server runs on a separate port using `prometheus_client` (optional dependency):
+RPC-level metrics (dispatch latency, request counts) are produced automatically by the `otelgrpc` interceptor. The runtime-specific counters/gauges/histograms are registered with `prometheus/client_golang` and exposed on a separate port via `promhttp` — compiled into the binary, so there is no "metrics disabled if not installed" branch. Metric names are unchanged from the original contract (FR-14).
 
-```python
-async def _start_metrics_server(port: int):
-    """Start a simple Prometheus HTTP server. Lazy import."""
-    try:
-        from prometheus_client import start_http_server, Counter, Gauge, Histogram
-    except ImportError:
-        print(f"WARNING: prometheus_client not installed; metrics endpoint disabled.")
-        return
+```go
+// internal/runtime/metrics.go
+package runtime
 
-    TASKS_SUBMITTED = Counter(
-        "tag_runtime_tasks_submitted_total",
-        "Tasks submitted to the runtime host",
-        ["profile"],
-    )
-    TASKS_COMPLETED = Counter(
-        "tag_runtime_tasks_completed_total",
-        "Tasks completed by runtime workers",
-        ["profile", "status"],
-    )
-    WORKERS_CONNECTED = Gauge(
-        "tag_runtime_workers_connected",
-        "Number of workers currently connected",
-    )
-    DISPATCH_LATENCY = Histogram(
-        "tag_runtime_task_dispatch_latency_seconds",
-        "Seconds between task submission and worker dispatch",
-        buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
-    )
-    TASK_DURATION = Histogram(
-        "tag_runtime_task_duration_seconds",
-        "Total task execution duration in seconds",
-        ["profile"],
-        buckets=[1, 5, 15, 30, 60, 120, 300, 600],
-    )
+import (
+    "net/http"
 
-    start_http_server(port)
-    # Expose registry on module for use in host methods
-    return TASKS_SUBMITTED, TASKS_COMPLETED, WORKERS_CONNECTED, DISPATCH_LATENCY, TASK_DURATION
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+type metrics struct {
+    submitted       *prometheus.CounterVec   // labels: profile
+    completed       *prometheus.CounterVec   // labels: profile, status
+    workersConn     prometheus.Gauge
+    dispatchLatency prometheus.Histogram
+    taskDuration    *prometheus.HistogramVec // labels: profile
+}
+
+func newMetrics(reg prometheus.Registerer) *metrics {
+    f := promauto.With(reg)
+    return &metrics{
+        submitted: f.NewCounterVec(prometheus.CounterOpts{
+            Name: "tag_runtime_tasks_submitted_total",
+            Help: "Tasks submitted to the runtime host",
+        }, []string{"profile"}),
+        completed: f.NewCounterVec(prometheus.CounterOpts{
+            Name: "tag_runtime_tasks_completed_total",
+            Help: "Tasks completed by runtime workers",
+        }, []string{"profile", "status"}),
+        workersConn: f.NewGauge(prometheus.GaugeOpts{
+            Name: "tag_runtime_workers_connected",
+            Help: "Number of workers currently connected",
+        }),
+        dispatchLatency: f.NewHistogram(prometheus.HistogramOpts{
+            Name:    "tag_runtime_task_dispatch_latency_seconds",
+            Help:    "Seconds between task submission and worker dispatch",
+            Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0},
+        }),
+        taskDuration: f.NewHistogramVec(prometheus.HistogramOpts{
+            Name:    "tag_runtime_task_duration_seconds",
+            Help:    "Total task execution duration in seconds",
+            Buckets: []float64{1, 5, 15, 30, 60, 120, 300, 600},
+        }, []string{"profile"}),
+    }
+}
+
+// startMetricsServer serves /metrics on its own port; a metricsPort of 0 disables it.
+func startMetricsServer(ctx context.Context, port int, reg *prometheus.Registry) *http.Server {
+    mux := http.NewServeMux()
+    mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+    srv := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: mux}
+    go func() { _ = srv.ListenAndServe() }()
+    go func() { <-ctx.Done(); _ = srv.Shutdown(context.Background()) }()
+    return srv
+}
 ```
 
-### 9.9 `pyproject.toml` Optional Dependency
+### 9.9 `go.mod` Dependencies
 
-```toml
-[project.optional-dependencies]
-runtime = [
-    "grpcio>=1.62.0",
-    "grpcio-status>=1.62.0",
-    "prometheus-client>=0.20.0",
-]
+Runtime support is not an optional install extra — it compiles into the single static binary. The relevant module requirements:
+
+```
+// go.mod (module github.com/tag-agent/tag; go 1.24)
+require (
+    google.golang.org/grpc v1.68.0
+    google.golang.org/protobuf v1.36.0
+    github.com/prometheus/client_golang v1.20.0
+    go.opentelemetry.io/otel v1.32.0
+    go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.57.0
+    github.com/cenkalti/backoff/v4 v4.3.0
+    golang.org/x/sync v0.10.0            // errgroup
+    modernc.org/sqlite v1.34.1           // pure-Go, CGO_ENABLED=0
+)
 ```
 
-Install with: `pip install tag[runtime]`
+Built and released as a single static binary via GoReleaser (with cosign signing and SLSA provenance); `grpc_health_probe` is used only in tests/ops, not shipped as a dependency.
 
 ---
 
 ## 10. Security Considerations
 
-1. **Bearer token minimum entropy.** The auth token must be at least 32 characters. On startup, if no token is configured, the host generates a cryptographically random token using `secrets.token_hex(32)` (256 bits of entropy) and prints it once. The token is never written to SQLite or log files; it is only stored in the process's in-memory config and in `cli-config.yaml` (mode 0600).
+1. **Bearer token minimum entropy.** The auth token must be at least 32 characters. On startup, if no token is configured, the host generates a cryptographically random token by reading 32 bytes from `crypto/rand` and hex-encoding them (256 bits of entropy) and prints it once. The token is never written to SQLite or log files; it is only stored in the process's in-memory config and in `cli-config.yaml` (mode 0600), loaded via `koanf/v2` + `yaml.v3`.
 
-2. **Token comparison timing safety.** The host validates tokens using `hmac.compare_digest` (constant-time comparison) to prevent timing oracle attacks.
+2. **Token comparison timing safety.** The host validates tokens using `crypto/subtle.ConstantTimeCompare` (constant-time comparison) to prevent timing oracle attacks.
 
 3. **TLS for production deployments.** Without TLS, auth tokens and task payloads (including file contents and prompts) are transmitted in plaintext. The host emits a startup warning and documentation must state that TLS is required for any non-localhost deployment. Provide a quickstart using `mkcert` for LAN deployments.
 
@@ -1012,7 +1102,7 @@ Install with: `pip install tag[runtime]`
 
 5. **Task prompt injection.** Worker operators must be aware that the prompt field of `TaskRequest` is executed verbatim by the TAG agent. A malicious host can inject arbitrary prompts. Workers should only connect to hosts they trust (controlled by the same organization). Future enhancement: sign `TaskRequest` payloads with the host's private key.
 
-6. **gRPC reflection disabled by default.** The host must not enable `grpc.reflection.v1alpha.ServerReflection` in production mode, as it exposes the full service schema to unauthenticated clients. Reflection can be enabled with `--debug-reflection` for development tooling.
+6. **gRPC reflection disabled by default.** The host must not register `google.golang.org/grpc/reflection` in production mode, as it exposes the full service schema to unauthenticated clients. Reflection can be enabled with `--debug-reflection` for development tooling (e.g. `grpcurl`).
 
 7. **Worker isolation.** Workers run with the same OS user as the `tag runtime worker start` invocation. If the TAG sandbox (PRD-028) is configured for a profile, the worker's agent execution uses the sandbox. Operators should run workers under dedicated low-privilege OS users.
 
@@ -1020,7 +1110,7 @@ Install with: `pip install tag[runtime]`
 
 9. **Prompt/output data residency.** Task prompts, file contents, and outputs are stored in the host's SQLite database. Operators must be aware of data residency implications when running the host in a different jurisdiction from where the task data originates.
 
-10. **Timeout enforcement.** The `timeout_seconds` field in `TaskRequest` is enforced by the worker using `asyncio.timeout`. When the timeout fires, the agent subprocess is `SIGKILL`ed and a `FAILED` event with `reason: timeout` is emitted. Callers must not rely on graceful cleanup within the agent on timeout.
+10. **Timeout enforcement.** The `timeout_seconds` field in `TaskRequest` is enforced by the worker via a `context.WithTimeout` deadline on the task context. When the deadline fires, the context is canceled (propagating to any agent subprocess via `exec.CommandContext`, which sends the configured kill signal) and a `FAILED` event with `reason: timeout` is emitted. Callers must not rely on graceful cleanup within the agent on timeout.
 
 ---
 
@@ -1028,25 +1118,27 @@ Install with: `pip install tag[runtime]`
 
 ### 11.1 Unit Tests
 
-- **`tests/test_runtime_proto.py`**: Roundtrip serialization tests for all dataclasses (`WorkerInfo`, `TaskRequest`, `TaskEvent`, `WorkerCommand`). Edge cases: empty profiles list, null optional fields, UTF-8 prompt with emoji, priority 0 and 9.
-- **`tests/test_runtime_state_machine.py`**: Test all allowed and disallowed transitions in `TASK_TRANSITIONS`. Verify that illegal transitions raise `ValueError`. Test the dispatch priority queue invariant (higher priority tasks dispatch first).
-- **`tests/test_runtime_auth.py`**: Verify `hmac.compare_digest` comparison, too-short token rejection at startup, `UNAUTHENTICATED` gRPC status on wrong token.
-- **`tests/test_runtime_import_isolation.py`**: Assert that `import tag.controller` does not import `grpc`, `grpcio`, or `prometheus_client`. Assert that calling `cmd_runtime_host_start` without `grpcio` installed raises a friendly `SystemExit(1)` with install instructions.
-- **`tests/test_runtime_dispatch.py`**: Test affinity selection with various worker+profile combinations. Test least-loaded selection. Test round-robin ordering. Test that tasks remain QUEUED when no matching worker is connected.
+Standard `go test` with table-driven cases. In-process gRPC uses `google.golang.org/grpc/test/bufconn` (an in-memory listener) so no real ports are bound.
+
+- **`internal/runtime/proto_test.go`**: Protobuf marshal/unmarshal roundtrip for all messages (`WorkerInfo`, `TaskRequest`, `TaskEvent`, `WorkerCommand`). Edge cases: empty profiles slice, zero-valued optional fields, UTF-8 prompt with emoji, priority 0 and 9, binary file blobs.
+- **`internal/runtime/state_test.go`**: Table-driven test of `canTransition` over all allowed and disallowed pairs. Verify illegal transitions are rejected (returns `false`, state unchanged). Test the `container/heap` dispatch queue invariant (higher priority dequeues first, FIFO on ties).
+- **`internal/runtime/auth_test.go`**: Verify `subtle.ConstantTimeCompare` acceptance/rejection, too-short token rejection at startup, and that the auth interceptor returns `codes.Unauthenticated` on a wrong token (asserted via `status.Code(err)`).
+- **`internal/runtime/init_test.go`**: Assert the single-machine `tag run` path constructs no `grpc.Server` and dials no channel (via an injected listener/dialer counter). A `go test -bench` guards against init-cost regressions.
+- **`internal/runtime/dispatch_test.go`**: Test affinity selection over various worker+profile combinations. Test least-loaded selection. Test round-robin ordering. Test that tasks remain QUEUED when no matching worker is connected.
 
 ### 11.2 Integration Tests
 
-- **`tests/integration/test_runtime_end_to_end.py`**: Starts a host subprocess and a worker subprocess (both using `subprocess.Popen` with `--port 50099` to avoid conflicts). Submits a task via `tag submit --runtime grpc://localhost:50099`, waits for completion, asserts the task appears as COMPLETED in `tag runtime status --json`. Cleans up subprocesses on teardown.
-- **`tests/integration/test_runtime_worker_reconnect.py`**: Starts host, connects worker, kills host process, restarts it, verifies worker reconnects within 30 seconds.
-- **`tests/integration/test_runtime_task_cancel.py`**: Submits a long-running task (prompt designed to run >10 seconds), cancels it via `tag runtime task cancel`, verifies the task reaches CANCELED state and the worker process terminates.
-- **`tests/integration/test_runtime_event_replay.py`**: Submits a task, lets it complete, then calls `tag runtime task stream <id> --from-beginning` and verifies all stored events are replayed in order.
-- **`tests/integration/test_runtime_file_upload.py`**: Submits a task with `--files` pointing to a small Python file, verifies the worker can read the file and the agent output references it.
+- **`internal/runtime/e2e_test.go`**: Spins up a host and worker in-process against a `bufconn` listener (and a separate variant launching the compiled binary with `os/exec` on `--port 50099`). Submits a task, waits for completion, asserts the task appears as COMPLETED in `GetStatus`. Uses `t.Cleanup` to tear down goroutines/subprocesses.
+- **`internal/runtime/reconnect_test.go`**: Starts host, connects worker, stops the host, restarts it, verifies the worker reconnects (backoff loop) within 30 seconds.
+- **`internal/runtime/cancel_test.go`**: Submits a long-running task (>10s), cancels it via `CancelTask`, verifies the task reaches CANCELED and the task context is canceled on the worker.
+- **`internal/runtime/replay_test.go`**: Submits a task, lets it complete, then calls `StreamTaskEvents` with `from_beginning=true` and verifies all stored events replay in order.
+- **`internal/runtime/fileupload_test.go`**: Submits a task with a small file blob, verifies the worker writes it into the temp workdir and the agent output references it.
 
-### 11.3 Performance Tests
+### 11.3 Performance / Benchmark Tests
 
-- **`tests/perf/test_runtime_throughput.py`**: Starts 1 host and 3 workers (concurrency=2 each). Submits 100 no-op tasks (profile `echo` that returns immediately). Measures total wall time and asserts completion within 30 seconds. Checks for memory leaks in the host process (RSS growth < 50 MB).
-- **`tests/perf/test_runtime_streaming_latency.py`**: Measures the p99 latency between a worker emitting a `TaskEvent` and the event arriving at a `StreamTaskEvents` subscriber. Uses monotonic timestamps in the payload. Asserts p99 < 200 ms on localhost.
-- **`tests/perf/test_runtime_concurrent_dispatch.py`**: Verifies that 10 tasks submitted simultaneously are all dispatched within 1 second with no dropped events.
+- **`internal/runtime/bench_throughput_test.go`**: 1 host + 3 workers (concurrency=2 each) over `bufconn`. Submits 100 no-op tasks (profile `echo`). Asserts completion within 30 seconds and, using `runtime.ReadMemStats` / `testing.B` allocation reporting, that host heap growth stays under 50 MB.
+- **`internal/runtime/bench_streaming_test.go`**: Measures p99 latency between a worker emitting a `TaskEvent` and its arrival at a `StreamTaskEvents` subscriber, using monotonic `time.Now()` timestamps. Asserts p99 < 200 ms in-process.
+- **`internal/runtime/bench_dispatch_test.go`**: Verifies 10 concurrently-submitted tasks are all dispatched within 1 second with no dropped events (goroutine-driven concurrency).
 
 ---
 
@@ -1067,8 +1159,8 @@ Install with: `pip install tag[runtime]`
 | AC-11 | Priority ordering is respected | Three tasks submitted with priorities 1, 5, 9 to a single worker; the priority-9 task is dispatched first |
 | AC-12 | File upload reaches worker | `tag submit --files auth.py` results in `auth.py` being present in the agent's working directory on the worker |
 | AC-13 | Prometheus metrics are exported | After submitting 3 tasks, `curl http://localhost:9090/metrics` shows `tag_runtime_tasks_submitted_total{profile="coder"} 3` |
-| AC-14 | Zero gRPC import on cold path | `python -c "import tag.controller; import sys; assert 'grpc' not in sys.modules"` exits 0 |
-| AC-15 | Missing grpcio handled gracefully | `tag submit --runtime grpc://...` without grpcio installed prints a `pip install tag[runtime]` hint and exits 1, not a Python traceback |
+| AC-14 | Zero gRPC init on cold path | `runtime.InitTest` (a `go test` that runs `tag run` and inspects the injected listener/dialer counters) confirms no gRPC server or channel is created; `init` benchmark shows no regression |
+| AC-15 | Unreachable host handled gracefully | `tag submit --runtime grpc://badhost:50051` prints a clear connection error (host, port, gRPC status) and exits 1, not a Go panic/stack trace |
 | AC-16 | Worker drain on SIGTERM | `kill -TERM <worker-pid>` causes the worker to finish its current task and exit cleanly |
 | AC-17 | Event replay for late subscribers | `tag runtime task stream <completed-id> --from-beginning` replays all stored events in chronological order |
 | AC-18 | Unhealthy worker task re-queue | Kill worker process mid-task; after 3 missed heartbeats, host re-queues the task to another worker |
@@ -1081,19 +1173,22 @@ Install with: `pip install tag[runtime]`
 
 | Dependency | Type | Version | Notes |
 |------------|------|---------|-------|
-| `grpcio` | Optional Python package | `>=1.62.0` | Core gRPC transport. Install via `pip install tag[runtime]`. |
-| `grpcio-status` | Optional Python package | `>=1.62.0` | Rich status codes for gRPC errors. Companion to `grpcio`. |
-| `prometheus-client` | Optional Python package | `>=0.20.0` | Prometheus metrics HTTP exporter. Disabled gracefully if absent. |
-| `asyncio` | Python stdlib | 3.10+ | `asyncio.TaskGroup` (3.11+) used; fallback to `asyncio.gather` for 3.10. |
-| `hmac` | Python stdlib | any | Constant-time token comparison. |
-| `secrets` | Python stdlib | any | Cryptographic token generation. |
-| `tempfile` | Python stdlib | any | Isolated working directories for file uploads. |
-| PRD-013 (tracing) | Internal | — | Trace IDs assigned to runtime tasks for cross-referencing. |
+| `google.golang.org/grpc` | Go module | `>=1.68.0` | Core gRPC transport (server + client). Compiled into the single static binary. |
+| `google.golang.org/protobuf` | Go module | `>=1.36.0` | Wire serialization; stubs via `protoc-gen-go` + `protoc-gen-go-grpc`. |
+| `google.golang.org/grpc/health` + `grpc_health_v1` | Go module (in grpc) | — | Service discovery / liveness health checks. |
+| `github.com/prometheus/client_golang` | Go module | `>=1.20.0` | Prometheus metrics registry + `promhttp` `/metrics` handler. |
+| `go.opentelemetry.io/otel` + `.../otelgrpc` | Go module | `otel >=1.32.0` | Tracing/metrics interceptors on the gRPC server and client. |
+| `github.com/cenkalti/backoff/v4` | Go module | `>=4.3.0` | Exponential-backoff reconnection for workers. |
+| `golang.org/x/sync/errgroup` | Go module | `>=0.10.0` | Coordinate the send/receive goroutines of the bidi stream. |
+| `modernc.org/sqlite` | Go module | `>=1.34.0` | Pure-Go, CGO-free SQLite driver for host task/worker persistence. |
+| `crypto/subtle`, `crypto/rand` | Go stdlib | — | Constant-time token comparison and cryptographic token generation. |
+| `context`, `os`, `container/heap` | Go stdlib | — | Cancellation/deadlines, temp workdirs for file uploads, priority queue. |
+| PRD-013 (tracing) | Internal | — | Trace IDs assigned to runtime tasks; carried via `otelgrpc` context propagation. |
 | PRD-028 (sandbox) | Internal | — | Workers honor per-profile sandbox config for agent execution. |
 | PRD-034 (security) | Internal | — | Token validation follows the credential hygiene patterns from PRD-034. |
-| PRD-012 (budget) | Internal | — | `budget.record_spend` called on host with task cost data. |
+| PRD-012 (budget) | Internal | — | `budget.RecordSpend` (`internal/budget`) called on host with task cost data. |
 | PRD-008 (queue) | Internal | — | Conceptual predecessor; runtime supersedes queue for multi-machine scenarios. |
-| `controller.py:run_agent_for_runtime` | Internal | — | New async generator function added to controller.py to bridge agent execution into the worker's event stream. |
+| `internal/agent.RunForRuntime` | Internal | — | New function in `internal/agent` returning an events channel to bridge agent execution into the worker's event stream. |
 
 ---
 
@@ -1101,13 +1196,13 @@ Install with: `pip install tag[runtime]`
 
 | # | Question | Owner | Target Date |
 |---|----------|-------|-------------|
-| OQ-1 | **`grpc.aio` vs thread-based gRPC.** `grpc.aio` (asyncio native) is the modern path but has known issues with some `grpcio` versions on macOS. Should we implement a synchronous thread-based fallback? | Runtime lead | Before Phase 2 start |
-| OQ-2 | **Compiled proto vs. raw byte handlers.** Raw byte handlers (current plan) avoid build tooling but lose type safety and IDE autocompletion for gRPC message types. Is a Makefile-based `protoc` step acceptable for contributors? | Tech lead | Architecture review |
+| OQ-1 | **Concurrency model.** *(Largely resolved by the Go move.)* `google.golang.org/grpc` uses a goroutine-per-RPC model with no async/sync split, eliminating the original `grpc.aio`-vs-threads question and its macOS caveats. Remaining sub-question: should the per-worker command channel be bounded (backpressure) or unbounded? | Runtime lead | Before Phase 2 start |
+| OQ-2 | **Generated-stub codegen workflow.** *(Reframed for Go.)* Go uses committed `protoc-gen-go`/`protoc-gen-go-grpc` stubs, so there is no runtime-codegen tradeoff. Open sub-question: pin `protoc` + plugin versions via a tool dependency (`tools.go` / `go run`) so contributor codegen is reproducible, or require a documented local `protoc`? | Tech lead | Architecture review |
 | OQ-3 | **Worker task resumption after crash.** If the worker OS process crashes mid-task (not a graceful disconnect), the task is re-queued by the host after 3 missed heartbeats. But the agent may have partially modified files. Should we snapshot agent state (e.g., diff context) before execution? | Runtime lead | Phase 3 |
 | OQ-4 | **mTLS vs. bearer token auth.** mTLS would eliminate the need for a shared secret (each worker gets a certificate signed by the host's CA). More operationally complex but more secure. Treat as a v2 enhancement or required for v1? | Security | Before Phase 1 complete |
-| OQ-5 | **Event fanout scalability.** The current design uses one `asyncio.Queue` per `StreamTaskEvents` subscriber. With many concurrent subscribers watching the same task, this could become a bottleneck. A broadcast mechanism (e.g., `asyncio.Event` + shared list) may be needed at scale. | Runtime lead | Phase 2 |
-| OQ-6 | **`run_agent_for_runtime` controller bridge.** The current proposal requires adding a new async generator to `controller.py`. Given controller.py is already ~10,000 lines, should this live in a dedicated `runtime_agent_bridge.py` to keep concerns separated? | Lead engineer | Design review |
-| OQ-7 | **SQLite concurrency on the host.** The host's asyncio event loop writes task events at high frequency (many events per second from multiple workers). WAL mode helps but sequential writes in asyncio may become a bottleneck. Should events be batched (e.g., every 100 ms)? | Runtime lead | Phase 2 performance testing |
+| OQ-5 | **Event fanout scalability.** The current design uses one buffered Go channel per `StreamTaskEvents` subscriber, with the host fanning out under a mutex. With many concurrent subscribers watching the same task, this could become a bottleneck; a `sync.Cond`- or broadcast-based mechanism may be needed at scale. | Runtime lead | Phase 2 |
+| OQ-6 | **`RunForRuntime` agent bridge placement.** The proposal adds `RunForRuntime` to `internal/agent`. Should it instead live in a dedicated `internal/agent/runtime_bridge.go` (or a separate `internal/runtimebridge` package) to keep the runtime event-channel concerns separated from the core agent loop? | Lead engineer | Design review |
+| OQ-7 | **SQLite write concurrency on the host.** With `modernc.org/sqlite`, event writes from many workers arrive on separate goroutines; even with WAL mode, a single writer serializes them. Should events be batched (e.g., flushed every 100 ms) or funneled through a dedicated writer goroutine + channel? | Runtime lead | Phase 2 performance testing |
 | OQ-8 | **GitHub issue #347 A2A interoperability.** Should the host also expose an A2A-compatible endpoint (JSON-RPC 2.0 over HTTP+SSE at `/.well-known/agent-card.json`) so that A2A clients can submit tasks without the TAG runtime client? This would make the host interoperable with the broader A2A ecosystem. | Product | Before v1.0 release |
 | OQ-9 | **Worker identity for audit.** Should the `runtime_tasks` table record the submitter's identity (not just IP)? This requires extending `tag submit` to include a user identity claim in the task request. | Security | Before enterprise pilot |
 
@@ -1119,13 +1214,13 @@ Install with: `pip install tag[runtime]`
 
 **Goal:** A working host and worker on localhost. Task submission, dispatch, execution, and result retrieval. No TLS, no Prometheus, no file uploads.
 
-- Day 1–2: Define all dataclasses in `runtime_proto.py`. Implement serialization roundtrips. Write unit tests for all dataclasses and the state machine. CI green.
-- Day 3–4: Implement `TagRuntimeHost` gRPC server using `grpc.aio` with raw byte handlers. `RegisterWorker` BIDI stream, `SubmitTask` unary, `GetStatus` unary. Write minimal in-memory worker registry (no SQLite yet).
-- Day 5–6: Implement `TagRuntimeWorker` client. Connect to host, register, receive `assign_task` command, execute task via a stub `run_agent_for_runtime` (returns "hello" immediately), emit `final_output` event.
-- Day 7: Wire `cmd_runtime_host_start` and `cmd_runtime_worker_start` into `controller.py` CLI dispatch. Lazy import guard. `tag runtime host start` and `tag runtime worker start` work end-to-end on localhost.
-- Day 8: Implement `runtime_tasks` and `runtime_workers` SQLite tables. Persist task state transitions. `cmd_runtime_task_get` works.
-- Day 9: Implement affinity dispatch scheduler with `heapq` priority queue. Test with 2 workers of different profiles.
-- Day 10: Auth token validation with `hmac.compare_digest`. 32-character minimum. End-to-end integration test (host subprocess + worker subprocess + submit). Phase 1 review.
+- Day 1–2: Author `runtime.proto`; generate and commit Go stubs (`protoc-gen-go` + `protoc-gen-go-grpc`). Implement the state enum + `canTransition`. Write `go test` unit tests for proto roundtrips and the state machine. CI green.
+- Day 3–4: Implement `TagRuntimeHost` on `google.golang.org/grpc` with the generated typed server. `RegisterWorker` bidi stream, `SubmitTask` unary, `GetStatus` unary. In-memory worker registry (no SQLite yet); register `grpc_health_v1`.
+- Day 5–6: Implement `TagRuntimeWorker` client. Connect, register, receive `ASSIGN_TASK` command, execute via a stub `agent.RunForRuntime` (returns "hello" immediately), emit `FINAL_OUTPUT` event.
+- Day 7: Wire `runtimeHostStart` and `runtimeWorkerStart` cobra commands in `internal/server`. `tag runtime host start` and `tag runtime worker start` work end-to-end on localhost.
+- Day 8: Implement `runtime_tasks` and `runtime_workers` tables via `modernc.org/sqlite` (`internal/runtime/store.go`). Persist task state transitions. `runtimeTaskGet` works.
+- Day 9: Implement affinity dispatch scheduler with a `container/heap` priority queue. Test with 2 workers of different profiles.
+- Day 10: Auth interceptor with `subtle.ConstantTimeCompare`. 32-character minimum. End-to-end test over `bufconn` (host + worker + submit). Phase 1 review.
 
 ### Phase 2 — Feature Completeness (Weeks 3–4, ~10 days)
 
@@ -1135,9 +1230,9 @@ Install with: `pip install tag[runtime]`
 - Day 13: `CancelTask` RPC. `cancel_task` command sent to worker. Worker SIGKILL of agent subprocess on cancel. CANCELED state in SQLite.
 - Day 14: Worker reconnection with exponential backoff. Host detects missed heartbeats and marks workers UNHEALTHY. Task re-queue on worker UNHEALTHY.
 - Day 15: `--files` upload in `TaskRequest`. File decoding in worker temp directory. Path traversal validation. 10 MB payload limit check.
-- Day 16: Real `run_agent_for_runtime` bridge in `controller.py`. Wire Hermes callbacks into async event queue. Test with `coder` profile on actual prompt.
-- Day 17: Prometheus metrics (`prometheus_client` lazy import). Counters and histograms. Metrics HTTP server on separate port. Test with `curl`.
-- Day 18: `tag runtime status --watch` Rich Live rendering. `tag runtime worker list` command. `--json` output for all commands.
+- Day 16: Real `agent.RunForRuntime` bridge in `internal/agent`. Wire agent callback hooks into the events channel. Test with `coder` profile on an actual prompt.
+- Day 17: Prometheus metrics via `prometheus/client_golang` + `promhttp` on a separate port; `otelgrpc` interceptors for RPC-level metrics. Counters and histograms. Test with `curl`.
+- Day 18: `tag runtime status --watch` in-place table rendering (`time.Ticker` + context). `tag runtime worker list` command. `--json` output for all commands.
 - Day 19–20: `tag submit --stream`, `--wait`, `--priority`, `--env`, `--timeout` flags. TLS support (`--tls-cert`, `--tls-key` on host; `--tls-ca-cert` on worker). Phase 2 review.
 
 ### Phase 3 — Hardening and Documentation (Weeks 5–6, ~8 days)
@@ -1149,7 +1244,7 @@ Install with: `pip install tag[runtime]`
 - Day 24: Worker drain on SIGTERM. Worker-side task reconciliation on reconnect.
 - Day 25: Security hardening: IP logging for auth failures, gRPC reflection disabled by default, file path sanitization tests.
 - Day 26: Full acceptance criteria verification. Run all AC-01 through AC-20.
-- Day 27–28: Documentation in `docs/`, CLI `--help` text, `pyproject.toml` optional dependency entry, GitHub issue #347 close checklist. Final review and merge.
+- Day 27–28: Documentation in `docs/`, CLI `--help` text, `go.mod` dependency entries, GoReleaser config for the static binary (cosign + SLSA), GitHub issue #347 close checklist. Final review and merge.
 
 **Total: 28 engineering days (5–6 weeks with review overhead)**
 

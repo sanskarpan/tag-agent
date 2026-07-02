@@ -1,10 +1,12 @@
 # PRD-114: Five Team Orchestration Primitives (`tag team`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P1
 **Estimated Effort:** L (8-13 days)
 **Category:** Workflow State
-**Affects:** `team_orchestration.py + controller.py`
+**Affects:** `internal/swarm (process registry + orchestrator) + internal/cli (team command group)`
 **Depends on:** PRD-082 (multi-agent team primitives), PRD-108 (MagenticOne orchestrator), PRD-112 (graph-based workflow), PRD-109 (HITL interrupt)
 **Inspired by:** CrewAI Process types, AutoGen GroupChat, LangGraph multi-agent, Microsoft Autogen 0.4 team primitives
 
@@ -147,13 +149,15 @@ Process-specific options:
 | NFR-01 | Supervisor model prompt stays under 4096 tokens via state summarization. |
 | NFR-02 | Debate round timeout: if any agent fails to respond within 60s, skip that agent for this round. |
 | NFR-03 | Sequential process must detect cycles (agent A → agent B → agent A) via visit tracking. |
-| NFR-04 | Swarm fan-out uses PRD-111 `fan_out_execute` directly; not re-implemented. |
+| NFR-04 | Swarm fan-out reuses the PRD-111 `errgroup`-bounded worker pool directly (`golang.org/x/sync/errgroup` + semaphore-bounded goroutines); not re-implemented. |
 
 ---
 
 ## 9. Technical Design
 
 ### 9.1 SQLite DDL
+
+DB-neutral DDL; targets `modernc.org/sqlite` (pure-Go, CGO_ENABLED=0) in the single `tag.sqlite3` store owned by `internal/store`. All writes go through the single-writer + `gofrs/flock` atomic read-modify-write path.
 
 ```sql
 CREATE TABLE IF NOT EXISTS team_process_sessions (
@@ -181,59 +185,165 @@ CREATE TABLE IF NOT EXISTS team_process_steps (
 );
 ```
 
-### 9.2 Process dispatcher
+### 9.2 Process interface + registry (`internal/swarm`)
 
-```python
-from __future__ import annotations
-from typing import List
+The five process types become a `Process` interface with one concrete implementation per mode, wired through a `map[string]Process` registry — no reflection / getattr-style method dispatch. New process types (a non-goal, see §3.1 NG2) would require a new Go type in the registry at compile time.
 
-PROCESS_TYPES = {
-    "sequential": "_run_sequential",
-    "hierarchical": "_run_hierarchical",
-    "supervisor": "_run_supervisor",
-    "debate": "_run_debate",
-    "swarm": "_run_swarm",
+```go
+package swarm
+
+import (
+	"context"
+
+	"github.com/tag-agent/tag/internal/agent"
+	"github.com/tag-agent/tag/internal/llm"
+)
+
+// Agent is a team member resolved from the PRD-082 registry.
+type Agent struct {
+	Name  string `json:"name"`
+	Role  string `json:"role"`
+	Model string `json:"model,omitempty"`
 }
 
-class TeamOrchestrator:
-    def __init__(self, team_agents: List[dict], model: str) -> None:
-        self.agents = team_agents
-        self.model = model
+// State is the accumulated process state, persisted between rounds.
+type State struct {
+	Goal    string        `json:"goal"`
+	Outputs []AgentOutput `json:"outputs"`
+	Final   string        `json:"final,omitempty"`
+}
 
-    def run(self, process: str, goal: str, **kwargs) -> dict:
-        method = getattr(self, PROCESS_TYPES[process])
-        return method(goal, **kwargs)
+type AgentOutput struct {
+	Agent  string `json:"agent"`
+	Round  int    `json:"round"`
+	Result string `json:"result"`
+}
 
-    def _run_sequential(self, goal: str, order: List[str] = None, **kw) -> dict:
-        agents = [a for a in self.agents if a["name"] in (order or [a["name"] for a in self.agents])]
-        state: dict = {"goal": goal, "outputs": []}
-        for agent in agents:
-            result = _call_agent(agent, state)
-            state["outputs"].append({"agent": agent["name"], "result": result})
-            state["last_output"] = result
-        return state
+// Options carries process-specific flags (order, manager, max rounds, workers…).
+type Options struct {
+	Order      []string
+	Manager    string
+	MaxRounds  int
+	MaxWorkers int
+	Model      string
+}
 
-    def _run_supervisor(self, goal: str, max_rounds: int = 20, **kw) -> dict:
-        import json
-        state: dict = {"goal": goal, "history": []}
-        for _ in range(max_rounds):
-            prompt = _supervisor_prompt(self.agents, state)
-            response = _call_llm(self.model, prompt)
-            try:
-                parsed = json.loads(response)
-            except Exception:
-                break
-            if parsed.get("action") == "FINISH":
-                state["final"] = parsed.get("result", "")
-                break
-            agent_name = parsed.get("agent")
-            agent = next((a for a in self.agents if a["name"] == agent_name), None)
-            if not agent:
-                break
-            result = _call_agent(agent, state)
-            state["history"].append({"agent": agent_name, "result": result})
-        return state
+// Result is returned to the CLI/persistence layer.
+type Result struct {
+	State  State
+	Rounds int
+}
+
+// Process is the single orchestration primitive contract. Every mode
+// (sequential/hierarchical/supervisor/debate/swarm) implements it.
+type Process interface {
+	Run(ctx context.Context, goal string, opts Options) (Result, error)
+}
+
+// registry maps the --process flag to a constructor; no reflection.
+type Factory func(agents []Agent, prov llm.Provider) Process
+
+var registry = map[string]Factory{
+	"sequential":   func(a []Agent, p llm.Provider) Process { return &Sequential{agents: a, prov: p} },
+	"hierarchical": func(a []Agent, p llm.Provider) Process { return &Hierarchical{agents: a, prov: p} },
+	"supervisor":   func(a []Agent, p llm.Provider) Process { return &Supervisor{agents: a, prov: p} },
+	"debate":       func(a []Agent, p llm.Provider) Process { return &Debate{agents: a, prov: p} },
+	"swarm":        func(a []Agent, p llm.Provider) Process { return &Swarm{agents: a, prov: p} },
+}
+
+// New resolves a process type, or an error for an unknown --process value.
+func New(process string, agents []Agent, prov llm.Provider) (Process, error) {
+	f, ok := registry[process]
+	if !ok {
+		return nil, fmt.Errorf("unknown process type %q", process)
+	}
+	return f(agents, prov), nil
+}
 ```
+
+Two representative implementations. Agents run via the shared `internal/agent` loop; the LLM supervisor calls the `internal/llm` provider (`Stream(ctx, Request) -> <-chan Event`, accumulated to a final message). LLM output is parsed with a tolerant `encoding/json` decode.
+
+```go
+// Sequential: run agents in a fixed order, threading accumulated state forward.
+type Sequential struct {
+	agents []Agent
+	prov   llm.Provider
+}
+
+func (s *Sequential) Run(ctx context.Context, goal string, opts Options) (Result, error) {
+	order := opts.Order
+	if len(order) == 0 {
+		for _, a := range s.agents {
+			order = append(order, a.Name)
+		}
+	}
+	byName := indexByName(s.agents)
+	seen := map[string]bool{} // NFR-03 cycle detection
+	state := State{Goal: goal}
+	for i, name := range order {
+		if seen[name] {
+			return Result{}, fmt.Errorf("sequential cycle detected at %q", name)
+		}
+		seen[name] = true
+		a, ok := byName[name]
+		if !ok {
+			return Result{}, fmt.Errorf("unknown agent %q", name)
+		}
+		out, err := agent.Run(ctx, a.Model, a.Role, renderState(state))
+		if err != nil {
+			return Result{}, err
+		}
+		state.Outputs = append(state.Outputs, AgentOutput{Agent: name, Round: i, Result: out})
+	}
+	return Result{State: state, Rounds: len(order)}, nil
+}
+
+// Supervisor: an LLM decides the next agent each turn; stops on FINISH.
+type Supervisor struct {
+	agents []Agent
+	prov   llm.Provider
+}
+
+func (s *Supervisor) Run(ctx context.Context, goal string, opts Options) (Result, error) {
+	maxRounds := opts.MaxRounds
+	if maxRounds == 0 {
+		maxRounds = 20
+	}
+	byName := indexByName(s.agents)
+	state := State{Goal: goal}
+	for round := 0; round < maxRounds; round++ {
+		msg, err := s.prov.Complete(ctx, supervisorRequest(opts.Model, s.agents, state))
+		if err != nil {
+			return Result{}, err
+		}
+		var decision struct {
+			Action string `json:"action"`
+			Agent  string `json:"agent"`
+			Result string `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(msg.Text), &decision); err != nil {
+			// FR-09: robust parse; treat unparseable supervisor output as a stop.
+			break
+		}
+		if decision.Action == "FINISH" {
+			state.Final = decision.Result
+			break
+		}
+		a, ok := byName[decision.Agent]
+		if !ok {
+			break
+		}
+		out, err := agent.Run(ctx, a.Model, a.Role, renderState(state))
+		if err != nil {
+			return Result{}, err
+		}
+		state.Outputs = append(state.Outputs, AgentOutput{Agent: decision.Agent, Round: round, Result: out})
+	}
+	return Result{State: state, Rounds: len(state.Outputs)}, nil
+}
+```
+
+The `swarm` process does not implement its own fan-out: it decomposes the goal into N subtasks and dispatches them through the PRD-111 `errgroup`-bounded worker pool (`golang.org/x/sync/errgroup` + a semaphore channel sized to `opts.MaxWorkers`), then reduces the per-agent `AgentOutput` slice into the final result (NFR-04).
 
 ---
 
@@ -248,11 +358,14 @@ class TeamOrchestrator:
 
 ## 11. Testing Strategy
 
+Go `testing` (table-driven cases per process type; a fake `llm.Provider` returns scripted events for deterministic supervisor/debate runs). Latency/throughput metrics from §4 measured with `testing.B` benchmarks. Integration tests run against an in-memory `modernc.org/sqlite` store.
+
 | Layer | Tests |
 |-------|-------|
-| Unit | Sequential order compliance; supervisor FINISH detection; debate agreement scoring |
-| Integration | 3-agent sequential pipeline end-to-end; 2-agent debate convergence |
-| Resilience | Agent failure mid-process triggers graceful degradation |
+| Unit | Table-driven: sequential order compliance + cycle detection; supervisor FINISH detection; debate agreement scoring; registry lookup rejects unknown `--process` |
+| Integration | 3-agent sequential pipeline end-to-end; 2-agent debate convergence (against in-memory store) |
+| Benchmark | `testing.B` for the sequential-pipeline and swarm-speedup targets in §4 |
+| Resilience | Agent `error` mid-process triggers graceful degradation (errgroup context cancellation for swarm) |
 
 ---
 
@@ -282,8 +395,8 @@ class TeamOrchestrator:
 
 | ID | Question |
 |----|---------|
-| OQ-01 | Should process types be extensible (plugin architecture)? |
-| OQ-02 | Should the debate process use an LLM judge to score agreement, or embedding cosine similarity? |
+| OQ-01 | Should process types be extensible (plugin architecture)? **Reconsidered by the Go move:** the static single-binary model has no dynamic plugin loading (GO_MIGRATION_PLAN decision #6 rejects `go-plugin`/gRPC and scripting VMs for v1). A new process type is a new Go type registered in the `map[string]Factory` at compile time. Runtime extensibility, if ever needed, is limited to the shell/HTTP hook surface + MCP servers — not in-process custom `Process` implementations. This reinforces NG2 ("custom process types via plugins" is a non-goal). |
+| OQ-02 | Should the debate process use an LLM judge to score agreement, or embedding cosine similarity (in-Go cosine over provider/`internal/memory` embeddings, per decision #2)? |
 
 ---
 

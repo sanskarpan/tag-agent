@@ -1,10 +1,12 @@
 # PRD-100: Auto-Stop/Auto-Archive Lifecycle Policies for Idle Sandboxes (`tag sandbox policy`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P3
 **Estimated Effort:** S (3-5 days)
 **Category:** Sandbox & Execution Environment
-**Affects:** `sandbox.py`
+**Affects:** `internal/sandbox` (with `internal/cron`, `internal/notify`, `internal/obs`)
 **Depends on:** PRD-028 (Sandbox Code Execution), PRD-091 (Configurable Sandbox TTL + Session Refresh), PRD-022 (Cron Scheduled Agents), PRD-013 (Agent Tracing / Observability), PRD-034 (Secret Scanning / Security), PRD-012 (Cost Tracking / Budget), PRD-039 (Token Budget Enforcement), PRD-040 (Notification Hooks)
 **Inspired by:** Daytona workspace policies, Gitpod idle timeout, GitHub Codespaces timeout
 
@@ -16,9 +18,9 @@ TAG's sandbox subsystem (PRD-028) currently provides ephemeral command execution
 
 Cloud sandbox providers have each converged on a tiered policy model above the raw TTL primitive. Daytona exposes `WorkspacePolicies` at the profile or organization level with `auto_stop_interval`, `pinned_image`, and `inactivity_lock_duration` fields, allowing administrators to declare rules once and have the platform enforce them fleet-wide. Gitpod's idle timeout applies to all workspaces in a team plan, with per-workspace overrides; the daemon monitors CPU/network quiescence and stops workspaces that breach the threshold. GitHub Codespaces separates `idle_timeout` (default 30 minutes) from `retention_period` (default 30 days to deletion) and enforces both independently. All three providers treat policy as a first-class configuration entity distinct from per-session state, and all three enforce policies via an asynchronous daemon rather than requiring user-triggered cleanup.
 
-This PRD introduces `tag sandbox policy` — a lifecycle policy subsystem for TAG's sandbox module. A **SandboxPolicy** is a named, profile-scoped configuration document stored in SQLite that captures four enforcement axes: (1) auto-stop after N minutes of idle time (no new commands executed), (2) auto-archive after M days since creation, (3) a maximum number of concurrently running sandboxes per profile, and (4) a maximum USD cost incurred by sandboxes within a rolling 24-hour window. The existing `cron_scheduler.py` daemon is extended with a `sandbox_policy_sweep` hook that fires every minute and applies all active policies to all matching sandboxes in the appropriate state transitions. Notifications via `notifications.py` fire pre-stop warnings and post-archive confirmations, giving users the same experience as commercial providers.
+This PRD introduces `tag sandbox policy` — a lifecycle policy subsystem in `internal/sandbox`. A **SandboxPolicy** is a named, profile-scoped configuration document stored in the `modernc.org/sqlite` state store (`internal/store`) that captures four enforcement axes: (1) auto-stop after N minutes of idle time (no new commands executed), (2) auto-archive after M days since creation, (3) a maximum number of concurrently running sandboxes per profile, and (4) a maximum USD cost incurred by sandboxes within a rolling 24-hour window. The scheduler (`internal/cron`, backed by `go-co-op/gocron v2`) runs a `sandbox-policy-sweep` job every minute — a background reaper goroutine driven by the scheduler — that applies all active policies to all matching sandboxes in the appropriate state transitions. Notifications via `internal/notify` fire pre-stop warnings and post-archive confirmations, giving users the same experience as commercial providers. Policies may also be seeded from `tag.yaml` via the `koanf`/`yaml.v3` config layer, but the SQLite table is the authoritative durable store and audit sink.
 
-The implementation is additive and backward-compatible. Sandboxes without a matching policy continue to behave exactly as before. When a policy is attached to a profile, it applies to all new sandbox sessions created under that profile starting from the moment of policy creation; existing sessions are brought into compliance on the next sweep cycle. The `tag sandbox policy apply --now` command triggers an immediate enforcement sweep for operators who need instant compliance without waiting for the next cron tick.
+The implementation is additive and backward-compatible. Sandboxes without a matching policy continue to behave exactly as before. When a policy is attached to a profile, it applies to all new sandbox sessions created under that profile starting from the moment of policy creation; existing sessions are brought into compliance on the next sweep cycle. The `tag sandbox policy apply --now` command triggers an immediate enforcement sweep for operators who need instant compliance without waiting for the next scheduler tick.
 
 The feature has low implementation complexity (difficulty 2/5) but provides meaningful operational value for teams running cost-sensitive or resource-constrained sandbox workloads: it prevents runaway costs from forgotten idle sandboxes, prevents resource contention from sandbox proliferation, and provides the audit trail needed for capacity planning. The `tag sandbox policy show --json` command exposes the active policy in a machine-readable form suitable for CI assertions and compliance reporting.
 
@@ -51,12 +53,12 @@ GitHub Codespaces addresses this with per-user spending limits that automaticall
 | # | Goal |
 |---|------|
 | G1 | A single `tag sandbox policy set` command creates or replaces a policy for the current or named profile, accepting `--idle-timeout`, `--archive-after`, `--max-concurrent`, and `--max-cost-daily` as independent, composable constraints. |
-| G2 | The policy daemon sweep runs every 60 seconds via `cron_scheduler.py` and autonomously stops sandboxes that have been idle beyond `idle_timeout_minutes` and archives (marks as `archived`) those that have exceeded `archive_after_days`. |
+| G2 | The policy reaper sweep runs every 60 seconds as a `go-co-op/gocron v2` job in `internal/cron` and autonomously stops sandboxes that have been idle beyond `idle_timeout_minutes` and archives (marks as `archived`) those that have exceeded `archive_after_days`. |
 | G3 | `tag sandbox policy apply --now` triggers an immediate synchronous enforcement sweep for the active profile, reporting each action taken. |
 | G4 | `tag sandbox policy show` and `tag sandbox policy show --json` display the effective policy for the active profile, including computed enforcement state (next sweep time, sandboxes currently in scope, projected cost impact). |
 | G5 | When a policy's `max_concurrent` limit is reached, new `tag sandbox run` calls under that profile fail fast with a clear error message before allocating any backend resources. |
-| G6 | When the rolling 24-hour sandbox cost for a profile reaches `max_cost_daily_usd`, the policy daemon stops the most-idle running sandboxes until the projected cost drops below the cap; a notification is fired via `notifications.py`. |
-| G7 | A pre-stop warning notification is fired via `notifications.py` at least 60 seconds before an idle-timeout stop is executed, giving an interactive user the chance to send a keepalive. |
+| G6 | When the rolling 24-hour sandbox cost for a profile reaches `max_cost_daily_usd`, the policy reaper stops the most-idle running sandboxes until the projected cost drops below the cap; a notification is fired via `internal/notify`. |
+| G7 | A pre-stop warning notification is fired via `internal/notify` at least 60 seconds before an idle-timeout stop is executed, giving an interactive user the chance to send a keepalive. |
 | G8 | All policy actions (stop, archive, warning) are recorded in a `sandbox_policy_events` SQLite table with a foreign key to `sandbox_runs`, enabling audit trails and `tag sandbox policy history` reporting. |
 | G9 | Policies are profile-scoped: setting a policy on profile `coder` does not affect sandboxes created under profile `researcher`. A `--profile` flag on all policy subcommands allows cross-profile management. |
 | G10 | Zero behavioral change for sandboxes created under profiles with no active policy. The sweep function is a no-op for those sessions. |
@@ -71,7 +73,7 @@ GitHub Codespaces addresses this with per-user spending limits that automaticall
 | NG4 | Per-sandbox policy overrides. Policy is a profile-level construct; individual sandboxes cannot opt out of the profile policy. Per-session TTL (PRD-091) remains the mechanism for sandbox-specific lifetime control. |
 | NG5 | Policy templates or inheritance hierarchies. There is one active policy per profile; there is no `extends` or `inherit` mechanism. |
 | NG6 | Retroactive cost recovery. The max-cost-daily cap stops future sandbox creation and stops idle sandboxes; it does not issue refunds or modify cloud billing. |
-| NG7 | Real-time resource metering inside sandboxes (CPU%, memory%). The idle signal is defined solely as time elapsed since the last command was submitted via `run_in_sandbox()`, not OS-level resource quiescence. |
+| NG7 | Real-time resource metering inside sandboxes (CPU%, memory%). The idle signal is defined solely as time elapsed since the last command was submitted via `RunInSandbox()`, not OS-level resource quiescence. |
 
 ---
 
@@ -80,12 +82,12 @@ GitHub Codespaces addresses this with per-user spending limits that automaticall
 | Metric | Target | Measurement Method |
 |--------|--------|--------------------|
 | Idle cost reduction | Sandboxes stopped within `idle_timeout + 60s` of going idle | Integration test: create sandbox, wait `idle_timeout + 70s`, assert `status = stopped` |
-| Sweep latency | p99 sweep execution time < 200 ms for up to 1 000 sandbox rows | Benchmark test: populate 1 000 `sandbox_runs` rows, time `policy_sweep()` call |
-| Concurrency gate | `tag sandbox run` rejects with exit code 2 within 50 ms when `max_concurrent` is reached | Unit test: mock 5 running sandboxes, assert rejection before Docker call |
+| Sweep latency | p99 sweep execution time < 200 ms for up to 1 000 sandbox rows | Benchmark test: populate 1 000 `sandbox_runs` rows, time `PolicySweep()` call |
+| Concurrency gate | `tag sandbox run` rejects with exit code 2 within 50 ms when `max_concurrent` is reached | Unit test: fake 5 running sandboxes, assert rejection before the Docker client call |
 | Cost cap accuracy | Daily cost cap triggers stop action within one sweep cycle (≤ 60 s) of breach | Integration test: inject synthetic `cost_usd` rows summing to `> max_cost_daily_usd`, run sweep, assert stop actions |
-| Notification timing | Pre-stop warning fires between 60 s and 120 s before actual stop action | Unit test: advance mock clock to `idle_timeout - 90s`, assert warning notification emitted |
-| Policy persistence | Policy survives TAG process restart and re-read from SQLite | Integration test: set policy, close DB connection, reopen, assert policy row present |
-| Zero-policy overhead | `run_in_sandbox()` latency with no active policy ≤ 1 ms increase over baseline | Benchmark: 100 calls, measure p99 latency delta |
+| Notification timing | Pre-stop warning fires between 60 s and 120 s before actual stop action | Unit test: set injected `Clock` to `idle_timeout - 90s`, assert warning notification emitted |
+| Policy persistence | Policy survives TAG process restart and re-read from SQLite | Integration test: set policy, close DB handle, reopen, assert policy row present |
+| Zero-policy overhead | `RunInSandbox()` latency with no active policy ≤ 1 ms increase over baseline | Benchmark: 100 calls, measure p99 latency delta |
 | Audit trail completeness | Every stop and archive action has a corresponding row in `sandbox_policy_events` | Assert via `SELECT COUNT(*)` after integration test sweep |
 
 ---
@@ -345,26 +347,26 @@ TIMESTAMP                  SANDBOX       ACTION    REASON           DETAIL
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-01 | `sandbox_policies` SQLite table is created by `ensure_schema()` on first call; schema is idempotent (uses `CREATE TABLE IF NOT EXISTS`). | P0 |
-| FR-02 | `sandbox_policy_events` SQLite table records every enforcement action (stop, archive, warning, concurrency-block, cost-block) with `sandbox_id`, `action`, `reason`, `detail`, and `timestamp`. | P0 |
-| FR-03 | `tag sandbox policy set` creates a new policy row if none exists for the profile, or updates the existing row if one exists, preserving unspecified fields. | P0 |
+| FR-01 | The `sandbox_policies` SQLite table is created by `EnsureSchema(ctx, db)` on first call; schema is idempotent (uses `CREATE TABLE IF NOT EXISTS` on the `modernc.org/sqlite` handle). | P0 |
+| FR-02 | The `sandbox_policy_events` SQLite table records every enforcement action (stop, archive, warning, concurrency-block, cost-block) with `sandbox_id`, `action`, `reason`, `detail`, and `timestamp`. | P0 |
+| FR-03 | `tag sandbox policy set` creates a new policy row if none exists for the profile, or updates the existing row if one exists, preserving unspecified fields (`nil` pointer fields on the update struct leave the column untouched). | P0 |
 | FR-04 | `tag sandbox policy set --idle-timeout 0` sets `idle_timeout_minutes = NULL`, disabling idle-timeout enforcement for that policy without removing other constraints. | P1 |
-| FR-05 | Duration arguments accept integer seconds, `Nm` (minutes), `Nh` (hours), `Nd` (days), and compound forms `NhMm`. An invalid duration string causes a parse error before any DB write. | P1 |
-| FR-06 | `policy_sweep(conn, profile)` selects all `sandbox_runs` rows where `profile = ?` and `status = 'running'`, computes idle duration as `NOW() - last_activity_at`, and stops any sandbox where `idle_duration > idle_timeout_minutes`. | P0 |
-| FR-07 | `policy_sweep()` fires a pre-stop warning notification via `notifications.notify()` for any sandbox within 60 seconds of its idle-timeout threshold, if a warning has not already been fired for that sandbox in the current window. | P1 |
-| FR-08 | `policy_sweep()` selects all `sandbox_runs` rows where `profile = ?` and `status IN ('stopped', 'done', 'failed')` and archives rows where `age_days > archive_after_days`. Archive sets `status = 'archived'`. | P0 |
-| FR-09 | Before a new `run_in_sandbox()` call, the concurrency gate queries `COUNT(*) WHERE profile = ? AND status = 'running'`. If the count meets or exceeds `max_concurrent`, the function raises `PolicyViolationError` with code `concurrency_limit` before allocating any backend resource. | P0 |
-| FR-10 | The cost gate queries `SUM(cost_usd) WHERE profile = ? AND created_at >= NOW() - INTERVAL 24h`. If the sum meets or exceeds `max_cost_daily_usd`, `run_in_sandbox()` raises `PolicyViolationError` with code `cost_cap`. | P0 |
-| FR-11 | When the `max_cost_daily_usd` cap is breached mid-sweep (i.e., a running sandbox's accumulated cost causes the rolling sum to exceed the cap), `policy_sweep()` stops the most-idle running sandbox and fires a cost-cap notification. | P1 |
-| FR-12 | `policy_sweep()` is registered as a named cron job `__sandbox_policy_sweep__` with schedule `* * * * *` (every minute) via `cron_scheduler.py` when a policy is first set. It is deregistered when all policies are removed. | P1 |
-| FR-13 | `tag sandbox policy apply --now` calls `policy_sweep()` synchronously and prints each action. The `--dry-run` flag calls a read-only `policy_sweep_preview()` that returns actions without executing them. | P1 |
-| FR-14 | `tag sandbox policy show --json` returns a JSON object with both the policy configuration and the live enforcement state (running count, stopped count, archived count, rolling 24h cost). | P1 |
+| FR-05 | Duration arguments accept integer seconds, `Nm` (minutes), `Nh` (hours), `Nd` (days), and compound forms `NhMm`. An invalid duration string returns a parse error before any DB write. | P1 |
+| FR-06 | `PolicySweep(ctx, db, clock, profile)` selects all `sandbox_runs` rows where `profile = ?` and `status = 'running'`, computes idle duration as `clock.Now() - last_activity_at`, and stops any sandbox where `idle_duration > idle_timeout_minutes`. | P0 |
+| FR-07 | `PolicySweep()` fires a pre-stop warning notification via the injected `notify.Notifier` for any sandbox within 60 seconds of its idle-timeout threshold, if a warning has not already been fired for that sandbox in the current window. | P1 |
+| FR-08 | `PolicySweep()` selects all `sandbox_runs` rows where `profile = ?` and `status IN ('stopped', 'done', 'failed')` and archives rows where `age_days > archive_after_days`. Archive sets `status = 'archived'`. | P0 |
+| FR-09 | Before a new `RunInSandbox()` call, the concurrency gate queries `COUNT(*) WHERE profile = ? AND status = 'running'`. If the count meets or exceeds `max_concurrent`, the function returns a `*PolicyViolationError` with `Code = "concurrency_limit"` before allocating any backend resource. | P0 |
+| FR-10 | The cost gate queries `SUM(cost_usd) WHERE profile = ? AND created_at >= ?` (24h window computed in Go). If the sum meets or exceeds `max_cost_daily_usd`, `RunInSandbox()` returns a `*PolicyViolationError` with `Code = "cost_cap"`. | P0 |
+| FR-11 | When the `max_cost_daily_usd` cap is breached mid-sweep (i.e., a running sandbox's accumulated cost causes the rolling sum to exceed the cap), `PolicySweep()` stops the most-idle running sandbox and fires a cost-cap notification. | P1 |
+| FR-12 | The sweep is registered as a named `go-co-op/gocron v2` job `sandbox-policy-sweep` at `* * * * *` (every minute, `WithSingletonMode`) in `internal/cron` when a policy is first set; the job is removed when all policies are removed. On process start, `internal/cron` re-registers it iff any enabled policy row exists. | P1 |
+| FR-13 | `tag sandbox policy apply --now` calls `PolicySweep()` synchronously and prints each action. The `--dry-run` flag passes `dryRun=true` through `PolicySweep()` so it returns the actions without executing them. | P1 |
+| FR-14 | `tag sandbox policy show --json` returns a JSON object (typed structs, `encoding/json`) with both the policy configuration and the live enforcement state (running count, stopped count, archived count, rolling 24h cost). | P1 |
 | FR-15 | `tag sandbox policy list` returns all rows from `sandbox_policies` where `enabled = 1`, formatted as a table. | P2 |
 | FR-16 | `tag sandbox policy history` queries `sandbox_policy_events` with profile filter and optional `since` timestamp filter, ordered by `timestamp DESC`. | P2 |
-| FR-17 | `tag sandbox policy unset` deletes the policy row for the given profile and deregisters the cron sweep job if no other policies remain. It does NOT stop or archive running sandboxes. | P1 |
-| FR-18 | The `sandbox_runs` table gains a `profile` column (TEXT, nullable, indexed) and a `cost_usd` column (REAL, nullable) via a `ALTER TABLE` migration executed by `ensure_schema()`. | P0 |
-| FR-19 | The `sandbox_runs` table gains a `last_activity_at` column (TEXT, nullable) updated on every `run_in_sandbox()` call for an existing session. For legacy rows where `last_activity_at IS NULL`, idle-timeout computes from `created_at`. | P0 |
-| FR-20 | All policy enforcement actions emit an OpenTelemetry span via `tracing.py` with attributes `sandbox.policy.action`, `sandbox.policy.reason`, and `sandbox.id`, enabling correlation with existing TAG traces. | P2 |
+| FR-17 | `tag sandbox policy unset` deletes the policy row for the given profile and deregisters the gocron sweep job if no other policies remain. It does NOT stop or archive running sandboxes. | P1 |
+| FR-18 | The `sandbox_runs` table gains a `profile` column (TEXT, nullable, indexed) and a `cost_usd` column (REAL, nullable) via `ALTER TABLE` migrations run in Go and guarded by a `duplicate column name` error check. | P0 |
+| FR-19 | The `sandbox_runs` table gains a `last_activity_at` column (TEXT, nullable) updated on every `RunInSandbox()` call for an existing session. For legacy rows where `last_activity_at IS NULL`, idle-timeout computes from `created_at`. | P0 |
+| FR-20 | All policy enforcement actions emit an OpenTelemetry span via `internal/obs` (`go.opentelemetry.io/otel`) with attributes `sandbox.policy.action`, `sandbox.policy.reason`, and `sandbox.id`, enabling correlation with existing TAG traces. | P2 |
 
 ---
 
@@ -372,16 +374,16 @@ TIMESTAMP                  SANDBOX       ACTION    REASON           DETAIL
 
 | ID | Requirement | Target |
 |----|-------------|--------|
-| NFR-01 | Sweep latency | `policy_sweep()` completes in < 200 ms for up to 1 000 sandbox rows at p99. Uses a single indexed `SELECT` for candidate selection, not N individual queries. |
-| NFR-02 | Zero import cost | `import tag.sandbox` does not import `cron_scheduler` or `notifications` at module load time; these are imported lazily inside `policy_sweep()` and `_fire_warning()`. |
-| NFR-03 | Atomicity | Each stop or archive action within a sweep is committed to SQLite in its own transaction. A failure on sandbox N does not roll back actions on sandboxes 1..N-1. |
-| NFR-04 | Idempotency | Running `policy_sweep()` twice in rapid succession for the same profile produces the same final state without duplicate actions or events. Warning notifications are deduplicated using a `warned_at` column on `sandbox_runs`. |
-| NFR-05 | Thread safety | `policy_sweep()` acquires a `threading.Lock` keyed on the profile name for the duration of the sweep to prevent concurrent sweeps from racing on the same profile's sandboxes. |
-| NFR-06 | WAL-mode compatibility | All DB writes use `conn.execute()` with positional parameters; no use of SQLite `BEGIN EXCLUSIVE`. Compatible with the WAL-mode database at `~/.tag/runtime/tag.sqlite3`. |
-| NFR-07 | Duration parse accuracy | Duration parser correctly handles: `"30m"` → 30, `"1h"` → 60, `"2h30m"` → 150, `"90"` → 1.5, `"7d"` → 10 080. Float seconds are rounded to nearest integer minute. |
-| NFR-08 | Backward compatibility | Existing `sandbox_runs` rows without `profile`, `cost_usd`, `last_activity_at`, or `warned_at` columns are handled gracefully; `ensure_schema()` adds the columns with `ALTER TABLE ... ADD COLUMN` which is a no-op if already present. |
-| NFR-09 | Error isolation | A stop action that fails (e.g., Docker container already removed) logs a warning and records a `stop_failed` event but does not abort the sweep. The sweep continues to the next candidate. |
-| NFR-10 | Policy visibility | Every policy check that results in a block (concurrency, cost) prints a human-readable error to stderr: `PolicyViolationError: concurrency limit reached (3/3 sandboxes running for profile 'coder')`. |
+| NFR-01 | Sweep latency | `PolicySweep()` completes in < 200 ms for up to 1 000 sandbox rows at p99. Uses a single indexed `SELECT` for candidate selection, not N individual queries. |
+| NFR-02 | Decoupling | `internal/sandbox` does not take a hard package dependency on `internal/cron` or `internal/notify`; the scheduler and the `notify.Notifier` are supplied through interfaces via dependency injection, so the sweep and warning paths are testable with fakes and impose no init-time cost. |
+| NFR-03 | Atomicity | Each stop or archive action within a sweep is committed to SQLite in its own `*sql.Tx`. A failure on sandbox N does not roll back actions on sandboxes 1..N-1. |
+| NFR-04 | Idempotency | Running `PolicySweep()` twice in rapid succession for the same profile produces the same final state without duplicate actions or events. Warning notifications are deduplicated using a `warned_at` column on `sandbox_runs`. |
+| NFR-05 | Concurrency safety | `PolicySweep()` acquires a per-profile `*sync.Mutex` (from a mutex map guarded by its own mutex) for the duration of the sweep; the gocron job additionally runs in `WithSingletonMode` so overlapping ticks cannot double-fire. |
+| NFR-06 | WAL-mode compatibility | All DB writes go through the single `internal/store` handle with `?` positional parameters; no `BEGIN EXCLUSIVE`. Compatible with the WAL-mode `modernc.org/sqlite` database at `~/.tag/runtime/tag.sqlite3`. |
+| NFR-07 | Duration parse accuracy | Duration parser correctly handles: `"30m"` → 30, `"1h"` → 60, `"2h30m"` → 150, `"90"` → 90 (bare integer = minutes), `"7d"` → 10 080. Sub-minute seconds are truncated to whole minutes via integer division. |
+| NFR-08 | Backward compatibility | Existing `sandbox_runs` rows without `profile`, `cost_usd`, `last_activity_at`, or `warned_at` columns are handled gracefully; `EnsureSchema()` runs each `ALTER TABLE … ADD COLUMN` in Go, swallowing the `duplicate column name` error so re-runs are no-ops. |
+| NFR-09 | Error isolation | A stop action that fails (e.g., Docker container already removed) logs via `slog.Warn` and records a `stop_failed` event but does not abort the sweep. The sweep continues to the next candidate. |
+| NFR-10 | Policy visibility | Every policy check that results in a block (concurrency, cost) surfaces a human-readable error (the `*PolicyViolationError.Error()` string) to stderr: `policy violation: concurrency limit reached (3/3 sandboxes running for profile 'coder')`. |
 
 ---
 
@@ -391,12 +393,23 @@ TIMESTAMP                  SANDBOX       ACTION    REASON           DETAIL
 
 | File | Change Type | Description |
 |------|-------------|-------------|
-| `src/tag/sandbox.py` | Modified | Primary implementation target. Adds `ensure_schema()` extension, `SandboxPolicy` dataclass, `PolicyViolationError`, `set_policy()`, `get_policy()`, `delete_policy()`, `list_policies()`, `policy_sweep()`, `policy_sweep_preview()`, `_parse_duration()`, `_get_enforcement_state()`, `_fire_warning()`, concurrency/cost gates in `run_in_sandbox()`. |
-| `src/tag/controller.py` | Modified | Adds `cmd_sandbox_policy_set`, `cmd_sandbox_policy_show`, `cmd_sandbox_policy_apply`, `cmd_sandbox_policy_unset`, `cmd_sandbox_policy_list`, `cmd_sandbox_policy_history` command handlers and registers them under the `tag sandbox policy` subcommand group. |
+| `internal/sandbox/policy.go` | New | Primary implementation target. Adds the `EnsureSchema()` extension, the `SandboxPolicy` struct, `PolicyViolationError`, `SetPolicy()`, `GetPolicy()`, `DeletePolicy()`, `ListPolicies()`, `PolicySweep()` (with a `dryRun` param), `parseDurationMinutes()`, `enforcementState()`, `fireWarning()`, and the concurrency/cost gates called from `RunInSandbox()` (in `internal/sandbox/run.go`). |
+| `internal/cli/sandbox_policy.go` | New | Adds the `set`, `show`, `apply`, `unset`, `list`, `history` `cobra` subcommands under the `tag sandbox policy` command group. |
+| `internal/cron/policy.go` | New | Registers/deregisters the `sandbox-policy-sweep` `go-co-op/gocron v2` job and provides `PolicySweepAllProfiles(ctx)`. |
 
 ### 9.2 SQLite DDL
 
-The following DDL is added to `ensure_schema()` in `sandbox.py`. All `ALTER TABLE` statements use the `ADD COLUMN IF NOT EXISTS` pattern (SQLite 3.37+); for older SQLite, the migration catches `OperationalError` with message `duplicate column name` and ignores it.
+The following DDL is applied by `EnsureSchema()` in `internal/sandbox` against the single `modernc.org/sqlite` handle (CGO_ENABLED=0, WAL). `CREATE TABLE`/`CREATE INDEX` use the idempotent `IF NOT EXISTS` form. Each `ALTER TABLE … ADD COLUMN` is executed from Go and wrapped by an `addColumn` helper that swallows an error whose message contains `duplicate column name`, making re-runs no-ops:
+
+```go
+func addColumn(ctx context.Context, db store.Querier, ddl string) error {
+	if _, err := db.ExecContext(ctx, ddl); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	return nil
+}
+```
 
 ```sql
 -- sandbox_policies: one row per profile, declarative lifecycle policy
@@ -438,384 +451,395 @@ CREATE INDEX IF NOT EXISTS idx_sr_profile_status
     ON sandbox_runs(profile, status, last_activity_at);
 ```
 
-### 9.3 Core Python Dataclasses
+### 9.3 Core Go Types
 
-```python
-from __future__ import annotations
-import dataclasses
-import datetime
-from typing import Optional
+Nullable columns map to pointer fields (`*int`, `*float64`) — a `nil` field means "constraint disabled". `sql.NullString`/`COALESCE` handle nullable reads. `PolicyViolationError` is a Go error type with an inspectable `Code`, matchable via `errors.As`. JSON field names are set with struct tags to match the §6 output contract exactly.
 
+```go
+package sandbox
 
-@dataclasses.dataclass
-class SandboxPolicy:
-    """Declarative lifecycle policy for sandboxes under a given profile."""
-    id: str
-    profile: str
-    idle_timeout_minutes: Optional[int]   # None = disabled
-    archive_after_days: Optional[int]     # None = disabled
-    max_concurrent: Optional[int]         # None = disabled
-    max_cost_daily_usd: Optional[float]   # None = disabled
-    enabled: bool
-    created_at: str
-    updated_at: str
+// SandboxPolicy is a declarative lifecycle policy for sandboxes under a profile.
+type SandboxPolicy struct {
+	ID                 string   `json:"id"`
+	Profile            string   `json:"profile"`
+	IdleTimeoutMinutes *int     `json:"idle_timeout_minutes"` // nil = disabled
+	ArchiveAfterDays   *int     `json:"archive_after_days"`   // nil = disabled
+	MaxConcurrent      *int     `json:"max_concurrent"`       // nil = disabled
+	MaxCostDailyUSD    *float64 `json:"max_cost_daily_usd"`   // nil = disabled
+	Enabled            bool     `json:"enabled"`
+	CreatedAt          string   `json:"created_at"`
+	UpdatedAt          string   `json:"updated_at"`
+}
 
-    def to_dict(self) -> dict:
-        return dataclasses.asdict(self)
+// scanPolicy scans one row into a SandboxPolicy (nullable columns via pointers).
+func scanPolicy(s interface{ Scan(...any) error }) (SandboxPolicy, error) {
+	var p SandboxPolicy
+	err := s.Scan(&p.ID, &p.Profile, &p.IdleTimeoutMinutes, &p.ArchiveAfterDays,
+		&p.MaxConcurrent, &p.MaxCostDailyUSD, &p.Enabled, &p.CreatedAt, &p.UpdatedAt)
+	return p, err
+}
 
-    @classmethod
-    def from_row(cls, row: tuple) -> "SandboxPolicy":
-        return cls(
-            id=row[0], profile=row[1],
-            idle_timeout_minutes=row[2], archive_after_days=row[3],
-            max_concurrent=row[4], max_cost_daily_usd=row[5],
-            enabled=bool(row[6]), created_at=row[7], updated_at=row[8],
-        )
+// PolicyEnforcementState is live enforcement state computed at query time.
+type PolicyEnforcementState struct {
+	Policy           SandboxPolicy `json:"policy"`
+	RunningCount     int           `json:"running_count"`
+	StoppedCount     int           `json:"stopped_count"`
+	ArchivedCount    int           `json:"archived_count"`
+	CostLast24hUSD   float64       `json:"cost_last_24h_usd"`
+	NextSweepAt      string        `json:"next_sweep_at,omitempty"`
+	LastSweepAt      string        `json:"last_sweep_at,omitempty"`
+	LastSweepActions int           `json:"last_sweep_actions"`
+}
 
+// PolicyAction is a single action taken (or previewed) during a sweep.
+type PolicyAction struct {
+	Action    string `json:"action"`     // stopped|archived|warning|skipped
+	SandboxID string `json:"sandbox_id"`
+	Reason    string `json:"reason"`     // idle_timeout|archive_after|cost_cap
+	Detail    string `json:"detail"`     // human-readable
+	DryRun    bool   `json:"-"`
+}
 
-@dataclasses.dataclass
-class PolicyEnforcementState:
-    """Live enforcement state computed at query time."""
-    policy: SandboxPolicy
-    running_count: int
-    stopped_count: int
-    archived_count: int
-    cost_last_24h_usd: float
-    next_sweep_at: Optional[str]
-    last_sweep_at: Optional[str]
-    last_sweep_actions: int
+// PolicyViolationError is returned when a new sandbox creation is blocked.
+type PolicyViolationError struct {
+	Code    string // "concurrency_limit" | "cost_cap"
+	Message string
+}
 
-
-@dataclasses.dataclass
-class PolicyAction:
-    """A single action taken (or to be taken) during a policy sweep."""
-    action: str          # stopped|archived|warning|skipped
-    sandbox_id: str
-    reason: str          # idle_timeout|archive_after|cost_cap
-    detail: str          # human-readable
-    dry_run: bool = False
-
-
-class PolicyViolationError(Exception):
-    """Raised when a new sandbox creation is blocked by an active policy."""
-    def __init__(self, code: str, message: str):
-        self.code = code   # concurrency_limit|cost_cap
-        super().__init__(message)
+func (e *PolicyViolationError) Error() string { return "policy violation: " + e.Message }
 ```
 
 ### 9.4 Duration Parser
 
-```python
-import re
+Returns `(*int, error)`: a `nil` pointer means "unset" (empty input); a `0` value means "explicitly disabled". This distinguishes "field omitted" from "field set to disable" for the update semantics in FR-03/FR-04.
 
-_DURATION_RE = re.compile(
-    r"^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?$",
-    re.IGNORECASE,
-)
+```go
+var durationRe = regexp.MustCompile(`(?i)^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?$`)
 
-def _parse_duration_minutes(s: str) -> Optional[int]:
-    """
-    Parse a duration string to integer minutes.
-
-    Accepted forms:
-      "0"          → 0 (disable)
-      "30"         → 30 (bare integer = minutes)
-      "30m"        → 30
-      "1h"         → 60
-      "2h30m"      → 150
-      "7d"         → 10080
-      "1d12h"      → 2160
-
-    Returns None if s is empty or None.
-    Raises ValueError on unrecognised format.
-    """
-    if not s:
-        return None
-    s = s.strip()
-    if s == "0":
-        return 0
-    # bare integer without suffix = minutes
-    if s.isdigit():
-        return int(s)
-    m = _DURATION_RE.match(s)
-    if not m or not any(m.groups()):
-        raise ValueError(f"Unrecognised duration: {s!r}. "
-                         "Use formats like 30m, 1h, 2h30m, 7d.")
-    days    = int(m.group(1) or 0)
-    hours   = int(m.group(2) or 0)
-    minutes = int(m.group(3) or 0)
-    seconds = int(m.group(4) or 0)
-    total = days * 1440 + hours * 60 + minutes + seconds // 60
-    if total == 0:
-        raise ValueError(f"Duration {s!r} resolves to 0 minutes; "
-                         "use --idle-timeout 0 to disable enforcement.")
-    return total
+// parseDurationMinutes parses a duration string to integer minutes.
+//
+//	""       -> nil  (unset, leave existing value)
+//	"0"      -> 0     (explicitly disable)
+//	"30"     -> 30    (bare integer = minutes)
+//	"30m"    -> 30
+//	"1h"     -> 60
+//	"2h30m"  -> 150
+//	"7d"     -> 10080
+//	"1d12h"  -> 2160
+func parseDurationMinutes(s string) (*int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	if s == "0" {
+		zero := 0
+		return &zero, nil
+	}
+	if n, err := strconv.Atoi(s); err == nil { // bare integer = minutes
+		return &n, nil
+	}
+	m := durationRe.FindStringSubmatch(s)
+	if m == nil || (m[1] == "" && m[2] == "" && m[3] == "" && m[4] == "") {
+		return nil, fmt.Errorf("unrecognised duration %q: use formats like 30m, 1h, 2h30m, 7d", s)
+	}
+	atoi := func(x string) int { n, _ := strconv.Atoi(x); return n }
+	total := atoi(m[1])*1440 + atoi(m[2])*60 + atoi(m[3]) + atoi(m[4])/60
+	if total == 0 {
+		return nil, fmt.Errorf("duration %q resolves to 0 minutes; use 0 to disable enforcement", s)
+	}
+	return &total, nil
+}
 ```
 
 ### 9.5 Policy Sweep Algorithm
 
-```python
-import threading
-import sqlite3
-import uuid
+The sweep is a goroutine-safe function. Per-profile serialization uses a `*sync.Mutex` from a map guarded by its own mutex; a non-blocking `TryLock` skips a profile whose sweep is already running (the gocron job additionally uses `WithSingletonMode`). Time comes from the injected `Clock`. Backend teardown is behind a `Reaper` interface so tests inject a fake.
 
-_sweep_locks: dict[str, threading.Lock] = {}
+```go
+var (
+	sweepMu    sync.Mutex
+	sweepLocks = map[string]*sync.Mutex{}
+)
 
-def policy_sweep(
-    conn: sqlite3.Connection,
-    profile: str,
-    *,
-    dry_run: bool = False,
-) -> list[PolicyAction]:
-    """
-    Enforce the active policy for *profile* against all matching sandbox_runs rows.
+func profileLock(profile string) *sync.Mutex {
+	sweepMu.Lock()
+	defer sweepMu.Unlock()
+	l, ok := sweepLocks[profile]
+	if !ok {
+		l = &sync.Mutex{}
+		sweepLocks[profile] = l
+	}
+	return l
+}
 
-    Algorithm:
-      1. Load the SandboxPolicy for this profile; return [] if none or disabled.
-      2. Acquire per-profile lock (prevents concurrent sweeps for same profile).
-      3. IDLE-TIMEOUT: SELECT running sandboxes ordered by last_activity_at ASC.
-         For each: if idle_minutes >= idle_timeout_minutes → stop it.
-                   if idle_minutes >= idle_timeout_minutes - 1 and warned_at IS NULL
-                      → fire warning notification, set warned_at.
-      4. ARCHIVE: SELECT stopped/done/failed sandboxes older than archive_after_days.
-         For each: set status = 'archived'.
-      5. COST CAP: Compute rolling 24h cost sum. For each running sandbox, if
-         cost_sum >= max_cost_daily_usd, stop the most-idle running sandbox
-         and fire a cost-cap notification.
-      6. Record each action in sandbox_policy_events.
-      7. Return list[PolicyAction].
+// PolicySweep enforces the active policy for profile against all matching
+// sandbox_runs rows. When dryRun is true it computes actions without executing
+// DB writes, notifications, or backend teardown.
+//
+// Algorithm:
+//  1. Load the SandboxPolicy; return nil if none or disabled.
+//  2. Acquire the per-profile lock (skip if a sweep is already in progress).
+//  3. IDLE-TIMEOUT: running sandboxes ordered by last_activity_at ASC.
+//     >= idle_timeout_minutes-1 && warned_at IS NULL -> warn + set warned_at.
+//     >= idle_timeout_minutes                        -> stop.
+//  4. ARCHIVE: stopped/done/failed rows older than archive_after_days -> archived.
+//  5. COST CAP: rolling 24h cost >= max_cost_daily_usd -> stop most-idle running sandbox.
+//  6. Record each action in sandbox_policy_events; return []PolicyAction.
+func (s *Service) PolicySweep(ctx context.Context, profile string, dryRun bool) ([]PolicyAction, error) {
+	lock := profileLock(profile)
+	if !lock.TryLock() {
+		return nil, nil // sweep already in progress for this profile
+	}
+	defer lock.Unlock()
 
-    Stopping a sandbox:
-      - status = 'stopped', completed_at = NOW()  (DB update, always)
-      - If backend == 'docker': subprocess.run(['docker', 'stop', container_id],
-        timeout=10, capture_output=True). Failure logged but does not abort sweep.
-      - If backend == 'modal': imported lazily, modal.Sandbox.from_id(id).terminate()
-      - If backend == 'restricted': no external action needed (subprocess already done).
-    """
-    lock = _sweep_locks.setdefault(profile, threading.Lock())
-    if not lock.acquire(blocking=False):
-        return []   # sweep already in progress for this profile
+	policy, err := s.GetPolicy(ctx, profile)
+	if err != nil || policy == nil || !policy.Enabled {
+		return nil, err
+	}
+	now := s.clock.Now().UTC()
+	var actions []PolicyAction
 
-    try:
-        return _sweep_inner(conn, profile, dry_run=dry_run)
-    finally:
-        lock.release()
+	// 1. Idle-timeout enforcement.
+	if policy.IdleTimeoutMinutes != nil {
+		limit := float64(*policy.IdleTimeoutMinutes)
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT id, backend, last_activity_at, created_at, warned_at
+			   FROM sandbox_runs
+			  WHERE profile = ? AND status = 'running'
+			  ORDER BY COALESCE(last_activity_at, created_at) ASC`, profile)
+		if err != nil {
+			return nil, err
+		}
+		type cand struct {
+			id, backend string
+			lastAct     sql.NullString
+			createdAt   string
+			warnedAt    sql.NullString
+		}
+		var cands []cand
+		for rows.Next() {
+			var c cand
+			if err := rows.Scan(&c.id, &c.backend, &c.lastAct, &c.createdAt, &c.warnedAt); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			cands = append(cands, c)
+		}
+		rows.Close()
 
+		for _, c := range cands {
+			ref := c.createdAt
+			if c.lastAct.Valid {
+				ref = c.lastAct.String
+			}
+			refDt, _ := parseISO(ref)
+			idleMin := now.Sub(refDt).Minutes()
 
-def _sweep_inner(
-    conn: sqlite3.Connection,
-    profile: str,
-    *,
-    dry_run: bool,
-) -> list[PolicyAction]:
-    policy = get_policy(conn, profile)
-    if policy is None or not policy.enabled:
-        return []
+			if idleMin >= limit-1 && !c.warnedAt.Valid {
+				s.fireWarning(ctx, policy, c.id, idleMin, limit, dryRun)
+				actions = append(actions, PolicyAction{
+					Action: "warning", SandboxID: c.id, Reason: "idle_timeout",
+					Detail: fmt.Sprintf("idle %.1fm / limit %.0fm", idleMin, limit), DryRun: dryRun,
+				})
+			}
+			if idleMin >= limit {
+				s.stopSandbox(ctx, policy, c.id, c.backend, "idle_timeout",
+					fmt.Sprintf("idle %.1fm / limit %.0fm", idleMin, limit), dryRun)
+				actions = append(actions, PolicyAction{
+					Action: "stopped", SandboxID: c.id, Reason: "idle_timeout",
+					Detail: fmt.Sprintf("idle %.1fm", idleMin), DryRun: dryRun,
+				})
+			}
+		}
+	}
 
-    now = datetime.datetime.now(datetime.timezone.utc)
-    actions: list[PolicyAction] = []
+	// 2. Archive enforcement.
+	if policy.ArchiveAfterDays != nil {
+		cutoff := now.AddDate(0, 0, -*policy.ArchiveAfterDays).Format(isoMicros)
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT id, created_at FROM sandbox_runs
+			  WHERE profile = ? AND status IN ('stopped','done','failed') AND created_at < ?`,
+			profile, cutoff)
+		if err != nil {
+			return nil, err
+		}
+		type arch struct{ id, createdAt string }
+		var toArchive []arch
+		for rows.Next() {
+			var a arch
+			if err := rows.Scan(&a.id, &a.createdAt); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			toArchive = append(toArchive, a)
+		}
+		rows.Close()
 
-    # ── 1. Idle-timeout enforcement ─────────────────────────────────────────
-    if policy.idle_timeout_minutes is not None:
-        candidates = conn.execute(
-            """SELECT id, backend, last_activity_at, created_at, warned_at
-               FROM sandbox_runs
-               WHERE profile = ? AND status = 'running'
-               ORDER BY COALESCE(last_activity_at, created_at) ASC""",
-            (profile,),
-        ).fetchall()
+		for _, a := range toArchive {
+			createdDt, _ := parseISO(a.createdAt)
+			ageDays := int(now.Sub(createdDt).Hours() / 24)
+			s.archiveSandbox(ctx, policy, a.id,
+				fmt.Sprintf("age %dd / limit %dd", ageDays, *policy.ArchiveAfterDays), dryRun)
+			actions = append(actions, PolicyAction{
+				Action: "archived", SandboxID: a.id, Reason: "archive_after",
+				Detail: fmt.Sprintf("age %dd", ageDays), DryRun: dryRun,
+			})
+		}
+	}
 
-        for row in candidates:
-            sb_id, backend, last_act, created_at, warned_at = row
-            ref_ts = last_act or created_at
-            ref_dt = datetime.datetime.fromisoformat(ref_ts.replace("Z", "+00:00"))
-            idle_minutes = (now - ref_dt).total_seconds() / 60
+	// 3. Cost-cap mid-sweep enforcement (epsilon guard against float rounding).
+	if policy.MaxCostDailyUSD != nil {
+		windowStart := now.Add(-24 * time.Hour).Format(isoMicros)
+		var rolling float64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COALESCE(SUM(cost_usd), 0.0) FROM sandbox_runs WHERE profile = ? AND created_at >= ?`,
+			profile, windowStart).Scan(&rolling); err != nil {
+			return nil, err
+		}
+		if rolling >= *policy.MaxCostDailyUSD-0.001 {
+			var id, backend string
+			err := s.db.QueryRowContext(ctx,
+				`SELECT id, backend FROM sandbox_runs
+				  WHERE profile = ? AND status = 'running'
+				  ORDER BY COALESCE(last_activity_at, created_at) ASC LIMIT 1`, profile).
+				Scan(&id, &backend)
+			if err == nil {
+				s.stopSandbox(ctx, policy, id, backend, "cost_cap",
+					fmt.Sprintf("24h cost $%.2f / cap $%.2f", rolling, *policy.MaxCostDailyUSD), dryRun)
+				actions = append(actions, PolicyAction{
+					Action: "stopped", SandboxID: id, Reason: "cost_cap",
+					Detail: fmt.Sprintf("24h cost $%.2f", rolling), DryRun: dryRun,
+				})
+			}
+		}
+	}
 
-            warn_threshold = policy.idle_timeout_minutes - 1  # 1 minute before stop
-            if idle_minutes >= warn_threshold and warned_at is None:
-                _fire_warning(conn, policy, sb_id, idle_minutes,
-                              policy.idle_timeout_minutes, dry_run=dry_run)
-                actions.append(PolicyAction(
-                    action="warning", sandbox_id=sb_id,
-                    reason="idle_timeout",
-                    detail=f"idle {idle_minutes:.1f}m / limit {policy.idle_timeout_minutes}m",
-                    dry_run=dry_run,
-                ))
-
-            if idle_minutes >= policy.idle_timeout_minutes:
-                _stop_sandbox(conn, policy, sb_id, backend,
-                              reason="idle_timeout",
-                              detail=f"idle {idle_minutes:.1f}m / limit {policy.idle_timeout_minutes}m",
-                              dry_run=dry_run)
-                actions.append(PolicyAction(
-                    action="stopped", sandbox_id=sb_id,
-                    reason="idle_timeout",
-                    detail=f"idle {idle_minutes:.1f}m",
-                    dry_run=dry_run,
-                ))
-
-    # ── 2. Archive enforcement ───────────────────────────────────────────────
-    if policy.archive_after_days is not None:
-        cutoff = (now - datetime.timedelta(days=policy.archive_after_days)).isoformat()
-        archive_candidates = conn.execute(
-            """SELECT id FROM sandbox_runs
-               WHERE profile = ?
-                 AND status IN ('stopped', 'done', 'failed')
-                 AND created_at < ?""",
-            (profile, cutoff),
-        ).fetchall()
-
-        for (sb_id,) in archive_candidates:
-            age_days = (now - datetime.datetime.fromisoformat(
-                conn.execute("SELECT created_at FROM sandbox_runs WHERE id=?",
-                             (sb_id,)).fetchone()[0].replace("Z", "+00:00")
-            )).days
-            _archive_sandbox(conn, policy, sb_id,
-                             detail=f"age {age_days}d / limit {policy.archive_after_days}d",
-                             dry_run=dry_run)
-            actions.append(PolicyAction(
-                action="archived", sandbox_id=sb_id,
-                reason="archive_after",
-                detail=f"age {age_days}d",
-                dry_run=dry_run,
-            ))
-
-    # ── 3. Cost-cap mid-sweep enforcement ───────────────────────────────────
-    if policy.max_cost_daily_usd is not None:
-        window_start = (now - datetime.timedelta(hours=24)).isoformat()
-        row = conn.execute(
-            """SELECT COALESCE(SUM(cost_usd), 0.0)
-               FROM sandbox_runs
-               WHERE profile = ? AND created_at >= ?""",
-            (profile, window_start),
-        ).fetchone()
-        rolling_cost = row[0] if row else 0.0
-
-        if rolling_cost >= policy.max_cost_daily_usd:
-            # Stop the most-idle running sandbox to reduce projected cost
-            idle_sb = conn.execute(
-                """SELECT id, backend FROM sandbox_runs
-                   WHERE profile = ? AND status = 'running'
-                   ORDER BY COALESCE(last_activity_at, created_at) ASC
-                   LIMIT 1""",
-                (profile,),
-            ).fetchone()
-            if idle_sb:
-                sb_id, backend = idle_sb
-                _stop_sandbox(conn, policy, sb_id, backend,
-                              reason="cost_cap",
-                              detail=f"24h cost ${rolling_cost:.2f} / cap ${policy.max_cost_daily_usd:.2f}",
-                              dry_run=dry_run)
-                actions.append(PolicyAction(
-                    action="stopped", sandbox_id=sb_id,
-                    reason="cost_cap",
-                    detail=f"24h cost ${rolling_cost:.2f}",
-                    dry_run=dry_run,
-                ))
-
-    return actions
+	return actions, nil
+}
 ```
 
-### 9.6 Concurrency and Cost Gate in `run_in_sandbox()`
+`stopSandbox` sets `status='stopped', completed_at=NOW()` in its own `*sql.Tx` (always) and then tears down the backend via the injected `Reaper` (skipped when `dryRun`): for `docker`/`gvisor` it calls the `docker/moby` client `ContainerStop(ctx, id, container.StopOptions{Timeout})` then `ContainerRemove`; for `firecracker` it calls the `firecracker-go-sdk` machine `Shutdown`/`StopVMM`; for `modal` it calls the provider's terminate HTTP endpoint; for `restricted` it cancels the process `context.Context` / kills the process group (`syscall.Kill(-pgid, SIGTERM)`) — no external call. A teardown failure is logged via `slog.Warn` and recorded as a `stop_failed` event but does not abort the sweep (NFR-09).
 
-```python
-def _check_policy_gates(conn: sqlite3.Connection, profile: Optional[str]) -> None:
-    """
-    Called at the top of run_in_sandbox() before any backend allocation.
-    Raises PolicyViolationError if the active policy blocks the new sandbox.
-    No-op if profile is None or no policy exists for the profile.
-    """
-    if not profile:
-        return
-    policy = get_policy(conn, profile)
-    if policy is None or not policy.enabled:
-        return
+### 9.6 Concurrency and Cost Gate in `RunInSandbox()`
 
-    # Concurrency gate
-    if policy.max_concurrent is not None:
-        count = conn.execute(
-            "SELECT COUNT(*) FROM sandbox_runs WHERE profile = ? AND status = 'running'",
-            (profile,),
-        ).fetchone()[0]
-        if count >= policy.max_concurrent:
-            raise PolicyViolationError(
-                "concurrency_limit",
-                f"concurrency limit reached ({count}/{policy.max_concurrent} sandboxes "
-                f"running for profile {profile!r}). "
-                "Run `tag sandbox kill <id>` or wait for idle-timeout enforcement.",
-            )
+```go
+// checkPolicyGates is called at the top of RunInSandbox() before any backend
+// allocation. It returns a *PolicyViolationError if the active policy blocks the
+// new sandbox. No-op if profile is empty or no policy exists.
+func (s *Service) checkPolicyGates(ctx context.Context, profile string) error {
+	if profile == "" {
+		return nil
+	}
+	policy, err := s.GetPolicy(ctx, profile)
+	if err != nil || policy == nil || !policy.Enabled {
+		return err
+	}
 
-    # Cost gate
-    if policy.max_cost_daily_usd is not None:
-        window_start = (
-            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
-        ).isoformat()
-        row = conn.execute(
-            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM sandbox_runs "
-            "WHERE profile = ? AND created_at >= ?",
-            (profile, window_start),
-        ).fetchone()
-        rolling = row[0] if row else 0.0
-        if rolling >= policy.max_cost_daily_usd:
-            raise PolicyViolationError(
-                "cost_cap",
-                f"daily cost cap reached (${rolling:.2f}/${policy.max_cost_daily_usd:.2f} "
-                f"in last 24h for profile {profile!r}). "
-                "Use `tag sandbox policy show` to review spend.",
-            )
+	// Concurrency gate.
+	if policy.MaxConcurrent != nil {
+		var count int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM sandbox_runs WHERE profile = ? AND status = 'running'`,
+			profile).Scan(&count); err != nil {
+			return err
+		}
+		if count >= *policy.MaxConcurrent {
+			return &PolicyViolationError{
+				Code: "concurrency_limit",
+				Message: fmt.Sprintf(
+					"concurrency limit reached (%d/%d sandboxes running for profile %q). "+
+						"Run `tag sandbox kill <id>` or wait for idle-timeout enforcement.",
+					count, *policy.MaxConcurrent, profile),
+			}
+		}
+	}
+
+	// Cost gate.
+	if policy.MaxCostDailyUSD != nil {
+		windowStart := s.clock.Now().UTC().Add(-24 * time.Hour).Format(isoMicros)
+		var rolling float64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COALESCE(SUM(cost_usd), 0.0) FROM sandbox_runs WHERE profile = ? AND created_at >= ?`,
+			profile, windowStart).Scan(&rolling); err != nil {
+			return err
+		}
+		if rolling >= *policy.MaxCostDailyUSD-0.001 { // epsilon guard
+			return &PolicyViolationError{
+				Code: "cost_cap",
+				Message: fmt.Sprintf(
+					"daily cost cap reached ($%.2f/$%.2f in last 24h for profile %q). "+
+						"Use `tag sandbox policy show` to review spend.",
+					rolling, *policy.MaxCostDailyUSD, profile),
+			}
+		}
+	}
+	return nil
+}
 ```
 
-### 9.7 Cron Integration
+`RunInSandbox()` calls `checkPolicyGates` first and returns the `*PolicyViolationError` unwrapped so `internal/cli` can map `Code` to exit code 2. Callers detect it via `errors.As(err, &*PolicyViolationError)`.
 
-The sweep is registered as a one-minute cron job using the existing `cron_scheduler.py` infrastructure when the first policy is created for any profile. The job is removed when the last policy is deleted.
+### 9.7 Scheduler Integration (`go-co-op/gocron v2`)
 
-```python
-_SWEEP_JOB_NAME = "__sandbox_policy_sweep__"
-_SWEEP_CRON_EXPR = "* * * * *"   # every minute
+The sweep is a `go-co-op/gocron v2` job (not a `cron_jobs` sentinel row): `internal/cron` registers a named, singleton, one-minute job whose task is a Go closure — no `__internal__:` command-string dispatch is needed. The job is added when the first policy is created and removed when the last policy is deleted. Because gocron's schedule lives in memory, `internal/cron` re-registers the job on process start iff `SELECT COUNT(*) FROM sandbox_policies WHERE enabled = 1 > 0`, preserving the persisted-across-restart behaviour via the SQLite policy table.
 
-def _register_sweep_cron(conn: sqlite3.Connection) -> None:
-    """Ensure the policy sweep cron job exists in the scheduler table."""
-    from tag.cron_scheduler import ensure_cron_schema
-    ensure_cron_schema(conn)
-    existing = conn.execute(
-        "SELECT id FROM cron_jobs WHERE name = ?", (_SWEEP_JOB_NAME,)
-    ).fetchone()
-    if not existing:
-        conn.execute(
-            """INSERT INTO cron_jobs(id, name, schedule, command, enabled, created_at)
-               VALUES(?, ?, ?, ?, 1, ?)""",
-            (
-                "cj_" + uuid.uuid4().hex[:8],
-                _SWEEP_JOB_NAME,
-                _SWEEP_CRON_EXPR,
-                "__internal__:sandbox_policy_sweep",
-                _utc_now(),
-            ),
-        )
-        conn.commit()
+```go
+const sweepJobName = "sandbox-policy-sweep"
 
-def _deregister_sweep_cron_if_no_policies(conn: sqlite3.Connection) -> None:
-    count = conn.execute(
-        "SELECT COUNT(*) FROM sandbox_policies WHERE enabled = 1"
-    ).fetchone()[0]
-    if count == 0:
-        conn.execute(
-            "DELETE FROM cron_jobs WHERE name = ?", (_SWEEP_JOB_NAME,)
-        )
-        conn.commit()
+// RegisterSweep ensures the one-minute policy-sweep job exists on the scheduler.
+func RegisterSweep(sched gocron.Scheduler, svc *sandbox.Service) error {
+	for _, j := range sched.Jobs() {
+		if j.Name() == sweepJobName {
+			return nil // already registered
+		}
+	}
+	_, err := sched.NewJob(
+		gocron.CronJob("* * * * *", false), // every minute
+		gocron.NewTask(func(ctx context.Context) { PolicySweepAllProfiles(ctx, svc) }),
+		gocron.WithName(sweepJobName),
+		gocron.WithSingletonMode(gocron.LimitModeReschedule), // no overlapping ticks
+	)
+	return err
+}
+
+// DeregisterSweepIfNoPolicies removes the job when no enabled policies remain.
+func DeregisterSweepIfNoPolicies(ctx context.Context, sched gocron.Scheduler, svc *sandbox.Service) error {
+	n, err := svc.CountEnabledPolicies(ctx)
+	if err != nil || n > 0 {
+		return err
+	}
+	for _, j := range sched.Jobs() {
+		if j.Name() == sweepJobName {
+			return sched.RemoveJob(j.ID())
+		}
+	}
+	return nil
+}
+
+// PolicySweepAllProfiles fans out over every enabled-policy profile.
+func PolicySweepAllProfiles(ctx context.Context, svc *sandbox.Service) {
+	profiles, err := svc.EnabledPolicyProfiles(ctx)
+	if err != nil {
+		slog.Warn("policy sweep: list profiles", "err", err)
+		return
+	}
+	for _, p := range profiles {
+		if _, err := svc.PolicySweep(ctx, p, false); err != nil {
+			slog.Warn("policy sweep failed", "profile", p, "err", err)
+		}
+	}
+}
 ```
-
-The `controller.py` cron dispatcher recognises the sentinel command `__internal__:sandbox_policy_sweep` and calls `policy_sweep_all_profiles(conn)` which iterates over all active policy profiles and calls `policy_sweep(conn, profile)` for each.
 
 ### 9.8 Integration Points
 
 | Integration | Mechanism |
 |-------------|-----------|
-| `cron_scheduler.py` | `cron_jobs` table row with `name = '__sandbox_policy_sweep__'`; the dispatcher calls the sweep function |
-| `notifications.py` | `notifications.notify(title, body, level)` called by `_fire_warning()` and cost-cap events |
-| `tracing.py` | Each sweep action is wrapped in `tracing.start_span("sandbox.policy.sweep")` with relevant attributes |
-| `budget.py` | Cost gate reads `cost_usd` from `sandbox_runs`; budget.py token budgets remain independent |
-| `controller.py` | Six new command handlers registered under `tag sandbox policy` subcommand group using existing Typer app patterns |
+| `internal/cron` (`go-co-op/gocron v2`) | Named singleton job `sandbox-policy-sweep` at `* * * * *`; its task closure fans out to `PolicySweepAllProfiles` |
+| `internal/notify` | The injected `notify.Notifier` interface (`Notify(ctx, Notification)`) called by `fireWarning()` and cost-cap events |
+| `internal/obs` (`go.opentelemetry.io/otel`) | Each sweep action is wrapped in a span `tracer.Start(ctx, "sandbox.policy.sweep")` with the relevant attributes |
+| `internal/obs` budget gate | Cost gate reads `cost_usd` from `sandbox_runs`; the token-budget gate remains independent |
+| `internal/cli` (`spf13/cobra`) | Six new subcommands registered under the `tag sandbox policy` command group |
 
 ---
 
@@ -825,63 +849,65 @@ The `controller.py` cron dispatcher recognises the sentinel command `__internal_
 
 2. **Policy bypass via `--profile` spoofing is not possible.** The `profile` column is set by the caller at sandbox creation time; if a caller intentionally passes a different profile name to bypass concurrency limits, they are effectively self-misclassifying their sandbox and only bypass enforcement for themselves.
 
-3. **Stop actions against Docker containers use `docker stop` (SIGTERM then SIGKILL).** This is the same signal sequence as manual `docker rm -f`. The container ID is read from the SQLite row; if the row's `container_id` no longer exists in Docker (e.g., manually removed), the stop command fails silently and the DB row is still updated to `stopped` status, preventing zombie rows.
+3. **Stop actions against Docker containers use the `docker/moby` client `ContainerStop` (SIGTERM then SIGKILL after the grace timeout) followed by `ContainerRemove`.** This is the same signal sequence as a manual `docker rm -f`. The container ID is read from the SQLite row; if the ID no longer exists in Docker (e.g., manually removed), the moby call returns a not-found error that is logged and ignored, and the DB row is still updated to `stopped` status, preventing zombie rows.
 
 4. **Pre-stop warning notifications must not disclose policy configuration to untrusted processes.** The notification body includes sandbox ID and idle duration but not the raw `max_cost_daily_usd` or other policy parameters, to prevent information leakage in shared notification channels.
 
 5. **Cost values are stored as REAL (float) in SQLite.** Floating-point arithmetic for cost comparisons uses `>= cap - 0.001` (epsilon) to avoid false negatives from IEEE 754 rounding. This is documented explicitly in the sweep code.
 
-6. **The sweep lock (`threading.Lock`) prevents TOCTOU races** between the concurrency gate check and the sandbox insertion. However, SQLite WAL mode does not provide cross-process mutual exclusion; if two TAG processes run simultaneously for the same profile, the concurrency gate may be bypassed. Operators running TAG in multi-process mode should be aware of this limitation.
+6. **The per-profile `*sync.Mutex` (plus gocron `WithSingletonMode`) prevents in-process TOCTOU races** between the concurrency gate check and the sandbox insertion. However, this is single-process only: WAL mode does not provide cross-process mutual exclusion, so if two TAG processes run simultaneously for the same profile the concurrency gate may be bypassed. The single-writer/wire-protocol invariant (one `tag serve` daemon owns the store) mitigates this; operators running TAG in a multi-process configuration should be aware of the limitation.
 
-7. **`policy_sweep_preview()` (dry-run) must not call `docker stop` or modify any SQLite row.** The dry-run path is enforced by passing `dry_run=True` through the entire call stack; all DB write operations and external process calls are gated behind `if not dry_run:` checks verified by unit tests.
+7. **The dry-run path (`dryRun=true`) must not call the backend `Reaper` or modify any SQLite row.** `dryRun` is threaded through the entire call stack; all DB writes, notifications, and backend teardown are gated behind `if !dryRun {` checks, verified by unit tests that assert the DB and the fake `Reaper` are untouched.
 
 ---
 
 ## 11. Testing Strategy
 
-### 11.1 Unit Tests
+Tests use the Go `testing` package with table-driven cases, an in-memory `modernc.org/sqlite` DB, an injected fake `Clock`, and fake `Notifier`/`Reaper` implementations (interfaces, not monkeypatching). CLI round-trips drive the `cobra` command via `cmd.SetArgs(...)` with a captured `OutOrStdout()`.
+
+### 11.1 Unit Tests (`internal/sandbox/policy_test.go`)
 
 | Test | Description |
 |------|-------------|
-| `test_parse_duration_minutes` | Table-driven: `"30m"→30`, `"1h"→60`, `"2h30m"→150`, `"7d"→10080`, `"0"→0`, `"invalid"→ValueError` |
-| `test_set_policy_creates_row` | Assert row exists in `sandbox_policies` after `set_policy()` call |
-| `test_set_policy_updates_row` | Call `set_policy()` twice; assert `updated_at` changed and only one row exists |
-| `test_get_policy_none` | Assert `get_policy()` returns `None` for profile with no policy |
-| `test_sweep_noop_no_policy` | Call `policy_sweep()` with no policy; assert returns `[]` |
-| `test_sweep_idle_timeout_stops` | Insert running sandbox row with `last_activity_at = 40m ago`, policy idle=30m; assert sweep stops it |
-| `test_sweep_idle_timeout_no_action` | Insert running sandbox row idle for 20m, policy idle=30m; assert sweep returns `[]` |
-| `test_sweep_warning_fired` | Advance mock clock to `idle - 1m`; assert warning action in result and `warned_at` set |
-| `test_sweep_warning_not_duplicated` | Run sweep twice at warning threshold; assert only one warning event in `sandbox_policy_events` |
-| `test_sweep_archive` | Insert `status='stopped'` row with `created_at = 16d ago`, policy archive=14d; assert `status='archived'` |
-| `test_sweep_archive_skips_running` | Running sandbox older than archive threshold is not archived |
-| `test_concurrency_gate_blocks` | Insert 3 running rows, policy max_concurrent=3; assert `PolicyViolationError(code='concurrency_limit')` |
-| `test_concurrency_gate_allows` | Insert 2 running rows, policy max_concurrent=3; assert no error |
-| `test_cost_gate_blocks` | Insert rows summing to `cost_usd = 5.10` in last 24h, policy max_cost_daily=5.00; assert `PolicyViolationError(code='cost_cap')` |
-| `test_cost_gate_allows` | Insert rows summing to `cost_usd = 4.99`, policy max_cost_daily=5.00; assert no error |
-| `test_sweep_dry_run` | Dry-run sweep; assert actions returned but `sandbox_runs.status` unchanged and no events in `sandbox_policy_events` |
-| `test_sweep_stop_failure_continues` | Simulate `docker stop` failing for sandbox 1; assert sandbox 2 is still processed |
-| `test_policy_events_recorded` | After sweep stops 2 sandboxes; assert 2 rows in `sandbox_policy_events` with correct `reason` and `action` |
+| `TestParseDurationMinutes` | Table-driven: `"30m"→30`, `"1h"→60`, `"2h30m"→150`, `"7d"→10080`, `"0"→0`, `""→nil`, `"invalid"→error` |
+| `TestSetPolicyCreatesRow` | Assert row exists in `sandbox_policies` after `SetPolicy()` |
+| `TestSetPolicyUpdatesRow` | Call `SetPolicy()` twice; assert `updated_at` changed, `nil` fields preserved, and only one row exists |
+| `TestGetPolicyNone` | Assert `GetPolicy()` returns `(nil, nil)` for a profile with no policy |
+| `TestSweepNoopNoPolicy` | Call `PolicySweep()` with no policy; assert returns `nil` |
+| `TestSweepIdleTimeoutStops` | Insert running row with `last_activity_at = 40m ago` (fake clock), policy idle=30m; assert sweep stops it |
+| `TestSweepIdleTimeoutNoAction` | Insert running row idle for 20m, policy idle=30m; assert sweep returns `nil` |
+| `TestSweepWarningFired` | Set injected `Clock` to `idle - 1m`; assert warning action in result and `warned_at` set |
+| `TestSweepWarningNotDuplicated` | Run sweep twice at warning threshold; assert only one warning event in `sandbox_policy_events` |
+| `TestSweepArchive` | Insert `status='stopped'` row `created_at = 16d ago`, policy archive=14d; assert `status='archived'` |
+| `TestSweepArchiveSkipsRunning` | Running sandbox older than archive threshold is not archived |
+| `TestConcurrencyGateBlocks` | Insert 3 running rows, policy max_concurrent=3; assert `errors.As` matches `*PolicyViolationError` with `Code=="concurrency_limit"` |
+| `TestConcurrencyGateAllows` | Insert 2 running rows, policy max_concurrent=3; assert no error |
+| `TestCostGateBlocks` | Insert rows summing to `cost_usd = 5.10` in last 24h, policy max_cost_daily=5.00; assert `Code=="cost_cap"` |
+| `TestCostGateAllows` | Insert rows summing to `cost_usd = 4.99`, policy max_cost_daily=5.00; assert no error |
+| `TestSweepDryRun` | Dry-run sweep; assert actions returned but `sandbox_runs.status` unchanged, no events, and the fake `Reaper` never called |
+| `TestSweepStopFailureContinues` | Fake `Reaper` returns an error for sandbox 1; assert sandbox 2 is still processed and a `stop_failed` event recorded |
+| `TestPolicyEventsRecorded` | After sweep stops 2 sandboxes; assert 2 rows in `sandbox_policy_events` with correct `reason`/`action` |
 
-### 11.2 Integration Tests
+### 11.2 Integration Tests (`internal/cli/sandbox_policy_test.go`)
 
 | Test | Description |
 |------|-------------|
-| `test_cmd_policy_set_show_roundtrip` | Run `cmd_sandbox_policy_set()`, then `cmd_sandbox_policy_show()`, assert JSON output fields match input |
-| `test_cmd_policy_apply_now` | Create 2 idle sandboxes, set policy, run `cmd_sandbox_policy_apply(now=True)`, assert both stopped in DB |
-| `test_cmd_policy_unset_removes_row` | Set policy, unset it, assert `get_policy()` returns None and cron job deregistered |
-| `test_cron_registration` | After `set_policy()`, assert `__sandbox_policy_sweep__` row in `cron_jobs` table |
-| `test_cron_deregistration` | After `delete_policy()` for last profile, assert cron row deleted |
-| `test_schema_migration_idempotent` | Call `ensure_schema()` twice on same DB; assert no error and no duplicate rows |
-| `test_policy_list_shows_all` | Create 3 policies for different profiles; assert all 3 appear in `list_policies()` output |
-| `test_history_query` | Insert 5 events, query history with `since=3d`; assert correct subset returned |
+| `TestCmdPolicySetShowRoundtrip` | Run `set` then `show --json` via `cmd.SetArgs`; `json.Unmarshal` output and assert fields match input |
+| `TestCmdPolicyApplyNow` | Create 2 idle sandboxes, set policy, run `apply --now`, assert both stopped in DB |
+| `TestCmdPolicyUnsetRemovesRow` | Set policy, unset it; assert `GetPolicy()` returns nil and the gocron job is deregistered |
+| `TestCronRegistration` | After `SetPolicy()`, assert `sched.Jobs()` contains a job named `sandbox-policy-sweep` |
+| `TestCronDeregistration` | After `DeletePolicy()` for the last profile, assert the job is gone |
+| `TestSchemaMigrationIdempotent` | Call `EnsureSchema()` twice on the same DB; assert no error and no duplicate columns |
+| `TestPolicyListShowsAll` | Create 3 policies for different profiles; assert all 3 appear in `ListPolicies()` output |
+| `TestHistoryQuery` | Insert 5 events, query history with `since=3d`; assert the correct subset returned |
 
-### 11.3 Performance Tests
+### 11.3 Performance Tests (`internal/sandbox/policy_bench_test.go`)
 
 | Test | Threshold |
 |------|-----------|
-| `bench_sweep_1000_sandboxes` | Populate 1 000 `sandbox_runs` rows (500 running, 300 stopped, 200 archived); time `policy_sweep()`; assert p99 < 200 ms |
-| `bench_concurrency_gate` | Call `_check_policy_gates()` 10 000 times; assert p99 < 1 ms per call |
-| `bench_schema_migration` | Call `ensure_schema()` 100 times on existing DB; assert total time < 100 ms |
+| `BenchmarkSweep1000Sandboxes` | Populate 1 000 `sandbox_runs` rows (500 running, 300 stopped, 200 archived); benchmark `PolicySweep()`; assert `NsPerOp` implies p99 < 200 ms |
+| `BenchmarkConcurrencyGate` | Call `checkPolicyGates()` in a `b.N` loop; assert < 1 ms per call |
+| `BenchmarkSchemaMigration` | Call `EnsureSchema()` 100 times on an existing DB; assert total time < 100 ms |
 
 ---
 
@@ -891,19 +917,19 @@ The `controller.py` cron dispatcher recognises the sentinel command `__internal_
 |----|-----------|--------------|
 | AC-01 | `tag sandbox policy set --idle-timeout 30m` creates a policy row with `idle_timeout_minutes = 30` in `sandbox_policies`. | `SELECT idle_timeout_minutes FROM sandbox_policies WHERE profile = ?` returns 30. |
 | AC-02 | Running sandbox idle for more than `idle_timeout_minutes` is set to `status = 'stopped'` within 60 seconds of the next cron tick. | Integration test: insert idle sandbox, advance clock, run sweep, assert status. |
-| AC-03 | A pre-stop warning notification is emitted between 60 s and 120 s before the idle-timeout stop action. | Unit test with mock clock and mock `notifications.notify()`; assert call timing. |
-| AC-04 | `tag sandbox policy set --max-concurrent 3` causes the 4th concurrent `run_in_sandbox()` call to raise `PolicyViolationError` with `code = 'concurrency_limit'` before any Docker invocation. | Unit test: mock 3 running rows, call `_check_policy_gates()`, assert exception before `subprocess.run` call. |
-| AC-05 | `tag sandbox policy set --max-cost-daily 5.00` causes `run_in_sandbox()` to raise `PolicyViolationError` with `code = 'cost_cap'` when the rolling 24h `SUM(cost_usd)` for the profile meets or exceeds 5.00. | Unit test: insert cost rows summing to 5.01, call gate, assert exception. |
-| AC-06 | `tag sandbox policy apply --now --dry-run` prints the list of actions that would be taken without modifying any `sandbox_runs` row or inserting any `sandbox_policy_events` row. | Integration test: assert DB unchanged after dry-run call. |
+| AC-03 | A pre-stop warning notification is emitted between 60 s and 120 s before the idle-timeout stop action. | Unit test with an injected `Clock` and a fake `Notifier`; assert call timing. |
+| AC-04 | `tag sandbox policy set --max-concurrent 3` causes the 4th concurrent `RunInSandbox()` call to return a `*PolicyViolationError` with `Code == "concurrency_limit"` before any Docker client call. | Unit test: seed 3 running rows, call `checkPolicyGates()`, assert `errors.As` before the fake backend's launch method. |
+| AC-05 | `tag sandbox policy set --max-cost-daily 5.00` causes `RunInSandbox()` to return a `*PolicyViolationError` with `Code == "cost_cap"` when the rolling 24h `SUM(cost_usd)` for the profile meets or exceeds 5.00. | Unit test: insert cost rows summing to 5.01, call gate, assert `errors.As`. |
+| AC-06 | `tag sandbox policy apply --now --dry-run` prints the list of actions that would be taken without modifying any `sandbox_runs` row or inserting any `sandbox_policy_events` row. | Integration test: assert DB unchanged and fake `Reaper` uncalled after dry-run. |
 | AC-07 | Stopped sandboxes older than `archive_after_days` have `status = 'archived'` after a sweep. | Integration test: insert stopped row with `created_at = archive_after_days + 1d ago`, run sweep, assert status. |
-| AC-08 | `tag sandbox policy unset` removes the policy row; subsequent `run_in_sandbox()` calls under that profile are not blocked by any gate. | Integration test: set policy, unset, call `_check_policy_gates()`, assert no exception. |
-| AC-09 | `tag sandbox policy show --json` returns valid JSON with all policy fields and live state fields without error. | `json.loads()` succeeds on stdout; assert required keys present. |
+| AC-08 | `tag sandbox policy unset` removes the policy row; subsequent `RunInSandbox()` calls under that profile are not blocked by any gate. | Integration test: set policy, unset, call `checkPolicyGates()`, assert nil error. |
+| AC-09 | `tag sandbox policy show --json` returns valid JSON with all policy fields and live state fields without error. | `json.Unmarshal` succeeds on stdout; assert required keys present. |
 | AC-10 | All policy enforcement actions appear in `sandbox_policy_events` with correct `action`, `reason`, and `sandbox_id`. | After sweep, `SELECT COUNT(*) FROM sandbox_policy_events WHERE policy_id = ?` matches expected action count. |
-| AC-11 | Sandboxes created under a profile with no active policy are not affected by sweep execution. | Insert sandboxes under `profile = 'no-policy'`; call `policy_sweep(conn, 'no-policy')`; assert returns `[]`. |
-| AC-12 | `ensure_schema()` called on a DB that already has the new columns does not raise an exception. | Call twice; assert no `OperationalError`. |
-| AC-13 | The cron job `__sandbox_policy_sweep__` is registered in `cron_jobs` after the first `set_policy()` call and removed after the last `delete_policy()` call. | Assert row presence/absence via `SELECT COUNT(*) FROM cron_jobs WHERE name = ?`. |
-| AC-14 | `tag sandbox policy history --since 7d` returns only events with `timestamp >= NOW() - 7d`. | Insert events at `now - 3d` and `now - 10d`; assert only one returned. |
-| AC-15 | `policy_sweep()` completes in under 200 ms for 1 000 candidate rows (benchmark test). | `time.perf_counter()` before and after; assert delta < 0.200. |
+| AC-11 | Sandboxes created under a profile with no active policy are not affected by sweep execution. | Insert sandboxes under `profile = 'no-policy'`; call `PolicySweep(ctx, "no-policy", false)`; assert returns `nil`. |
+| AC-12 | `EnsureSchema()` called on a DB that already has the new columns does not return an error. | Call twice; assert the `duplicate column name` case is swallowed and `err == nil`. |
+| AC-13 | The gocron job `sandbox-policy-sweep` is registered after the first `SetPolicy()` call and removed after the last `DeletePolicy()` call. | Assert presence/absence in `sched.Jobs()` by job name. |
+| AC-14 | `tag sandbox policy history --since 7d` returns only events with `timestamp >= clock.Now() - 7d`. | Insert events at `now - 3d` and `now - 10d`; assert only one returned. |
+| AC-15 | `PolicySweep()` completes in under 200 ms for 1 000 candidate rows (benchmark test). | `go test -bench`; assert `NsPerOp` implies < 200 ms. |
 
 ---
 
@@ -911,15 +937,17 @@ The `controller.py` cron dispatcher recognises the sentinel command `__internal_
 
 | Dependency | Type | Notes |
 |------------|------|-------|
-| PRD-028 (Sandbox Code Execution) | Blocking | `sandbox_runs` table, `run_in_sandbox()` function, backend abstractions must exist |
+| PRD-028 (Sandbox Code Execution) | Blocking | `sandbox_runs` table, `RunInSandbox()` (`internal/sandbox`), backend abstractions must exist |
 | PRD-091 (Configurable Sandbox TTL) | Blocking | `last_activity_at` column may overlap; coordinate schema to avoid conflicts |
-| PRD-022 (Cron Scheduled Agents) | Blocking | `cron_jobs` table and `cron_scheduler.py` module required for automated sweep registration |
-| PRD-040 (Notification Hooks) | Soft | Pre-stop warning notifications require `notifications.py`; gracefully degraded if absent |
-| PRD-013 (Agent Tracing) | Soft | Sweep actions emit OTel spans if tracing is enabled; no-op if `tracing.py` not configured |
-| PRD-012 / PRD-039 (Budget) | Informational | Cost cap is independent of token budget; both coexist without conflict |
-| Python `threading` | Stdlib | Lock per profile; no third-party dependency |
-| Python `re` | Stdlib | Duration parser |
-| SQLite 3.25+ | Runtime | `CREATE INDEX IF NOT EXISTS` and WAL mode; standard in Python 3.8+ |
+| PRD-022 (Cron Scheduled Agents) | Blocking | `internal/cron` (`go-co-op/gocron v2`) required for automated sweep registration |
+| PRD-040 (Notification Hooks) | Soft | Pre-stop warning notifications use the `internal/notify` `Notifier`; degrades gracefully if a no-op notifier is injected |
+| PRD-013 (Agent Tracing) | Soft | Sweep actions emit OTel spans via `internal/obs` (`go.opentelemetry.io/otel`) if a tracer is configured; no-op otherwise |
+| PRD-012 / PRD-039 (Budget) | Informational | Cost cap is independent of the token budget; both coexist without conflict |
+| Go stdlib `sync` | Stdlib | `*sync.Mutex` per profile; no third-party dependency |
+| Go stdlib `regexp` / `strconv` | Stdlib | Duration parser |
+| `go-co-op/gocron v2` | Runtime | Singleton one-minute sweep job (replaces apscheduler/threading.Timer) |
+| `docker/moby` client / `firecracker-go-sdk` | Runtime | Backend teardown (`ContainerStop`/`ContainerRemove`, microVM `Shutdown`) |
+| `modernc.org/sqlite` (`internal/store`) | Runtime | Pure-Go, CGO_ENABLED=0, WAL, `CREATE INDEX IF NOT EXISTS` |
 
 ---
 
@@ -927,11 +955,11 @@ The `controller.py` cron dispatcher recognises the sentinel command `__internal_
 
 | # | Question | Owner | Target Resolution |
 |---|----------|-------|-------------------|
-| OQ-1 | Should `cost_usd` be populated automatically by `run_in_sandbox()` based on cloud provider metadata, or should callers be responsible for updating the column after a run completes? Modal and E2B expose per-run cost in their response objects; the Docker backend has no billing signal. | @sandbox-lead | Before implementation starts |
+| OQ-1 | Should `cost_usd` be populated automatically by `RunInSandbox()` based on cloud provider metadata (or the PRD-099 per-second attribution), or should callers update the column after a run completes? Modal and E2B expose per-run cost in their responses; the Docker backend has no billing signal. | @sandbox-lead | Before implementation starts |
 | OQ-2 | Should the sweep be a pull (cron calls sweep function) or a push (sandbox creation registers a per-sandbox timer)? The cron approach has 60-second granularity but zero idle overhead; per-sandbox timers are more precise but add state management complexity. Current design uses cron. | @infra | Design review |
-| OQ-3 | The concurrency gate reads `status = 'running'` which is set synchronously at INSERT time. If two `run_in_sandbox()` calls race before either updates status, the gate may allow both through. Is a SQLite `UNIQUE` constraint on `(profile, status='running')` feasible, or should we accept the race condition as acceptable at the current concurrency level? | @db | Before implementation |
+| OQ-3 | The concurrency gate reads `status = 'running'` which is set synchronously at INSERT time. If two `RunInSandbox()` goroutines race before either updates status, the gate may allow both through. Is a SQLite partial `UNIQUE` index on `(profile) WHERE status='running'` feasible, or should we accept the race at the current concurrency level (mitigated by the single-writer daemon)? | @db | Before implementation |
 | OQ-4 | Should `tag sandbox policy set` validate that the active profile exists in the TAG config before creating a policy? If a user typos the profile name, the policy silently does nothing. | @ux | Before implementation |
-| OQ-5 | For the Docker backend, `_stop_sandbox()` calls `docker stop <container_id>`. The `container_id` must be stored in `sandbox_runs`, but PRD-028's schema only stores the image name and run parameters, not the Docker container ID. Should we add a `container_id` column now, or resolve container ID via `docker ps --filter label=tag.run_id=<id>`? | @sandbox-lead | Schema review |
+| OQ-5 | For the Docker backend, `stopSandbox()` calls the moby client `ContainerStop(ctx, containerID, …)`. The `container_id` must be stored in `sandbox_runs`, but PRD-028's schema only stores the image name and run parameters, not the container ID. Should we add a `container_id` column now, or resolve it via the moby `ContainerList` filter `label=tag.run_id=<id>`? | @sandbox-lead | Schema review |
 | OQ-6 | Should `archive_after_days` also trigger pruning of Docker images that are no longer referenced by any non-archived sandbox? Image pruning is disk-impactful and could be disruptive on shared Docker installations. | @platform | Before implementation |
 | OQ-7 | Is the 60-second sweep interval (one cron tick per minute) acceptable for idle-timeout durations as short as 5 minutes? The worst-case latency is idle_timeout + 60s. If users want sub-minute accuracy, we would need a higher-frequency mechanism. | @product | Spec review |
 
@@ -943,41 +971,40 @@ The `controller.py` cron dispatcher recognises the sentinel command `__internal_
 
 ### Phase 1 — Schema and Core Data Layer (Day 1)
 
-- Add `ensure_schema()` extension for `sandbox_policies`, `sandbox_policy_events`, and `sandbox_runs` migration columns in `sandbox.py`
-- Implement `SandboxPolicy` dataclass and `PolicyViolationError`
-- Implement `_parse_duration_minutes()` with full test coverage
-- Implement `set_policy()`, `get_policy()`, `delete_policy()`, `list_policies()`
-- Write unit tests for all data layer functions
+- Add the `EnsureSchema()` extension for `sandbox_policies`, `sandbox_policy_events`, and the `sandbox_runs` migration columns (via the `addColumn` guard) in `internal/sandbox/policy.go`
+- Implement the `SandboxPolicy` struct and `PolicyViolationError`
+- Implement `parseDurationMinutes()` (returning `(*int, error)`) with full table-driven coverage
+- Implement `SetPolicy()`, `GetPolicy()`, `DeletePolicy()`, `ListPolicies()`
+- Write unit tests for all data-layer functions
 
-**Exit criterion:** All unit tests for data layer pass; `sandbox_policies` table created correctly on a fresh DB.
+**Exit criterion:** All data-layer unit tests pass; `sandbox_policies` table created correctly on a fresh `modernc.org/sqlite` DB.
 
 ### Phase 2 — Sweep Engine and Gates (Days 2–3)
 
-- Implement `policy_sweep()` with idle-timeout, archive, and cost-cap enforcement
-- Implement `policy_sweep_preview()` (dry-run path)
-- Implement `_check_policy_gates()` (concurrency and cost gates in `run_in_sandbox()`)
-- Implement `_fire_warning()` with `notifications.py` integration
-- Implement `_stop_sandbox()` with Docker, Modal, and restricted backend handlers
-- Register and deregister sweep cron job via `cron_scheduler.py`
-- Write unit tests for sweep logic (idle, archive, cost) and gate logic
+- Implement `PolicySweep(ctx, profile, dryRun)` with idle-timeout, archive, and cost-cap enforcement (per-profile `*sync.Mutex`)
+- Implement `checkPolicyGates()` (concurrency and cost gates called from `RunInSandbox()`)
+- Implement `fireWarning()` against the injected `notify.Notifier`
+- Implement `stopSandbox()` / the `Reaper` interface with docker (moby `ContainerStop`/`ContainerRemove`), firecracker (`Shutdown`/`StopVMM`), modal (HTTP terminate), and restricted (process-group kill) handlers
+- Register/deregister the `sandbox-policy-sweep` `go-co-op/gocron v2` job in `internal/cron`
+- Write unit tests for sweep logic (idle, archive, cost) and gate logic with a fake `Clock`/`Reaper`
 
-**Exit criterion:** `policy_sweep()` correctly stops/archives sandboxes in unit tests; gates reject violating calls; dry-run leaves DB unchanged.
+**Exit criterion:** `PolicySweep()` correctly stops/archives sandboxes in unit tests; gates return the violating error; dry-run leaves DB and `Reaper` untouched.
 
-### Phase 3 — CLI Commands and Controller Integration (Day 4)
+### Phase 3 — CLI Commands and Scheduler Integration (Day 4)
 
-- Implement `cmd_sandbox_policy_set`, `cmd_sandbox_policy_show`, `cmd_sandbox_policy_apply`, `cmd_sandbox_policy_unset`, `cmd_sandbox_policy_list`, `cmd_sandbox_policy_history` in `controller.py`
-- Wire `__internal__:sandbox_policy_sweep` sentinel to `policy_sweep_all_profiles()` in the cron dispatcher
-- Add `--profile` flag propagation to `run_in_sandbox()` callers that do not yet pass profile
-- Write integration tests for CLI round-trips
+- Implement the `set`, `show`, `apply`, `unset`, `list`, `history` `cobra` subcommands in `internal/cli/sandbox_policy.go`
+- Wire `PolicySweepAllProfiles()` as the gocron job task closure (no sentinel command string)
+- Add `Profile` propagation to `RunInSandbox()` callers that do not yet pass it
+- Write integration tests for CLI round-trips (`cmd.SetArgs` + captured output)
 
 **Exit criterion:** All six CLI subcommands produce correct output; integration tests pass end-to-end.
 
 ### Phase 4 — Testing, Benchmarks, and Documentation (Day 5)
 
-- Run performance benchmark for 1 000-row sweep; optimise if needed (batch SELECT, indexed scan)
-- Add OTel span emission for sweep actions via `tracing.py`
+- Run the 1 000-row sweep benchmark (`go test -bench`); optimise if needed (batch SELECT, indexed scan)
+- Add OTel span emission for sweep actions via `internal/obs`
 - Verify backward compatibility: existing `sandbox_runs` rows with null columns handled gracefully
-- Update `docs/prd/INDEX.md` with PRD-100 entry
+- Update `docs/prd/INDEX.md` with the PRD-100 entry
 - Final review and cleanup
 
 **Exit criterion:** All acceptance criteria verified; benchmark under 200 ms; no regressions in existing sandbox tests.

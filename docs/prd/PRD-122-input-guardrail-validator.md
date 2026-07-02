@@ -1,11 +1,13 @@
 # PRD-122: Input Guardrail Validator (`tag guardrail input`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Security/Guardrails
-**Affects:** `guardrails.py + controller.py`
-**Depends on:** PRD-124 (GuardrailResult dataclass), PRD-034 (secret scanning), PRD-121 (output guardrail processor — shared infrastructure)
+**Affects:** `internal/agent (input guardrail middleware chain) + internal/store (audit log)`
+**Depends on:** PRD-124 (GuardrailResult type), PRD-034 (secret scanning), PRD-121 (output guardrail processor — shared infrastructure)
 **Inspired by:** Guardrails AI input validators, Nemo Guardrails input rails, AWS Bedrock Guardrails input filters, PromptGuard
 
 ---
@@ -14,9 +16,9 @@
 
 User-provided inputs to agent systems are an attack surface: prompt injection attacks, jailbreak attempts, inputs containing PII or credentials, and requests that violate usage policies can all enter through the input channel. TAG's current execution model passes user inputs directly to the model API without any validation layer.
 
-Input Guardrail Validator (`tag guardrail input`) introduces a pre-processing validation pipeline that inspects user inputs before they reach the model. Built-in input guardrails detect prompt injection patterns, PII in inputs, secrets accidentally included in prompts, topic restrictions (e.g., "do not accept financial advice requests"), and input length limits. The pipeline is composable: multiple guardrails can be chained with configurable `block`, `warn`, or `sanitize` actions.
+Input Guardrail Validator (`tag guardrail input`) introduces a pre-processing validation pipeline modeled as an **input middleware chain wrapped around the hand-rolled agent loop** (`internal/agent`), gated in the same style as the tool permission service (`internal/tool`). It inspects user inputs before they reach the model. Built-in input guardrails detect prompt injection patterns, PII in inputs, secrets accidentally included in prompts, topic restrictions (e.g., "do not accept financial advice requests"), and input length limits. Each guardrail is a Go type implementing the `InputGuardrail` interface and returns a typed `Decision` (`GuardrailResult`, PRD-124) with `block`, `warn`, or `sanitize` semantics; the chain is composable.
 
-The design is inspired by LlamaGuard (Meta's input safety classifier), PromptGuard (Llama-based prompt injection detector), Nemo Guardrails input rails, and AWS Bedrock Guardrails input content filters. TAG's implementation uses a combination of regex-based fast-path detection (for known patterns) and optional LLM-based classification (for subtle attacks) to balance speed and accuracy.
+The design is inspired by LlamaGuard (Meta's input safety classifier), PromptGuard (Llama-based prompt injection detector), Nemo Guardrails input rails, and AWS Bedrock Guardrails input content filters. TAG's implementation combines RE2-regexp fast-path detection (for known patterns) with optional LLM-based classification (for subtle attacks, via the `internal/llm` provider interface) to balance speed and accuracy. **Extensibility note:** guardrails are compiled into the static Go binary as `InputGuardrail` implementations registered in a slice; because TAG ships as a single binary, custom guardrails are NOT dynamic user-supplied code plugins. Regex- and config-declared guardrails port directly; arbitrary custom logic is expressed as compiled-in Go implementations, shell/HTTP hooks, or MCP tools (GO_MIGRATION_PLAN decision #6).
 
 ---
 
@@ -40,12 +42,12 @@ Certain agent deployments have topic restrictions: "don't answer questions about
 
 | ID | Goal |
 |----|------|
-| G1 | `InputGuardrailPipeline.validate(input: str) -> GuardrailResult` runs all configured input guardrails and returns the first non-pass result or a pass. |
+| G1 | `InputChain.Validate(ctx, *Request) (Decision, error)` runs all configured input guardrails and returns the first non-pass decision or a pass. |
 | G2 | Built-in input guardrails: prompt injection detector (regex + LLM classifier), PII detector, secret scanner, topic filter, length limiter. |
 | G3 | `GuardrailResult.action == "sanitize"` triggers text sanitization (regex replacement, redaction) before passing to the model. |
 | G4 | All input guardrail decisions logged to `guardrail_events` with `direction='input'`. |
 | G5 | `tag guardrail input add`, `list`, `remove`, `test` CLI subcommands. |
-| G6 | Integration with `cmd_run` in `controller.py` as a pre-processing hook before the model API call. |
+| G6 | Integration with the agent loop (`internal/agent`) as pre-request middleware before the model API call. |
 | G7 | Fast-path regex detectors for known injection patterns; optional LLM classifier for high-confidence detection. |
 
 ## 3.1 Non-Goals
@@ -117,16 +119,16 @@ tag guardrail input history [--profile PROFILE] [--since 7d]
 
 | ID | Requirement |
 |----|------------|
-| FR-01 | `InputGuardrailPipeline.validate(input: str) -> GuardrailResult` runs registered guardrails in severity order; returns first non-pass result or PASS. |
-| FR-02 | Prompt injection guardrail: fast-path regex for known patterns (`ignore previous instructions`, `jailbreak`, `DAN`, `system prompt override`); optionally call LLM classifier for uncertain cases. |
-| FR-03 | PII input guardrail: detect PII in user input using same regex patterns as PRD-121 PIIGuardrail; `sanitize` action replaces PII with `[REDACTED_EMAIL]` / `[REDACTED_SSN]` / etc. |
-| FR-04 | Secret input guardrail: detect secrets using PRD-034 SecretScanner; `block` action prevents the key from reaching the model API. |
-| FR-05 | Length limit guardrail: if `len(input) > max_length`, block with `INPUT_TOO_LONG` reason. |
-| FR-06 | Topic filter guardrail: compute embedding similarity between input and forbidden topic vectors; block if similarity > threshold. |
-| FR-07 | Sanitize action: return a modified version of the input string with the detected content replaced; the sanitized input is passed to the model instead of the original. |
-| FR-08 | All decisions written to `guardrail_events` with `direction='input'`, `run_id`, `action`, `reason`. |
-| FR-09 | `cmd_run` calls `InputGuardrailPipeline.validate(user_input)` before the model API call; if `blocked`, return error message to caller immediately. |
-| FR-10 | Guardrail configs loaded from `input_guardrail_configs` SQLite table at process start and cached for the session. |
+| FR-01 | `InputChain.Validate(ctx context.Context, req *Request) (Decision, error)` runs the registered `InputGuardrail` slice in severity order; returns the first non-pass `Decision` or a pass. |
+| FR-02 | Prompt injection guardrail: fast-path RE2 regexp for known patterns (`ignore previous instructions`, `jailbreak`, `DAN`, `system prompt override`); optionally call an LLM classifier (`internal/llm`) for uncertain cases. |
+| FR-03 | PII input guardrail: detect PII in user input using the same RE2 patterns as the PRD-121 PII guardrail; `sanitize` action replaces PII with `[REDACTED_EMAIL]` / `[REDACTED_SSN]` / etc. |
+| FR-04 | Secret input guardrail: detect secrets using the PRD-034 secret scanner; `block` `Decision` prevents the key from reaching the model API. |
+| FR-05 | Length limit guardrail: if `utf8.RuneCountInString(input) > maxLength`, block with `INPUT_TOO_LONG` reason. |
+| FR-06 | Topic filter guardrail: compute embedding similarity between input and forbidden-topic vectors (embeddings via the `internal/llm` Embedder interface); block if similarity > threshold. |
+| FR-07 | Sanitize action: the `Decision` carries a modified copy of the input (`Sanitized` field) with detected content replaced; the sanitized input is passed to the model instead of the original. |
+| FR-08 | All decisions written to `guardrail_events` (`internal/store`) with `direction='input'`, `run_id`, `action`, `reason`. |
+| FR-09 | The agent loop (`internal/agent`) invokes `InputChain.Validate` as pre-request middleware before the model API call; a block `Decision` short-circuits the turn (`stop`) and returns an error to the caller immediately — a `Decision`/`error` return, not a panic. |
+| FR-10 | Guardrail configs loaded from the `input_guardrail_configs` table via `internal/store` at startup and cached for the session. |
 
 ---
 
@@ -134,16 +136,18 @@ tag guardrail input history [--profile PROFILE] [--since 7d]
 
 | ID | Requirement |
 |----|------------|
-| NFR-01 | Regex-based guardrails must complete in < 5ms for 2000-token input. |
+| NFR-01 | RE2-regexp-based guardrails must complete in < 5ms for 2000-token input (RE2 gives linear-time matching — no catastrophic backtracking). |
 | NFR-02 | LLM classifier guardrails are optional and disabled by default (require explicit `--classifier-model` configuration). |
 | NFR-03 | Sanitize action produces deterministic output for the same input (no randomness). |
-| NFR-04 | `injection_patterns.json` file contains the known injection pattern regex list; updatable without code changes. |
+| NFR-04 | Injection patterns loaded from a `go:embed`-ed `injection_patterns.json` (default) and overridable via a config-declared list (`internal/config`, koanf v2); updatable without recompiling core logic. |
 
 ---
 
 ## 9. Technical Design
 
 ### 9.1 SQLite DDL
+
+Owned by `internal/store` (`modernc.org/sqlite`, pure-Go, single-writer). Shares the `guardrail_events` table defined in PRD-121; DDL below is the input-config table (unchanged from the original design):
 
 ```sql
 CREATE TABLE IF NOT EXISTS input_guardrail_configs (
@@ -159,7 +163,7 @@ CREATE TABLE IF NOT EXISTS input_guardrail_configs (
 );
 ```
 
-### 9.2 Injection pattern file (injection_patterns.json)
+### 9.2 Injection pattern file (`injection_patterns.json`, `go:embed`-ed)
 
 ```json
 [
@@ -175,66 +179,151 @@ CREATE TABLE IF NOT EXISTS input_guardrail_configs (
 ]
 ```
 
-### 9.3 Python core
+> **RE2 note:** Go's `regexp` uses the RE2 engine, which has **no backreferences and no lookahead/lookbehind** and guarantees linear-time matching. All shipped patterns above are plain alternations/character classes and compile cleanly under RE2 (this also makes the ReDoS mitigation in §10 automatic). Operator-supplied patterns that rely on PCRE-only features (`(?=...)`, `(?<=...)`, `\1`) will fail to compile — the loader must reject them at config-load time with a clear error rather than silently dropping them.
 
-```python
-from __future__ import annotations
-import json
-import re
-from pathlib import Path
-from typing import List, Optional
-from tag.guardrail_result import GuardrailResult, GuardrailAction
+### 9.3 Go core (`internal/agent`)
 
-class PromptInjectionGuardrail:
-    def __init__(self, action: GuardrailAction = GuardrailAction.BLOCK,
-                 pattern_file: Optional[str] = None) -> None:
-        self.action = action
-        patterns_path = Path(pattern_file or Path(__file__).parent / "injection_patterns.json")
-        patterns = json.loads(patterns_path.read_text()) if patterns_path.exists() else []
-        self.patterns = [re.compile(p, re.IGNORECASE) for p in patterns]
+Guardrails are Go interfaces (replacing Python ABCs); the registry is an `[]InputGuardrail` slice. `Decision` carries block/warn/sanitize semantics as a value type (blocking is a returned `Decision`, never a panic). The chain runs as input middleware before the agent loop's model call and threads the possibly-sanitized text forward.
 
-    def check(self, input_text: str) -> GuardrailResult:
-        for i, pattern in enumerate(self.patterns):
-            if pattern.search(input_text):
-                return GuardrailResult(
-                    action=self.action,
-                    reason=f"PROMPT_INJECTION:pattern_{i}",
-                    guardrail="prompt-injection"
-                )
-        return GuardrailResult(action=GuardrailAction.PASS, guardrail="prompt-injection")
+```go
+package agent
 
-class PIIInputGuardrail:
-    EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-    SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+import (
+	"context"
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"regexp"
 
-    def __init__(self, action: GuardrailAction = GuardrailAction.SANITIZE) -> None:
-        self.action = action
+	"github.com/tag/internal/store"
+)
 
-    def check(self, input_text: str) -> GuardrailResult:
-        if self.EMAIL_RE.search(input_text) or self.SSN_RE.search(input_text):
-            if self.action == GuardrailAction.SANITIZE:
-                sanitized = self.EMAIL_RE.sub("[REDACTED_EMAIL]", input_text)
-                sanitized = self.SSN_RE.sub("[REDACTED_SSN]", sanitized)
-                return GuardrailResult(action=GuardrailAction.SANITIZE, reason="PII_SANITIZED",
-                                       guardrail="pii-input", sanitized_text=sanitized)
-            return GuardrailResult(action=self.action, reason="PII_IN_INPUT", guardrail="pii-input")
-        return GuardrailResult(action=GuardrailAction.PASS, guardrail="pii-input")
+//go:embed injection_patterns.json
+var defaultInjectionPatterns []byte
 
-class InputGuardrailPipeline:
-    def __init__(self, guardrails: list) -> None:
-        self.guardrails = guardrails
+// InputGuardrail is the interface every input guardrail implements
+// (Go interface in place of a Python ABC).
+type InputGuardrail interface {
+	Name() string
+	Severity() string
+	Validate(ctx context.Context, req *Request) (Decision, error)
+}
 
-    def validate(self, input_text: str) -> GuardrailResult:
-        current_text = input_text
-        for g in self.guardrails:
-            result = g.check(current_text)
-            if result.action in (GuardrailAction.BLOCK,):
-                return result
-            if result.action == GuardrailAction.SANITIZE and result.sanitized_text:
-                current_text = result.sanitized_text
-        return GuardrailResult(action=GuardrailAction.PASS, guardrail="pipeline",
-                               sanitized_text=current_text if current_text != input_text else None)
+// Request carries the (mutable) user input threaded through the chain.
+type Request struct {
+	Input string
+	RunID string
+}
+
+// --- Prompt injection (RE2; case-insensitive via (?i) inline flag) ---
+
+type PromptInjectionGuardrail struct {
+	action   Action
+	severity string
+	patterns []*regexp.Regexp
+}
+
+// NewPromptInjectionGuardrail compiles the embedded (or config-supplied)
+// pattern list. Patterns using PCRE-only features fail here (RE2 has no
+// backreferences/lookahead) — surfaced as a load-time error.
+func NewPromptInjectionGuardrail(action Action, raw []byte) (*PromptInjectionGuardrail, error) {
+	if raw == nil {
+		raw = defaultInjectionPatterns
+	}
+	var src []string
+	if err := json.Unmarshal(raw, &src); err != nil {
+		return nil, fmt.Errorf("load injection patterns: %w", err)
+	}
+	pats := make([]*regexp.Regexp, 0, len(src))
+	for _, p := range src {
+		re, err := regexp.Compile("(?i)" + p)
+		if err != nil {
+			return nil, fmt.Errorf("injection pattern %q not RE2-compatible: %w", p, err)
+		}
+		pats = append(pats, re)
+	}
+	return &PromptInjectionGuardrail{action: action, severity: "high", patterns: pats}, nil
+}
+
+func (g *PromptInjectionGuardrail) Name() string     { return "prompt-injection" }
+func (g *PromptInjectionGuardrail) Severity() string { return g.severity }
+
+func (g *PromptInjectionGuardrail) Validate(_ context.Context, req *Request) (Decision, error) {
+	for i, re := range g.patterns {
+		if re.MatchString(req.Input) {
+			return Decision{Action: g.action, Reason: fmt.Sprintf("PROMPT_INJECTION:pattern_%d", i), Guardrail: g.Name()}, nil
+		}
+	}
+	return Decision{Action: ActionPass, Guardrail: g.Name()}, nil
+}
+
+// --- PII input (block or sanitize) ---
+
+var (
+	reEmail = regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
+	reSSN   = regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)
+)
+
+type PIIInputGuardrail struct {
+	action   Action
+	severity string
+}
+
+func (g *PIIInputGuardrail) Name() string     { return "pii-input" }
+func (g *PIIInputGuardrail) Severity() string { return g.severity }
+
+func (g *PIIInputGuardrail) Validate(_ context.Context, req *Request) (Decision, error) {
+	if reEmail.MatchString(req.Input) || reSSN.MatchString(req.Input) {
+		if g.action == ActionSanitize {
+			s := reEmail.ReplaceAllString(req.Input, "[REDACTED_EMAIL]")
+			s = reSSN.ReplaceAllString(s, "[REDACTED_SSN]")
+			return Decision{Action: ActionSanitize, Reason: "PII_SANITIZED", Guardrail: g.Name(), Sanitized: s}, nil
+		}
+		return Decision{Action: g.action, Reason: "PII_IN_INPUT", Guardrail: g.Name()}, nil
+	}
+	return Decision{Action: ActionPass, Guardrail: g.Name()}, nil
+}
+
+// --- Chain / middleware around the agent loop ---
+
+type InputChain struct {
+	guardrails []InputGuardrail
+	store      *store.DB
+}
+
+func NewInputChain(gs []InputGuardrail, db *store.DB) *InputChain {
+	// gs is pre-sorted by severity by the loader (see PRD-121 OutputChain).
+	return &InputChain{guardrails: gs, store: db}
+}
+
+// Validate runs guardrails in order. BLOCK short-circuits; SANITIZE rewrites
+// the input threaded to subsequent guardrails and, ultimately, the model.
+// Every decision is appended to guardrail_events with direction='input'.
+func (c *InputChain) Validate(ctx context.Context, req *Request) (Decision, error) {
+	original := req.Input
+	for _, g := range c.guardrails {
+		d, err := g.Validate(ctx, req)
+		if err != nil {
+			return Decision{}, err
+		}
+		_ = c.store.AppendGuardrailEvent(ctx, "input", req.RunID, d)
+		switch d.Action {
+		case ActionBlock:
+			return d, nil
+		case ActionSanitize:
+			if d.Sanitized != "" {
+				req.Input = d.Sanitized
+			}
+		}
+	}
+	if req.Input != original {
+		return Decision{Action: ActionSanitize, Guardrail: "chain", Sanitized: req.Input}, nil
+	}
+	return Decision{Action: ActionPass, Guardrail: "chain"}, nil
+}
 ```
+
+> `Action`/`Decision` are the shared types defined in PRD-121 §9.2 (`ActionSanitize` is added to the constant set for the input direction; `Decision.Sanitized` holds the rewritten text).
 
 ---
 
@@ -244,7 +333,7 @@ class InputGuardrailPipeline:
 |------|-----------|
 | Injection patterns being too broad (false positives) | Pattern list is conservative; operators can tune via config |
 | Sanitization leaking partial PII | Test sanitization regex for edge cases; verify no partial match |
-| Regex catastrophic backtracking | All patterns tested with ReDoS checker before inclusion |
+| Regex catastrophic backtracking | Go's `regexp` (RE2) guarantees linear-time matching, so ReDoS is structurally impossible for all patterns (built-in and operator-supplied) |
 
 ---
 
@@ -252,8 +341,9 @@ class InputGuardrailPipeline:
 
 | Layer | Tests |
 |-------|-------|
-| Unit | `PromptInjectionGuardrail` on 10 known injection prompts; `PIIInputGuardrail` sanitize/block on email+SSN inputs |
-| Integration | Full pipeline: injection attempt → block → audit log entry |
+| Unit | Table-driven `go test` for `PromptInjectionGuardrail` on 10 known injection prompts; `PIIInputGuardrail` sanitize/block on email+SSN inputs; RE2-compile rejection of a PCRE-only pattern |
+| Benchmark | `testing.B` for chain latency on a 2000-token input (NFR-01 < 5ms regexp path) |
+| Integration | Full chain: injection attempt → block `Decision` → `guardrail_events` audit row (`direction='input'`) |
 | Evaluation | 50-prompt injection test set: recall > 85%; 100 legitimate prompts: FPR < 5% |
 
 ---
@@ -274,9 +364,12 @@ class InputGuardrailPipeline:
 
 | Dependency | Reason |
 |-----------|--------|
-| PRD-124 GuardrailResult | Shared result dataclass |
-| PRD-034 secret scanning | SecretScanner reuse |
-| PRD-121 output guardrail | Shared audit log infrastructure |
+| PRD-124 GuardrailResult (`Decision`) | Shared result type |
+| PRD-034 secret scanning | Secret scanner reuse |
+| PRD-121 output guardrail | Shared `Action`/`Decision` types + `guardrail_events` audit infrastructure |
+| `internal/store` (`modernc.org/sqlite`) | Config + audit-log persistence |
+| `internal/llm` provider interface | Optional LLM injection classifier + topic-filter embeddings |
+| `internal/config` (koanf v2) | Config-declared pattern/guardrail overrides |
 
 ---
 
@@ -296,8 +389,8 @@ class InputGuardrailPipeline:
 
 | Phase | Work | Days |
 |-------|------|------|
-| 1 | `PromptInjectionGuardrail`, `PIIInputGuardrail`, unit tests | 2 |
-| 2 | `InputGuardrailPipeline`, sanitize action, audit log | 2 |
-| 3 | CLI commands, `cmd_run` integration, topic filter guardrail | 2 |
+| 1 | `InputGuardrail` interface, `PromptInjectionGuardrail`, `PIIInputGuardrail`, table-driven unit tests | 2 |
+| 2 | `InputChain`, sanitize action, `internal/store` audit log | 2 |
+| 3 | CLI commands (`internal/cli`), agent-loop middleware integration, topic filter guardrail | 2 |
 | 4 | Evaluation tests, documentation | 1 |
 

@@ -1,10 +1,12 @@
 # PRD-111: Dynamic Fan-Out/Map-Reduce (`tag workflow fan-out`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Workflow State
-**Affects:** `workflow_engine.py + controller.py`
+**Affects:** `internal/queue + internal/cli`
 **Depends on:** PRD-112 (graph-based workflow), PRD-110 (state serialization), PRD-082 (multi-agent team primitives)
 **Inspired by:** LangGraph Send API, AutoGen parallel execution, Dask graph scheduler, Ray tasks, CrewAI parallel process
 
@@ -14,9 +16,9 @@
 
 Complex agent workflows often require processing a dynamic list of items in parallel — searching N documents simultaneously, running N code review agents in parallel, or spawning N summarization agents for N sections of a large document. TAG's current workflow model executes steps sequentially; there is no mechanism to fan out over a runtime-determined list of items, execute sub-agents in parallel, and reduce the results back into a single state.
 
-Dynamic Fan-Out/Map-Reduce (`tag workflow fan-out`) introduces LangGraph-inspired `Send` API and map-reduce primitives to the TAG workflow engine. A workflow node can emit multiple `Send(node_name, state_update)` objects from a single conditional edge, causing the workflow engine to spawn parallel execution branches — one per Send — that all run concurrently and whose results are merged back into the parent state via a configurable reduce function.
+Dynamic Fan-Out/Map-Reduce (`tag workflow fan-out`) introduces a LangGraph-inspired `Send` API and map-reduce primitives to the TAG workflow engine. A workflow node can emit multiple `Send{Node, StateUpdate}` values from a single conditional edge, causing the workflow engine to spawn parallel execution branches — one per Send — that all run concurrently and whose results are merged back into the parent state via a configurable reduce function.
 
-The design follows LangGraph's `Send` API (introduced in 0.2.x) which enables dynamic parallelism within a graph, and the map-reduce pattern from distributed computing (Google MapReduce, Dask, Spark). Unlike those systems, TAG's implementation uses Python's `concurrent.futures.ThreadPoolExecutor` for local concurrency (no external workers), with SQLite checkpointing (PRD-110) for each parallel branch to support partial failure recovery.
+The design follows LangGraph's `Send` API (introduced in 0.2.x) which enables dynamic parallelism within a graph, and the map-reduce pattern from distributed computing (Google MapReduce, Dask, Spark). Concretely, fan-out is implemented on the bespoke SQLite-backed goroutine DAG scheduler in `internal/queue` (see GO_MIGRATION_PLAN.md decision (5)): each `Send` becomes a dynamically enqueued child job, the parallel "map" phase runs on a bounded goroutine worker pool over `golang.org/x/sync/errgroup` + channels, and the reduce node is a join/barrier node whose `deps_json` lists every map job so the scheduler promotes it to `ready` only once all branches are `done`. There are **no** external workers — River (Postgres) and asynq (Redis) are explicitly rejected because they break the single-binary mandate, and no drop-in pure-Go embedded durable DAG queue exists, so this scheduler is genuine engineering. Each parallel branch is event-sourced to the single `modernc.org/sqlite` store (pure-Go, WAL, `CGO_ENABLED=0`) via PRD-110 checkpointing to support partial failure recovery and replay.
 
 ---
 
@@ -24,7 +26,7 @@ The design follows LangGraph's `Send` API (introduced in 0.2.x) which enables dy
 
 ### 2.1 Sequential processing of large item lists is too slow
 
-Summarizing 20 documents sequentially (20 × 30s = 10 minutes) is impractical when parallel execution (30s total) is possible. Without fan-out primitives, engineers must implement parallel execution manually using `threading` or `asyncio`, outside the workflow graph.
+Summarizing 20 documents sequentially (20 × 30s = 10 minutes) is impractical when parallel execution (30s total) is possible. Without fan-out primitives, engineers must implement parallel execution manually using raw goroutines and `sync`/`errgroup`, outside the workflow graph.
 
 ### 2.2 Dynamic fan-out not possible at graph design time
 
@@ -40,11 +42,11 @@ Even when engineers implement ad-hoc parallelism, there is no standard way to re
 
 | ID | Goal |
 |----|------|
-| G1 | Provide a `Send(node_name, state_update)` return type that causes the workflow engine to spawn a parallel branch for each Send. |
-| G2 | Execute all parallel branches concurrently using `ThreadPoolExecutor` with configurable max workers. |
-| G3 | Provide a reduce node pattern: after all branches complete, a designated reduce node receives a list of all branch results and merges them into the shared state. |
-| G4 | Support partial failure handling: on branch failure, either fail fast (default) or collect errors and continue with successful branches. |
-| G5 | Checkpoint each branch independently (PRD-110) so partial failures can resume individual branches. |
+| G1 | Provide a `Send{Node, StateUpdate}` return type that causes the workflow engine to spawn a parallel branch for each Send. |
+| G2 | Execute all parallel branches concurrently on a bounded goroutine worker pool (`errgroup` + a semaphore channel) with configurable max workers. |
+| G3 | Provide a reduce node pattern: after all branches complete, a designated reduce (join/barrier) node receives a slice of all branch results and merges them into the shared state. |
+| G4 | Support partial failure handling: on branch failure, either fail fast (default, via `errgroup` context cancellation) or collect errors and continue with successful branches. |
+| G5 | Checkpoint each branch independently (PRD-110) to `modernc.org/sqlite` so partial failures can resume individual branches. |
 | G6 | `tag workflow fan-out show <session-id>` displays a live view of parallel branch statuses. |
 | G7 | Support nested fan-out (a branch can itself emit Sends). |
 
@@ -83,36 +85,47 @@ Even when engineers implement ad-hoc parallelism, there is no standard way to re
 
 ## 6. CLI Surface
 
+```go
+// In a workflow definition (Go API, internal/queue):
+import "github.com/tag-agent/tag/internal/queue"
+
+// SplitNode returns a slice of Send values to fan out.
+func SplitNode(state queue.State) ([]queue.Send, error) {
+    var sends []queue.Send
+    for docID, content := range state.Map("documents") {
+        sends = append(sends, queue.Send{
+            Node:        "process_doc",
+            StateUpdate: queue.State{"doc_id": docID, "content": content},
+        })
+    }
+    return sends, nil
+}
+
+// MergeNode is the reduce/barrier node: it receives all branch results.
+func MergeNode(state queue.State, branchResults []queue.State) (queue.State, error) {
+    summaries := make([]any, 0, len(branchResults))
+    for _, r := range branchResults {
+        summaries = append(summaries, r["summary"])
+    }
+    state["summaries"] = summaries
+    return state, nil
+}
+
+g := queue.NewWorkflowGraph()
+g.AddNode("split", SplitNode)
+g.AddNode("process_doc", ProcessOneDoc)
+g.AddReduceNode("merge", MergeNode) // marks merge as a join/barrier node
+g.AddConditionalEdges("split", SplitNode)
+g.SetFanOut("split", queue.FanOut{ReduceNode: "merge", MaxWorkers: 10, OnError: "continue"})
 ```
-# In workflow definition (Python API):
-from tag.workflow_engine import Send, WorkflowGraph, reduce
 
-def split_node(state):
-    """Return a list of Send objects to fan out."""
-    return [
-        Send("process_doc", {"doc_id": doc_id, "content": content})
-        for doc_id, content in state["documents"].items()
-    ]
-
-@reduce
-def merge_node(state, branch_results):
-    """Receives list of all branch state dicts."""
-    state["summaries"] = [r["summary"] for r in branch_results]
-    return state
-
-graph = WorkflowGraph()
-graph.add_node("split", split_node)
-graph.add_node("process_doc", process_one_doc)
-graph.add_node("merge", merge_node)
-graph.add_conditional_edges("split", split_node)
-graph.set_fan_out("split", reduce_node="merge", max_workers=10, on_error="continue")
-
+```
 # CLI:
 tag workflow fan-out show <session-id> [--live]
 tag workflow fan-out retry <session-id> --branch BRANCH_ID
 
 Options:
-  --max-workers N    Thread pool size (default: min(10, cpu_count))
+  --max-workers N    Worker-pool size (default: min(10, runtime.NumCPU()))
   --on-error        fail_fast|continue (default: fail_fast)
   --live            Live-refresh branch status display
 ```
@@ -123,15 +136,15 @@ Options:
 
 | ID | Requirement |
 |----|------------|
-| FR-01 | When a node returns `List[Send]`, the engine creates one branch per Send, each with its own `branch_id` and state update applied to a copy of the shared state. |
-| FR-02 | All branches are submitted to `ThreadPoolExecutor` simultaneously; the engine blocks until all branches complete (or fail). |
-| FR-03 | Each branch writes checkpoints (PRD-110) with key `(session_id, branch_id, step_num)`. |
-| FR-04 | After all branches complete: collect all branch final states, invoke the reduce node with the list of states, and merge the result back into the shared state. |
-| FR-05 | `--on-error fail_fast`: first branch failure immediately cancels all remaining branches and raises. |
+| FR-01 | When a node returns `[]Send`, the engine enqueues one child job per Send, each with its own `branch_id` and state update applied to a deep copy of the shared state. |
+| FR-02 | All branches are dispatched to the bounded goroutine worker pool concurrently; the scheduler blocks (on the reduce barrier node) until all branches complete or fail. |
+| FR-03 | Each branch writes checkpoints (PRD-110) with key `(session_id, branch_id, step_num)` to `modernc.org/sqlite`. |
+| FR-04 | After all branches complete: collect all branch final states, invoke the reduce node with the slice of states, and merge the result back into the shared state. |
+| FR-05 | `--on-error fail_fast`: the first branch failure cancels the shared `context.Context` via `errgroup`, stopping all remaining branches, and `RunFanOut` returns the error. |
 | FR-06 | `--on-error continue`: collect branch errors in `state["branch_errors"]`, include successful branch results in reduce. |
-| FR-07 | Reduce node receives `(shared_state, branch_results: List[dict])` as arguments. |
-| FR-08 | Branch status tracked in `workflow_branches` SQLite table: `pending`, `running`, `completed`, `failed`. |
-| FR-09 | `tag workflow fan-out show --live` polls `workflow_branches` every second and renders a live table. |
+| FR-07 | Reduce node receives `(sharedState queue.State, branchResults []queue.State)` as arguments. |
+| FR-08 | Branch status tracked in the `workflow_branches` SQLite table: `pending`, `running`, `completed`, `failed`. |
+| FR-09 | `tag workflow fan-out show --live` polls `workflow_branches` every second and renders a live table (`lipgloss`/`bubbles` table). |
 | FR-10 | `tag workflow fan-out retry <session-id> --branch BRANCH_ID` re-runs a specific failed branch from its last checkpoint. |
 
 ---
@@ -140,9 +153,9 @@ Options:
 
 | ID | Requirement |
 |----|------------|
-| NFR-01 | ThreadPoolExecutor size bounded by `min(--max-workers, cpu_count() * 2)`; never unbounded. |
-| NFR-02 | Branch state is a copy of the shared state (deep copy) to prevent cross-branch mutation. |
-| NFR-03 | Reduce function is called in the main thread after all branches complete; no reduce concurrency. |
+| NFR-01 | Worker-pool concurrency bounded by `min(--max-workers, runtime.NumCPU() * 2)` via a semaphore channel; never unbounded goroutine spawn. |
+| NFR-02 | Branch state is a deep copy of the shared state (no aliased maps/slices) to prevent cross-branch mutation. |
+| NFR-03 | The reduce function runs on the scheduler goroutine after all branches complete; no reduce concurrency. |
 | NFR-04 | Memory per branch: peak usage < 50MB for typical agent state; warn on states > 100MB. |
 
 ---
@@ -150,6 +163,8 @@ Options:
 ## 9. Technical Design
 
 ### 9.1 SQLite DDL
+
+Created by a `internal/store` migration against the single pure-Go `modernc.org/sqlite` connection (WAL, `CGO_ENABLED=0`); all writes go through the single-writer + `flock` atomic RMW contract.
 
 ```sql
 CREATE TABLE IF NOT EXISTS workflow_branches (
@@ -167,56 +182,109 @@ CREATE INDEX IF NOT EXISTS idx_branches_session
   ON workflow_branches(session_id, fan_out_step);
 ```
 
-### 9.2 Python core
+### 9.2 Go core (`internal/queue`)
 
-```python
-from __future__ import annotations
-import copy
-import dataclasses
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, List, Optional
+The map phase runs on `errgroup` with a semaphore channel for bounded concurrency; branch ordering is preserved by index rather than completion order (`errgroup.Wait` replaces `as_completed`). `fail_fast` uses the group's derived `context.Context`; `continue` records per-branch errors.
 
-@dataclasses.dataclass
-class Send:
-    node: str
-    state_update: dict
+```go
+package queue
 
-def _execute_branch(node_fn: Callable, state: dict, send: Send) -> dict:
-    branch_state = copy.deepcopy(state)
-    branch_state.update(send.state_update)
-    return node_fn(branch_state)
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"strconv"
+	"sync"
 
-def fan_out_execute(
-    sends: List[Send],
-    node_registry: dict,
-    shared_state: dict,
-    reduce_fn: Callable,
-    max_workers: int = 10,
-    on_error: str = "fail_fast",
-) -> dict:
-    results = []
-    errors = []
-    with ThreadPoolExecutor(max_workers=min(max_workers, len(sends))) as pool:
-        futures = {
-            pool.submit(_execute_branch, node_registry[s.node], shared_state, s): i
-            for i, s in enumerate(sends)
-        }
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                results.append((idx, future.result()))
-            except Exception as e:
-                if on_error == "fail_fast":
-                    for f in futures:
-                        f.cancel()
-                    raise
-                errors.append((idx, str(e)))
-    ordered = [r for _, r in sorted(results, key=lambda x: x[0])]
-    merged = reduce_fn(shared_state, ordered)
-    if errors:
-        merged["branch_errors"] = {str(i): err for i, err in errors}
-    return merged
+	"golang.org/x/sync/errgroup"
+)
+
+type State map[string]any
+
+type Send struct {
+	Node        string
+	StateUpdate State
+}
+
+type NodeFunc func(State) (State, error)
+type ReduceFunc func(State, []State) (State, error)
+
+// deepCopy returns a value-independent clone so branches cannot alias the parent.
+func deepCopy(s State) State { /* recursive clone of maps/slices/scalars */ return s }
+
+func executeBranch(fn NodeFunc, shared State, send Send) (State, error) {
+	bs := deepCopy(shared)
+	for k, v := range send.StateUpdate {
+		bs[k] = v
+	}
+	return fn(bs)
+}
+
+func RunFanOut(
+	ctx context.Context,
+	sends []Send,
+	registry map[string]NodeFunc,
+	shared State,
+	reduce ReduceFunc,
+	maxWorkers int,
+	onError string, // "fail_fast" | "continue"
+) (State, error) {
+	if maxWorkers <= 0 || maxWorkers > runtime.NumCPU()*2 {
+		maxWorkers = min(maxWorkers, runtime.NumCPU()*2)
+	}
+	results := make([]State, len(sends)) // indexed => deterministic order
+	branchErrs := map[string]string{}
+	var mu sync.Mutex
+
+	g, ctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, min(maxWorkers, len(sends)))
+	for i, s := range sends {
+		i, s := i, s
+		g.Go(func() error {
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			defer func() { <-sem }()
+
+			out, err := executeBranch(registry[s.Node], shared, s)
+			if err != nil {
+				if onError == "fail_fast" {
+					return fmt.Errorf("branch %d: %w", i, err) // cancels ctx -> stops peers
+				}
+				mu.Lock()
+				branchErrs[strconv.Itoa(i)] = err.Error()
+				mu.Unlock()
+				return nil
+			}
+			results[i] = out
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Drop nil slots (failed branches under "continue") before reduce.
+	ordered := make([]State, 0, len(results))
+	for _, r := range results {
+		if r != nil {
+			ordered = append(ordered, r)
+		}
+	}
+	merged, err := reduce(shared, ordered)
+	if err != nil {
+		return nil, err
+	}
+	if len(branchErrs) > 0 {
+		merged["branch_errors"] = branchErrs
+	}
+	return merged, nil
+}
 ```
+
+In the persisted scheduler path, `RunFanOut` is expressed declaratively as DAG jobs: each `Send` is an enqueued child job row, and the reduce node is a barrier whose `deps_json` names every child. The in-memory `RunFanOut` above is the equivalent single-shot form used for small, non-durable fan-outs and for unit tests.
 
 ---
 
@@ -224,9 +292,9 @@ def fan_out_execute(
 
 | Risk | Mitigation |
 |------|-----------|
-| Thread safety of shared state | Branch receives a deep copy; only reduce node writes back |
-| Unbounded branch creation | Hard cap at 1000 branches per fan-out; larger sends raise ValueError |
-| Branch timeout | `ThreadPoolExecutor.shutdown(wait=True, cancel_futures_on_timeout=True)` with configurable timeout |
+| Data race on shared state | Each branch receives a deep copy; only the reduce node (on the scheduler goroutine) writes back. Verified under `go test -race`. |
+| Unbounded branch creation | Hard cap at 1000 branches per fan-out; larger `[]Send` returns an error before any goroutine is spawned. |
+| Branch timeout | A per-fan-out `context.WithTimeout` cancels all in-flight branches; workers observe `ctx.Done()` and child processes are killed via `Setpgid` process-group signal. |
 
 ---
 
@@ -234,9 +302,9 @@ def fan_out_execute(
 
 | Layer | Tests |
 |-------|-------|
-| Unit | `fan_out_execute` with 5 mock branches; reduce correctness; `--on-error continue` with 1 failure |
-| Integration | Full workflow with `Send` fan-out, reduce, and checkpoint resume |
-| Stress | 100-branch fan-out completes without error |
+| Unit | Table-driven `RunFanOut` with 5 fake branches; reduce correctness; `--on-error continue` with 1 failure; all run under `go test -race` to prove no shared-state data race |
+| Integration | Full workflow with `Send` fan-out, reduce, and checkpoint resume against a temp `modernc.org/sqlite` DB |
+| Stress | 100-branch fan-out completes without error; assert bounded goroutine count |
 
 ---
 
@@ -244,7 +312,7 @@ def fan_out_execute(
 
 | ID | Criterion |
 |----|----------|
-| AC-01 | A node returning `[Send("x", {...}), Send("x", {...})]` spawns 2 parallel branches |
+| AC-01 | A node returning `[]Send{{Node: "x", ...}, {Node: "x", ...}}` spawns 2 parallel branches |
 | AC-02 | 10 branches with 1s sleep each complete in < 3s wall time |
 | AC-03 | Reduce node receives all branch results |
 | AC-04 | On branch failure with `--on-error continue`, remaining branches complete and reduce runs |
@@ -276,8 +344,8 @@ def fan_out_execute(
 
 | Phase | Work | Days |
 |-------|------|------|
-| 1 | `Send` dataclass, `fan_out_execute`, unit tests | 2 |
-| 2 | SQLite branch tracking, integration with PRD-112 | 2 |
-| 3 | CLI (`fan-out show --live`, `retry`), error handling | 2 |
-| 4 | Integration tests, stress test, documentation | 1 |
+| 1 | `Send` struct, `RunFanOut` (errgroup + semaphore + deep copy), table-driven unit tests | 2 |
+| 2 | SQLite branch tracking (`workflow_branches`), integration with PRD-112 declarative DAG jobs | 2 |
+| 3 | CLI (`fan-out show --live`, `retry`) cobra handlers, error handling | 2 |
+| 4 | Integration tests, `-race` + stress test, documentation | 1 |
 

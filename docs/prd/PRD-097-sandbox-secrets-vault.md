@@ -1,10 +1,12 @@
 # PRD-097: Sandbox-Level Secrets Injection via Encrypted Vault (`tag sandbox secret`)
 
+> **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
+
 **Status:** Proposed
 **Priority:** P3
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Sandbox & Execution Environment
-**Affects:** `sandbox.py + secrets_vault.py` (new)
+**Affects:** `internal/sandbox` + `internal/credentials/vault` (new)
 **Depends on:** PRD-028 (Sandbox Code Execution), PRD-034 (Secret Scanning), PRD-013 (Agent Tracing / Observability), PRD-008 (Background Task Queue)
 **GitHub Issue:** #348
 **Inspired by:** Modal secrets, E2B environment variables, HashiCorp Vault
@@ -15,11 +17,11 @@
 
 TAG's sandbox subsystem (PRD-028) provides process isolation via Docker, E2B, Modal, and restricted-subprocess backends. However, it has no first-class mechanism for delivering secrets to sandbox workloads. Today, users who need an `OPENAI_API_KEY` inside a sandboxed code execution have three bad options: embed the key in `--code` (leaks into `sandbox_runs.command`), pass it via `--env KEY=value` on the CLI (leaks into shell history and process lists), or hardcode it in the agent's system prompt (leaks into traces and profile exports). All three paths violate the security guarantees that the sandbox itself is meant to provide.
 
-This PRD specifies `tag sandbox secret`: a local, encrypted secrets vault integrated tightly with the sandbox execution layer. Secrets are stored in an AES-256-GCM encrypted SQLite database at `~/.tag/vault/vault.db`, separate from the main `tag.sqlite3` state store. At sandbox invocation time, named secrets are decrypted in memory, injected into the sandbox environment (as environment variables or ephemeral files), and immediately zeroed after the process exits. The plaintext value never touches disk outside the vault, never appears in `sandbox_runs`, never appears in audit logs, and never appears in any TAG config file.
+This PRD specifies `tag sandbox secret`: a local, encrypted secrets vault integrated tightly with the sandbox execution layer. Secrets are stored as AES-256-GCM ciphertext in BLOB columns of a pure-Go `modernc.org/sqlite` database (CGO_ENABLED=0) at `~/.tag/vault/vault.db`, separate from the main `tag.sqlite3` state store. At sandbox invocation time, named secrets are decrypted in memory, injected into the sandbox environment (as environment variables or ephemeral files) through the `internal/sandbox` Backend interface, and immediately zeroed after the process exits. The plaintext value never touches disk outside the vault, never appears in `sandbox_runs`, never appears in audit logs, and never appears in any TAG config file.
 
-The design draws directly from three production systems. Modal Secrets stores key-value maps encrypted at rest, exposes them to function invocations via a `secrets=[Secret.from_name("my-secret")]` parameter, and never logs values. E2B environment variables are injected at sandbox creation time into the Firecracker microVM, so the host process never exposes them as CLI arguments. HashiCorp Vault's model of explicit `vault read secret/myapp/api-key` → in-process decryption → injected into `subprocess.env` without writing to disk is the procedural template for the vault client in this PRD. TAG adopts all three patterns: named secrets, injection at creation time, and in-process-only decryption.
+The design draws directly from three production systems. Modal Secrets stores key-value maps encrypted at rest, exposes them to function invocations via a `secrets=[Secret.from_name("my-secret")]` parameter, and never logs values. E2B environment variables are injected at sandbox creation time into the Firecracker microVM, so the host process never exposes them as CLI arguments. HashiCorp Vault's model of explicit `vault read secret/myapp/api-key` → in-process decryption → injected into the child process environment without writing to disk is the procedural template for the vault client in this PRD. TAG adopts all three patterns: named secrets, injection at creation time, and in-process-only decryption.
 
-The vault key derivation is user-space and deterministic: a master key is derived from a user-supplied passphrase via Argon2id (the OWASP-recommended KDF for password-based key derivation as of 2024) and stored in the OS keychain (macOS Keychain, Linux libsecret, Windows Credential Manager) via the `keyring` Python library. When `keyring` is unavailable, the derived key is cached in `~/.tag/vault/.key` with mode `0600`. Each secret ciphertext includes its own random 96-bit nonce and 128-bit authentication tag per AES-256-GCM, making the vault tamper-evident at the per-secret level.
+The vault key derivation is user-space and deterministic: a master key is derived from a user-supplied passphrase via Argon2id (`golang.org/x/crypto/argon2.IDKey`, the OWASP-recommended KDF for password-based key derivation) and stored in the OS keychain (macOS Keychain, Linux libsecret/Secret Service, Windows Credential Manager) via the `github.com/zalando/go-keyring` module. When `go-keyring` reports no usable backend, the derived key is cached in `~/.tag/vault/.key` with mode `0600`. Each secret ciphertext includes its own random 96-bit nonce and 128-bit authentication tag per AES-256-GCM (`crypto/aes` + `crypto/cipher` GCM), making the vault tamper-evident at the per-secret level.
 
 Audit trails are written to a separate append-only `secret_audit` table in `tag.sqlite3`. Every access event — `add`, `get`, `list`, `delete`, `inject` — is recorded with timestamp, secret name (never value), operation, invoking sandbox run ID (if applicable), and the OS user. This gives platform engineers and security teams a complete access log without storing any plaintext material.
 
@@ -29,11 +31,11 @@ Audit trails are written to a separate append-only `secret_audit` table in `tag.
 
 ### 2.1 Secrets Leak Through Sandbox Run Records
 
-`sandbox.py:ensure_schema()` creates a `sandbox_runs` table with a `command TEXT NOT NULL` column. When a user today passes credentials as environment variables via `--env OPENAI_KEY=sk-...`, those values are captured in the command string or in the process environment visible via `/proc/<pid>/environ` on Linux. The `sandbox_runs.output` column also captures full stdout, meaning any debug print of `os.environ` inside sandboxed code permanently embeds the key in the database. PRD-034 (Secret Scanning) gates profile export but has no coverage of the `sandbox_runs` table.
+`internal/sandbox`'s schema bootstrap (`EnsureSchema`) creates a `sandbox_runs` table with a `command TEXT NOT NULL` column. When a user today passes credentials as environment variables via `--env OPENAI_KEY=sk-...`, those values are captured in the command string or in the process environment visible via `/proc/<pid>/environ` on Linux. The `sandbox_runs.output` column also captures full stdout, meaning any debug print of the environment inside sandboxed code permanently embeds the key in the database. PRD-034 (Secret Scanning) gates profile export but has no coverage of the `sandbox_runs` table.
 
 ### 2.2 No Secure Handoff Between Agent Loop and Sandbox
 
-The agent loop in `controller.py` generates code dynamically. If an agent needs to call an external API, it must either hardcode the key into the generated code (which then appears in `sandbox_runs.command`) or the user must pre-inject it via a mechanism that does not exist. The gap is structural: there is a secure vault in principle (the OS keychain, `.env` files) and there is a secure execution environment (the sandbox), but there is no bridge between them that maintains the security invariant across the boundary.
+The agent loop in `internal/agent` generates code dynamically. If an agent needs to call an external API, it must either hardcode the key into the generated code (which then appears in `sandbox_runs.command`) or the user must pre-inject it via a mechanism that does not exist. The gap is structural: there is a secure vault in principle (the OS keychain, `.env` files) and there is a secure execution environment (the sandbox), but there is no bridge between them that maintains the security invariant across the boundary.
 
 ### 2.3 Audit-Free Secret Usage in Agent Workflows
 
@@ -48,13 +50,13 @@ TAG supports multi-step agent workflows (queue jobs, swarm agents, DAG pipelines
 | G1 | Store named secrets in an AES-256-GCM encrypted local vault; plaintext never written to any TAG config file, `sandbox_runs`, or log. |
 | G2 | Inject secrets into sandbox workloads as environment variables or ephemeral temp files at runtime, with zero-on-exit memory clearing for in-process buffers. |
 | G3 | `tag sandbox secret list` shows only names and metadata; values are never displayed in any list or table output. |
-| G4 | Derive the vault master key from a user passphrase via Argon2id; store derived key in OS keychain via `keyring`; fall back to `~/.tag/vault/.key` (mode 0600) when keychain is unavailable. |
+| G4 | Derive the vault master key from a user passphrase via Argon2id; store derived key in OS keychain via `zalando/go-keyring`; fall back to `~/.tag/vault/.key` (mode 0600) when keychain is unavailable. |
 | G5 | Write a tamper-evident audit record for every secret operation (add, delete, inject, list) to `secret_audit` in `tag.sqlite3`. |
 | G6 | `tag sandbox run --secret NAME` syntax binds a named vault secret to the sandbox invocation; multiple `--secret` flags are supported. |
 | G7 | `tag sandbox secret inject-file --name DB_CERT --mount /run/secrets/db.crt` delivers a secret as an ephemeral read-only file inside the sandbox (Docker and E2B backends). |
 | G8 | Secrets survive across shell sessions; the vault persists at `~/.tag/vault/vault.db`. |
 | G9 | `tag sandbox secret rotate --name OPENAI_KEY` re-encrypts a secret with a fresh nonce without exposing the plaintext value. |
-| G10 | Zero mandatory new binary dependencies; `cryptography` (already a transitive dependency of many Python packages) is the only new Python import; `keyring` is optional. |
+| G10 | Zero mandatory new binary dependencies; AES-256-GCM and Argon2id come from the Go standard library and `golang.org/x/crypto` (no cgo, CGO_ENABLED=0 preserved); `zalando/go-keyring` is the only optional module. |
 
 ---
 
@@ -83,7 +85,7 @@ TAG supports multi-step agent workflows (queue jobs, swarm agents, DAG pipelines
 | Vault size | 10,000 secrets stored and retrieved in < 50 ms | SQLite benchmark with 10k rows |
 | Key derivation time | Argon2id KDF completes in 200–500 ms on reference hardware (M-series Mac, c5.xlarge) | Timed unit test |
 | Keychain integration | On macOS, derived key is stored in and retrieved from Keychain without user prompt after first unlock | Manual verification test on macOS 14+ |
-| Memory zero-on-exit | Decrypted secret bytes are zeroed before `run_sandbox()` returns | Unit test with `ctypes` memory inspection post-call |
+| Memory zero-on-exit | Decrypted secret bytes are zeroed before `RunSandbox()` returns | Unit test asserts the backing `[]byte` slice is all-zero after the call |
 
 ---
 
@@ -123,7 +125,7 @@ tag sandbox secret add \
 ```
 
 - `--name`: Identifier used to reference the secret in `--secret` flags. Must match `[A-Z][A-Z0-9_]*` (POSIX env var convention). Required.
-- `--value`: Plaintext value. Mutually exclusive with `--from-env` and `--from-file`. If none of the three are provided, the CLI prompts interactively using `getpass.getpass()` so the value is never echoed.
+- `--value`: Plaintext value. Mutually exclusive with `--from-env` and `--from-file`. If none of the three are provided, the CLI prompts interactively using `golang.org/x/term.ReadPassword` so the value is never echoed.
 - `--from-env VAR`: Read the current value of environment variable `VAR` and store it. Useful in CI.
 - `--from-file PATH`: Read the first 65536 bytes of `PATH` and store as the secret value. Useful for certificates, private keys, JSON service account files.
 - `--description`: Human-readable description stored in the vault metadata (plaintext, not encrypted; do not put sensitive data here).
@@ -298,25 +300,25 @@ TIMESTAMP              OP       NAME         RUN_ID              USER
 |----|-------------|-------------------|
 | FR-01 | Vault database created at `~/.tag/vault/vault.db` on first `secret add`, with file mode 0600. | `os.stat(vault_path).st_mode & 0o777 == 0o600` after first add |
 | FR-02 | Each secret ciphertext uses AES-256-GCM with a unique 96-bit random nonce per secret per write. | Read two rows; assert nonces differ. Assert nonce length == 12 bytes. |
-| FR-03 | Vault master key is derived via Argon2id with at minimum: time_cost=3, memory_cost=65536 (64 MiB), parallelism=1, hash_len=32. | Unit test verifies `argon2.low_level.hash_secret_raw` called with these parameters |
-| FR-04 | On macOS/Linux/Windows with `keyring` installed, derived key is stored in and retrieved from the OS keychain under service name `tag-vault`. | Integration test: store key, restart process, retrieve without re-prompting passphrase |
-| FR-05 | If `keyring` is unavailable, derived key is written to `~/.tag/vault/.key` with mode 0600 and a warning printed. | Unit test with mocked ImportError for keyring; assert file created with correct mode |
-| FR-06 | Passphrase can be supplied via `TAG_VAULT_PASSPHRASE` environment variable for CI/non-interactive use; when set, no passphrase prompt is issued. | Test: set env var, call `secret add` without TTY; assert no prompt |
+| FR-03 | Vault master key is derived via Argon2id with at minimum: time=3, memory=65536 (64 MiB), threads=1, keyLen=32. | Unit test verifies `argon2.IDKey` is invoked with `time=3, memory=64*1024, threads=1, keyLen=32` |
+| FR-04 | On macOS/Linux/Windows where `go-keyring` has a usable backend, the derived key is stored in and retrieved from the OS keychain under service name `tag-vault`. | Integration test: store key, restart process, retrieve without re-prompting passphrase |
+| FR-05 | If `go-keyring` reports no backend (`keyring.ErrUnsupportedPlatform`/error), the derived key is written to `~/.tag/vault/.key` with mode 0600 and a warning printed. | Unit test injects a keyring stub returning an error; assert file created with correct mode |
+| FR-06 | Passphrase can be supplied via `TAG_VAULT_PASSPHRASE` environment variable for CI/non-interactive use; when set, no passphrase prompt is issued. | Test: set env var, call `secret add` without a TTY; assert no prompt |
 | FR-07 | `secret add` rejects names that do not match `[A-Z][A-Z0-9_]*`; error message cites the naming constraint. | `secret add --name my-key` exits 1 with pattern-mismatch message |
-| FR-08 | `secret add` rejects values exceeding 65536 bytes; the value is zeroed from memory before the error is raised. | Test with 65537-byte value; assert exit 1 and no vault row created |
+| FR-08 | `secret add` rejects values exceeding 65536 bytes; the backing `[]byte` is zeroed before the error is returned. | Test with 65537-byte value; assert exit 1 and no vault row created |
 | FR-09 | `secret list` output never contains any substring that matches any stored ciphertext or plaintext value. | Store known value, capture `list` stdout, assert value not present |
 | FR-10 | `secret delete` overwrites the `ciphertext` column with `NULL` or zero bytes before executing `DELETE`. | Read row after failed delete (simulate); assert ciphertext is zeroed in the UPDATE |
 | FR-11 | `tag sandbox run --secret NAME` injects the secret into the sandbox process environment exclusively; the value does not appear in `sandbox_runs.command`, `sandbox_runs.output`, or `sandbox_runs.error`. | Integration test: print secret value inside sandbox; grep `sandbox_runs` for the known value |
-| FR-12 | In Docker backend, secrets are injected via `docker run --env NAME=VALUE` where VALUE is the decrypted string, never written to any intermediate file. | Inspect subprocess call args; assert no temp file written to disk |
-| FR-13 | In file-injection mode, the secret is written to a named temporary file, mounted read-only into the container (`--volume /tmp/tag-secret-XXXX:/run/secrets/name:ro`), and the temp file is unlinked after `docker run` returns. | Assert temp file does not exist after run; assert file was read-only inside container |
-| FR-14 | E2B backend injects secrets via `Sandbox.create(envs={...})` parameter, never via `sandbox.commands.run("export ...")`. | Unit test with mocked E2B SDK; assert `envs` kwarg populated, no export command issued |
-| FR-15 | Modal backend injects secrets via `modal.Secret.from_dict({...})` passed to the Modal function invocation. | Unit test with mocked Modal SDK; assert `secrets` param populated |
-| FR-16 | Restricted subprocess backend injects secrets by passing a filtered `env` dict to `subprocess.run`; the dict is built from `os.environ` copy with secrets merged in. | Assert subprocess called with correct `env` containing secret value |
-| FR-17 | Every secret operation writes a row to `secret_audit` in `tag.sqlite3` before the operation completes. If the audit write fails, the main operation is rolled back and an error is returned. | Mock DB write failure; assert main operation not committed |
+| FR-12 | The Docker backend injects secrets via the `docker/moby` client `container.Config.Env` field on `ContainerCreate` (the request body, never argv), where the value is the decrypted string, never written to any intermediate file. | Inspect the `ContainerCreate` request struct in a fake moby client; assert no temp file written to disk |
+| FR-13 | In file-injection mode, the secret is written to a `0400` temp file (`os.CreateTemp`), bind-mounted read-only into the container (`mount.Mount{Type: bind, ReadOnly: true, Source: <temp>, Target: /run/secrets/name}`), and the temp file is removed after the container run returns. | Assert temp file does not exist after run; assert file was read-only inside container |
+| FR-14 | The E2B backend injects secrets via the `envs` field of its create-sandbox HTTP request (Go HTTP client), never via a `commands.run("export ...")` call. | Unit test with a stub E2B transport; assert `envs` field populated, no export command issued |
+| FR-15 | The Modal backend injects secrets via the secret-dict field of its function-invoke HTTP request (Go HTTP client). | Unit test with a stub Modal transport; assert the secrets field populated |
+| FR-16 | The restricted backend injects secrets by setting `exec.Cmd.Env` to a filtered slice built from `os.Environ()` with the secrets merged in (no inheritance of unrelated host env). | Assert `Cmd.Env` contains the secret value and excludes filtered host vars |
+| FR-17 | Every secret operation writes a row to `secret_audit` in `tag.sqlite3` inside the same transaction as the main operation. If the audit write fails, the transaction is rolled back and an error is returned. | Inject a DB write failure; assert main operation not committed |
 | FR-18 | `secret audit` filters by `--name`, `--op`, `--since`, and `--last N`; all filters combine with AND semantics. | Test each filter in isolation and in combination |
 | FR-19 | `secret rotate` generates a new 96-bit nonce, re-encrypts with the same vault key, updates the row atomically in a single SQLite transaction; the old ciphertext is overwritten. | Assert new nonce != old nonce; assert row count unchanged; assert old ciphertext not retrievable |
 | FR-20 | When `--secret NAME` references a secret that does not exist in the vault, `sandbox run` exits with code 1 and prints `Error: secret 'NAME' not found in vault.` before starting any sandbox process. | Test with non-existent secret name |
-| FR-21 | Decrypted secret byte arrays are explicitly zeroed after use: for `bytearray` buffers call `memset`; for `str` objects use `ctypes.memset`. | Unit test using `ctypes` to inspect memory after vault read returns |
+| FR-21 | Decrypted secret values are held in `[]byte` (never `string`) and explicitly zeroed after use via a `zeroBytes(b []byte)` helper (a `for i := range b { b[i] = 0 }` loop the compiler must not elide). | Unit test inspects the slice contents after vault read returns; assert all-zero |
 | FR-22 | `secret add --from-file PATH` rejects symlinks and paths outside `~` to prevent path-traversal injection of system files. | Test with `/etc/passwd` symlink; assert rejection |
 | FR-23 | The vault database uses `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON` for consistency with the main `tag.sqlite3`. | Assert PRAGMA values after open |
 | FR-24 | `tag sandbox secret list --json` output is valid JSON and contains no `value` or `plaintext` key at any nesting level. | Parse JSON output; recurse all keys; assert absence of sensitive keys |
@@ -331,12 +333,12 @@ TIMESTAMP              OP       NAME         RUN_ID              USER
 | NFR-02 | Secret inject latency | Decryption and env-var injection adds < 5 ms to sandbox startup for up to 10 secrets |
 | NFR-03 | Vault DB size | 10,000 secrets with 64-byte values consume < 10 MB on disk (SQLite row overhead ~150 bytes per secret) |
 | NFR-04 | Audit table growth | `secret_audit` rows are append-only; table must support 1M rows without query degradation (index on `name`, `created_at`) |
-| NFR-05 | Cross-platform support | vault.py must run on macOS 12+, Ubuntu 20.04+, Windows 10+ (where Docker backend is available); `keyring` integration tested on macOS Keychain and Linux Secret Service |
-| NFR-06 | Dependency minimalism | Only new hard dependency is `cryptography>=42.0`; `argon2-cffi>=23.0` is new hard dependency; `keyring>=25.0` is optional soft dependency |
-| NFR-07 | Thread safety | Vault operations are safe to call from multiple threads (use per-connection SQLite with WAL; key derivation is idempotent and cached behind a `threading.Lock`) |
-| NFR-08 | No secret in core dumps | On Linux, call `prctl(PR_SET_DUMPABLE, 0)` before decryption if running as root; document that users should set `ulimit -c 0` for defense-in-depth |
-| NFR-09 | Test coverage | `secrets_vault.py` unit test coverage >= 90%; integration tests cover all four sandbox backends |
-| NFR-10 | Code auditability | `secrets_vault.py` is a standalone module with no imports from `controller.py`; it imports only stdlib + `cryptography` + optional `keyring`; total file size target < 600 lines |
+| NFR-05 | Cross-platform support | `internal/credentials/vault` must run on macOS 12+, Ubuntu 20.04+, Windows 10+ (where Docker backend is available); `go-keyring` integration tested on macOS Keychain and Linux Secret Service |
+| NFR-06 | Dependency minimalism | AES-256-GCM (`crypto/aes`+`crypto/cipher`) and Argon2id (`golang.org/x/crypto/argon2`) are the only crypto deps and require no cgo; `github.com/zalando/go-keyring` is an optional module; the SQLite store reuses the project-wide `modernc.org/sqlite` driver |
+| NFR-07 | Concurrency safety | Vault operations are safe to call from multiple goroutines (WAL-mode SQLite with a serialized writer; key derivation is idempotent and cached behind a `sync.Mutex`) |
+| NFR-08 | No secret in core dumps | On Linux, call `unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0)` (`golang.org/x/sys/unix`) before decryption if running as root; document that users should set `ulimit -c 0` for defense-in-depth |
+| NFR-09 | Test coverage | `internal/credentials/vault` coverage >= 90% (`go test -cover`); integration tests cover all four sandbox backends |
+| NFR-10 | Code auditability | `internal/credentials/vault` is a standalone package with no import of `internal/agent`; it imports only stdlib + `golang.org/x/crypto` + `modernc.org/sqlite` + optional `zalando/go-keyring`; target < 600 lines |
 
 ---
 
@@ -346,18 +348,23 @@ TIMESTAMP              OP       NAME         RUN_ID              USER
 
 | File | Purpose |
 |------|---------|
-| `src/tag/secrets_vault.py` | Vault client: key derivation, AES-256-GCM encrypt/decrypt, vault DB CRUD, audit writes |
-| `src/tag/vault_schema.sql` | SQL DDL for vault.db and the `secret_audit` table migration |
-| `tests/test_secrets_vault.py` | Unit + integration tests for vault module |
-| `tests/test_sandbox_secret_injection.py` | Integration tests for --secret flag across all backends |
+| `internal/credentials/vault/vault.go` | Vault client: key derivation, AES-256-GCM encrypt/decrypt, vault DB CRUD, audit writes |
+| `internal/credentials/vault/schema.sql` | SQL DDL (`go:embed`ed) for vault.db and the `secret_audit` table migration |
+| `internal/credentials/vault/vault_test.go` | Table-driven unit tests for the vault package |
+| `internal/sandbox/secret_inject.go` | `InjectSecrets` bridge + `Backend` env/file wiring |
+| `internal/sandbox/secret_inject_test.go` | Integration tests for the `--secret` flag across all backends |
+
+The vault package lives under `internal/credentials` (the 18-source credential + execution-backend home) and is imported by `internal/sandbox` for injection and by `internal/cli` for the `tag sandbox secret` command tree (cobra).
 
 ### 10.2 SQLite DDL
 
 #### `~/.tag/vault/vault.db` (separate database, mode 0600)
 
+The DDL is stored as an embedded `schema.sql` and applied by `vault.EnsureSchema(db *sql.DB)` over the pure-Go `modernc.org/sqlite` driver.
+
 ```sql
 -- vault.db: encrypted secrets store
--- Created by secrets_vault.py:ensure_vault_schema()
+-- Applied by vault.EnsureSchema() over modernc.org/sqlite
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 PRAGMA secure_delete = ON;   -- overwrite freed pages with zeros
@@ -394,14 +401,16 @@ CREATE INDEX IF NOT EXISTS idx_secrets_created ON secrets(created_at);
 
 #### `~/.tag/runtime/tag.sqlite3` audit table (appended by migration)
 
+This table is added to the main store by `store.migratePRD097SecretAudit(db)`, registered in the `internal/store` migration chain. It is a `CREATE TABLE IF NOT EXISTS`, so it is idempotent; had it needed `ALTER TABLE ... ADD COLUMN`, the migration would swallow the `duplicate column name` error returned by the driver (the standard guarded-migration idiom used across `internal/store`).
+
 ```sql
--- Added by _migrate_prd_097_secret_audit() in controller.py
+-- Added by store.migratePRD097SecretAudit() in the internal/store migration chain
 CREATE TABLE IF NOT EXISTS secret_audit (
   id          TEXT    PRIMARY KEY,   -- UUID4
   name        TEXT    NOT NULL,      -- secret name (never value)
   operation   TEXT    NOT NULL,      -- add|delete|inject|list|export|rotate
   run_id      TEXT,                  -- sandbox_runs.id if operation=inject, else NULL
-  os_user     TEXT    NOT NULL,      -- getpass.getuser()
+  os_user     TEXT    NOT NULL,      -- os/user.Current().Username
   is_warning  INTEGER NOT NULL DEFAULT 0,   -- 1 for export operations
   created_at  TEXT    NOT NULL
 );
@@ -411,195 +420,281 @@ CREATE INDEX IF NOT EXISTS idx_sa_run_id     ON secret_audit(run_id) WHERE run_i
 CREATE INDEX IF NOT EXISTS idx_sa_operation  ON secret_audit(operation, created_at);
 ```
 
-### 10.3 Core Dataclasses
+### 10.3 Core Types
 
-```python
-# src/tag/secrets_vault.py
-from __future__ import annotations
+```go
+// Package vault: internal/credentials/vault/vault.go
+package vault
 
-import os
-import uuid
-import sqlite3
-import getpass
-import secrets as _secrets
-import threading
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional
+import (
+	"database/sql"
+	"path/filepath"
+	"sync"
+	"time"
+)
 
+// InjectMode is a typed string constant (replaces the Python enum-by-convention).
+type InjectMode string
 
-@dataclass
-class VaultConfig:
-    """Paths and KDF parameters for the vault."""
-    vault_dir: Path = field(
-        default_factory=lambda: Path.home() / ".tag" / "vault"
-    )
-    db_name: str = "vault.db"
-    kdf_time_cost: int = 3
-    kdf_memory_cost: int = 65_536   # 64 MiB in KiB
-    kdf_parallelism: int = 1
-    kdf_hash_len: int = 32          # 256-bit AES key
-    keyring_service: str = "tag-vault"
-    keyring_username: str = "master-key"
+const (
+	InjectEnv  InjectMode = "env"
+	InjectFile InjectMode = "file"
+)
 
-    @property
-    def db_path(self) -> Path:
-        return self.vault_dir / self.db_name
+// Operation is the audited operation kind.
+type Operation string
 
-    @property
-    def key_fallback_path(self) -> Path:
-        return self.vault_dir / ".key"
+const (
+	OpAdd    Operation = "add"
+	OpDelete Operation = "delete"
+	OpInject Operation = "inject"
+	OpList   Operation = "list"
+	OpExport Operation = "export"
+	OpRotate Operation = "rotate"
+)
 
+// Config holds paths and KDF parameters for the vault.
+type Config struct {
+	VaultDir        string // default: ~/.tag/vault
+	DBName          string // default: "vault.db"
+	KDFTime         uint32 // Argon2id time cost, default 3
+	KDFMemory       uint32 // Argon2id memory in KiB, default 65536 (64 MiB)
+	KDFParallelism  uint8  // default 1
+	KDFKeyLen       uint32 // default 32 (256-bit AES key)
+	KeyringService  string // default "tag-vault"
+	KeyringUsername string // default "master-key"
+}
 
-@dataclass
-class SecretMeta:
-    """Vault metadata for a single secret (no plaintext value)."""
-    name: str
-    description: str
-    tags: dict[str, str]
-    size_bytes: int
-    inject_mode: str        # 'env' | 'file'
-    file_mount_path: Optional[str]
-    file_mode: int          # octal, e.g. 0o400
-    created_at: str
-    updated_at: str
-    last_used_at: Optional[str]
+func (c Config) DBPath() string      { return filepath.Join(c.VaultDir, c.DBName) }
+func (c Config) KeyFallback() string { return filepath.Join(c.VaultDir, ".key") }
 
+// DefaultConfig returns the vault defaults.
+func DefaultConfig(home string) Config {
+	return Config{
+		VaultDir:        filepath.Join(home, ".tag", "vault"),
+		DBName:          "vault.db",
+		KDFTime:         3,
+		KDFMemory:       64 * 1024,
+		KDFParallelism:  1,
+		KDFKeyLen:       32,
+		KeyringService:  "tag-vault",
+		KeyringUsername: "master-key",
+	}
+}
 
-@dataclass
-class AuditEvent:
-    """A single secret audit record."""
-    id: str
-    name: str
-    operation: str          # add | delete | inject | list | export | rotate
-    run_id: Optional[str]
-    os_user: str
-    is_warning: bool
-    created_at: str
+// SecretMeta is vault metadata for a single secret (never carries the plaintext).
+type SecretMeta struct {
+	Name          string            `json:"name"`
+	Description   string            `json:"description"`
+	Tags          map[string]string `json:"tags"`
+	SizeBytes     int               `json:"size_bytes"`
+	InjectMode    InjectMode        `json:"inject_mode"`
+	FileMountPath string            `json:"file_mount_path,omitempty"`
+	FileMode      uint32            `json:"file_mode"` // octal, e.g. 0o400
+	CreatedAt     time.Time         `json:"created_at"`
+	UpdatedAt     time.Time         `json:"updated_at"`
+	LastUsedAt    *time.Time        `json:"last_used_at,omitempty"`
+}
+
+// AuditEvent is a single secret audit record.
+type AuditEvent struct {
+	ID        string    `json:"id"` // UUIDv4
+	Name      string    `json:"name"`
+	Operation Operation `json:"operation"`
+	RunID     string    `json:"run_id,omitempty"`
+	OSUser    string    `json:"os_user"`
+	IsWarning bool      `json:"is_warning"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// Vault is the stateful client. The derived key is cached behind keyMu for the
+// process lifetime (idempotent KDF); it is never logged or serialized.
+type Vault struct {
+	cfg    Config
+	db     *sql.DB
+	keyMu  sync.Mutex
+	key    []byte // 32-byte AES-256 key, or nil until unlocked
+}
 ```
 
 ### 10.4 Vault Client Core Algorithms
 
-```python
-# Key derivation (called once per process, result cached)
-_KEY_CACHE: dict[str, bytes] = {}
-_KEY_LOCK = threading.Lock()
+```go
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"errors"
 
+	"golang.org/x/crypto/argon2"
+)
 
-def _derive_key(passphrase: str, salt: bytes, cfg: VaultConfig) -> bytes:
-    """Argon2id password-based key derivation. Result is 32 bytes (AES-256 key)."""
-    from argon2.low_level import hash_secret_raw, Type
-    return hash_secret_raw(
-        secret=passphrase.encode("utf-8"),
-        salt=salt,
-        time_cost=cfg.kdf_time_cost,
-        memory_cost=cfg.kdf_memory_cost,
-        parallelism=cfg.kdf_parallelism,
-        hash_len=cfg.kdf_hash_len,
-        type=Type.ID,
-    )
+// deriveKey performs Argon2id password-based derivation. Returns a 32-byte AES-256 key.
+// The result is cached on the Vault for the process lifetime (see unlock()).
+func (c Config) deriveKey(passphrase, salt []byte) []byte {
+	return argon2.IDKey(passphrase, salt, c.KDFTime, c.KDFMemory, c.KDFParallelism, c.KDFKeyLen)
+}
 
+// encrypt performs AES-256-GCM sealing. Returns (ciphertext, nonce, authTag).
+// The 16-byte GCM tag is split out to match the vault column layout; on read it
+// is re-appended before Open.
+func encrypt(plaintext, key []byte) (ciphertext, nonce, authTag []byte, err error) {
+	block, err := aes.NewCipher(key) // key len 32 => AES-256
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	gcm, err := cipher.NewGCM(block) // 12-byte nonce, 16-byte tag
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	nonce = make([]byte, gcm.NonceSize()) // 96-bit random nonce
+	if _, err = rand.Read(nonce); err != nil {
+		return nil, nil, nil, err
+	}
+	sealed := gcm.Seal(nil, nonce, plaintext, nil) // ciphertext||tag
+	tagLen := gcm.Overhead()                         // 16
+	return sealed[:len(sealed)-tagLen], nonce, sealed[len(sealed)-tagLen:], nil
+}
 
-def _encrypt(plaintext: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
-    """AES-256-GCM encrypt. Returns (ciphertext, nonce, auth_tag)."""
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    nonce = _secrets.token_bytes(12)        # 96-bit random nonce
-    aesgcm = AESGCM(key)
-    ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, None)
-    # cryptography library appends 16-byte GCM tag to ciphertext
-    ciphertext = ciphertext_with_tag[:-16]
-    auth_tag = ciphertext_with_tag[-16:]
-    return ciphertext, nonce, auth_tag
+// decrypt performs AES-256-GCM opening. Returns a non-nil error on authentication
+// failure (the Go equivalent of cryptography's InvalidTag). Caller zeroes plaintext.
+func decrypt(ciphertext, nonce, authTag, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	sealed := append(append([]byte{}, ciphertext...), authTag...)
+	pt, err := gcm.Open(nil, nonce, sealed, nil)
+	if err != nil {
+		return nil, errors.New("vault: authentication failed (tampered ciphertext or wrong key)")
+	}
+	return pt, nil
+}
 
-
-def _decrypt(ciphertext: bytes, nonce: bytes, auth_tag: bytes, key: bytes) -> bytes:
-    """AES-256-GCM decrypt. Raises InvalidTag on authentication failure."""
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    aesgcm = AESGCM(key)
-    return aesgcm.decrypt(nonce, ciphertext + auth_tag, None)
-
-
-def _zero_bytes(buf: bytearray) -> None:
-    """Overwrite a bytearray with zeros in-place."""
-    import ctypes
-    ctypes.memset((ctypes.c_char * len(buf)).from_buffer(buf), 0, len(buf))
+// zeroBytes overwrites b in place. Written as an explicit loop so the value is
+// clobbered even though Go's GC may have copied the backing array elsewhere.
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
 ```
 
-### 10.5 Injection Bridge: `inject_secrets_into_env()`
+> **Note on Fernet parity:** the Python design used `cryptography`'s Fernet/`AESGCM`. Fernet is a higher-level authenticated-encryption token format; the Go re-frame drops it in favor of `crypto/cipher` AES-256-GCM directly (authenticated encryption with a per-secret random nonce), which is equivalent in guarantees and avoids a third-party token format. `golang.org/x/crypto/nacl/secretbox` (XSalsa20-Poly1305) or `chacha20poly1305` are documented drop-in alternatives if a non-AES AEAD is preferred; AES-256-GCM is the default because it has hardware acceleration on all target CPUs.
 
-This is the core bridge between the vault and sandbox backends:
+### 10.5 Injection Bridge: `InjectSecrets`
 
-```python
-def inject_secrets_into_env(
-    names: list[str],
-    vault_cfg: VaultConfig,
-    base_env: dict[str, str],
-    *,
-    main_db_conn: sqlite3.Connection,
-    run_id: str,
-) -> tuple[dict[str, str], list[tuple[str, str]]]:
-    """
-    Decrypt named secrets and merge into base_env for env-mode secrets.
-    Returns:
-      - merged_env: dict to pass to subprocess / Docker / E2B as environment
-      - file_mounts: list of (host_temp_path, container_path) for file-mode secrets
+This is the core bridge between the vault and the sandbox `Backend` interface. It lives in `internal/sandbox/secret_inject.go`:
 
-    Writes an 'inject' audit event for each secret.
-    Caller is responsible for unlinking host_temp_path after sandbox exits.
-    Plaintext bytes are zeroed before this function returns.
-    """
+```go
+// FileMount pairs a host temp file with its in-sandbox target path (file-mode secrets).
+type FileMount struct {
+	HostPath      string // 0400 temp file the caller must remove after the run
+	ContainerPath string // e.g. /run/secrets/tls.crt
+	Mode          uint32 // e.g. 0o400
+}
+
+// InjectSecrets decrypts the named vault secrets and produces the environment
+// additions (env-mode) and file mounts (file-mode) for a sandbox run.
+//
+// mergedEnv is the []string ("KEY=VALUE") slice to hand to the Backend.
+// fileMounts must be removed by the caller after the sandbox process exits.
+// An 'inject' audit row is written for each secret inside the store transaction.
+// All decrypted []byte buffers are zeroed before InjectSecrets returns; only the
+// string form required at the OS boundary escapes into mergedEnv.
+func InjectSecrets(
+	ctx context.Context,
+	v *vault.Vault,
+	names []string,
+	baseEnv []string,
+	store *sql.DB,
+	runID string,
+) (mergedEnv []string, fileMounts []FileMount, err error)
 ```
 
-### 10.6 Integration Points with `sandbox.py`
+`InjectSecrets` returns an error before any process starts if a named secret is missing (FR-20), so the caller aborts the run without writing a `sandbox_runs` row.
 
-The existing `run_sandbox()` function in `sandbox.py` gains a `secret_names: list[str]` parameter:
+### 10.6 Integration Points with `internal/sandbox`
 
-```python
-def run_sandbox(
-    command: list[str],
-    *,
-    backend: str = "restricted",
-    image: str | None = None,
-    timeout: int = 60,
-    workdir: Path | None = None,
-    code: str | None = None,
-    secret_names: list[str] | None = None,   # NEW
-    cfg: dict | None = None,                  # for open_db() and VaultConfig
-) -> tuple[int, str, str]:
-    ...
-    # Before dispatching to backend:
-    if secret_names:
-        env, file_mounts = inject_secrets_into_env(
-            names=secret_names,
-            vault_cfg=VaultConfig(),
-            base_env=_safe_base_env(),
-            main_db_conn=conn,
-            run_id=run_id,
-        )
-    else:
-        env, file_mounts = _safe_base_env(), []
-    ...
-    # After sandbox exits, regardless of exit code:
-    finally:
-        for host_path, _ in file_mounts:
-            Path(host_path).unlink(missing_ok=True)
+Secret delivery is expressed through the `Backend` interface so each isolation tier
+(process/restricted, docker/moby, gVisor, firecracker) injects secrets in its native
+way. The `RunOpts` gains `SecretNames`, and `RunSandbox` wires injection in:
+
+```go
+// Backend is the isolation-ladder interface (process -> docker/moby -> gVisor -> firecracker).
+type Backend interface {
+	// Run executes cmd with the given environment and file mounts, honoring ctx
+	// for cancellation/timeout. Env is []string of "KEY=VALUE"; Mounts are the
+	// decrypted secret files (and any workspace mounts).
+	Run(ctx context.Context, cmd []string, env []string, mounts []FileMount) (Result, error)
+}
+
+type RunOpts struct {
+	Backend     string        // "restricted" | "docker" | "gvisor" | "firecracker" | "e2b" | "modal"
+	Image       string
+	Timeout     time.Duration
+	Workdir     string
+	Code        string
+	SecretNames []string // NEW — resolved against the vault at run time
+}
+
+func RunSandbox(ctx context.Context, v *vault.Vault, store *sql.DB, opts RunOpts) (Result, error) {
+	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	defer cancel()
+
+	env, mounts := safeBaseEnv(), []FileMount(nil)
+	if len(opts.SecretNames) > 0 {
+		var err error
+		env, mounts, err = InjectSecrets(ctx, v, opts.SecretNames, safeBaseEnv(), store, runID)
+		if err != nil {
+			return Result{}, err // aborts before any process starts (FR-20)
+		}
+	}
+	// Ensure temp secret files are removed regardless of outcome (FR-13).
+	defer func() {
+		for _, m := range mounts {
+			_ = os.Remove(m.HostPath)
+		}
+	}()
+
+	be := selectBackend(opts.Backend)
+	return be.Run(ctx, buildCommand(opts), env, mounts)
+}
 ```
 
-### 10.7 Controller Integration
+Per-backend env injection (never on argv, never in `sandbox_runs.command`):
 
-`controller.py` gains the following new command handler functions and CLI routes:
+- **restricted / process** — `exec.CommandContext(ctx, ...)` with `cmd.Env = env`.
+- **docker / gVisor** — `docker/moby` client: `container.Config{Env: env}` on `ContainerCreate`; file secrets as `mount.Mount{Type: mount.TypeBind, ReadOnly: true, ...}`.
+- **firecracker** — `firecracker-go-sdk`: env delivered via kernel boot-args / MMDS (metadata service), file secrets staged into the guest rootfs image before boot.
+- **e2b / modal** — Go HTTP client passes the secrets in the create/invoke request body (`envs` / secret-dict field).
 
+### 10.7 CLI Integration (cobra)
+
+`internal/cli` gains a `tag sandbox secret` command subtree (cobra), mirroring the `internal/cli/sandbox.go` group. Each leaf `RunE` calls the vault package:
+
+```go
+// internal/cli/sandbox_secret.go (abbreviated)
+func newSandboxSecretCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "secret", Short: "Manage the encrypted sandbox secrets vault"}
+	cmd.AddCommand(
+		newSecretAddCmd(),        // --name --value --from-env --from-file --description --tags --overwrite
+		newSecretListCmd(),       // --json --tags
+		newSecretDeleteCmd(),     // <NAME> --yes
+		newSecretRotateCmd(),     // --name
+		newSecretExportCmd(),     // --name --to-env
+		newSecretInjectFileCmd(), // --name --mount --mode
+		newSecretAuditCmd(),      // --name --op --since --last --json
+	)
+	return cmd
+}
 ```
-cmd_sandbox_secret_add(cfg, name, value, from_env, from_file, description, tags, overwrite)
-cmd_sandbox_secret_list(cfg, json_output, tags_filter)
-cmd_sandbox_secret_delete(cfg, name, yes)
-cmd_sandbox_secret_rotate(cfg, name)
-cmd_sandbox_secret_export(cfg, name, to_env)
-cmd_sandbox_secret_inject_file(cfg, name, mount, mode)
-cmd_sandbox_secret_audit(cfg, name, op, since, last, json_output)
-```
 
-And the `_migrate_prd_097_secret_audit()` migration is added to the existing migration chain called from `open_db()`.
+The `--secret` flag is added to the existing `tag sandbox run` command (`StringArrayVar`, repeatable). The `store.migratePRD097SecretAudit()` migration is registered in the `internal/store` migration chain run at DB open.
 
 ### 10.8 Vault Unlock Flow
 
@@ -607,51 +702,52 @@ And the `_migrate_prd_097_secret_audit()` migration is added to the existing mig
 tag sandbox secret add --name FOO --value bar
   │
   ▼
-1. Check TAG_VAULT_PASSPHRASE env var
+1. Check TAG_VAULT_PASSPHRASE env var (os.Getenv)
    If set → use as passphrase (CI mode)
-   If not set and TTY → getpass.getpass("Vault passphrase: ")
+   If not set and stdin is a TTY (golang.org/x/term.IsTerminal) → term.ReadPassword("Vault passphrase: ")
    If not set and no TTY → exit 1 "Set TAG_VAULT_PASSPHRASE for non-interactive use"
   │
   ▼
-2. Open vault.db (create if not exists)
-   If new vault: generate 16-byte salt, write vault_meta row
+2. Open vault.db via modernc.org/sqlite (create if not exists; EnsureSchema)
+   If new vault: crypto/rand 16-byte salt, insert vault_meta row
    If existing vault: read salt from vault_meta
   │
   ▼
-3. Check keyring for cached derived key
+3. Check go-keyring for cached derived key (keyring.Get("tag-vault","master-key"))
    If found → use directly (skip KDF)
-   If not found → run Argon2id KDF (~300ms)
-                → store result in keyring (or .key file)
+   If not found → run argon2.IDKey (~300ms)
+                → keyring.Set(...) (or write .key file 0600 on keyring error)
+   Cache on Vault.key under keyMu for the process lifetime
   │
   ▼
-4. Execute operation (encrypt/decrypt/delete/list)
+4. Execute operation (encrypt/decrypt/delete/list) in a store transaction
   │
   ▼
-5. Write audit event to tag.sqlite3
+5. Insert audit event into tag.sqlite3 in the SAME transaction, then commit
   │
   ▼
-6. Zero plaintext buffers
+6. zeroBytes() all decrypted []byte buffers
 ```
 
 ---
 
 ## 11. Security Considerations
 
-1. **AES-256-GCM authentication tag verification.** The `cryptography` library's `AESGCM.decrypt()` raises `cryptography.exceptions.InvalidTag` if the ciphertext has been tampered with. This exception must propagate to the caller as a hard error, not silently ignored. Any `InvalidTag` exception should be logged as a security event (without the ciphertext value) and abort the operation.
+1. **AES-256-GCM authentication tag verification.** Go's `cipher.AEAD.Open` returns a non-nil error (not the plaintext) if the ciphertext has been tampered with — the equivalent of `cryptography`'s `InvalidTag`. This error must propagate to the caller as a hard error, never discarded. Any authentication failure is logged as a security event (without the ciphertext value) and aborts the operation.
 
-2. **Nonce uniqueness.** AES-GCM is catastrophically broken if a (key, nonce) pair is reused. The 96-bit nonce is generated via `secrets.token_bytes(12)` (CSPRNG) for every `add` and `rotate` operation. The probability of a nonce collision for a single key across 2^32 secrets is less than 2^-64 — negligible for local use cases. No counter-based nonce scheme is used.
+2. **Nonce uniqueness.** AES-GCM is catastrophically broken if a (key, nonce) pair is reused. The 96-bit nonce is generated via `crypto/rand.Read` into a `gcm.NonceSize()` (12-byte) buffer for every `add` and `rotate` operation. The probability of a nonce collision for a single key across 2^32 secrets is less than 2^-64 — negligible for local use cases. No counter-based nonce scheme is used.
 
-3. **Vault key never in `sandbox_runs`.** The `run_sandbox()` function writes the `command` string (the user-facing template) to `sandbox_runs.command` before calling `inject_secrets_into_env()`. The env dict containing decrypted secrets is passed directly to `subprocess.run(env=...)`, `docker run --env`, or the E2B/Modal SDK; it is never concatenated into a loggable command string.
+3. **Vault key never in `sandbox_runs`.** `RunSandbox` writes the `command` string (the user-facing template) to `sandbox_runs.command` before calling `InjectSecrets`. The `[]string` env slice containing decrypted secrets is passed directly to `exec.Cmd.Env`, the moby client's `container.Config.Env`, or the E2B/Modal HTTP request body; it is never concatenated into a loggable command string.
 
-4. **Process list exposure.** For the Docker backend, secrets are passed via `--env NAME=VALUE` in the `docker run` subprocess arguments. On Linux, `/proc/<pid>/cmdline` is readable by the local user during the brief window between `Popen` and container start. To mitigate: use `docker run --env-file <(echo KEY=VALUE)` with a process substitution (fd-based pipe) on Linux, so the value never appears in `cmdline`. On macOS, process argument inspection is restricted to root by default.
+4. **Process list exposure.** The Go Docker backend uses the `docker/moby` API client rather than shelling out to `docker run`: environment variables travel in the `ContainerCreate` request body over the daemon socket, never on any process `argv`. This structurally eliminates the `/proc/<pid>/cmdline` exposure window that the CLI (`docker run --env NAME=VALUE`) had — a strict improvement over the Python design. For the restricted backend, `exec.Cmd.Env` is likewise passed via the process environment (not argv). On macOS, process argument inspection is restricted to root by default.
 
 5. **`PRAGMA secure_delete = ON`.** The vault DB uses SQLite's `secure_delete` pragma, which causes SQLite to overwrite deleted database pages with zeros before freeing them. This is defense-in-depth against recovery of deleted secret bytes from disk.
 
 6. **OS keychain as secondary storage.** The derived key (not the passphrase, not any secret value) is stored in the OS keychain. The keychain entry is 32 bytes — not the secret itself. Even if the keychain is compromised, an attacker needs the vault DB to recover secrets. Even if the vault DB is copied, an attacker needs the keychain key or the passphrase to decrypt.
 
-7. **Vault directory permissions.** `secrets_vault.py:ensure_vault_dir()` creates `~/.tag/vault/` with mode `0700` (owner-only access). The vault DB is created with mode `0600`. If the directory or file is found with broader permissions, a warning is printed and the operation is aborted.
+7. **Vault directory permissions.** `vault.ensureVaultDir()` creates `~/.tag/vault/` with mode `0700` (owner-only access) via `os.MkdirAll` + `os.Chmod`. The vault DB is created with mode `0600`. If the directory or file is found with broader permissions, a warning is printed and the operation is aborted.
 
-8. **Memory zeroing is best-effort in CPython.** CPython strings are immutable; once a secret is assigned to a `str`, the bytes cannot be reliably zeroed because the interpreter may hold internal references. The vault API uses `bytearray` for decrypted values throughout and calls `_zero_bytes()` before returning. Callers are responsible for not converting to `str` until the last possible moment (env dict construction for subprocess). The env dict passed to `subprocess.run` is a `{str: str}` dict as required by the Python API; the str conversion is unavoidable at the system boundary.
+8. **Memory zeroing is best-effort in Go.** Go `string` values are immutable and garbage-collected; once a secret is materialized as a `string`, the bytes cannot be reliably wiped because the runtime may have copied them. The vault API therefore carries decrypted values as `[]byte` throughout and calls `zeroBytes()` before returning; the zeroing loop is written so the compiler cannot elide it. Callers must not convert to `string` until the last possible moment. The final `KEY=VALUE` entries in the `[]string` env passed to `exec.Cmd.Env` / the moby API are unavoidably string-typed at the OS boundary; the GC may relocate them, so this residual exposure is documented, not eliminated (identical to the CPython constraint).
 
 9. **Export operation is audited with warning flag.** `secret export` is the only operation that intentionally exposes a plaintext value outside the sandbox. Its `secret_audit` row has `is_warning=1`. A separate `tag sandbox secret audit --op export` query surfaces all historical export events for review.
 
@@ -665,42 +761,44 @@ tag sandbox secret add --name FOO --value bar
 
 ## 12. Testing Strategy
 
-### 12.1 Unit Tests (`tests/test_secrets_vault.py`)
+Tests use Go's `testing` package, table-driven cases where the inputs vary, and interfaces + dependency injection for mocking (a `Keyring` interface and a `Backend` interface, both stubbed in tests). No global monkeypatching; the OS-keychain and sandbox backends are injected.
+
+### 12.1 Unit Tests (`internal/credentials/vault/vault_test.go`)
 
 | Test | Description |
 |------|-------------|
-| `test_encrypt_decrypt_roundtrip` | Encrypt a known plaintext, decrypt, assert equality; assert nonce is 12 bytes |
-| `test_nonce_uniqueness` | Call `_encrypt` 1000 times; assert all nonces are distinct |
-| `test_invalid_tag_raises` | Corrupt 1 byte of ciphertext; assert `InvalidTag` raised on decrypt |
-| `test_argon2id_params` | Mock `hash_secret_raw`; assert called with `time_cost=3, memory_cost=65536, type=Type.ID` |
-| `test_vault_dir_created_mode_0700` | Call `ensure_vault_dir` on temp path; assert directory mode |
-| `test_vault_db_mode_0600` | After first `secret add`, assert vault DB file mode |
-| `test_name_validation_rejects_lowercase` | `secret add --name lower_case`; assert ValueError |
-| `test_name_validation_accepts_uppercase` | `secret add --name VALID_KEY`; assert no error |
-| `test_value_size_limit` | Pass 65537-byte value; assert VaultError raised before DB write |
-| `test_list_contains_no_values` | Add secret, call `list_secrets()`; assert returned SecretMeta has no `value` field |
-| `test_delete_zeros_ciphertext` | After delete, assert the row's ciphertext column was overwritten before DELETE |
-| `test_rotate_new_nonce` | `rotate_secret`; assert new_nonce != old_nonce; assert decrypt still works |
-| `test_memory_zero_after_decrypt` | Use `ctypes` to inspect buffer after `_zero_bytes(buf)`; assert all zeros |
-| `test_audit_written_on_add` | Add secret; assert `secret_audit` row count == 1, operation == 'add' |
-| `test_audit_written_on_inject` | Call `inject_secrets_into_env`; assert audit row with operation == 'inject' |
-| `test_audit_rollback_on_main_failure` | Mock main operation to fail; assert audit row NOT written |
-| `test_keyring_cache_hit` | Mock keyring; assert `_derive_key` not called on second vault unlock |
-| `test_env_var_passphrase` | Set `TAG_VAULT_PASSPHRASE`; call add without TTY; assert no prompt |
-| `test_secure_delete_pragma` | Open vault DB; `PRAGMA secure_delete`; assert `= on` |
-| `test_integrity_check_on_open` | Corrupt vault DB; assert `VaultIntegrityError` raised on open |
+| `TestEncryptDecryptRoundtrip` | Encrypt a known plaintext, decrypt, assert equality; assert nonce is 12 bytes |
+| `TestNonceUniqueness` | Call `encrypt` 1000 times; assert all nonces are distinct |
+| `TestOpenRejectsTamperedCiphertext` | Corrupt 1 byte of ciphertext; assert `decrypt` returns a non-nil error |
+| `TestArgon2idParams` | Assert `deriveKey` calls `argon2.IDKey` with `time=3, memory=64*1024, threads=1, keyLen=32` (verified via a known-answer vector) |
+| `TestVaultDirMode0700` | Call `ensureVaultDir` on a temp path; assert directory mode via `os.Stat` |
+| `TestVaultDBMode0600` | After first `AddSecret`, assert vault DB file mode |
+| `TestNameValidationRejectsLowercase` | `AddSecret` with `lower_case`; assert error |
+| `TestNameValidationAcceptsUppercase` | `AddSecret` with `VALID_KEY`; assert no error |
+| `TestValueSizeLimit` | Pass 65537-byte value; assert error returned before DB write |
+| `TestListContainsNoValues` | Add secret, call `ListSecrets`; assert returned `SecretMeta` has no value field |
+| `TestDeleteZerosCiphertext` | After delete, assert the row's ciphertext column was overwritten before DELETE |
+| `TestRotateNewNonce` | `RotateSecret`; assert new nonce != old nonce; assert decrypt still works |
+| `TestZeroBytesAfterDecrypt` | Inspect the `[]byte` slice after `zeroBytes(buf)`; assert all zero |
+| `TestAuditWrittenOnAdd` | Add secret; assert `secret_audit` row count == 1, operation == `add` |
+| `TestAuditWrittenOnInject` | Call `InjectSecrets`; assert audit row with operation == `inject` |
+| `TestAuditRollbackOnMainFailure` | Inject a store failure; assert the transaction rolls back and no audit row is written |
+| `TestKeyringCacheHit` | Stub `Keyring`; assert `deriveKey` not called on second unlock (key cached under `keyMu`) |
+| `TestEnvVarPassphrase` | Set `TAG_VAULT_PASSPHRASE`; call add with no TTY; assert no prompt |
+| `TestSecureDeletePragma` | Open vault DB; `PRAGMA secure_delete`; assert `= 1` |
+| `TestIntegrityCheckOnOpen` | Corrupt vault DB; assert `Open` returns an integrity error |
 
-### 12.2 Integration Tests (`tests/test_sandbox_secret_injection.py`)
+### 12.2 Integration Tests (`internal/sandbox/secret_inject_test.go`)
 
 | Test | Description |
 |------|-------------|
-| `test_restricted_backend_env_injection` | Add secret, run with restricted backend, assert secret value appears in subprocess env via echo; assert `sandbox_runs.command` does not contain value |
-| `test_docker_backend_env_injection` | (requires Docker) Add secret, run docker sandbox, assert env var accessible inside container |
-| `test_docker_backend_file_injection` | (requires Docker) Add secret with `inject_mode='file'`, run, assert file readable at mount path inside container; assert temp file deleted on host after run |
-| `test_nonexistent_secret_hard_error` | Pass `--secret DOES_NOT_EXIST`; assert exit 1 before docker/subprocess started |
-| `test_multiple_secrets_injected` | Add 3 secrets, pass all 3 via `--secret`; assert all 3 env vars accessible inside sandbox |
-| `test_output_does_not_contain_secret` | Sandboxed code echoes secret; assert `sandbox_runs.output` column in DB does NOT contain the known secret value (scrubbing is post-hoc — this test validates that the command column is clean) |
-| `test_audit_run_id_linked` | After `--secret` injection run, assert `secret_audit.run_id` matches `sandbox_runs.id` |
+| `TestRestrictedBackendEnvInjection` | Add secret, run with restricted backend, assert value appears in `cmd.Env` via echo; assert `sandbox_runs.command` does not contain value |
+| `TestDockerBackendEnvInjection` | (requires Docker; `t.Skip` otherwise) Add secret, run docker sandbox via moby client, assert env var accessible inside container |
+| `TestDockerBackendFileInjection` | (requires Docker) Add secret with `InjectFile`, run, assert file readable at mount path inside container; assert temp file removed on host after run |
+| `TestNonexistentSecretHardError` | Pass `--secret DOES_NOT_EXIST`; assert error before any backend `Run`; no `sandbox_runs` row created |
+| `TestMultipleSecretsInjected` | Add 3 secrets, pass all 3; assert all 3 env vars accessible inside sandbox |
+| `TestOutputDoesNotContainSecret` | Sandboxed code echoes secret; assert `sandbox_runs.command` column does NOT contain the known value |
+| `TestAuditRunIDLinked` | After injection run, assert `secret_audit.run_id` matches `sandbox_runs.id` |
 
 ### 12.3 Performance Tests
 
@@ -745,17 +843,17 @@ tag sandbox secret add --name FOO --value bar
 
 | Dependency | Type | Version | Purpose | Already Present? |
 |------------|------|---------|---------|-----------------|
-| `cryptography` | Hard (new) | >= 42.0 | AES-256-GCM via `AESGCM`; `InvalidTag` exception | No (add to pyproject.toml) |
-| `argon2-cffi` | Hard (new) | >= 23.0 | Argon2id KDF via `argon2.low_level.hash_secret_raw` | No (add to pyproject.toml) |
-| `keyring` | Soft (optional) | >= 25.0 | OS keychain integration for derived key storage | No (optional extras) |
-| `sqlite3` | stdlib | — | Vault DB and audit table | Yes |
-| `secrets` | stdlib | — | CSPRNG for nonce generation | Yes |
-| `getpass` | stdlib | — | Passphrase prompt without echo | Yes |
-| `ctypes` | stdlib | — | Memory zeroing of decrypted buffers | Yes |
-| PRD-028 (sandbox.py) | Internal | — | `run_sandbox()` to extend with `secret_names` param | Yes (implemented) |
-| PRD-034 (security.py) | Internal | — | Pattern library reference for audit log filtering | Yes (implemented) |
-| PRD-013 (tracing.py) | Internal | — | Audit event correlation with trace spans | Yes (implemented) |
-| PRD-008 (queue_worker.py) | Internal | — | Future: queue jobs referencing vault secrets | Yes (implemented) |
+| `crypto/aes` + `crypto/cipher` | stdlib | — | AES-256-GCM authenticated encryption (`cipher.AEAD`) | Yes (Go stdlib) |
+| `crypto/rand` | stdlib | — | CSPRNG for nonce and salt generation | Yes (Go stdlib) |
+| `golang.org/x/crypto/argon2` | Hard (new) | latest | Argon2id KDF via `argon2.IDKey` | No (add to go.mod) |
+| `github.com/zalando/go-keyring` | Soft (optional) | latest | OS keychain integration for derived key storage | No (add to go.mod) |
+| `modernc.org/sqlite` | Hard | project-wide | Pure-Go SQLite driver for vault.db + audit table (CGO_ENABLED=0) | Yes (project driver) |
+| `golang.org/x/term` | Hard | latest | Passphrase prompt without echo (`ReadPassword`) | Likely (CLI already uses it) |
+| `golang.org/x/sys/unix` | Hard | latest | `Prctl(PR_SET_DUMPABLE, 0)` core-dump suppression (Linux) | Likely |
+| PRD-028 (`internal/sandbox`) | Internal | — | `RunSandbox` / `Backend` interface to extend with `SecretNames` | Yes (implemented) |
+| PRD-034 (`internal/obs` scanning) | Internal | — | Pattern library reference for audit log filtering | Yes (implemented) |
+| PRD-013 (`internal/obs` tracing) | Internal | — | Audit event correlation with OTel spans | Yes (implemented) |
+| PRD-008 (`internal/queue`) | Internal | — | Future: queue jobs referencing vault secrets | Yes (implemented) |
 
 ---
 
@@ -765,7 +863,7 @@ tag sandbox secret add --name FOO --value bar
 |----|----------|-------|-------------------|
 | OQ-01 | Should the vault passphrase be derivable from the user's system login password (PAM integration on Linux, Keychain login keychain on macOS) so users never need to set a separate passphrase? | Security lead | Before implementation kickoff |
 | OQ-02 | Should `secret add` accept a `--ttl <duration>` so secrets auto-expire? Useful for short-lived CI tokens. | Product | v2 consideration; not blocking v1 |
-| OQ-03 | For the Docker backend, should we use `--env-file /dev/stdin` (piped from Python) instead of `--env NAME=VALUE` to eliminate cmdline exposure? This requires Docker 20.10+ and Linux process substitution support. | Engineering | During implementation |
+| OQ-03 | The Go Docker backend uses the `docker/moby` API client (env travels in the `ContainerCreate` body, so cmdline exposure is already eliminated). Should we still support a `docker` CLI fallback for hosts without socket access, and if so, use `--env-file` via an `os.Pipe` rather than `--env NAME=VALUE`? | Engineering | During implementation |
 | OQ-04 | Should `inject_secrets_into_env` scrub the `sandbox_runs.output` column post-run using the known secret values as a regex? This would prevent secrets echoed by careless code from persisting. The counterargument is that scrubbing may mask debugging information. | Security + Product | Design review |
 | OQ-05 | Should the vault support named secret groups (analogous to Modal's `Secret` objects), where `tag sandbox run --secret-group MY_APP_SECRETS` injects all secrets tagged with that group? | Product | v2 |
 | OQ-06 | Should `tag sandbox secret audit` be surfaced in the existing `tag trace` output (e.g., as child spans under a sandbox run span in PRD-013)? | Engineering | PRD-013 owner alignment |
@@ -778,43 +876,43 @@ tag sandbox secret add --name FOO --value bar
 
 ### Phase 1 — Vault Core (Days 1–4)
 
-- Implement `secrets_vault.py`: `VaultConfig`, `SecretMeta`, `AuditEvent` dataclasses.
-- Implement `ensure_vault_dir()`, `ensure_vault_schema()`, `_open_vault_db()`.
-- Implement Argon2id KDF with `keyring` integration and `.key` fallback.
-- Implement `_encrypt()`, `_decrypt()`, `_zero_bytes()`.
-- Implement `add_secret()`, `list_secrets()`, `delete_secret()`, `rotate_secret()`.
-- Unit tests for all crypto primitives and vault CRUD (AC-01, AC-03, AC-04, AC-06, AC-11, AC-12).
+- Implement `internal/credentials/vault`: `Config`, `SecretMeta`, `AuditEvent`, `Vault`, and the `InjectMode`/`Operation` typed constants.
+- Implement `ensureVaultDir()`, `EnsureSchema()` (embedded `schema.sql`), `Open()` over `modernc.org/sqlite`.
+- Implement Argon2id KDF (`argon2.IDKey`) with `go-keyring` integration behind a `Keyring` interface and `.key` fallback.
+- Implement `encrypt()`, `decrypt()`, `zeroBytes()`.
+- Implement `AddSecret()`, `ListSecrets()`, `DeleteSecret()`, `RotateSecret()`.
+- Table-driven unit tests for all crypto primitives and vault CRUD (AC-01, AC-03, AC-04, AC-06, AC-11, AC-12).
 
 ### Phase 2 — Audit Layer (Day 5)
 
-- Add `_migrate_prd_097_secret_audit()` to `controller.py` migration chain.
-- Implement `write_audit_event()` in `secrets_vault.py`.
-- Ensure audit writes are transactional with main operations (FR-17).
+- Register `store.migratePRD097SecretAudit()` in the `internal/store` migration chain.
+- Implement `WriteAuditEvent()` in the vault package.
+- Ensure audit writes share the main operation's `*sql.Tx` (FR-17).
 - Tests: AC-05, AC-13.
 
 ### Phase 3 — Sandbox Integration (Days 6–8)
 
-- Extend `sandbox.py:run_sandbox()` with `secret_names` parameter.
-- Implement `inject_secrets_into_env()` for all four backends (restricted, docker, e2b, modal).
-- Implement file-injection mode with temp-file lifecycle management (FR-13).
+- Add `SecretNames` to `RunOpts`; wire `InjectSecrets` into `RunSandbox`.
+- Implement per-`Backend` injection (restricted via `exec.Cmd.Env`, docker/gVisor via moby `container.Config.Env`, firecracker via MMDS/boot-args, e2b/modal via HTTP body).
+- Implement file-injection mode with temp-file lifecycle via `defer os.Remove` (FR-13).
 - Integration tests for restricted and Docker backends (AC-02, AC-09, AC-10, AC-14).
-- CLI wiring: `cmd_sandbox_secret_*` handlers in `controller.py`.
+- CLI wiring: `tag sandbox secret` cobra subtree in `internal/cli`.
 
 ### Phase 4 — CLI Surface + Audit Query (Days 9–10)
 
-- Implement all `tag sandbox secret` subcommands: `add`, `list`, `delete`, `rotate`, `export`, `inject-file`, `audit`.
-- `--json` output for `list` and `audit` (AC-15).
-- `tag sandbox run --secret` flag plumbing.
+- Implement all `tag sandbox secret` subcommands: `add`, `list`, `delete`, `rotate`, `export`, `inject-file`, `audit` (cobra).
+- `--json` output for `list` and `audit` via `encoding/json` (AC-15).
+- `tag sandbox run --secret` flag plumbing (`StringArrayVar`).
 - End-to-end CLI tests matching AC-01 through AC-15.
 - Documentation update in `docs/prd/INDEX.md`.
 
 ### Phase 5 — Hardening and Review (Days 11–14)
 
-- Security review: verify memory zeroing, nonce uniqueness, permission checks, process-list exposure.
-- Performance benchmarks: KDF latency, inject latency, 10k-secret list.
-- Address OQ-03 (Docker `--env-file` via pipe) if decided.
+- Security review: verify `[]byte` zeroing, nonce uniqueness, permission checks, moby-vs-CLI process exposure.
+- Benchmarks (`go test -bench`): KDF latency, inject latency, 10k-secret list.
+- Address OQ-03 (moby client vs docker CLI `--env-file` fallback) if decided.
 - Address OQ-04 (output scrubbing) if decided.
-- Code coverage gate: `secrets_vault.py` >= 90%.
+- Coverage gate: `internal/credentials/vault` >= 90% (`go test -cover`).
 - PR review and merge.
 
 **Total estimated effort: 10–14 engineering days (M size estimate confirmed).**
