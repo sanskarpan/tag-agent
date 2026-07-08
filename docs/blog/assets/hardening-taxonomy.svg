@@ -1,0 +1,35 @@
+<svg viewBox="0 0 1400 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">TAG bug-bash taxonomy</title>
+  <desc id="desc">A ranked bar chart showing the phase-three bug taxonomy from the adversarial audit.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fffaf2"/><stop offset="1" stop-color="#eef7f0"/></linearGradient>
+    <style>.serif{font-family:Georgia,serif}.sans{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ink{fill:#14231f}.muted{fill:#68786f}.grid{stroke:#d8cfbf;stroke-width:1}</style>
+  </defs>
+  <rect width="1400" height="760" rx="34" fill="url(#bg)"/>
+  <text x="74" y="78" class="serif ink" font-size="38" font-weight="700">The real bugs were product-boundary bugs</text>
+  <text x="74" y="114" class="sans muted" font-size="17">Phase 3: 149 confirmed issues from auditors running the CLI in isolated sandboxes.</text>
+  <g transform="translate(250 170)" class="sans">
+    <g class="grid">
+      <line x1="0" y1="0" x2="0" y2="485"/><line x1="160" y1="0" x2="160" y2="485"/><line x1="320" y1="0" x2="320" y2="485"/><line x1="480" y1="0" x2="480" y2="485"/><line x1="640" y1="0" x2="640" y2="485"/>
+    </g>
+    <g font-size="13" class="muted" text-anchor="middle"><text x="0" y="520">0</text><text x="160" y="520">8</text><text x="320" y="520">16</text><text x="480" y="520">24</text><text x="640" y="520">32</text></g>
+    <g font-size="15" font-weight="800" fill="#14231f" text-anchor="end">
+      <text x="-22" y="28">wrong behavior</text><text x="-22" y="68">validation</text><text x="-22" y="108">data integrity</text><text x="-22" y="148">consistency</text><text x="-22" y="188">security</text><text x="-22" y="228">crash</text><text x="-22" y="268">dead code</text><text x="-22" y="308">resource leak</text><text x="-22" y="348">JSON contract</text><text x="-22" y="388">doc mismatch</text><text x="-22" y="428">exit code</text><text x="-22" y="468">cross-platform</text>
+    </g>
+    <g>
+      <rect x="0" y="8" width="620" height="24" rx="8" fill="#d98f72"/><rect x="0" y="48" width="380" height="24" rx="8" fill="#f0c46d"/><rect x="0" y="88" width="360" height="24" rx="8" fill="#8bd3bf"/><rect x="0" y="128" width="320" height="24" rx="8" fill="#dfe7c2"/><rect x="0" y="168" width="280" height="24" rx="8" fill="#c45f54"/><rect x="0" y="208" width="260" height="24" rx="8" fill="#a9a0d6"/><rect x="0" y="248" width="200" height="24" rx="8" fill="#90bde8"/><rect x="0" y="288" width="160" height="24" rx="8" fill="#b7cabf"/><rect x="0" y="328" width="140" height="24" rx="8" fill="#ead9f1"/><rect x="0" y="368" width="120" height="24" rx="8" fill="#d7c8aa"/><rect x="0" y="408" width="100" height="24" rx="8" fill="#cfe3f4"/><rect x="0" y="448" width="40" height="24" rx="8" fill="#a9b9b1"/>
+    </g>
+    <g font-size="13" fill="#14231f" font-weight="900">
+      <text x="636" y="27">31</text><text x="396" y="67">19</text><text x="376" y="107">18</text><text x="336" y="147">16</text><text x="296" y="187">14</text><text x="276" y="227">13</text><text x="216" y="267">10</text><text x="176" y="307">8</text><text x="156" y="347">7</text><text x="136" y="387">6</text><text x="116" y="427">5</text><text x="56" y="467">2</text>
+    </g>
+  </g>
+  <g transform="translate(980 205)">
+    <rect width="300" height="235" rx="26" fill="#123b35"/>
+    <text x="150" y="54" fill="#fff8ec" class="serif" font-size="32" font-weight="700" text-anchor="middle">200 total</text>
+    <text x="150" y="88" fill="#c9d8d1" class="sans" font-size="14" text-anchor="middle">149 in phase 3 + 51 in phase 4</text>
+    <text x="42" y="135" fill="#fff8ec" class="sans" font-size="14">Method:</text>
+    <text x="42" y="164" fill="#c9d8d1" class="sans" font-size="13">run the real CLI</text>
+    <text x="42" y="190" fill="#c9d8d1" class="sans" font-size="13">use isolated TAG_HOME</text>
+    <text x="42" y="216" fill="#c9d8d1" class="sans" font-size="13">verify findings independently</text>
+  </g>
+</svg>
