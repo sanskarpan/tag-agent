@@ -16,6 +16,16 @@ func newReg(t *testing.T) (*agent.Registry, string) {
 	return reg, root
 }
 
+func TestRegisterDisableBashOmitsBash(t *testing.T) {
+	reg := agent.NewRegistry()
+	Register(reg, Options{DisableBash: true})
+	for _, d := range reg.Defs() {
+		if d.Name == "bash" {
+			t.Error("bash must be omitted when DisableBash is set")
+		}
+	}
+}
+
 func TestWriteReadRoundTrip(t *testing.T) {
 	reg, root := newReg(t)
 	out, err := runNamed(t, reg, "write_file", map[string]any{"path": "sub/hello.txt", "content": "hi there"})

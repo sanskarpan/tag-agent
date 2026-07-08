@@ -17,11 +17,16 @@ func UpdateFact(db *sql.DB, memID, newContent, profile, reason string) (string, 
 	if newContent == "" {
 		return "", fmt.Errorf("memory content must not be empty")
 	}
+	tx, err := db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
 	var oldID, oldProfile, oldContent, oldType, oldSrc, oldCreated, oldValidAt string
 	var oldConf float64
 	var oldAccessed sql.NullString
 	var oldCount sql.NullInt64
-	err := db.QueryRow(`SELECT id, profile, content, memory_type, confidence, created_at,
+	err = tx.QueryRow(`SELECT id, profile, content, memory_type, confidence, created_at,
 		accessed_at, access_count, source, COALESCE(valid_at, created_at)
 		FROM semantic_memories WHERE id=? AND profile=?`, memID, profile).
 		Scan(&oldID, &oldProfile, &oldContent, &oldType, &oldConf, &oldCreated, &oldAccessed, &oldCount, &oldSrc, &oldValidAt)
@@ -34,21 +39,30 @@ func UpdateFact(db *sql.DB, memID, newContent, profile, reason string) (string, 
 	now := nowISO()
 	historyID := uuid.NewString()[:16]
 	newID := uuid.NewString()[:16]
-	if _, err := db.Exec(`INSERT INTO memory_fact_history
+	if _, err := tx.Exec(`INSERT INTO memory_fact_history
 		(history_id,original_id,successor_id,profile,content,memory_type,confidence,source,valid_at,invalid_at,reason,archived_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 		historyID, oldID, newID, oldProfile, oldContent, oldType, oldConf, oldSrc, oldValidAt, now, reason, now); err != nil {
 		return "", err
 	}
-	db.Exec(`DELETE FROM semantic_memories WHERE id=?`, oldID)
-	db.Exec(`DELETE FROM semantic_memories_fts WHERE id=?`, oldID)
-	if _, err := db.Exec(`INSERT INTO semantic_memories
+	if _, err := tx.Exec(`DELETE FROM semantic_memories WHERE id=?`, oldID); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(`DELETE FROM semantic_memories_fts WHERE id=?`, oldID); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(`INSERT INTO semantic_memories
 		(id,profile,content,memory_type,confidence,created_at,accessed_at,access_count,source,valid_at,tier)
 		VALUES(?,?,?,?,?,?,?,0,?,?,'archival')`,
 		newID, oldProfile, newContent, oldType, oldConf, now, now, oldSrc, now); err != nil {
 		return "", err
 	}
-	db.Exec(`INSERT INTO semantic_memories_fts(id,profile,content,memory_type) VALUES(?,?,?,?)`, newID, oldProfile, newContent, oldType)
+	if _, err := tx.Exec(`INSERT INTO semantic_memories_fts(id,profile,content,memory_type) VALUES(?,?,?,?)`, newID, oldProfile, newContent, oldType); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
 	return newID, nil
 }
 
@@ -85,6 +99,9 @@ func FactHistory(db *sql.DB, memID string) ([]FactVersion, error) {
 			return nil, err
 		}
 		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	// append the live version if it matches
 	var v FactVersion
@@ -125,6 +142,10 @@ func FactAt(db *sql.DB, profile, atTime string) ([]Mem, error) {
 		}
 		m.Confidence = effectiveConfidence(m.Confidence, m.MemoryType, m.CreatedAt)
 		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
 	rows.Close()
 	// archived versions valid at atTime (valid_at <= atTime < invalid_at)

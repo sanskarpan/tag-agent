@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -66,9 +68,12 @@ func registerBudget(root *cobra.Command, app *App) {
 			var wp float64
 			var en int
 			err = db.QueryRow(`SELECT id,max_tokens,period,warn_pct,enabled FROM token_budgets WHERE profile=?`, prof).Scan(&id, &mt, &pd, &wp, &en)
-			if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
 				outJSON(map[string]any{"profile": prof, "budget": nil}, fmt.Sprintf("No budget set for profile '%s'.", prof))
 				return nil
+			}
+			if err != nil {
+				return err
 			}
 			outJSON(map[string]any{"id": id, "profile": prof, "period": pd, "max_tokens": mt, "warn_pct": wp, "enabled": en != 0},
 				fmt.Sprintf("%s: %d tokens/%s (warn %d%%)", prof, mt, pd, int(wp*100)))
@@ -102,6 +107,9 @@ func registerBudget(root *cobra.Command, app *App) {
 				}
 				r.Enabled = en != 0
 				out = append(out, r)
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			if flagJSON {
 				return emitJSON(out)
@@ -149,7 +157,10 @@ func registerBudget(root *cobra.Command, app *App) {
 			var wp float64
 			var en int
 			err = db.QueryRow(`SELECT id,period,max_tokens,warn_pct,enabled FROM token_budgets WHERE profile=?`, prof).Scan(&id, &pd, &mt, &wp, &en)
-			if err != nil || en == 0 {
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if errors.Is(err, sql.ErrNoRows) || en == 0 {
 				if flagJSON {
 					b, _ := json.Marshal(map[string]any{"profile": prof, "budget": nil, "unlimited": true})
 					fmt.Println(string(b))

@@ -61,6 +61,9 @@ func registerMemory(root *cobra.Command, app *App) {
 				}
 				items = append(items, map[string]string{"key": k, "value": v})
 			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
 			if flagJSON {
 				b, _ := json.Marshal(items)
 				fmt.Println(string(b))

@@ -62,7 +62,9 @@ func Add(db *sql.DB, profile, content, memType string, confidence float64) (stri
 	if err != nil {
 		return "", err
 	}
-	_, _ = db.Exec(`INSERT INTO semantic_memories_fts(id,profile,content,memory_type) VALUES(?,?,?,?)`, id, profile, content, memType)
+	if _, err := db.Exec(`INSERT INTO semantic_memories_fts(id,profile,content,memory_type) VALUES(?,?,?,?)`, id, profile, content, memType); err != nil {
+		return "", err
+	}
 	return id, nil
 }
 
@@ -122,7 +124,7 @@ func Search(db *sql.DB, profile, query string, limit int, memType string) ([]Mem
 		q += ` AND m.memory_type=?`
 		args = append(args, memType)
 	}
-	q += ` ORDER BY bm25(semantic_memories_fts, 1.5, 0.75) LIMIT ?`
+	q += ` ORDER BY bm25(semantic_memories_fts, 0, 0, 1, 0) LIMIT ?`
 	args = append(args, limit)
 	res, err := scan(db, q, args...)
 	if err != nil {
@@ -139,7 +141,7 @@ func Search(db *sql.DB, profile, query string, limit int, memType string) ([]Mem
 	if len(res) > 0 {
 		now := nowISO()
 		for _, m := range res {
-			db.Exec(`UPDATE semantic_memories SET access_count=access_count+1, accessed_at=? WHERE id=?`, now, m.ID)
+			_, _ = db.Exec(`UPDATE semantic_memories SET access_count=access_count+1, accessed_at=? WHERE id=?`, now, m.ID)
 		}
 	}
 	return res, nil
@@ -162,9 +164,17 @@ func Forget(db *sql.DB, profile, id string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	_, _ = db.Exec(`DELETE FROM semantic_memories_fts WHERE id=?`, id)
-	n, _ := r.RowsAffected()
-	return n > 0, nil
+	n, err := r.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, nil
+	}
+	if _, err := db.Exec(`DELETE FROM semantic_memories_fts WHERE id=?`, id); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Stats returns per-type counts with both the average BASE confidence
@@ -189,6 +199,10 @@ func Stats(db *sql.DB, profile string) (map[string]map[string]any, error) {
 			return nil, err
 		}
 		baseSum[mt] += c
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
 	rows.Close()
 

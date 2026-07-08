@@ -135,7 +135,16 @@ func buildAnthropicBody(req Request) map[string]any {
 		"stream":     true,
 	}
 	if system != "" {
-		body["system"] = system
+		if req.CacheHint {
+			// A breakpoint on the last system block caches the tools+system prefix
+			// (tools render before system in the Messages API prompt).
+			body["system"] = []map[string]any{{
+				"type": "text", "text": system,
+				"cache_control": map[string]any{"type": "ephemeral"},
+			}}
+		} else {
+			body["system"] = system
+		}
 	}
 	if len(req.Tools) > 0 {
 		var tools []map[string]any
@@ -145,6 +154,9 @@ func buildAnthropicBody(req Request) map[string]any {
 				schema = map[string]any{"type": "object"}
 			}
 			tools = append(tools, map[string]any{"name": t.Name, "description": t.Description, "input_schema": schema})
+		}
+		if req.CacheHint {
+			tools[len(tools)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
 		}
 		body["tools"] = tools
 	}
@@ -205,8 +217,9 @@ func parseAnthropicSSE(r io.Reader, ch chan<- Event) {
 			} `json:"usage"`
 			Message *struct {
 				Usage *struct {
-					InputTokens     int `json:"input_tokens"`
-					CacheReadTokens int `json:"cache_read_input_tokens"`
+					InputTokens         int `json:"input_tokens"`
+					CacheReadTokens     int `json:"cache_read_input_tokens"`
+					CacheCreationTokens int `json:"cache_creation_input_tokens"`
 				} `json:"usage"`
 			} `json:"message"`
 			Error *struct {
@@ -228,7 +241,11 @@ func parseAnthropicSSE(r io.Reader, ch chan<- Event) {
 			return
 		case "message_start":
 			if ev.Message != nil && ev.Message.Usage != nil {
-				ch <- Event{Type: EventUsage, Usage: &Usage{PromptTokens: ev.Message.Usage.InputTokens, CacheReadTokens: ev.Message.Usage.CacheReadTokens}}
+				ch <- Event{Type: EventUsage, Usage: &Usage{
+					PromptTokens:        ev.Message.Usage.InputTokens,
+					CacheReadTokens:     ev.Message.Usage.CacheReadTokens,
+					CacheCreationTokens: ev.Message.Usage.CacheCreationTokens,
+				}}
 			}
 		case "content_block_start":
 			if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" {
@@ -260,6 +277,10 @@ func parseAnthropicSSE(r io.Reader, ch chan<- Event) {
 			ch <- Event{Type: EventFinish}
 			return
 		}
+	}
+	if err := sc.Err(); err != nil {
+		ch <- Event{Type: EventError, Err: fmt.Errorf("anthropic stream read: %w", err)}
+		return
 	}
 	flushTool()
 	ch <- Event{Type: EventFinish}

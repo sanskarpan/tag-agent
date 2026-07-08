@@ -3,6 +3,9 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -41,9 +44,11 @@ func registerOtelExport(root *cobra.Command, app *App) {
 			for rows.Next() {
 				var id, tid, pid, name, prof, model, start, fin, status string
 				var dur, pt, ct int
-				rows.Scan(&id, &tid, &pid, &name, &prof, &model, &start, &fin, &dur, &status, &pt, &ct)
+				if err := rows.Scan(&id, &tid, &pid, &name, &prof, &model, &start, &fin, &dur, &status, &pt, &ct); err != nil {
+					return err
+				}
 				attrs := []map[string]any{
-					otelAttr("gen_ai.system", model),
+					otelAttr("gen_ai.system", otelDetectProvider(model)),
 					otelAttr("gen_ai.request.model", model),
 					otelAttr("tag.profile", prof),
 					otelAttrInt("gen_ai.usage.input_tokens", pt),
@@ -51,10 +56,13 @@ func registerOtelExport(root *cobra.Command, app *App) {
 				}
 				spans = append(spans, map[string]any{
 					"traceId": tid, "spanId": id, "parentSpanId": pid, "name": name,
-					"startTimeUnixNano": start, "endTimeUnixNano": fin,
+					"startTimeUnixNano": otelISOToNanos(start), "endTimeUnixNano": otelISOToNanos(fin),
 					"status":     map[string]any{"code": status},
 					"attributes": attrs,
 				})
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			payload := map[string]any{
 				"resourceSpans": []map[string]any{{
@@ -78,4 +86,55 @@ func otelAttr(k, v string) map[string]any {
 }
 func otelAttrInt(k string, v int) map[string]any {
 	return map[string]any{"key": k, "value": map[string]any{"intValue": v}}
+}
+
+// otelProviderNamespaces / otelProviderPrefixes mirror otel_semconv.py's
+// _PROVIDER_NAMESPACES and _PROVIDER_MAP for gen_ai.system detection.
+var otelProviderNamespaces = map[string]string{
+	"anthropic": "anthropic", "openai": "openai", "google": "google",
+	"mistral": "mistral", "meta": "meta", "meta-llama": "meta", "cohere": "cohere",
+}
+
+var otelProviderPrefixes = []struct{ prefix, provider string }{
+	{"claude", "anthropic"}, {"gpt", "openai"}, {"gemini", "google"},
+	{"mistral", "mistral"}, {"llama", "meta"}, {"command", "cohere"},
+}
+
+// otelDetectProvider infers gen_ai.system from a model id (port of
+// otel_semconv.detect_provider): handles both bare names ("gpt-4o") and
+// provider-namespaced ids ("anthropic/claude-sonnet-4-6").
+func otelDetectProvider(modelID string) string {
+	if modelID == "" {
+		return "unknown"
+	}
+	m := strings.ToLower(modelID)
+	if ns, rest, ok := strings.Cut(m, "/"); ok {
+		if p, ok := otelProviderNamespaces[ns]; ok {
+			return p
+		}
+		m = rest
+	}
+	for _, e := range otelProviderPrefixes {
+		if strings.HasPrefix(m, e.prefix) {
+			return e.provider
+		}
+	}
+	return "unknown"
+}
+
+// otelISOToNanos converts an ISO timestamp to Unix nanoseconds as the
+// stringified int64 OTLP/JSON expects (port of otel_semconv._iso_to_ns;
+// unparseable/empty inputs map to "0").
+func otelISOToNanos(iso string) string {
+	if iso == "" {
+		return "0"
+	}
+	t, err := time.Parse(time.RFC3339Nano, iso)
+	if err != nil {
+		t, err = time.ParseInLocation("2006-01-02T15:04:05", iso, time.UTC)
+		if err != nil {
+			return "0"
+		}
+	}
+	return strconv.FormatInt(t.UnixNano(), 10)
 }

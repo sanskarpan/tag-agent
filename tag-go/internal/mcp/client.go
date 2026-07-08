@@ -163,7 +163,28 @@ func (c *Client) call(method string, params any, out any) error {
 	}
 }
 
-// Initialize performs the MCP handshake.
+// notify sends a JSON-RPC notification (no id, no response expected).
+func (c *Client) notify(method string, params any) error {
+	msg := struct {
+		JSONRPC string `json:"jsonrpc"`
+		Method  string `json:"method"`
+		Params  any    `json:"params,omitempty"`
+	}{JSONRPC: "2.0", Method: method, Params: params}
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.readErr != nil {
+		return fmt.Errorf("mcp: transport closed: %w", c.readErr)
+	}
+	_, err = c.w.Write(append(b, '\n'))
+	return err
+}
+
+// Initialize performs the MCP handshake: the initialize request/response
+// followed by the notifications/initialized notification.
 func (c *Client) Initialize(clientName string) error {
 	params := map[string]any{
 		"protocolVersion": ProtocolVersion,
@@ -171,6 +192,9 @@ func (c *Client) Initialize(clientName string) error {
 		"clientInfo":      map[string]any{"name": clientName, "version": "0.9.0-go"},
 	}
 	if err := c.call("initialize", params, nil); err != nil {
+		return err
+	}
+	if err := c.notify("notifications/initialized", nil); err != nil {
 		return err
 	}
 	c.inited = true

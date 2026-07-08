@@ -14,7 +14,9 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +25,11 @@ import (
 )
 
 const maxBodyBytes = 10 * 1024 * 1024
+
+// slackTimestampTolerance is the maximum allowed age (or clock skew) of a
+// Slack request timestamp; Slack mandates rejecting stale timestamps to
+// prevent replay of captured signed payloads.
+const slackTimestampTolerance = 5 * time.Minute
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
 
@@ -41,6 +48,13 @@ func VerifySignature(platform string, body []byte, sigHeader, secret, timestamp 
 		return hmacEqual(sb, body, strings.TrimPrefix(sigHeader, "sha256="))
 	case "slack":
 		if !strings.HasPrefix(sigHeader, "v0=") || timestamp == "" {
+			return false
+		}
+		tsec, err := strconv.ParseInt(strings.TrimSpace(timestamp), 10, 64)
+		if err != nil {
+			return false
+		}
+		if age := time.Since(time.Unix(tsec, 0)); age > slackTimestampTolerance || age < -slackTimestampTolerance {
 			return false
 		}
 		base := append([]byte("v0:"+timestamp+":"), body...)
@@ -242,16 +256,54 @@ func buildTaskText(platform, eventType string, info EventInfo) string {
 	return strings.Join(parts, "\n\n")
 }
 
+// maxSeenDeliveryIDs bounds the in-memory replay-protection set.
+const maxSeenDeliveryIDs = 4096
+
+// deliveryCache is a bounded, thread-safe set of recently seen webhook
+// delivery IDs used to reject replays of captured signed payloads.
+type deliveryCache struct {
+	mu    sync.Mutex
+	seen  map[string]struct{}
+	order []string
+}
+
+// markSeen records id and reports whether it was new (false = replay).
+func (c *deliveryCache) markSeen(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, dup := c.seen[id]; dup {
+		return false
+	}
+	if c.seen == nil {
+		c.seen = make(map[string]struct{})
+	}
+	c.seen[id] = struct{}{}
+	c.order = append(c.order, id)
+	if len(c.order) > maxSeenDeliveryIDs {
+		delete(c.seen, c.order[0])
+		c.order = c.order[1:]
+	}
+	return true
+}
+
 // Handler builds the webhook HTTP mux. When secret is empty, events are only
 // accepted if allowUnsigned is true (an explicit operator opt-in); otherwise
 // every event POST is rejected 401 so unauthenticated callers cannot inject
 // queue jobs.
 func Handler(db *store.DB, secret string, allowUnsigned bool) http.Handler {
+	deliveries := &deliveryCache{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, 200, map[string]any{"status": "ok"})
 	})
 	mux.HandleFunc("/webhooks/rules", func(w http.ResponseWriter, r *http.Request) {
+		if secret != "" {
+			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if subtle.ConstantTimeCompare([]byte(token), []byte(secret)) != 1 {
+				sendJSON(w, 401, map[string]any{"error": "unauthorized"})
+				return
+			}
+		}
 		rules, _ := ListRules(db, "")
 		sendJSON(w, 200, rules)
 	})
@@ -283,6 +335,12 @@ func Handler(db *store.DB, secret string, allowUnsigned bool) http.Handler {
 		} else if !valid {
 			sendJSON(w, 401, map[string]any{"error": "invalid signature"})
 			return
+		}
+		if deliveryID := firstHeader(r, "X-GitHub-Delivery", "Linear-Delivery"); deliveryID != "" {
+			if !deliveries.markSeen(platform + ":" + deliveryID) {
+				sendJSON(w, 409, map[string]any{"error": "duplicate delivery"})
+				return
+			}
 		}
 		var payload map[string]any
 		if json.Unmarshal(body, &payload) != nil {
@@ -359,5 +417,12 @@ func Serve(db *store.DB, host string, port int, secret string, allowUnsigned boo
 	if secret == "" && allowUnsigned {
 		fmt.Println("WARNING: running with --allow-unsigned and no secret — events are UNAUTHENTICATED and can enqueue jobs.")
 	}
-	return (&http.Server{Addr: addr, Handler: Handler(db, secret, allowUnsigned)}).ListenAndServe()
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           Handler(db, secret, allowUnsigned),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	return srv.ListenAndServe()
 }

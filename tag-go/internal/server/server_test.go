@@ -64,6 +64,26 @@ func TestDashboardHTML(t *testing.T) {
 	}
 }
 
+func TestDashboardHTMLEscapesProfile(t *testing.T) {
+	db := testDB(t)
+	srv := httptest.NewServer(Handler(db, `<script>alert(1)</script>`))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 8192)
+	n, _ := resp.Body.Read(buf)
+	body := string(buf[:n])
+	if strings.Contains(body, "<script>alert(1)</script>") {
+		t.Error("profile must be HTML-escaped in the dashboard")
+	}
+	if !strings.Contains(body, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+		t.Errorf("escaped profile missing from body: %q", body)
+	}
+}
+
 func TestSSEOneShot(t *testing.T) {
 	db := testDB(t)
 	db.Exec(`INSERT INTO runs(id,created_at,kind,task_type,execution,master_profile,board,prompt,route_json,status) VALUES('r1','2026-07-01T00:00:00Z','agent','chat','native','p','default','hi','{}','completed')`)

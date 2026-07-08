@@ -44,6 +44,9 @@ func registerCompare(root *cobra.Command, app *App) {
 				}
 				out = append(out, r)
 			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
 			if flagJSON {
 				if out == nil {
 					out = []cmp{}
@@ -95,6 +98,9 @@ func registerCompare(root *cobra.Command, app *App) {
 					return err
 				}
 				results = append(results, r)
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			if flagJSON {
 				jr := make([]map[string]any, 0, len(results))

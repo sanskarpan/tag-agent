@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -150,7 +152,10 @@ func registerCron(root *cobra.Command, app *App) {
 			}
 			var profileVal, task string
 			if err := db.QueryRow(`SELECT profile, task FROM cron_jobs WHERE id=?`, args[0]).Scan(&profileVal, &task); err != nil {
-				return fmt.Errorf("Job '%s' not found", args[0])
+				if errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("Job '%s' not found", args[0])
+				}
+				return err
 			}
 			now := time.Now().UTC().Format(time.RFC3339)
 			qID := uuid.NewString()[:8]
@@ -166,6 +171,7 @@ func registerCron(root *cobra.Command, app *App) {
 				if err != nil {
 					return err
 				}
+				opts.OnlyJobs = []string{qID}
 				sum, err := worker.Drain(context.Background(), db.DB, opts)
 				if err != nil {
 					return err
@@ -199,7 +205,7 @@ func registerCron(root *cobra.Command, app *App) {
 			// managed runtime), so due jobs land in queue_jobs as 'queued'.
 			for {
 				t := time.Now().Truncate(time.Minute)
-				rows, err := db.Query(`SELECT id, schedule, profile, task FROM cron_jobs WHERE enabled=1`)
+				rows, err := db.Query(`SELECT id, schedule, profile, task, COALESCE(last_run,'') FROM cron_jobs WHERE enabled=1`)
 				if err != nil {
 					return err
 				}
@@ -207,14 +213,24 @@ func registerCron(root *cobra.Command, app *App) {
 				var dueJobs []due
 				var scanErr error
 				for rows.Next() {
-					var id, sched, profileVal, task string
-					if err := rows.Scan(&id, &sched, &profileVal, &task); err != nil {
+					var id, sched, profileVal, task, lastRun string
+					if err := rows.Scan(&id, &sched, &profileVal, &task, &lastRun); err != nil {
 						scanErr = err
 						break
 					}
-					if cron.Matches(sched, t) {
-						dueJobs = append(dueJobs, due{id, profileVal, task})
+					if !cron.Matches(sched, t) {
+						continue
 					}
+					// Guard against firing twice in the same calendar minute: the poll
+					// cadence (30s) is finer than the schedule resolution (1 minute),
+					// so skip a job whose last_run already falls in this minute
+					// (mirrors cron_scheduler.py fix C031).
+					if lastRun != "" {
+						if lr, perr := time.Parse(time.RFC3339, lastRun); perr == nil && lr.Truncate(time.Minute).Equal(t) {
+							continue
+						}
+					}
+					dueJobs = append(dueJobs, due{id, profileVal, task})
 				}
 				rows.Close()
 				if scanErr != nil {

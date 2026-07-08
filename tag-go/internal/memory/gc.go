@@ -65,9 +65,22 @@ func jaccard(a, b string) float64 {
 	return float64(inter) / float64(len(union))
 }
 
-func deleteMemoryRow(db *sql.DB, id, profile string) {
-	db.Exec(`DELETE FROM semantic_memories WHERE id=? AND profile=?`, id, profile)
-	db.Exec(`DELETE FROM semantic_memories_fts WHERE id=?`, id)
+func deleteMemoryRow(db *sql.DB, id, profile string) (bool, error) {
+	r, err := db.Exec(`DELETE FROM semantic_memories WHERE id=? AND profile=?`, id, profile)
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, nil
+	}
+	if _, err := db.Exec(`DELETE FROM semantic_memories_fts WHERE id=?`, id); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 type gcMem struct {
@@ -91,6 +104,10 @@ func EvictLowConfidence(db *sql.DB, profile string, cfg GCConfig) (int, error) {
 		}
 		mems = append(mems, m)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
 	rows.Close()
 
 	evicted := map[string]bool{}
@@ -99,8 +116,15 @@ func EvictLowConfidence(db *sql.DB, profile string, cfg GCConfig) (int, error) {
 		eff := effectiveConfidence(m.confBase, m.mtype, m.created)
 		effMap[m.id] = eff
 		if eff < cfg.MinConfidenceToKeep {
-			deleteMemoryRow(db, m.id, profile)
-			evicted[m.id] = true
+			applied, err := deleteMemoryRow(db, m.id, profile)
+			if err != nil {
+				return 0, err
+			}
+			if applied {
+				evicted[m.id] = true
+			} else {
+				delete(effMap, m.id)
+			}
 		}
 	}
 	// Cap enforcement over survivors.
@@ -119,8 +143,13 @@ func EvictLowConfidence(db *sql.DB, profile string, cfg GCConfig) (int, error) {
 		overage := len(survivors) - cfg.MaxMemoriesPerProfile
 		sort.Slice(survivors, func(i, j int) bool { return survivors[i].eff < survivors[j].eff })
 		for _, s := range survivors[:overage] {
-			deleteMemoryRow(db, s.id, profile)
-			capEvicted++
+			applied, err := deleteMemoryRow(db, s.id, profile)
+			if err != nil {
+				return 0, err
+			}
+			if applied {
+				capEvicted++
+			}
 		}
 	}
 	return len(evicted) + capEvicted, nil
@@ -141,6 +170,10 @@ func MergeDuplicates(db *sql.DB, profile string, cfg GCConfig) (int, error) {
 			return 0, err
 		}
 		mems = append(mems, m)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
 	}
 	rows.Close()
 	if len(mems) < 2 {
@@ -167,9 +200,14 @@ func MergeDuplicates(db *sql.DB, profile string, cfg GCConfig) (int, error) {
 			if effA < effB {
 				loser = a.id
 			}
-			deleteMemoryRow(db, loser, profile)
+			applied, err := deleteMemoryRow(db, loser, profile)
+			if err != nil {
+				return 0, err
+			}
 			deleted[loser] = true
-			merged++
+			if applied {
+				merged++
+			}
 		}
 	}
 	return merged, nil
@@ -194,6 +232,10 @@ func PromoteHighAccess(db *sql.DB, profile string, cfg GCConfig) (int, error) {
 			return 0, err
 		}
 		toPromote = append(toPromote, p)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
 	}
 	rows.Close()
 	for _, p := range toPromote {
@@ -246,6 +288,10 @@ func RunGCAllProfiles(db *sql.DB, cfg GCConfig) ([]GCResult, error) {
 			return nil, err
 		}
 		profiles = append(profiles, p)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
 	rows.Close()
 	var results []GCResult

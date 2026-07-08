@@ -226,6 +226,10 @@ func parseOpenAISSE(r io.Reader, ch chan<- Event) {
 			}
 		}
 	}
+	if err := sc.Err(); err != nil {
+		ch <- Event{Type: EventError, Err: fmt.Errorf("openai stream read: %w", err)}
+		return
+	}
 	flush()
 	ch <- Event{Type: EventFinish}
 }

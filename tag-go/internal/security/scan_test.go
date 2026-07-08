@@ -89,3 +89,38 @@ func TestScanSkipsOutOfTreeSymlink(t *testing.T) {
 		t.Errorf("out-of-tree symlink target must not be reported, got %+v", found)
 	}
 }
+
+func TestScanFollowsExplicitSymlink(t *testing.T) {
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "passwd.txt")
+	os.WriteFile(secret, []byte("AWS=AKIAIOSFODNN7EXAMPLE\n"), 0o644)
+
+	link := filepath.Join(t.TempDir(), "link.txt")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	if found := ScanFile(link); len(found) == 0 {
+		t.Error("an explicitly named symlink must be followed and its target scanned")
+	}
+}
+
+func TestScanDirSurfacesWalkErrors(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root; permissions are not enforced")
+	}
+	root := t.TempDir()
+	locked := filepath.Join(root, "locked")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(locked, "x.txt"), []byte("hi\n"), 0o644)
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+
+	if !hasPattern(ScanDir(root, 100), "walk_error") {
+		t.Error("permission-denied subtree must surface a walk_error finding")
+	}
+}

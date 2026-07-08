@@ -729,8 +729,8 @@ func ImportCursor(profileDir, profile, sourceHome string) (Result, error) {
 				if env, ok := cursorKnownKeyMap[k]; ok {
 					if _, dup := found[env]; !dup {
 						found[env] = value
-						continue
 					}
+					continue
 				}
 				for _, p := range cursorValuePrefixes {
 					if strings.HasPrefix(value, p.prefix) {
@@ -998,8 +998,8 @@ func ImportSSH(profileDir, profile, sourceHome string) (Result, error) {
 		keys = append(keys, "SSH_USER")
 	}
 	if keyFile != "" {
-		if strings.HasPrefix(keyFile, "~") {
-			keyFile = filepath.Join(homeDir(), keyFile[1:])
+		if strings.HasPrefix(keyFile, "~/") {
+			keyFile = filepath.Join(homeDir(), keyFile[2:])
 		}
 		if err := UpsertEnvLine(env, "SSH_KEY_FILE", keyFile); err != nil {
 			return Result{}, err
@@ -1020,8 +1020,9 @@ func ImportSSH(profileDir, profile, sourceHome string) (Result, error) {
 }
 
 // parseSSHConfig extracts the first concrete Host block's connection details
-// (skipping a bare wildcard "*"). Pre-seeded user/keyFile/port env values are
-// preserved and not overwritten.
+// (skipping wildcard/pattern entries such as "*", "*.example.com", "prod-?",
+// or "!negated"). Pre-seeded user/keyFile/port env values are preserved and
+// not overwritten.
 func parseSSHConfig(path, user, keyFile, port string) (h, u, kf, p, source string) {
 	u, kf, p = user, keyFile, port
 	b, err := os.ReadFile(path)
@@ -1044,11 +1045,19 @@ func parseSSHConfig(path, user, keyFile, port string) (h, u, kf, p, source strin
 			if h != "" {
 				return
 			}
-			if fields[1] == "*" {
+			name := ""
+			for _, f := range fields[1:] {
+				if !strings.ContainsAny(f, "*?!") {
+					name = f
+					break
+				}
+			}
+			if name == "" {
+				inHost = false
 				continue
 			}
 			inHost = true
-			h = fields[1]
+			h = name
 			source = path
 		case "hostname":
 			if inHost {

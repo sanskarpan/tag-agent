@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tag-agent/tag/internal/store"
 )
@@ -32,6 +34,37 @@ func TestVerifySignatureGitHub(t *testing.T) {
 	}
 	if VerifySignature("github", body, ghSig("s3cr3t", body), "", "") {
 		t.Error("no configured secret must return false")
+	}
+}
+
+func slackSig(secret, ts string, body []byte) string {
+	m := hmac.New(sha256.New, []byte(secret))
+	m.Write([]byte("v0:" + ts + ":"))
+	m.Write(body)
+	return "v0=" + hex.EncodeToString(m.Sum(nil))
+}
+
+func TestVerifySignatureSlackTimestampFreshness(t *testing.T) {
+	body := []byte(`{"type":"event_callback"}`)
+	secret := "s3cr3t"
+
+	fresh := strconv.FormatInt(time.Now().Unix(), 10)
+	if !VerifySignature("slack", body, slackSig(secret, fresh, body), secret, fresh) {
+		t.Error("fresh slack timestamp should verify")
+	}
+
+	stale := strconv.FormatInt(time.Now().Add(-10*time.Minute).Unix(), 10)
+	if VerifySignature("slack", body, slackSig(secret, stale, body), secret, stale) {
+		t.Error("stale slack timestamp must be rejected")
+	}
+
+	future := strconv.FormatInt(time.Now().Add(10*time.Minute).Unix(), 10)
+	if VerifySignature("slack", body, slackSig(secret, future, body), secret, future) {
+		t.Error("far-future slack timestamp must be rejected")
+	}
+
+	if VerifySignature("slack", body, slackSig(secret, "nonsense", body), secret, "nonsense") {
+		t.Error("non-numeric slack timestamp must be rejected")
 	}
 }
 
@@ -134,6 +167,83 @@ func TestHandlerEnforcesSignatureAndEnqueues(t *testing.T) {
 	db.QueryRow(`SELECT COUNT(*) FROM webhook_events WHERE signature_valid=1`).Scan(&events)
 	if events != 1 {
 		t.Errorf("the event should be recorded as signature_valid, got %d", events)
+	}
+}
+
+func TestHandlerRejectsDuplicateDelivery(t *testing.T) {
+	db := testDB(t)
+	CreateRule(db, "github", "pull_request.*", "coder", "run", nil)
+	secret := "topsecret"
+	srv := httptest.NewServer(Handler(db, secret, false))
+	defer srv.Close()
+
+	body := []byte(`{"action":"opened","pull_request":{"title":"T"}}`)
+	send := func() int {
+		req, _ := http.NewRequest("POST", srv.URL+"/webhook/github", strings.NewReader(string(body)))
+		req.Header.Set("X-Hub-Signature-256", ghSig(secret, body))
+		req.Header.Set("X-GitHub-Delivery", "d-123")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := send(); code != 200 {
+		t.Fatalf("first delivery should be 200, got %d", code)
+	}
+	if code := send(); code != 409 {
+		t.Errorf("replayed delivery should be 409, got %d", code)
+	}
+	var jobs int
+	db.QueryRow(`SELECT COUNT(*) FROM queue_jobs`).Scan(&jobs)
+	if jobs != 1 {
+		t.Errorf("replay must not enqueue a second job, got %d", jobs)
+	}
+}
+
+func TestRulesEndpointRequiresSecretWhenConfigured(t *testing.T) {
+	db := testDB(t)
+	CreateRule(db, "github", "pull_request.*", "coder", "run", nil)
+	secret := "topsecret"
+	srv := httptest.NewServer(Handler(db, secret, false))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/webhooks/rules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Errorf("rules without token should be 401, got %d", resp.StatusCode)
+	}
+
+	req, _ := http.NewRequest("GET", srv.URL+"/webhooks/rules", nil)
+	req.Header.Set("Authorization", "Bearer "+secret)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		t.Errorf("rules with correct token should be 200, got %d", resp2.StatusCode)
+	}
+	var rules []Rule
+	json.NewDecoder(resp2.Body).Decode(&rules)
+	if len(rules) != 1 {
+		t.Errorf("expected 1 rule, got %d", len(rules))
+	}
+
+	// secretless local dev keeps the endpoint open
+	open := httptest.NewServer(Handler(db, "", true))
+	defer open.Close()
+	resp3, err := http.Get(open.URL + "/webhooks/rules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != 200 {
+		t.Errorf("secretless rules endpoint should stay open, got %d", resp3.StatusCode)
 	}
 }
 

@@ -81,6 +81,9 @@ func registerMarketplace(root *cobra.Command, app *App) {
 				}
 				out = append(out, r)
 			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
 			if flagJSON {
 				return emitJSON(out)
 			}

@@ -2,8 +2,11 @@ package llm
 
 import (
 	"context"
+	"errors"
+	"io"
 	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 func TestOpenAISSETextStream(t *testing.T) {
@@ -74,6 +77,29 @@ func TestBuildOpenAIBody(t *testing.T) {
 	}
 	if body["stream"] != true {
 		t.Error("stream should be true")
+	}
+}
+
+func TestOpenAISSETruncationSurfacesError(t *testing.T) {
+	sse := `data: {"choices":[{"delta":{"content":"partial"}}]}` + "\n"
+	r := io.MultiReader(strings.NewReader(sse), iotest.ErrReader(errors.New("connection reset")))
+	ch := make(chan Event, 32)
+	go parseOpenAISSE(r, ch)
+	var gotErr error
+	finished := false
+	for ev := range ch {
+		switch ev.Type {
+		case EventError:
+			gotErr = ev.Err
+		case EventFinish:
+			finished = true
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("truncated stream must emit EventError")
+	}
+	if finished {
+		t.Error("truncated stream must not emit EventFinish")
 	}
 }
 

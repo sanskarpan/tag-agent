@@ -87,10 +87,14 @@ func highEntropy(line string) bool {
 
 // ScanFile scans one file, skipping binary/oversized/unsupported files.
 //
-// Symlinks are never followed out of the scanned tree. Called directly (no
-// root), a symlink is skipped entirely; ScanDir passes the scanned root so a
-// symlink is only followed when its real target resolves inside that root.
+// The path is an explicit user target, so a symlink is resolved and its real
+// target scanned. Symlinks encountered during directory walks go through
+// ScanDir, which only follows them when the real target resolves inside the
+// scanned root.
 func ScanFile(path string) []Finding {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
 	return scanFile(path, "")
 }
 
@@ -162,12 +166,18 @@ func symlinkInsideRoot(path, root string) bool {
 }
 
 // ScanDir walks root, scanning files (skip dirs), capped at maxFiles.
+// Unreadable entries (e.g. permission-denied subtrees) are surfaced as
+// "walk_error" findings rather than silently skipped.
 func ScanDir(root string, maxFiles int) []Finding {
 	var out []Finding
 	count := 0
 	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-		if err != nil || count >= maxFiles {
+		if err != nil {
+			out = append(out, Finding{File: p, Pattern: "walk_error"})
 			return nil
+		}
+		if count >= maxFiles {
+			return filepath.SkipAll
 		}
 		if d.IsDir() {
 			if skipDirs[d.Name()] {

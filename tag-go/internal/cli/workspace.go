@@ -118,9 +118,11 @@ func registerWorkspace(root *cobra.Command, app *App) {
 				h := sha256.Sum256(b)
 				tok := len(b) / 4
 				rel, _ := filepath.Rel(abs, c.path)
-				db.Exec(`INSERT INTO workspace_files(path,content_hash,byte_size,token_count,rank,indexed_at) VALUES(?,?,?,?,?,?)
+				if _, err := db.Exec(`INSERT INTO workspace_files(path,content_hash,byte_size,token_count,rank,indexed_at) VALUES(?,?,?,?,?,?)
 					ON CONFLICT(path) DO UPDATE SET content_hash=excluded.content_hash,byte_size=excluded.byte_size,token_count=excluded.token_count,rank=excluded.rank,indexed_at=excluded.indexed_at`,
-					rel, hex.EncodeToString(h[:8]), len(b), tok, c.rank, nowISO)
+					rel, hex.EncodeToString(h[:8]), len(b), tok, c.rank, nowISO); err != nil {
+					return err
+				}
 				indexed++
 				tokens += tok
 			}
@@ -136,7 +138,9 @@ func registerWorkspace(root *cobra.Command, app *App) {
 				return err
 			}
 			var n, tok int
-			db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(token_count),0) FROM workspace_files`).Scan(&n, &tok)
+			if err := db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(token_count),0) FROM workspace_files`).Scan(&n, &tok); err != nil {
+				return err
+			}
 			outJSON(map[string]any{"file_count": n, "total_tokens": tok}, fmt.Sprintf("Indexed: %d files  %d tokens", n, tok))
 			return nil
 		}}
@@ -182,6 +186,9 @@ func registerWorkspace(root *cobra.Command, app *App) {
 					node = child
 				}
 				node[parts[len(parts)-1]] = nil
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			var out string
 			if !hasRows {

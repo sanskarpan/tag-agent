@@ -421,6 +421,22 @@ func TestImportCursor(t *testing.T) {
 	assertEnvContains(t, dir, "GEMINI_API_KEY=AIzaGeminiViaPrefix")
 }
 
+func TestImportCursorDuplicateKnownKeyNotMisattributed(t *testing.T) {
+	clearCredEnv(t)
+	src := filepath.Join(t.TempDir(), "cursor")
+	makeCursorDB(t, src, map[string]string{
+		"anthropic.apiKey":       "AIzaNotActuallyGemini1",
+		"cursor.anthropicApiKey": "AIzaNotActuallyGemini2",
+	})
+	dir := profileDir(t)
+	if _, err := ImportCursor(dir, "p", src); err != nil {
+		t.Fatal(err)
+	}
+	if got := readEnv(t, dir); strings.Contains(got, "GEMINI_API_KEY") {
+		t.Fatalf("duplicate known key misattributed via value prefix:\n%s", got)
+	}
+}
+
 func TestImportCursorMissing(t *testing.T) {
 	clearCredEnv(t)
 	res, _ := ImportCursor(profileDir(t), "p", filepath.Join(t.TempDir(), "none"))
@@ -626,6 +642,43 @@ func TestImportSSHConfigFile(t *testing.T) {
 	assertEnvContains(t, dir, "SSH_HOST=prod.internal")
 	assertEnvContains(t, dir, "SSH_USER=deploy")
 	assertEnvContains(t, dir, "SSH_PORT=2200")
+}
+
+func TestImportSSHConfigSkipsPatternHosts(t *testing.T) {
+	clearCredEnv(t)
+	src := filepath.Join(t.TempDir(), "ssh")
+	writeFile(t, filepath.Join(src, "config"),
+		"Host *.example.com\n  User wild\n\nHost prod-?\n  User glob\n\nHost bastion staging\n  HostName bastion.internal\n  User deploy\n")
+	dir := profileDir(t)
+	if _, err := ImportSSH(dir, "p", src); err != nil {
+		t.Fatal(err)
+	}
+	assertEnvContains(t, dir, "SSH_HOST=bastion.internal")
+	assertEnvContains(t, dir, "SSH_USER=deploy")
+}
+
+func TestImportSSHConfigPatternOnly(t *testing.T) {
+	clearCredEnv(t)
+	src := filepath.Join(t.TempDir(), "ssh")
+	writeFile(t, filepath.Join(src, "config"), "Host *.example.com\n  User wild\n\nHost !prod\n  User negated\n")
+	res, err := ImportSSH(profileDir(t), "p", src)
+	if err != nil {
+		t.Fatalf("pattern-only config must not error: %v", err)
+	}
+	if res.Status != StatusSkipped {
+		t.Fatalf("status = %s", res.Status)
+	}
+}
+
+func TestImportSSHKeyFileTildeUserNotExpanded(t *testing.T) {
+	clearCredEnv(t)
+	t.Setenv("SSH_HOST", "build.example.com")
+	t.Setenv("SSH_KEY_FILE", "~other/key")
+	dir := profileDir(t)
+	if _, err := ImportSSH(dir, "p", ""); err != nil {
+		t.Fatal(err)
+	}
+	assertEnvContains(t, dir, "SSH_KEY_FILE=~other/key")
 }
 
 func TestImportSSHInvalidHost(t *testing.T) {

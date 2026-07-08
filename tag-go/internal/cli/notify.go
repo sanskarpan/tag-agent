@@ -101,7 +101,7 @@ func registerNotify(root *cobra.Command, app *App) {
 				if prof == "" {
 					prof = "*"
 				}
-				fmt.Printf("%s %s  %-10s %-20s profile=%s\n", status, str(h["id"])[:8], h["channel"], h["event"], prof)
+				fmt.Printf("%s %s  %-10s %-20s profile=%s\n", status, short(str(h["id"])), h["channel"], h["event"], prof)
 			}
 			return nil
 		}}
@@ -133,7 +133,7 @@ func registerNotify(root *cobra.Command, app *App) {
 				"error_message": "", "task": "Test notification", "event": "test",
 			}
 			rendered := renderTemplate(strOr(str(hook["template"]), "TAG {{event}}: run {{run_id}} {{status}}"), ctx)
-			fmt.Printf("✓ Hook %s (%s on %s) — rendered message:\n%s\n", str(hook["id"])[:8], hook["channel"], hook["event"], rendered)
+			fmt.Printf("✓ Hook %s (%s on %s) — rendered message:\n%s\n", short(str(hook["id"])), hook["channel"], hook["event"], rendered)
 			return nil
 		}}
 
@@ -151,12 +151,12 @@ func registerNotify(root *cobra.Command, app *App) {
 			if _, err := db.Exec(`DELETE FROM notification_hooks WHERE id=?`, id); err != nil {
 				return err
 			}
-			fmt.Printf("Notification hook removed: %s\n", id[:8])
+			fmt.Printf("Notification hook removed: %s\n", short(id))
 			return nil
 		}}
 
-	setEnabled := func(use, short string, enabled bool) *cobra.Command {
-		return &cobra.Command{Use: use, Short: short, Args: cobra.ExactArgs(1),
+	setEnabled := func(use, shortDesc string, enabled bool) *cobra.Command {
+		return &cobra.Command{Use: use, Short: shortDesc, Args: cobra.ExactArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
 				db, err := app.OpenDB()
 				if err != nil {
@@ -177,7 +177,7 @@ func registerNotify(root *cobra.Command, app *App) {
 				if enabled {
 					state = "enabled"
 				}
-				fmt.Printf("Notification hook %s: %s\n", state, id[:8])
+				fmt.Printf("Notification hook %s: %s\n", state, short(id))
 				return nil
 			}}
 	}
@@ -234,6 +234,9 @@ func resolveHookID(db *store.DB, prefix string) (string, error) {
 			return "", err
 		}
 		matches = append(matches, id)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
 	}
 	switch len(matches) {
 	case 0:

@@ -2,10 +2,14 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,7 +56,10 @@ func registerQueue(root *cobra.Command, app *App) {
 				for _, dep := range deps {
 					var got string
 					if err := db.QueryRow(`SELECT id FROM queue_jobs WHERE id=?`, dep).Scan(&got); err != nil {
-						return fmt.Errorf("Dependency job not found: %q", dep)
+						if errors.Is(err, sql.ErrNoRows) {
+							return fmt.Errorf("Dependency job not found: %q", dep)
+						}
+						return err
 					}
 				}
 				id := queueHexID(16)
@@ -173,6 +180,9 @@ func registerQueue(root *cobra.Command, app *App) {
 			var status, resultPath string
 			err = db.QueryRow(`SELECT status, COALESCE(result_path,'') FROM queue_jobs WHERE id=?`, args[0]).Scan(&status, &resultPath)
 			if err != nil {
+				if !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
 				if flagJSON {
 					b, _ := json.Marshal(map[string]any{"error": fmt.Sprintf("job %s not found", args[0]), "job_id": args[0]})
 					fmt.Println(string(b))
@@ -219,12 +229,59 @@ func registerQueue(root *cobra.Command, app *App) {
 			if err != nil {
 				return err
 			}
-			r, err := db.Exec(`DELETE FROM queue_jobs WHERE status IN ('done','failed','cancelled')`)
+			// Keep terminal jobs that are still referenced by a non-terminal
+			// dependent: the dependency check treats a missing dep as forever
+			// unsatisfied, so deleting a completed parent would strand its
+			// pending children.
+			rows, err := db.Query(`SELECT COALESCE(deps_json,'[]') FROM queue_jobs
+				WHERE status NOT IN ('done','failed','cancelled','timed_out')`)
+			if err != nil {
+				return err
+			}
+			referenced := map[string]bool{}
+			for rows.Next() {
+				var depsJSON string
+				if err := rows.Scan(&depsJSON); err != nil {
+					rows.Close()
+					return err
+				}
+				var ds []string
+				json.Unmarshal([]byte(depsJSON), &ds)
+				for _, d := range ds {
+					referenced[d] = true
+				}
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return err
+			}
+			rows.Close()
+			del := `DELETE FROM queue_jobs WHERE status IN ('done','failed','cancelled')`
+			var qargs []any
+			if len(referenced) > 0 {
+				ph := strings.TrimSuffix(strings.Repeat("?,", len(referenced)), ",")
+				del += ` AND id NOT IN (` + ph + `)`
+				for id := range referenced {
+					qargs = append(qargs, id)
+				}
+			}
+			var kept int
+			if len(referenced) > 0 {
+				ph := strings.TrimSuffix(strings.Repeat("?,", len(referenced)), ",")
+				if err := db.QueryRow(`SELECT COUNT(*) FROM queue_jobs WHERE status IN ('done','failed','cancelled') AND id IN (`+ph+`)`, qargs...).Scan(&kept); err != nil {
+					return err
+				}
+			}
+			r, err := db.Exec(del, qargs...)
 			if err != nil {
 				return err
 			}
 			n, _ := r.RowsAffected()
-			outJSON(map[string]any{"cleared": n}, fmt.Sprintf("cleared %d completed/failed jobs", n))
+			msg := fmt.Sprintf("cleared %d completed/failed jobs", n)
+			if kept > 0 {
+				msg += fmt.Sprintf(" (kept %d still referenced by active jobs)", kept)
+			}
+			outJSON(map[string]any{"cleared": n, "kept": kept}, msg)
 			return nil
 		}}
 	// worker: drain ready jobs and run each through the native agent loop.
@@ -241,7 +298,12 @@ func registerQueue(root *cobra.Command, app *App) {
 			if err != nil {
 				return err
 			}
-			sum, err := worker.Drain(context.Background(), db.DB, opts)
+			// Cancel on SIGINT/SIGTERM (mirroring the cron daemon) so an
+			// interrupted in-flight job is recorded as failed instead of being
+			// left in 'running' forever.
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			sum, err := worker.Drain(ctx, db.DB, opts)
 			if err != nil {
 				return err
 			}
@@ -274,7 +336,7 @@ func registerQueue(root *cobra.Command, app *App) {
 			// engine, which is the only key run_dag reads); the alias set below is
 			// rejected with a "use 'depends_on' instead" hint so a spec written for
 			// either implementation is validated identically.
-			recognized := map[string]bool{"name": true, "task": true, "depends_on": true, "profile": true}
+			recognized := map[string]bool{"name": true, "task": true, "depends_on": true, "profile": true, "task_type": true}
 			depAliases := map[string]bool{"deps": true, "depends": true, "needs": true, "dependencies": true, "requires": true, "after": true}
 			for i, s := range steps {
 				taskVal, ok := s["task"]
@@ -294,7 +356,7 @@ func registerQueue(root *cobra.Command, app *App) {
 					if depAliases[k] {
 						return fmt.Errorf("step %d uses unrecognized dependency key %q; use 'depends_on' instead", i, k)
 					}
-					return fmt.Errorf("step %d has unrecognized key %q; allowed keys are [depends_on name profile task]", i, k)
+					return fmt.Errorf("step %d has unrecognized key %q; allowed keys are [depends_on name profile task task_type]", i, k)
 				}
 			}
 			db, err := app.OpenDB()
@@ -440,7 +502,10 @@ func registerQueue(root *cobra.Command, app *App) {
 			}
 			var specJSON string
 			if err := db.QueryRow(`SELECT spec_json FROM queue_dags WHERE name=?`, args[0]).Scan(&specJSON); err != nil {
-				return fmt.Errorf("DAG not found: %q", args[0])
+				if errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("DAG not found: %q", args[0])
+				}
+				return err
 			}
 			var spec struct {
 				Steps []map[string]any `json:"steps"`
@@ -539,6 +604,7 @@ func registerQueue(root *cobra.Command, app *App) {
 				if err != nil {
 					return err
 				}
+				opts.OnlyJobs = submitted
 				s, err := worker.Drain(context.Background(), db.DB, opts)
 				if err != nil {
 					return err

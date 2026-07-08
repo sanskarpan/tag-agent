@@ -94,8 +94,13 @@ func registerEvalDataset(root *cobra.Command, app *App) {
 			var out []dsSummary
 			for rows.Next() {
 				var d dsSummary
-				rows.Scan(&d.Name, &d.Version, &d.CaseCount)
+				if err := rows.Scan(&d.Name, &d.Version, &d.CaseCount); err != nil {
+					return err
+				}
 				out = append(out, d)
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			if flagJSON {
 				return emitJSON(out)
@@ -216,6 +221,9 @@ func exportDatasetYAML(db *store.DB, datasetID string) (string, error) {
 			c.Expected = &v
 		}
 		doc.Cases = append(doc.Cases, c)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
 	}
 	b, err := yaml.Marshal(doc)
 	if err != nil {

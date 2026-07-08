@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"strings"
@@ -93,6 +94,30 @@ func TestMCPCallTool(t *testing.T) {
 	}
 	if res.Text() != "HELLO MCP" {
 		t.Errorf("tool result wrong: %q", res.Text())
+	}
+}
+
+func TestInitializeSendsInitializedNotification(t *testing.T) {
+	respR, respW := io.Pipe()
+	var buf bytes.Buffer
+	c := NewClient(&buf, respR)
+	go respW.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}` + "\n"))
+	if err := c.Initialize("tag-test"); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected initialize request + initialized notification, got %d frames: %q", len(lines), buf.String())
+	}
+	var note map[string]any
+	if err := json.Unmarshal([]byte(lines[1]), &note); err != nil {
+		t.Fatalf("notification frame not JSON: %v", err)
+	}
+	if note["method"] != "notifications/initialized" {
+		t.Errorf("second frame method = %v, want notifications/initialized", note["method"])
+	}
+	if _, hasID := note["id"]; hasID {
+		t.Error("notification must not carry an id")
 	}
 }
 

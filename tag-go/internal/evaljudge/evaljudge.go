@@ -130,14 +130,17 @@ func parseJudgeResponse(text string) (float64, string) {
 
 func decodeVerdict(s string) (float64, string, bool) {
 	var v struct {
-		Score     float64 `json:"score"`
-		Reasoning string  `json:"reasoning"`
-		Rationale string  `json:"rationale"`
+		Score     *float64 `json:"score"`
+		Reasoning string   `json:"reasoning"`
+		Rationale string   `json:"rationale"`
 	}
 	if err := json.Unmarshal([]byte(s), &v); err != nil {
 		return 0, "", false
 	}
-	score := v.Score
+	if v.Score == nil {
+		return 0, "", false
+	}
+	score := *v.Score
 	if score < 0 {
 		score = 0
 	}

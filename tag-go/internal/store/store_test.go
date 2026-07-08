@@ -2,7 +2,9 @@ package store
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -46,5 +48,35 @@ func TestConcurrentColdStartMigration(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Fatalf("concurrent cold-start migration failed: %v", err)
+	}
+}
+
+// A DB path containing URI-special characters ('?', '#') must not truncate the
+// DSN query string: the pragmas must still apply and the file must be created
+// at the literal path.
+func TestOpenPathSpecialCharsInPath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "we?ird#dir")
+	path := filepath.Join(dir, "tag.db")
+	db, err := OpenPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("db not created at the literal path: %v", err)
+	}
+	var fk int
+	if err := db.QueryRow("PRAGMA foreign_keys").Scan(&fk); err != nil {
+		t.Fatal(err)
+	}
+	if fk != 1 {
+		t.Errorf("foreign_keys = %d, want 1", fk)
+	}
+	var mode string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		t.Errorf("journal_mode = %q, want wal", mode)
 	}
 }

@@ -1,6 +1,9 @@
 package diffcontext
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestIsBlocked(t *testing.T) {
 	pats := DefaultBlockedPatterns
@@ -24,6 +27,20 @@ func TestIsBinary(t *testing.T) {
 	}
 	if isBinary("app.py") {
 		t.Error("app.py should not be binary")
+	}
+}
+
+func TestBuildRejectsOptionLikeRef(t *testing.T) {
+	for _, ref := range []string{"--output=/tmp/pwn", "-x", "--ext-diff"} {
+		if _, err := Build(ref, false, 3, 20, nil, t.TempDir()); err == nil || !strings.Contains(err.Error(), "invalid git ref") {
+			t.Errorf("ref %q: expected invalid ref error, got %v", ref, err)
+		}
+	}
+}
+
+func TestFileDiffRejectsOptionLikeRef(t *testing.T) {
+	if out := fileDiff("a.txt", "--output=/tmp/pwn", 3, false, t.TempDir()); out != "" {
+		t.Errorf("expected empty diff for option-like ref, got %q", out)
 	}
 }
 

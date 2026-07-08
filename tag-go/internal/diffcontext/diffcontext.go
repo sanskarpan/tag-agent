@@ -68,11 +68,21 @@ type GitError struct{ Msg string }
 
 func (e *GitError) Error() string { return e.Msg }
 
+func validateRef(ref string) error {
+	if strings.HasPrefix(ref, "-") {
+		return &GitError{Msg: "invalid git ref: " + ref}
+	}
+	return nil
+}
+
 func changedFiles(ref string, staged bool, workdir string) ([]string, error) {
 	args := []string{"diff", "--name-only"}
 	if staged {
 		args = append(args, "--cached")
 	} else {
+		if err := validateRef(ref); err != nil {
+			return nil, err
+		}
 		args = append(args, ref)
 	}
 	cmd := exec.Command("git", args...)
@@ -103,6 +113,9 @@ func fileDiff(filename, ref string, contextLines int, staged bool, workdir strin
 	if staged {
 		args = append(args, "--cached")
 	} else {
+		if validateRef(ref) != nil {
+			return ""
+		}
 		args = append(args, ref)
 	}
 	args = append(args, "--", filename)

@@ -141,9 +141,12 @@ func Fetch(rawURL string, timeout time.Duration) ([]byte, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("fetch failed: HTTP %d", resp.StatusCode)
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(b) > maxFetchBytes {
+		return nil, fmt.Errorf("fetch failed: response body exceeds %d bytes", maxFetchBytes)
 	}
 	return b, nil
 }

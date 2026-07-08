@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -34,12 +36,18 @@ func registerRouteFallback(root *cobra.Command, app *App) {
 			pr := app.profile(profile)
 			// dedupe
 			var dup int
-			db.QueryRow(`SELECT COUNT(*) FROM route_fallbacks WHERE profile=? AND primary_model=? AND fallback_model=? AND condition=?`, pr, primary, fallback, condition).Scan(&dup)
+			if err := db.QueryRow(`SELECT COUNT(*) FROM route_fallbacks WHERE profile=? AND primary_model=? AND fallback_model=? AND condition=?`, pr, primary, fallback, condition).Scan(&dup); err != nil {
+				return err
+			}
 			if dup > 0 {
 				return fmt.Errorf("identical fallback already exists")
 			}
 			// cycle check: does fallback already reach primary?
-			if reaches(db, pr, fallback, primary, condition) {
+			cyclic, err := reaches(db, pr, fallback, primary, condition)
+			if err != nil {
+				return err
+			}
+			if cyclic {
 				return fmt.Errorf("would create a cycle (%s -> ... -> %s)", primary, fallback)
 			}
 			id := uuid.NewString()[:12]
@@ -91,6 +99,9 @@ func registerRouteFallback(root *cobra.Command, app *App) {
 				r.Enabled = en != 0
 				out = append(out, r)
 			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
 			if flagJSON {
 				return emitJSON(out)
 			}
@@ -133,12 +144,15 @@ func registerRouteFallback(root *cobra.Command, app *App) {
 			var fm string
 			err = db.QueryRow(`SELECT fallback_model FROM route_fallbacks WHERE profile=? AND primary_model=? AND condition=? AND enabled=1 ORDER BY priority LIMIT 1`,
 				app.profile(profile), primary, condition).Scan(&fm)
-			if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
 				// A valid query that simply has no fallback configured is not an
 				// error (parity with Python cmd_route_fallback resolve, #542) — exit 0.
 				outJSON(map[string]any{"primary": primary, "fallback": nil, "condition": condition},
 					fmt.Sprintf("No fallback configured for %q on condition=%q", primary, condition))
 				return nil
+			}
+			if err != nil {
+				return err
 			}
 			outJSON(map[string]any{"primary": primary, "fallback": fm, "condition": condition},
 				fmt.Sprintf("Fallback: %s -> %s (condition: %s)", primary, fm, condition))
@@ -152,14 +166,14 @@ func registerRouteFallback(root *cobra.Command, app *App) {
 
 // reaches does a BFS over the fallback edges to detect if `from` can already
 // reach `target` under the same condition (i.e. adding target->... would cycle).
-func reaches(db *store.DB, profile, from, target, cond string) bool {
+func reaches(db *store.DB, profile, from, target, cond string) (bool, error) {
 	seen := map[string]bool{}
 	queue := []string{from}
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
 		if cur == target {
-			return true
+			return true, nil
 		}
 		if seen[cur] {
 			continue
@@ -167,17 +181,21 @@ func reaches(db *store.DB, profile, from, target, cond string) bool {
 		seen[cur] = true
 		rows, err := db.Query(`SELECT fallback_model FROM route_fallbacks WHERE profile=? AND primary_model=? AND condition=?`, profile, cur, cond)
 		if err != nil {
-			return false
+			return false, err
 		}
 		for rows.Next() {
 			var fm string
 			if err := rows.Scan(&fm); err != nil {
 				rows.Close()
-				return false
+				return false, err
 			}
 			queue = append(queue, fm)
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return false, err
+		}
 		rows.Close()
 	}
-	return false
+	return false, nil
 }

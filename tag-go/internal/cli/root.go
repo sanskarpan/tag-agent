@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/tag-agent/tag/internal/version"
@@ -22,6 +21,12 @@ func jsonErrorMaybe(err error) error {
 	return err
 }
 
+// parsePassed is set once cobra has resolved the target command, parsed its
+// flags, and validated its args (the root PersistentPreRunE only runs after all
+// of that succeeds). Usage errors — unknown command, bad flag, arg-count —
+// happen before it is set.
+var parsePassed bool
+
 // isUsageError reports whether err is a cobra usage/argument error, which
 // Python's argparse maps to exit code 2 (issue #531). Genuine runtime failures
 // stay at exit 1.
@@ -35,24 +40,7 @@ func isUsageError(err error) bool {
 	if errors.As(err, &ue) {
 		return true
 	}
-	m := err.Error()
-	for _, p := range []string{
-		"unknown command",
-		"unknown flag",
-		"unknown shorthand flag",
-		"unknown subcommand",
-		"invalid argument",
-		"required flag",
-		"accepts ", // "accepts N arg(s), received M"
-		"requires at least",
-		"requires exactly",
-		"flag needs an argument",
-	} {
-		if strings.Contains(m, p) {
-			return true
-		}
-	}
-	return false
+	return !parsePassed
 }
 
 var (
@@ -70,6 +58,7 @@ func NewRoot() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			parsePassed = true
 			// commands that don't need config opt out via annotation
 			if cmd.Annotations["noconfig"] == "1" {
 				return nil
@@ -176,7 +165,7 @@ func enforceUnknownSubcommand(cmd *cobra.Command) {
 			if len(args) == 0 {
 				return c.Help()
 			}
-			return fmt.Errorf("unknown command %q for %q", args[0], c.CommandPath())
+			return usageErrorf("unknown command %q for %q", args[0], c.CommandPath())
 		}
 	}
 }

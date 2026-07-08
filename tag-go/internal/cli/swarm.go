@@ -35,8 +35,15 @@ func registerSwarm(root *cobra.Command, app *App) {
 			var out []run
 			for rows.Next() {
 				var r run
-				rows.Scan(&r.SwarmID, &r.Goal, &r.Status, &r.Tasks, &r.Cost)
+				var cost sql.NullFloat64
+				if err := rows.Scan(&r.SwarmID, &r.Goal, &r.Status, &r.Tasks, &cost); err != nil {
+					return err
+				}
+				r.Cost = cost.Float64
 				out = append(out, r)
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			if flagJSON {
 				return emitJSON(out)
@@ -85,8 +92,15 @@ func registerSwarm(root *cobra.Command, app *App) {
 			var trs []task
 			for trows.Next() {
 				var t task
-				trows.Scan(&t.TaskID, &t.Profile, &t.Status, &t.Cost, &t.Error)
+				var tcost sql.NullFloat64
+				if err := trows.Scan(&t.TaskID, &t.Profile, &t.Status, &tcost, &t.Error); err != nil {
+					return err
+				}
+				t.Cost = tcost.Float64
 				trs = append(trs, t)
+			}
+			if err := trows.Err(); err != nil {
+				return err
 			}
 			if flagJSON {
 				return emitJSON(map[string]any{"run": map[string]any{"swarm_id": sid, "goal": goal, "status": st, "task_count": tasks, "total_cost_usd": cost.Float64}, "tasks": trs})
@@ -136,10 +150,17 @@ func registerSwarm(root *cobra.Command, app *App) {
 			var trs []task
 			for trows.Next() {
 				var t task
+				var tcost sql.NullFloat64
 				var tp, tc sql.NullInt64
-				trows.Scan(&t.TaskID, &t.Status, &t.Cost, &tp, &tc)
+				if err := trows.Scan(&t.TaskID, &t.Status, &tcost, &tp, &tc); err != nil {
+					return err
+				}
+				t.Cost = tcost.Float64
 				t.Tokens = tp.Int64 + tc.Int64
 				trs = append(trs, t)
+			}
+			if err := trows.Err(); err != nil {
+				return err
 			}
 			if flagJSON {
 				return emitJSON(map[string]any{"swarm_id": sid, "goal": goal, "status": st, "final_output": finalOut.String, "total_cost_usd": cost.Float64, "tasks": trs})

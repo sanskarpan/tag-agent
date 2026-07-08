@@ -2,6 +2,7 @@ package cli
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -32,11 +33,11 @@ type traceSpanRec struct {
 
 // traceBuildSnapshot builds an in-memory snapshot of a trace from live spans
 // (read-only; port of _build_snapshot). Returns nil if the trace has no spans.
-func traceBuildSnapshot(db *store.DB, traceID string) map[string]any {
+func traceBuildSnapshot(db *store.DB, traceID string) (map[string]any, error) {
 	rows, err := db.Query(`SELECT id,name,COALESCE(profile,''),COALESCE(model_id,''),started_at,COALESCE(finished_at,''),
 		prompt_tokens,completion_tokens,status,COALESCE(attributes,'{}'),error_msg FROM spans WHERE trace_id=? ORDER BY started_at`, traceID)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer rows.Close()
 	var spans []traceSpanRec
@@ -44,8 +45,10 @@ func traceBuildSnapshot(db *store.DB, traceID string) map[string]any {
 		var s traceSpanRec
 		var attrs string
 		var errMsg *string
-		rows.Scan(&s.ID, &s.Name, &s.Profile, &s.ModelID, &s.StartedAt, &s.FinishedAt,
-			&s.PromptTok, &s.CompTok, &s.Status, &attrs, &errMsg)
+		if err := rows.Scan(&s.ID, &s.Name, &s.Profile, &s.ModelID, &s.StartedAt, &s.FinishedAt,
+			&s.PromptTok, &s.CompTok, &s.Status, &attrs, &errMsg); err != nil {
+			return nil, err
+		}
 		s.Attributes = map[string]any{}
 		json.Unmarshal([]byte(attrs), &s.Attributes)
 		if errMsg != nil {
@@ -53,8 +56,11 @@ func traceBuildSnapshot(db *store.DB, traceID string) map[string]any {
 		}
 		spans = append(spans, s)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	if len(spans) == 0 {
-		return nil
+		return nil, nil
 	}
 	spanList := make([]any, len(spans))
 	for i, s := range spans {
@@ -64,7 +70,7 @@ func traceBuildSnapshot(db *store.DB, traceID string) map[string]any {
 		"trace_id":    traceID,
 		"captured_at": time.Now().UTC().Format(time.RFC3339),
 		"spans":       spanList,
-	}
+	}, nil
 }
 
 // traceSnapshotToSpans normalizes a snapshot's "spans" (which may be []any of
@@ -112,7 +118,9 @@ func registerObservability(root *cobra.Command, app *App) {
 				return err
 			}
 			var pt, ct int64
-			db.QueryRow(`SELECT COALESCE(SUM(prompt_tokens),0),COALESCE(SUM(completion_tokens),0) FROM spans`).Scan(&pt, &ct)
+			if err := db.QueryRow(`SELECT COALESCE(SUM(prompt_tokens),0),COALESCE(SUM(completion_tokens),0) FROM spans`).Scan(&pt, &ct); err != nil {
+				return err
+			}
 			out := map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
 			if flagJSON {
 				b, _ := json.Marshal(map[string]any{"totals": out})
@@ -173,8 +181,13 @@ func registerObservability(root *cobra.Command, app *App) {
 			var ids []string
 			for rows.Next() {
 				var id string
-				rows.Scan(&id)
+				if err := rows.Scan(&id); err != nil {
+					return err
+				}
 				ids = append(ids, id)
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			if flagJSON {
 				b, _ := json.Marshal(ids)
@@ -209,8 +222,13 @@ func registerObservability(root *cobra.Command, app *App) {
 			var recs []showRec
 			for rows.Next() {
 				var r showRec
-				rows.Scan(&r.id, &r.tid, &r.pid, &r.name, &r.profile, &r.model, &r.start, &r.fin, &r.dur, &r.status, &r.pt, &r.ct, &r.attrs, &r.errMsg)
+				if err := rows.Scan(&r.id, &r.tid, &r.pid, &r.name, &r.profile, &r.model, &r.start, &r.fin, &r.dur, &r.status, &r.pt, &r.ct, &r.attrs, &r.errMsg); err != nil {
+					return err
+				}
 				recs = append(recs, r)
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			if len(recs) == 0 {
 				if flagJSON {
@@ -270,12 +288,17 @@ func registerObservability(root *cobra.Command, app *App) {
 			for rows.Next() {
 				var id, tid, pid, name, prof, model, start, fin, status string
 				var dur, pt, ct int
-				rows.Scan(&id, &tid, &pid, &name, &prof, &model, &start, &fin, &dur, &status, &pt, &ct)
+				if err := rows.Scan(&id, &tid, &pid, &name, &prof, &model, &start, &fin, &dur, &status, &pt, &ct); err != nil {
+					return err
+				}
 				spans = append(spans, map[string]any{"traceId": tid, "spanId": id, "parentSpanId": pid,
-					"name": name, "startTimeUnixNano": start, "endTimeUnixNano": fin,
+					"name": name, "startTimeUnixNano": otelISOToNanos(start), "endTimeUnixNano": otelISOToNanos(fin),
 					"status": map[string]any{"code": status},
 					"attributes": []map[string]any{otelAttr("gen_ai.request.model", model), otelAttr("tag.profile", prof),
 						otelAttrInt("gen_ai.usage.input_tokens", pt), otelAttrInt("gen_ai.usage.output_tokens", ct)}})
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			// Live OTLP POST to a collector requires the network export backend,
 			// which is out of scope for the offline Go build (same stance as
@@ -325,8 +348,13 @@ func registerObservability(root *cobra.Command, app *App) {
 			var snaps []snap
 			for rows.Next() {
 				var s snap
-				rows.Scan(&s.id, &s.created)
+				if err := rows.Scan(&s.id, &s.created); err != nil {
+					return err
+				}
 				snaps = append(snaps, s)
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			if flagJSON {
 				items := []map[string]any{}
@@ -350,7 +378,10 @@ func registerObservability(root *cobra.Command, app *App) {
 			if err != nil {
 				return err
 			}
-			snap := traceLoadSnapshot(db, args[0])
+			snap, err := traceLoadSnapshot(db, args[0])
+			if err != nil {
+				return err
+			}
 			if snap == nil {
 				return fmt.Errorf("No snapshot found for trace %s", args[0])
 			}
@@ -378,11 +409,17 @@ func registerObservability(root *cobra.Command, app *App) {
 			if err != nil {
 				return err
 			}
-			snapA := traceLoadSnapshot(db, args[0])
+			snapA, err := traceLoadSnapshot(db, args[0])
+			if err != nil {
+				return err
+			}
 			if snapA == nil {
 				return fmt.Errorf("No snapshot for trace %s", args[0])
 			}
-			snapB := traceLoadSnapshot(db, args[1])
+			snapB, err := traceLoadSnapshot(db, args[1])
+			if err != nil {
+				return err
+			}
 			if snapB == nil {
 				return fmt.Errorf("No snapshot for trace %s", args[1])
 			}
@@ -459,27 +496,33 @@ func registerObservability(root *cobra.Command, app *App) {
 // traceSnapshot captures a snapshot of a trace into trace_snapshots (port of
 // _snapshot_trace: deterministic PK so repeats de-duplicate). No-op if empty.
 func traceSnapshot(db *store.DB, traceID string) error {
-	snap := traceBuildSnapshot(db, traceID)
+	snap, err := traceBuildSnapshot(db, traceID)
+	if err != nil {
+		return err
+	}
 	if snap == nil {
 		return nil
 	}
 	b, _ := json.Marshal(snap)
 	h := sha256.Sum256([]byte(traceID))
 	snapID := hex.EncodeToString(h[:])[:16]
-	_, err := db.Exec(`INSERT OR REPLACE INTO trace_snapshots(id,trace_id,step_index,snapshot_json,created_at)
+	_, err = db.Exec(`INSERT OR REPLACE INTO trace_snapshots(id,trace_id,step_index,snapshot_json,created_at)
 		VALUES(?,?,0,?,?)`, snapID, traceID, string(b), str(snap["captured_at"]))
 	return err
 }
 
 // traceLoadSnapshot returns the latest persisted snapshot for a trace, or —
 // when none is stored — an in-memory snapshot built from live spans.
-func traceLoadSnapshot(db *store.DB, traceID string) map[string]any {
+func traceLoadSnapshot(db *store.DB, traceID string) (map[string]any, error) {
 	var js string
-	if err := db.QueryRow(`SELECT snapshot_json FROM trace_snapshots WHERE trace_id=? ORDER BY created_at DESC LIMIT 1`, traceID).Scan(&js); err == nil {
+	err := db.QueryRow(`SELECT snapshot_json FROM trace_snapshots WHERE trace_id=? ORDER BY created_at DESC LIMIT 1`, traceID).Scan(&js)
+	if err == nil {
 		var snap map[string]any
 		if json.Unmarshal([]byte(js), &snap) == nil {
-			return snap
+			return snap, nil
 		}
+	} else if err != sql.ErrNoRows {
+		return nil, err
 	}
 	return traceBuildSnapshot(db, traceID)
 }

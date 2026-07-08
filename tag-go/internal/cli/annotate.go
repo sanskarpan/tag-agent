@@ -80,6 +80,9 @@ func registerAnnotate(root *cobra.Command, app *App) {
 				}
 				tasks = append(tasks, t)
 			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
 			if flagJSON {
 				if tasks == nil {
 					tasks = []claimed{}
@@ -167,6 +170,9 @@ func registerAnnotate(root *cobra.Command, app *App) {
 				}
 			}
 			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
 			var avg *float64
 			var v float64
 			if err := db.QueryRow(`SELECT AVG((julianday(completed_at)-julianday(created_at))*24.0)
@@ -211,6 +217,9 @@ func registerAnnotate(root *cobra.Command, app *App) {
 				}
 				r.Label, r.Notes, r.AssignedTo, r.CompletedAt = deref(label), deref(notes), deref(assigned), deref(completed)
 				recs = append(recs, r)
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			var data string
 			if format == "csv" {

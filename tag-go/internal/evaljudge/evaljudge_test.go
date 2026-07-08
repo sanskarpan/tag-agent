@@ -142,3 +142,22 @@ func TestShowNotFound(t *testing.T) {
 		t.Fatal("expected not-found error")
 	}
 }
+
+// TestParseJudgeResponseMissingScoreFallsBack: a verdict without a score (or
+// with a JSON null score) must hit the neutral fallback, while an explicit
+// zero score is honored.
+func TestParseJudgeResponseMissingScoreFallsBack(t *testing.T) {
+	for _, s := range []string{
+		`{"passed": true, "reasoning": "looks fine"}`,
+		`{"score": null, "reasoning": "null score"}`,
+	} {
+		score, reasoning := parseJudgeResponse(s)
+		if score != 0.5 || reasoning != "parse error" {
+			t.Errorf("%s: want neutral fallback, got score=%v reasoning=%q", s, score, reasoning)
+		}
+	}
+	score, reasoning := parseJudgeResponse(`{"score": 0, "reasoning": "wrong"}`)
+	if score != 0 || reasoning != "wrong" {
+		t.Errorf("explicit zero score must stay 0.0, got score=%v reasoning=%q", score, reasoning)
+	}
+}

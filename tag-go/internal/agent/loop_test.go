@@ -33,6 +33,23 @@ func (p *scriptedProvider) Stream(ctx context.Context, req llm.Request) (<-chan 
 	return ch, nil
 }
 
+func TestRegistryDefsSortedByName(t *testing.T) {
+	reg := NewRegistry()
+	for _, n := range []string{"zeta", "alpha", "mid"} {
+		reg.Add(Tool{Def: llm.ToolDef{Name: n}})
+	}
+	defs := reg.Defs()
+	want := []string{"alpha", "mid", "zeta"}
+	if len(defs) != len(want) {
+		t.Fatalf("expected %d defs, got %d", len(want), len(defs))
+	}
+	for i, n := range want {
+		if defs[i].Name != n {
+			t.Fatalf("Defs() must be sorted by name, got %v at %d (want %s)", defs[i].Name, i, n)
+		}
+	}
+}
+
 func TestLoopEchoTerminates(t *testing.T) {
 	// EchoProvider never requests tools -> loop finishes in one step.
 	l := &Loop{Provider: llm.EchoProvider{}}

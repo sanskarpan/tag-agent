@@ -23,6 +23,10 @@ type Options struct {
 	Root string
 	// BashTimeout caps shell command runtime.
 	BashTimeout time.Duration
+	// DisableBash omits the bash tool, leaving only the root-confined file tools.
+	// The bash tool executes unrestricted host commands (Root only sets its
+	// working directory; it is not a sandbox).
+	DisableBash bool
 	// MaxReadBytes caps read_file output.
 	MaxReadBytes int64
 }
@@ -40,7 +44,9 @@ func Register(reg *agent.Registry, opts Options) {
 	if opts.MaxReadBytes == 0 {
 		opts.MaxReadBytes = 256 * 1024
 	}
-	reg.Add(bashTool(opts))
+	if !opts.DisableBash {
+		reg.Add(bashTool(opts))
+	}
 	reg.Add(readFileTool(opts))
 	reg.Add(writeFileTool(opts))
 	reg.Add(listDirTool(opts))
@@ -109,7 +115,7 @@ func bashTool(opts Options) agent.Tool {
 	return agent.Tool{
 		Def: llm.ToolDef{
 			Name:        "bash",
-			Description: "Run a shell command and return combined stdout+stderr.",
+			Description: "Run a shell command and return combined stdout+stderr. Commands execute unrestricted on the host (NOT confined to the tool root, unlike the file tools); the tool root is only the working directory when one is configured.",
 			Schema:      map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}, "required": []string{"command"}},
 		},
 		Exec: func(ctx context.Context, in map[string]any) (string, error) {

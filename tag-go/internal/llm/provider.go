@@ -41,8 +41,9 @@ type Request struct {
 	Messages  []Message
 	Tools     []ToolDef
 	MaxTokens int
-	// CacheHint asks the adapter to place a prompt-cache breakpoint at the last
-	// user message boundary (Anthropic prompt caching, on by default).
+	// CacheHint asks the adapter to place Anthropic prompt-cache breakpoints on
+	// the stable prompt prefix (the last tool definition and the system prompt),
+	// so repeated turns reuse the cached prefix. On by default in agent.Options.
 	CacheHint bool
 }
 
@@ -68,7 +69,7 @@ type ToolCall struct {
 
 // Usage carries token accounting.
 type Usage struct {
-	PromptTokens, CompletionTokens, CacheReadTokens int
+	PromptTokens, CompletionTokens, CacheReadTokens, CacheCreationTokens int
 }
 
 // Event is one item in the provider-neutral output stream.

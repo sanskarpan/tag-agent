@@ -4,6 +4,8 @@
 package graph
 
 import (
+	"database/sql"
+	"errors"
 	"regexp"
 	"sort"
 	"strings"
@@ -105,6 +107,9 @@ func addEntity(db *store.DB, name, etype, profile string, confidence float64) (s
 		_, err = db.Exec(`UPDATE entities SET mention_count=?, confidence=? WHERE id=?`, count+1, newConf, id)
 		return id, err
 	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
 	id = uuid.NewString()[:12]
 	_, err = db.Exec(`INSERT INTO entities(id,name,entity_type,description,confidence,profile,created_at,mention_count)
 		VALUES(?,?,?,'',?,?,?,1)`, id, name, etype, confidence, profile, now())
@@ -118,6 +123,9 @@ func addRelation(db *store.DB, srcID, tgtID, relType string, confidence float64,
 		srcID, tgtID, relType).Scan(&existing)
 	if err == nil {
 		return nil // already present
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
 	}
 	_, err = db.Exec(`INSERT INTO relations(id,source_entity_id,target_entity_id,relation_type,confidence,source_memory_id,created_at)
 		VALUES(?,?,?,?,?,?,?)`, uuid.NewString()[:12], srcID, tgtID, relType, confidence, memoryID, now())
@@ -138,6 +146,10 @@ func Reset(db *store.DB, profile string) error {
 			return err
 		}
 		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
 	}
 	rows.Close()
 	for _, id := range ids {
@@ -235,6 +247,10 @@ func DetectCommunities(db *store.DB, profile string) ([]Community, error) {
 		nameMap[id] = name
 		countMap[id] = count
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
 	rows.Close()
 	if len(nodes) == 0 {
 		return nil, nil
@@ -253,6 +269,10 @@ func DetectCommunities(db *store.DB, profile string) ([]Community, error) {
 			return nil, err
 		}
 		edges = append(edges, [2]string{s, t})
+	}
+	if err := rrows.Err(); err != nil {
+		rrows.Close()
+		return nil, err
 	}
 	rrows.Close()
 

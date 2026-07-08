@@ -60,8 +60,13 @@ func registerHooks(root *cobra.Command, app *App) {
 			var out []logRow
 			for rows.Next() {
 				var r logRow
-				rows.Scan(&r.ID, &r.HookName, &r.EventType, &r.Status, &r.Response, &r.FiredAt)
+				if err := rows.Scan(&r.ID, &r.HookName, &r.EventType, &r.Status, &r.Response, &r.FiredAt); err != nil {
+					return err
+				}
 				out = append(out, r)
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			if flagJSON {
 				return emitJSON(out)
@@ -107,8 +112,10 @@ func registerHooks(root *cobra.Command, app *App) {
 				if errMsg != "" {
 					resp = errMsg
 				}
-				db.Exec(`INSERT INTO hook_log(id,hook_name,event_id,status,response,fired_at) VALUES(?,?,?,?,?,?)`,
-					uuid.NewString()[:12], str(hm["name"]), event, status, resp, time.Now().UTC().Format(time.RFC3339))
+				if _, err := db.Exec(`INSERT INTO hook_log(id,hook_name,event_id,status,response,fired_at) VALUES(?,?,?,?,?,?)`,
+					uuid.NewString()[:12], str(hm["name"]), event, status, resp, time.Now().UTC().Format(time.RFC3339)); err != nil {
+					return err
+				}
 			}
 			if fired == 0 {
 				fmt.Printf("⚠ No hooks matched event '%s'\n", event)

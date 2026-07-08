@@ -251,6 +251,9 @@ func registerMem2(root *cobra.Command, app *App) {
 					parts = append(parts, o.String)
 				}
 			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
 			if len(parts) == 0 {
 				return fmt.Errorf("Run not found or has no recorded output: %q", args[0])
 			}

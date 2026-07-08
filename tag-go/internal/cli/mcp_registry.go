@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -159,13 +161,18 @@ func loadProfileConfig(app *App, profile string) (string, map[string]any, error)
 	dir := paths.ProfileHome(homeDir, profile)
 	path := filepath.Join(dir, "config.yaml")
 	pcfg := map[string]any{}
-	if b, err := os.ReadFile(path); err == nil {
-		if err := yaml.Unmarshal(b, &pcfg); err != nil {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
 			return "", nil, err
 		}
-		if pcfg == nil {
-			pcfg = map[string]any{}
-		}
+		return path, pcfg, nil
+	}
+	if err := yaml.Unmarshal(b, &pcfg); err != nil {
+		return "", nil, err
+	}
+	if pcfg == nil {
+		pcfg = map[string]any{}
 	}
 	return path, pcfg, nil
 }

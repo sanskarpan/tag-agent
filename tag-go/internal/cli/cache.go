@@ -155,6 +155,9 @@ func registerCache(root *cobra.Command, app *App) {
 				r.NetSavings = round6(net)
 				out = append(out, r)
 			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
 			// warnThreshold==0 disables the warn gate (mirrors Python `if warn_threshold`).
 			warned := false
 			if flagJSON {
@@ -237,6 +240,9 @@ func registerCache(root *cobra.Command, app *App) {
 					return err
 				}
 				data[day] = dv{pt, crt}
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			today := time.Now().UTC()
 			start := today.AddDate(0, 0, -(days - 1))
@@ -338,6 +344,9 @@ func registerCache(root *cobra.Command, app *App) {
 					return err
 				}
 				recs = append(recs, r)
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			fmt.Printf("Cache tips for profile: %s\n\n", tipsProfile)
 			if len(recs) == 0 {

@@ -42,6 +42,9 @@ func registerEval(root *cobra.Command, app *App) {
 				}
 				out = append(out, r)
 			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
 			if flagJSON {
 				if out == nil {
 					out = []run{}
@@ -98,6 +101,9 @@ func registerEval(root *cobra.Command, app *App) {
 				}
 				c.Passed = p != 0
 				cases = append(cases, c)
+			}
+			if err := crows.Err(); err != nil {
+				return err
 			}
 			if flagJSON {
 				return emitJSON(map[string]any{

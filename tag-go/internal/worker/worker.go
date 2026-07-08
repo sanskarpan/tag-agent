@@ -38,6 +38,14 @@ var claimableStatuses = []string{"queued", "ready", "pending"}
 // 'done', so a dependent must be cascade-failed (mirrors dag.py _FAILED_DEP_STATUSES).
 var failedDepStatuses = map[string]bool{"failed": true, "cancelled": true, "timed_out": true}
 
+// staleClaimLease is how long a job may sit in 'running' before it is treated
+// as abandoned (worker crash/SIGKILL) and requeued for another drainer.
+const staleClaimLease = 30 * time.Minute
+
+// finishTimeout bounds the terminal-status write, which must succeed even when
+// the drain context has already been cancelled.
+const finishTimeout = 10 * time.Second
+
 // Summary reports the outcome of a Drain.
 type Summary struct {
 	Claimed int `json:"claimed"`
@@ -64,6 +72,9 @@ type Options struct {
 	WithTools bool
 	// MaxJobs caps how many jobs are claimed in this Drain (0 = unlimited).
 	MaxJobs int
+	// OnlyJobs, when non-empty, restricts this Drain to the given job ids;
+	// other claimable jobs in the queue are left untouched.
+	OnlyJobs []string
 	// Watch keeps polling instead of returning after the queue is drained.
 	Watch bool
 	// PollInterval is the Watch poll cadence (default 2s).
@@ -124,12 +135,15 @@ type jobRow struct {
 // still blocked at the end of this pass (so the terminal pass reports the true
 // blocked set rather than accumulating across passes).
 func drainPass(ctx context.Context, db *sql.DB, opts Options, sum *Summary) (int, error) {
+	if err := reclaimStale(ctx, db); err != nil {
+		return 0, err
+	}
 	// Read all claimable jobs first, then close the cursor before issuing any
 	// writes: the store uses a single writer connection, so an open SELECT
 	// cursor would deadlock a concurrent UPDATE on the same conn.
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(claimableStatuses)), ",")
 	q := `SELECT id, profile, task, COALESCE(deps_json,'[]') FROM queue_jobs
-	      WHERE status IN (` + placeholders + `) ORDER BY created_at ASC, id ASC`
+	      WHERE status IN (` + placeholders + `) ORDER BY priority DESC, created_at ASC, id ASC`
 	args := make([]any, len(claimableStatuses))
 	for i, s := range claimableStatuses {
 		args[i] = s
@@ -155,11 +169,25 @@ func drainPass(ctx context.Context, db *sql.DB, opts Options, sum *Summary) (int
 	}
 	rows.Close()
 
+	var only map[string]bool
+	if len(opts.OnlyJobs) > 0 {
+		only = make(map[string]bool, len(opts.OnlyJobs))
+		for _, id := range opts.OnlyJobs {
+			only[id] = true
+		}
+	}
+
 	claimedThisPass := 0
 	skippedThisPass := 0
 	for _, j := range jobs {
+		if ctx.Err() != nil {
+			break
+		}
 		if opts.MaxJobs > 0 && sum.Claimed >= opts.MaxJobs {
 			break
+		}
+		if only != nil && !only[j.id] {
+			continue
 		}
 		if len(j.deps) > 0 {
 			satisfied, failedDep, failedStatus, err := depState(ctx, db, j.deps)
@@ -194,15 +222,21 @@ func drainPass(ctx context.Context, db *sql.DB, opts Options, sum *Summary) (int
 
 		text, runErr := runJob(ctx, opts, j)
 		if runErr != nil {
-			if err := finish(ctx, db, j.id, "failed", "", runErr.Error()); err != nil {
+			applied, err := finish(db, j.id, "failed", "", runErr.Error())
+			if err != nil {
 				return claimedThisPass, err
 			}
-			sum.Failed++
+			if applied {
+				sum.Failed++
+			}
 		} else {
-			if err := finish(ctx, db, j.id, "done", text, ""); err != nil {
+			applied, err := finish(db, j.id, "done", text, "")
+			if err != nil {
 				return claimedThisPass, err
 			}
-			sum.Done++
+			if applied {
+				sum.Done++
+			}
 		}
 	}
 	sum.Skipped = skippedThisPass
@@ -270,10 +304,30 @@ func cascadeFail(ctx context.Context, db *sql.DB, id, reason string) (bool, erro
 	return n == 1, nil
 }
 
-// finish records the terminal state of a job that this drainer executed.
-func finish(ctx context.Context, db *sql.DB, id, status, result, errText string) error {
-	_, err := db.ExecContext(ctx, `UPDATE queue_jobs SET status=?, result=?, error=?, finished_at=? WHERE id=?`,
+// finish records the terminal state of a job that this drainer executed. It
+// runs on its own bounded context so a cancelled drain can still persist the
+// outcome, and only applies while the job is still 'running' (a concurrent
+// `queue cancel` wins). Returns whether the update was applied.
+func finish(db *sql.DB, id, status, result, errText string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), finishTimeout)
+	defer cancel()
+	r, err := db.ExecContext(ctx, `UPDATE queue_jobs SET status=?, result=?, error=?, finished_at=?
+		WHERE id=? AND status='running'`,
 		status, result, errText, time.Now().UTC().Format(time.RFC3339), id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := r.RowsAffected()
+	return n == 1, nil
+}
+
+// reclaimStale requeues jobs abandoned in 'running' (their claimer crashed or
+// was killed before writing a terminal status) once their claim is older than
+// staleClaimLease, so dependents are not blocked forever.
+func reclaimStale(ctx context.Context, db *sql.DB) error {
+	cutoff := time.Now().UTC().Add(-staleClaimLease).Format(time.RFC3339)
+	_, err := db.ExecContext(ctx, `UPDATE queue_jobs SET status='queued', started_at=NULL
+		WHERE status='running' AND started_at IS NOT NULL AND started_at < ?`, cutoff)
 	return err
 }
 

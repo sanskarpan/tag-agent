@@ -2,8 +2,11 @@ package llm
 
 import (
 	"context"
+	"errors"
+	"io"
 	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 func collect(ch <-chan Event) (text string, calls []*ToolCall, usage Usage, finished bool) {
@@ -18,6 +21,7 @@ func collect(ch <-chan Event) (text string, calls []*ToolCall, usage Usage, fini
 				usage.PromptTokens += ev.Usage.PromptTokens
 				usage.CompletionTokens += ev.Usage.CompletionTokens
 				usage.CacheReadTokens += ev.Usage.CacheReadTokens
+				usage.CacheCreationTokens += ev.Usage.CacheCreationTokens
 			}
 		case EventFinish:
 			finished = true
@@ -29,7 +33,7 @@ func collect(ch <-chan Event) (text string, calls []*ToolCall, usage Usage, fini
 func TestAnthropicSSETextStream(t *testing.T) {
 	sse := strings.Join([]string{
 		`event: message_start`,
-		`data: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":4}}}`,
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":4,"cache_creation_input_tokens":3}}}`,
 		``,
 		`event: content_block_delta`,
 		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello "}}`,
@@ -53,7 +57,7 @@ func TestAnthropicSSETextStream(t *testing.T) {
 	if len(calls) != 0 {
 		t.Errorf("unexpected tool calls: %+v", calls)
 	}
-	if usage.PromptTokens != 12 || usage.CompletionTokens != 7 || usage.CacheReadTokens != 4 {
+	if usage.PromptTokens != 12 || usage.CompletionTokens != 7 || usage.CacheReadTokens != 4 || usage.CacheCreationTokens != 3 {
 		t.Errorf("usage = %+v", usage)
 	}
 	if !finished {
@@ -115,6 +119,63 @@ func TestBuildAnthropicBody(t *testing.T) {
 	}
 	if _, ok := body["tools"]; !ok {
 		t.Error("tools should be included")
+	}
+}
+
+func TestAnthropicSSETruncationSurfacesError(t *testing.T) {
+	// A reader that fails mid-stream (connection reset) must yield EventError,
+	// never a clean EventFinish.
+	sse := `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}` + "\n"
+	r := io.MultiReader(strings.NewReader(sse), iotest.ErrReader(errors.New("connection reset")))
+	ch := make(chan Event, 32)
+	go parseAnthropicSSE(r, ch)
+	var gotErr error
+	finished := false
+	for ev := range ch {
+		switch ev.Type {
+		case EventError:
+			gotErr = ev.Err
+		case EventFinish:
+			finished = true
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("truncated stream must emit EventError")
+	}
+	if finished {
+		t.Error("truncated stream must not emit EventFinish")
+	}
+}
+
+func TestBuildAnthropicBodyCacheHint(t *testing.T) {
+	req := Request{
+		Model: "claude-opus-4-8",
+		Messages: []Message{
+			{Role: RoleSystem, Content: "be terse"},
+			{Role: RoleUser, Content: "hi"},
+		},
+		Tools:     []ToolDef{{Name: "alpha"}, {Name: "beta"}},
+		CacheHint: true,
+	}
+	body := buildAnthropicBody(req)
+	sys, ok := body["system"].([]map[string]any)
+	if !ok || len(sys) != 1 {
+		t.Fatalf("CacheHint system should be a content-block array: %v", body["system"])
+	}
+	if sys[0]["type"] != "text" || sys[0]["text"] != "be terse" {
+		t.Errorf("system block wrong: %+v", sys[0])
+	}
+	cc, ok := sys[0]["cache_control"].(map[string]any)
+	if !ok || cc["type"] != "ephemeral" {
+		t.Errorf("system block must carry an ephemeral cache_control: %+v", sys[0])
+	}
+	tools := body["tools"].([]map[string]any)
+	if _, ok := tools[0]["cache_control"]; ok {
+		t.Errorf("only the last tool gets the breakpoint: %+v", tools[0])
+	}
+	tcc, ok := tools[1]["cache_control"].(map[string]any)
+	if !ok || tcc["type"] != "ephemeral" {
+		t.Errorf("last tool must carry an ephemeral cache_control: %+v", tools[1])
 	}
 }
 

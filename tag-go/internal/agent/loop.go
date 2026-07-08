@@ -7,6 +7,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/tag-agent/tag/internal/llm"
 )
@@ -31,12 +32,14 @@ func NewRegistry() *Registry { return &Registry{tools: map[string]Tool{}} }
 // Add registers a tool.
 func (r *Registry) Add(t Tool) { r.tools[t.Def.Name] = t }
 
-// Defs returns the tool definitions for the provider request.
+// Defs returns the tool definitions for the provider request, sorted by name
+// so the rendered prompt prefix is stable across requests (prompt caching).
 func (r *Registry) Defs() []llm.ToolDef {
 	out := make([]llm.ToolDef, 0, len(r.tools))
 	for _, t := range r.tools {
 		out = append(out, t.Def)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
@@ -117,6 +120,7 @@ func (l *Loop) Run(ctx context.Context, userMessage string, opts Options) (*Resu
 					usage.PromptTokens += ev.Usage.PromptTokens
 					usage.CompletionTokens += ev.Usage.CompletionTokens
 					usage.CacheReadTokens += ev.Usage.CacheReadTokens
+					usage.CacheCreationTokens += ev.Usage.CacheCreationTokens
 				}
 			case llm.EventError:
 				if ev.Err != nil {
@@ -127,6 +131,7 @@ func (l *Loop) Run(ctx context.Context, userMessage string, opts Options) (*Resu
 		res.TotalUsage.PromptTokens += usage.PromptTokens
 		res.TotalUsage.CompletionTokens += usage.CompletionTokens
 		res.TotalUsage.CacheReadTokens += usage.CacheReadTokens
+		res.TotalUsage.CacheCreationTokens += usage.CacheCreationTokens
 
 		s := Step{Text: text, Usage: usage}
 		if len(calls) == 0 {

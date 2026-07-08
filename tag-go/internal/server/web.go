@@ -270,6 +270,7 @@ es.addEventListener('update',e=>{
   renderRuns(d.runs||[]); renderQueue(d.queue||[]); renderCosts(d.costs||[]);
 });
 function cls(s){return s==='completed'?'ok':s==='failed'?'fail':s==='running'?'run':'pend';}
+function esc(s){if(s===null||s===undefined)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function renderRuns(rs){
   const t=document.getElementById('runs-table');
   t.innerHTML='<tr><th>ID</th><th>Profile</th><th>Model</th><th>Status</th><th>Tokens</th><th>Cost</th><th>When</th></tr>';
@@ -277,7 +278,7 @@ function renderRuns(rs){
     const when=(r.created_at||'').substring(11,16);
     const tok=((r.prompt_tokens||0)+(r.completion_tokens||0)).toLocaleString();
     const cost=r.cost_usd?'$'+r.cost_usd.toFixed(4):'—';
-    t.innerHTML+='<tr><td>'+(r.id||'').substring(0,12)+'</td><td>'+(r.profile||'')+'</td><td>'+(r.model||'')+'</td><td class="'+cls(r.status)+'">'+r.status+'</td><td>'+tok+'</td><td>'+cost+'</td><td>'+when+'</td></tr>';
+    t.innerHTML+='<tr><td>'+esc((r.id||'').substring(0,12))+'</td><td>'+esc(r.profile||'')+'</td><td>'+esc(r.model||'')+'</td><td class="'+cls(r.status)+'">'+esc(r.status)+'</td><td>'+esc(tok)+'</td><td>'+esc(cost)+'</td><td>'+esc(when)+'</td></tr>';
   });
 }
 function renderQueue(qs){
@@ -285,7 +286,7 @@ function renderQueue(qs){
   t.innerHTML='<tr><th>ID</th><th>Profile</th><th>Task</th><th>Status</th><th>When</th></tr>';
   qs.slice(0,15).forEach(q=>{
     const when=(q.created_at||'').substring(11,16);
-    t.innerHTML+='<tr><td>'+(q.id||'').substring(0,12)+'</td><td>'+(q.profile||'')+'</td><td>'+(q.task||'').substring(0,50)+'</td><td class="'+cls(q.status)+'">'+q.status+'</td><td>'+when+'</td></tr>';
+    t.innerHTML+='<tr><td>'+esc((q.id||'').substring(0,12))+'</td><td>'+esc(q.profile||'')+'</td><td>'+esc((q.task||'').substring(0,50))+'</td><td class="'+cls(q.status)+'">'+esc(q.status)+'</td><td>'+esc(when)+'</td></tr>';
   });
 }
 function renderCosts(cs){
@@ -294,7 +295,7 @@ function renderCosts(cs){
   cs.forEach(c=>{
     const tok=(c.total_tokens||0).toLocaleString();
     const cost='$'+(c.total_cost_usd||0).toFixed(4);
-    t.innerHTML+='<tr><td>'+(c.profile||'')+'</td><td>'+(c.model||'')+'</td><td>'+c.runs+'</td><td>'+tok+'</td><td>'+cost+'</td></tr>';
+    t.innerHTML+='<tr><td>'+esc(c.profile||'')+'</td><td>'+esc(c.model||'')+'</td><td>'+esc(c.runs)+'</td><td>'+esc(tok)+'</td><td>'+esc(cost)+'</td></tr>';
   });
 }
 function show(panel){

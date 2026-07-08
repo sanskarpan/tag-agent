@@ -88,7 +88,7 @@ func registerAlert(root *cobra.Command, app *App) {
 				return emitJSON(rules)
 			}
 			for _, r := range rules {
-				fmt.Printf("%s  %-30s %s %s %g [%s]\n", r.ID[:8], r.Name, r.Metric, r.Condition, r.Threshold, r.Severity)
+				fmt.Printf("%s  %-30s %s %s %g [%s]\n", short(r.ID), r.Name, r.Metric, r.Condition, r.Threshold, r.Severity)
 			}
 			return nil
 		}}
@@ -151,8 +151,13 @@ func registerAlert(root *cobra.Command, app *App) {
 			out := []firing{}
 			for rows.Next() {
 				var f firing
-				rows.Scan(&f.ID, &f.RuleID, &f.RuleName, &f.Metric, &f.ActualValue, &f.Threshold, &f.Severity, &f.FiredAt, &f.ResolvedAt, &f.Message)
+				if err := rows.Scan(&f.ID, &f.RuleID, &f.RuleName, &f.Metric, &f.ActualValue, &f.Threshold, &f.Severity, &f.FiredAt, &f.ResolvedAt, &f.Message); err != nil {
+					return err
+				}
 				out = append(out, f)
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			if flagJSON {
 				return emitJSON(out)
@@ -229,6 +234,9 @@ func resolveAlertRuleID(db *store.DB, prefix string) (string, error) {
 			return "", err
 		}
 		matches = append(matches, id)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
 	}
 	switch len(matches) {
 	case 0:

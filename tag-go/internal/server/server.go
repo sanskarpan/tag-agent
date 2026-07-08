@@ -8,6 +8,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"net/http"
 	"time"
 
@@ -62,7 +63,7 @@ func Handler(db *store.DB, profile string) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprintf(w, dashboardHTML, profile)
+		fmt.Fprintf(w, dashboardHTML, html.EscapeString(profile))
 	})
 	mux.HandleFunc("/api/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		snap, err := ReadSnapshot(db)
