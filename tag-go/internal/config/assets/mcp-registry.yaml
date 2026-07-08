@@ -1,0 +1,131 @@
+servers:
+  mcp-filesystem:
+    description: "Read, write, and search files on the local filesystem"
+    category: filesystem
+    install:
+      type: npm
+      package: "@modelcontextprotocol/server-filesystem"
+    config:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "${WORKSPACE_DIR:-/tmp}"]
+    requires_env: []
+    profiles:
+      recommended: [coder, reviewer]
+
+  mcp-brave-search:
+    description: "Web search via Brave Search API"
+    category: web
+    install:
+      type: npm
+      package: "@modelcontextprotocol/server-brave-search"
+    config:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-brave-search"]
+    requires_env: ["BRAVE_API_KEY"]
+    profiles:
+      recommended: [researcher]
+
+  mcp-github:
+    description: "GitHub repository operations: clone, PRs, issues, commits"
+    category: vcs
+    install:
+      type: npm
+      package: "@modelcontextprotocol/server-github"
+    config:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-github"]
+    requires_env: ["GITHUB_TOKEN"]
+    profiles:
+      recommended: [coder, reviewer]
+
+  mcp-postgres:
+    description: "PostgreSQL read/write access via MCP"
+    category: database
+    install:
+      type: npm
+      package: "@modelcontextprotocol/server-postgres"
+    config:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-postgres", "${DATABASE_URL}"]
+    requires_env: ["DATABASE_URL"]
+    profiles:
+      recommended: [coder]
+
+  mcp-sqlite:
+    description: "SQLite database access via MCP"
+    category: database
+    install:
+      type: npm
+      package: "@modelcontextprotocol/server-sqlite"
+    config:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-sqlite", "${SQLITE_DB_PATH:-/tmp/mcp.db}"]
+    requires_env: []
+    profiles:
+      recommended: [coder]
+
+  mcp-fetch:
+    description: "HTTP fetch and web scraping tool"
+    category: web
+    install:
+      type: npm
+      package: "@modelcontextprotocol/server-fetch"
+    config:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-fetch"]
+    requires_env: []
+    profiles:
+      recommended: [researcher]
+
+  mcp-memory:
+    description: "In-memory key-value store for agent state"
+    category: memory
+    install:
+      type: npm
+      package: "@modelcontextprotocol/server-memory"
+    config:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-memory"]
+    requires_env: []
+    profiles:
+      recommended: [orchestrator]
+
+  mcp-sequentialthinking:
+    description: "Sequential reasoning and chain-of-thought tool"
+    category: reasoning
+    install:
+      type: npm
+      package: "@modelcontextprotocol/server-sequential-thinking"
+    config:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    requires_env: []
+    profiles:
+      recommended: [orchestrator, researcher]
+
+  mcp-slack:
+    description: "Send and read Slack messages via MCP"
+    category: messaging
+    install:
+      type: npm
+      package: "@modelcontextprotocol/server-slack"
+    config:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-slack"]
+    requires_env: ["SLACK_BOT_TOKEN"]
+    profiles:
+      recommended: [orchestrator]
+
+  mcp-puppeteer:
+    description: "Browser automation and web scraping via Puppeteer"
+    category: web
+    install:
+      type: npm
+      package: "@modelcontextprotocol/server-puppeteer"
+    config:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-puppeteer"]
+    requires_env: []
+    profiles:
+      recommended: [researcher]
+
