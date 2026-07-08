@@ -1,0 +1,136 @@
+lab_name: tag-control-plane
+upstream:
+  repo: https://github.com/NousResearch/Hermes-Agent.git
+  ref: main
+  checkout_dir: managed/hermes-agent-upstream
+runtime:
+  home_dir: runtime/home
+  codex_home: runtime/home/.codex
+  db_path: runtime/tag.sqlite3
+skins:
+  tag-control:
+    source: assets/skins/tag-control.yaml
+defaults:
+  master_profile: orchestrator
+  board: default
+env_examples:
+  shared:
+    OPENROUTER_API_KEY: your-openrouter-api-key
+  profiles:
+    orchestrator: {}
+    researcher: {}
+    coder: {}
+    reviewer: {}
+profiles:
+  orchestrator:
+    description: Top-level planner that decomposes work, chooses lanes, and delegates
+      durable tasks to specialists.
+    tags:
+    - orchestrator
+    - planning
+    - kanban
+    config:
+      display:
+        skin: tag-control
+        tui_statusbar: top
+        tui_status_indicator: unicode
+      model:
+        provider: openai-codex
+        default: gpt-5.4
+        openai_runtime: auto
+      delegation:
+        provider: openrouter
+        model: deepseek/deepseek-v4-flash
+        max_concurrent_children: 3
+        max_spawn_depth: 2
+        orchestrator_enabled: true
+      kanban:
+        default_assignee: orchestrator
+        dispatch_in_gateway: true
+        dispatch_interval_seconds: 60
+        max_in_progress_per_profile: 2
+  researcher:
+    description: Research worker for docs, web evidence, source extraction, and structured
+      summaries.
+    tags:
+    - research
+    - web
+    - extraction
+    config:
+      display:
+        skin: tag-control
+        tui_statusbar: top
+        tui_status_indicator: unicode
+      model:
+        provider: openrouter
+        default: deepseek/deepseek-v4-flash
+  coder:
+    description: Implementation worker for repository edits, test runs, and code-focused
+      debugging.
+    tags:
+    - coding
+    - terminal
+    - implementation
+    config:
+      display:
+        skin: tag-control
+        tui_statusbar: top
+        tui_status_indicator: unicode
+      model:
+        provider: openrouter
+        default: qwen/qwen3-coder
+  reviewer:
+    description: Verification worker for code review, synthesis checks, and final
+      gate decisions.
+    tags:
+    - review
+    - verification
+    - quality
+    config:
+      display:
+        skin: tag-control
+        tui_statusbar: top
+        tui_status_indicator: unicode
+      model:
+        provider: openrouter
+        default: deepseek/deepseek-v4-pro
+  codex-runtime-master:
+    description: Codex app-server based master for direct runtime comparison against
+      TAG-managed orchestration.
+    tags:
+    - codex
+    - master
+    - runtime
+    config:
+      display:
+        skin: tag-control
+        tui_statusbar: top
+        tui_status_indicator: unicode
+      model:
+        provider: openai-codex
+        default: gpt-5.4
+        openai_runtime: codex_app_server
+routing:
+  task_types:
+    research:
+      workers:
+      - researcher
+      verifier: reviewer
+      execution: kanban
+    implementation:
+      workers:
+      - coder
+      verifier: reviewer
+      execution: kanban
+    review:
+      workers:
+      - reviewer
+      verifier: reviewer
+      execution: direct
+    mixed:
+      workers:
+      - researcher
+      - coder
+      verifier: reviewer
+      execution: kanban
+
