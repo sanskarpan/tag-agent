@@ -136,9 +136,6 @@ func (l *Loop) Run(ctx context.Context, userMessage string, opts Options) (*Resu
 		s := Step{Text: text, Usage: usage}
 		if len(calls) == 0 {
 			// no tools requested -> loop is done
-			if text != "" {
-				msgs = append(msgs, llm.Message{Role: llm.RoleAssistant, Content: text})
-			}
 			s.ToolCalls = nil
 			res.Steps = append(res.Steps, s)
 			res.FinalText = text
