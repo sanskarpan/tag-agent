@@ -1,0 +1,36 @@
+plugins:
+  auto_install:
+    - hermes-local-memory
+  registry:
+    hermes-local-memory:
+      description: "SQLite-backed persistent memory"
+      pypi: "hermes-local-memory"
+      github: "smarzola/hermes-local-memory"
+      requires_env: []
+      memory_provider: true
+    hermes-web-search:
+      description: "Web search toolset via SerpAPI"
+      pypi: "hermes-web-search"
+      github: ""
+      requires_env:
+        - SERP_API_KEY
+      memory_provider: false
+    hermes-code-tools:
+      description: "Code execution and analysis tools"
+      pypi: "hermes-code-tools"
+      github: ""
+      requires_env: []
+      memory_provider: false
+    hermes-file-tools:
+      description: "File system tools"
+      pypi: "hermes-file-tools"
+      github: ""
+      requires_env: []
+      memory_provider: false
+    hermes-git-tools:
+      description: "Git integration tools"
+      pypi: "hermes-git-tools"
+      github: ""
+      requires_env: []
+      memory_provider: false
+
