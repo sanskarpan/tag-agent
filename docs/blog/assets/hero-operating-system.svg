@@ -1,0 +1,53 @@
+<svg viewBox="0 0 1400 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">TAG operating layer hero</title>
+  <desc id="desc">A layered editorial graphic showing TAG as a control plane around the Hermes runtime without connector arrows.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff8ec"/>
+      <stop offset="1" stop-color="#edf7ef"/>
+    </linearGradient>
+    <style>
+      .serif{font-family:Georgia,serif}
+      .sans{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}
+      .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+      .ink{fill:#14231f}
+      .muted{fill:#65766d}
+      .paper{fill:#fffdf8;stroke:#d8cfbf;stroke-width:1.4}
+      .dark{fill:#123b35}
+      .chip{fill:#f7ead2;stroke:#dfcda8;stroke-width:1}
+    </style>
+  </defs>
+  <rect width="1400" height="760" rx="34" fill="url(#bg)"/>
+  <text x="72" y="84" class="serif ink" font-size="42" font-weight="700">TAG made the runtime operable</text>
+  <text x="72" y="122" class="sans muted" font-size="18">Hermes handled execution. TAG added the local operating layer around it.</text>
+
+  <rect x="84" y="180" width="1232" height="452" rx="38" fill="#f9f0dc" opacity=".78"/>
+
+  <rect x="135" y="234" width="1130" height="92" rx="26" fill="#f0c46d"/>
+  <text x="178" y="273" class="sans ink" font-size="18" font-weight="900">Entry layer</text>
+  <text x="178" y="302" class="mono ink" font-size="13">CLI · queue · cron · webhooks · CI · dashboard</text>
+  <text x="1112" y="288" class="sans ink" font-size="15" font-weight="800" text-anchor="middle">work arrives through many doors</text>
+
+  <rect x="135" y="346" width="1130" height="146" rx="32" class="dark"/>
+  <text x="178" y="400" fill="#fff8ec" class="serif" font-size="34" font-weight="700">TAG control plane</text>
+  <text x="178" y="434" fill="#cbdad4" class="sans" font-size="16">routing · budgets · memory · evals · traces · hardening · cost policy</text>
+  <rect x="870" y="382" width="322" height="70" rx="20" fill="#fff8ec"/>
+  <text x="1031" y="410" class="sans ink" font-size="16" font-weight="900" text-anchor="middle">103-command surface</text>
+  <text x="1031" y="438" class="mono muted" font-size="13" text-anchor="middle">~72 implemented features / 127 PRDs</text>
+
+  <rect x="135" y="512" width="1130" height="86" rx="26" class="paper"/>
+  <text x="178" y="549" class="sans ink" font-size="18" font-weight="900">Runtime layer</text>
+  <text x="178" y="577" class="mono muted" font-size="13">Hermes · profiles · agent loop · tools · streaming</text>
+  <text x="1112" y="563" class="sans muted" font-size="15" font-weight="800" text-anchor="middle">engine stays visible, but policy lives above it</text>
+
+  <rect x="180" y="650" width="180" height="42" rx="21" class="chip"/>
+  <text x="270" y="677" class="sans ink" font-size="14" font-weight="800" text-anchor="middle">stateful</text>
+  <rect x="388" y="650" width="180" height="42" rx="21" class="chip"/>
+  <text x="478" y="677" class="sans ink" font-size="14" font-weight="800" text-anchor="middle">observable</text>
+  <rect x="596" y="650" width="180" height="42" rx="21" class="chip"/>
+  <text x="686" y="677" class="sans ink" font-size="14" font-weight="800" text-anchor="middle">routable</text>
+  <rect x="804" y="650" width="180" height="42" rx="21" class="chip"/>
+  <text x="894" y="677" class="sans ink" font-size="14" font-weight="800" text-anchor="middle">bounded</text>
+  <rect x="1012" y="650" width="180" height="42" rx="21" class="chip"/>
+  <text x="1102" y="677" class="sans ink" font-size="14" font-weight="800" text-anchor="middle">testable</text>
+</svg>
