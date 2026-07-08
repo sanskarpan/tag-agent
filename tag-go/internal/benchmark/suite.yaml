@@ -1,0 +1,15 @@
+# Default embedded benchmark suite (Go port of config/benchmark-suite.yaml).
+# Each case is scored by checking whether `expected` appears as a substring in
+# the agent loop's final text. The offline `echo` provider streams the prompt
+# back verbatim, so cases whose `expected` is contained in the prompt pass
+# offline and cases whose `expected` is absent fail — deterministic without keys.
+cases:
+  - id: echo-substring
+    prompt: "Reply with exactly: bench-ok"
+    expected: "bench-ok"
+  - id: greeting
+    prompt: "Please say hello world to the user"
+    expected: "hello world"
+  - id: json-shape
+    prompt: 'Return only compact JSON {"status":"ok"}'
+    expected: '"status":"ok"'
