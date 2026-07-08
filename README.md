@@ -24,6 +24,7 @@
   <a href="#command-reference">Commands</a> •
   <a href="#profiles">Profiles</a> •
   <a href="#architecture">Architecture</a> •
+  <a href="#native-go-harness-tag-go">Go Harness</a> •
   <a href="#how-tag-compares">Comparison</a> •
   <a href="https://github.com/sanskarpan/tag-agent/tree/main/docs/prd">PRDs</a>
 </p>
@@ -714,6 +715,27 @@ export TAG_HOME=/custom/path   # override root
 
 ---
 
+## Native Go Harness (`tag-go/`)
+
+A from-scratch **native Go port** of TAG lives in [`tag-go/`](tag-go/): a single static binary (`CGO_ENABLED=0`, ~18 MB) that owns its own runtime — no Python, no managed Hermes checkout, no interpreter startup.
+
+```bash
+cd tag-go
+CGO_ENABLED=0 go build -o tag ./cmd/tag   # Go 1.25+
+./tag --help
+go test ./...                             # fully offline; no API keys needed
+```
+
+- **87 top-level commands across 28 packages** — the full control plane ported, plus a native runtime: a provider-neutral LLM interface with raw-HTTP SSE streaming for **Anthropic and OpenAI**, a tool-calling agent loop, sandboxed built-in tools, an MCP client + server, HTTP `serve`/`devui`/`web` dashboards, an LSP server, and a terminal TUI.
+- **Offline by default:** execution paths run against a built-in `echo` provider so everything is testable without keys; pass `--provider anthropic|openai` to go live.
+- **Executes its own queue:** a native execution worker drives queued jobs and DAG dependency chains through the agent loop (`tag queue worker`, `tag dag run --execute`, `tag cron run --execute`).
+- **~10× faster startup, ~30× faster cold bootstrap, 18 MB binary vs 170 MB venv** — see [`COMPARISON_REPORT.md`](COMPARISON_REPORT.md) for the full benchmark and behavioral comparison against the Python edition.
+- The managed-Hermes passthrough commands (`chat`, `gateway`, `kanban`, …) and desktop packaging are deliberately not ported; `serve`/`devui`/`web` replace the dashboard.
+
+Per-subsystem status and audit history: [`tag-go/MIGRATION_STATUS.md`](tag-go/MIGRATION_STATUS.md).
+
+---
+
 ## How TAG Compares
 
 | Feature | TAG | Claude Code | Aider | AutoGen | CrewAI |
@@ -780,6 +802,13 @@ git clone https://github.com/sanskarpan/tag-agent
 cd tag-agent
 pip install -e ".[dev]"
 pytest tests/ -x -q --ignore=tests/hermes_cli
+```
+
+For the native Go harness:
+
+```bash
+cd tag-go
+gofmt -l . && go vet ./... && go test ./... -race
 ```
 
 Design decisions and feature specs live in [`docs/prd/`](docs/prd/) — 44 PRDs covering every subsystem. Open an issue before implementing a significant feature.

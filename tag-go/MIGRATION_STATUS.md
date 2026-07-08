@@ -4,14 +4,20 @@ Native Go port of the Python TAG control plane, per `../docs/GO_MIGRATION_PLAN.m
 Single static binary (`CGO_ENABLED=0`, ~18 MB), owns its own SQLite runtime
 (`modernc.org/sqlite`, FTS5, WAL, single-writer). Module: `github.com/tag-agent/tag`.
 
-**Status: feature-complete + adversarially audited.** 67 top-level commands · 25 packages ·
-182 test funcs · `gofmt`/`go vet` clean · `go test ./...` green · 159-command `--help` sweep passes.
+**Status: feature-complete + adversarially audited.** 87 top-level commands · 28 packages ·
+289 test funcs · `gofmt`/`go vet` clean · `go test ./... -race` green · 364-invocation
+recursive `--help` sweep passes (0 failures).
 A 5-agent adversarial audit (read + RUN) found ~30 real bugs behind the green suite; all
-critical/high are fixed and regression-tested — see the "Audit fixes" section below.
+critical/high are fixed and regression-tested — see the "Audit fixes" section below. Two
+later passes (code review + fresh-install QA) found and closed 26 more (#520–#546).
 Both tracks are done: the full control plane (Track A) and the native runtime
 (Track B — multi-provider LLM, agent loop, tools, MCP client+server+subprocess,
-HTTP servers, LSP, TUI). The only intentional non-ports are live-model execution
-paths, exercised via the offline `echo` provider per the no-model-calls constraint.
+HTTP servers, LSP, TUI, execution worker). Live-model execution defaults to the offline
+`echo` provider so everything is testable without keys; the real Anthropic/OpenAI
+providers (`--provider anthropic|openai`) have been verified live. The intentional
+non-ports are the managed-Hermes runtime-passthrough commands and OS desktop packaging
+(`serve`/`devui`/`web` replace the dashboard) — see "Parity waves" below and
+`../COMPARISON_REPORT.md`.
 
 Faithful port discipline: behavior is verified by **running the binary** in isolated
 `TAG_HOME` sandboxes (not just unit tests) — the Python audit lesson that the unit
@@ -72,9 +78,9 @@ preserved intentionally (e.g. substring keyword matching in the entity graph;
 drives the native agent loop (`internal/agent`) through tool-calling turns using
 the built-in tools (`internal/tool`: bash/read_file/write_file/list_dir, sandboxed),
 defaulting to the offline `echo` provider and recording each run to the `runs`
-table. The only piece left for live operation is a real provider adapter
-(anthropic/openai) that registers into `llm.Registry` — a drop-in behind the
-existing interface, deliberately not live-tested per the no-model-calls constraint. The mcp-registry
+table. The only piece then left for live operation was a real provider adapter
+(anthropic/openai) registering into `llm.Registry` — since delivered (see the
+Track B `internal/llm` row) and verified live outside the test suite. The mcp-registry
 enable/disable added reusable `loadProfileConfig`/`writeProfileConfig` helpers
 (runtime profile-home YAML), which `template` import/export builds on.
 
@@ -94,29 +100,34 @@ on `alert delete` (Go enforces FKs; Python's sqlite3 defaults them off).
 | Package | State |
 |---|---|
 | `internal/llm` | **interface + 3 providers done.** Provider-neutral `Provider`/`Event`/`Request`; self-registering `EchoProvider` (offline) + **real `AnthropicProvider` and `OpenAIProvider`** (raw net/http SSE streaming, no SDK dep — keeps the binary lean). Both map the neutral Request onto their API shape (Anthropic hoists system + tool_result blocks; OpenAI keeps system + tool-role messages) and decode streamed text **and tool calls** (assembling streamed JSON args). SSE parsers + body builders are unit-tested offline against canned streams; `Stream` refuses without an API key so **no network call is ever made in tests** (protects the no-model-calls constraint). Selected via `tag run --provider anthropic|openai|echo`. |
-| `internal/agent` | **agent loop done.** `Loop.Run` drives a `Provider` through tool-calling turns (execute → feed results → repeat) with a tool `Registry`, usage accumulation, unknown-tool handling, and a step cap. Fully tested offline via scripted/echo providers (4 tests). Real provider adapters are the only thing between this and live runs. |
+| `internal/agent` | **agent loop done.** `Loop.Run` drives a `Provider` through tool-calling turns (execute → feed results → repeat) with a tool `Registry`, usage accumulation, unknown-tool handling, and a step cap. Fully tested offline via scripted/echo providers (4 tests); runs live through the real Anthropic/OpenAI providers. |
 | `internal/mcp` | **client + server + subprocess done.** JSON-RPC 2.0 over stdio: client (`Initialize`/`ListTools`/`CallTool`), server (`Register`/`Serve`), and `NewProcessClient` which spawns an external MCP server as a child process and speaks to it over its stdio. `tag mcp-serve` exposes TAG tools; `tag mcp-connect <cmd…>` consumes a third-party server; `tool.RegisterMCP` bridges external tools into `agent.Registry` (`mcp__<server>__<tool>`). Interop tested offline (in-process pipes + a real subprocess round-trip against our own `mcp-serve`) + agent-loop-over-MCP. |
 | `internal/tool` | **built-in tools done.** `bash` (timeout), `read_file`, `write_file`, `list_dir` — all confined to a tool root with a path-traversal guard. Plug into `agent.Registry`; tested end-to-end *through* the agent loop via a one-shot provider (5 tests). |
 | `internal/server` | **HTTP `serve` + `devui` + `web` done.** Loopback dashboards + `/api/snapshot`, `/api/spans`, `/api/runs`, `/api/queue`, `/api/costs`, `/health` + SSE streams; no wildcard CORS. Pure `*store.DB` handlers, `httptest`-tested + smoke-tested live. `tag serve/devui/web`. |
 | `internal/lsp` | **LSP server done.** JSON-RPC 2.0 with `Content-Length` header framing (correct split-read + back-to-back handling); initialize/initialized/shutdown/exit/textDocument-hover; `-32601` on unknown method. Wired as `tag lsp`; framing tested offline (9 tests) + smoke-tested live. |
 | `internal/tui` | **Charm TUI done.** bubbletea + lipgloss dashboard over the same snapshot (runs/queue/journal), refresh/quit keys, live ticker. `Model.Update`/`View` are pure and unit-tested offline (3 tests); `Run()` needs a TTY. Wired as `tag tui`. |
-| `internal/swarm` | placeholder — kanban/swarm board |
-| `internal/obs` | placeholder — otel export |
-| `internal/credentials` | placeholder — provider auth |
-| `internal/queue` | placeholder — background worker (CLI CRUD lives in cli/) |
+| `internal/worker` | **execution worker done (#532).** Dep-aware atomic job claim; executes queued jobs and full DAG dependency chains through the native agent loop (`queue worker`, `dag run --execute`, `cron run --execute`). Offline via `echo` by default; verified live against OpenAI. |
+| `internal/webhook` | **listener done.** HMAC verify (GitHub/Slack/Linear), rule match, enqueue into the queue the worker drains. |
+| `internal/solver` | **solver harness done.** Backs `swe-solve` / `issue-solve` / `review-pr` / `agentic-ci`; drives the agent loop, honest stubs where a step needs a live external fetch. |
+| `internal/benchmark` / `internal/sandbox` / `internal/evaljudge` / `internal/contextwin` | **wave-1/2 backends done.** Benchmark suite runner, sandboxed code execution, LLM-as-judge scoring (verified live), context-window budget accounting. |
 
 ## Remaining
 
-The feature surface is ported. What is *deliberately* left as offline-only:
-- **Live-model execution paths** (swarm run, eval run/judge, split plan, issue-solve/
-  swe-solve/review-pr, ci/loop against a real provider): the orchestration is built
-  and runs against the `echo` provider; wiring `--provider anthropic|openai` makes them
-  live with an API key. Per the standing constraint they are never exercised live in tests.
-- **`desktop`** (native desktop shell) — an OS packaging concern, not a control-plane feature.
-- A handful of thin split/`import-*` variants beyond the 9 importers ported.
+The feature surface is ported. What is *deliberately* out of scope:
+- **Managed-Hermes runtime passthrough** (`chat`, `gateway`, `kanban`, `runtime`, `sessions`,
+  `status`, `dashboard`, `config`, `profile`, `submit`, `update`, `skills`, `tools`) and
+  **`desktop`** (OS packaging): the Go binary owns its own runtime instead of shipping the
+  Python Hermes checkout; `serve`/`devui`/`web` replace the dashboard.
+- **Offline-by-default execution:** every execution path (run, queue worker, swarm run,
+  eval run/judge, split plan, issue-solve/swe-solve/review-pr, ci/loop) runs against the
+  `echo` provider without keys; `--provider anthropic|openai` makes it live with an API key.
+  Both real providers were verified live once (see `../COMPARISON_REPORT.md`).
+- Steps that need a live model or external system are honest stubs (issue-solve/review-pr
+  remote fetch, split plan, context compress/trim, plugin install).
 
-**Constraint (still in force):** no live model calls in testing (never use the Anthropic
-account); all runtime work is built against the interface + echo/mock, verified offline.
+**Constraint (still in force):** no live model calls in the test suite; all runtime work is
+built against the interface + echo/mock, verified offline. `go test ./...` never touches
+the network.
 
 ## Audit fixes (2026-07-03)
 
@@ -172,3 +183,29 @@ Result: **19 tested packages, 187 test funcs**, gofmt+vet clean, `go test ./...`
 store`/`internal/paths` (previously untested) now have coverage. Confirmed solid by both waves:
 SQLite single-writer discipline, atomic config writes, concurrency (20 parallel writers, no lost
 updates), no schema drift, no SQL injection, loopback-only servers.
+
+## Parity waves (2026-07-07/08)
+
+A benchmark + parity pass against the published `tag-agent==0.8.2` wheel (full report:
+`../COMPARISON_REPORT.md`) drove the surface from 65 → 87 top-level commands and closed the
+biggest behavioral gaps the benchmark identified:
+
+- **Execution worker (#532):** `internal/worker` executes queued jobs and full DAG dependency
+  chains through the native agent loop (`queue worker`, `dag run --execute`, `cron run
+  --execute`) with dep-aware atomic claims — the queue is no longer inert. Verified live
+  against OpenAI (job add → worker → `queue result` shows model output).
+- **Wave 1:** `runs`, `logs`, `prompt-size`, `benchmark`, `sandbox`, plus 9 more credential
+  importers (18 `import-*` commands total).
+- **Wave 2:** `swe-solve` / `issue-solve` / `agentic-ci` / `review-pr` solvers
+  (`internal/solver`), `eval-judge` LLM-as-judge (verified live against OpenAI), `context`
+  show/compress/trim, `split` plan/list/show, and `memory` / `plugins` / `model` aliases.
+- **Contract parity:** the `--json` contract was audited across all commands (empty lists emit
+  `[]` not `null`, error paths emit `{"error":...}`, Python field names for `cache stats` /
+  `mem stats`); usage errors exit **2** like Python argparse; unknown subcommands error
+  instead of silently exiting 0.
+- **26 bugs** found by two audit passes (code review + fresh-install QA) fixed, verified on
+  the binary, and closed (issues #520–#546). No data races (`go test ./... -race` green), no
+  injection/SSRF/sandbox escapes.
+
+Final gates: `gofmt`/`go vet` clean, `go test ./... -race` green (28 packages, 289 test
+funcs), 364-invocation recursive `--help` sweep with 0 failures.
