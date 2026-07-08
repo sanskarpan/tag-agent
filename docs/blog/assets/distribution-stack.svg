@@ -1,0 +1,43 @@
+<svg viewBox="0 0 1400 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">TAG Python distribution stack</title>
+  <desc id="desc">A banded distribution diagram showing PyPI and npm reach, the Python TAG CLI, and the managed Hermes runtime without connector arrows.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff8ec"/><stop offset="1" stop-color="#eef7f0"/></linearGradient>
+    <style>.serif{font-family:Georgia,serif}.sans{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ink{fill:#14231f}.muted{fill:#63756c}.paper{fill:#fffdf8;stroke:#d8cfbf;stroke-width:1.4}.dark{fill:#123b35}</style>
+  </defs>
+  <rect width="1400" height="760" rx="34" fill="url(#bg)"/>
+  <text x="72" y="82" class="serif ink" font-size="38" font-weight="700">The installer was part of the product</text>
+  <text x="72" y="120" class="sans muted" font-size="17">Python TAG reached two developer ecosystems while managing a Hermes-backed runtime.</text>
+
+  <rect x="90" y="190" width="1220" height="396" rx="36" fill="#f9f0dc" opacity=".68"/>
+
+  <rect x="135" y="242" width="300" height="254" rx="30" fill="#fffdf8" stroke="#d8cfbf"/>
+  <text x="285" y="286" class="sans ink" font-size="20" font-weight="900" text-anchor="middle">Install paths</text>
+  <rect x="174" y="320" width="222" height="62" rx="20" fill="#f0c46d"/>
+  <text x="285" y="346" class="sans ink" font-size="16" font-weight="900" text-anchor="middle">PyPI</text>
+  <text x="285" y="369" class="mono ink" font-size="12" text-anchor="middle">pip install tag-agent</text>
+  <rect x="174" y="404" width="222" height="62" rx="20" fill="#d98f72"/>
+  <text x="285" y="430" class="sans ink" font-size="16" font-weight="900" text-anchor="middle">npm</text>
+  <text x="285" y="453" class="mono ink" font-size="12" text-anchor="middle">npm install -g tag-agent</text>
+
+  <text x="486" y="374" class="serif muted" font-size="54" font-weight="700" text-anchor="middle">+</text>
+
+  <rect x="545" y="242" width="310" height="254" rx="32" class="dark"/>
+  <text x="700" y="322" fill="#fff8ec" class="serif" font-size="32" font-weight="700" text-anchor="middle">Python TAG CLI</text>
+  <text x="700" y="360" fill="#cbdad4" class="sans" font-size="15" text-anchor="middle">routing · state · commands</text>
+  <rect x="604" y="398" width="192" height="46" rx="23" fill="#fff8ec"/>
+  <text x="700" y="427" class="mono muted" font-size="13" text-anchor="middle">103-command surface</text>
+
+  <text x="914" y="374" class="serif muted" font-size="54" font-weight="700" text-anchor="middle">+</text>
+
+  <rect x="965" y="242" width="300" height="254" rx="30" fill="#fffdf8" stroke="#d8cfbf"/>
+  <text x="1115" y="286" class="sans ink" font-size="20" font-weight="900" text-anchor="middle">Managed runtime</text>
+  <rect x="986" y="322" width="258" height="58" rx="19" fill="#edf5ef"/>
+  <text x="1115" y="357" class="mono muted" font-size="12" text-anchor="middle">Hermes / profiles / patching</text>
+  <rect x="986" y="406" width="258" height="58" rx="19" fill="#edf5ef"/>
+  <text x="1115" y="441" class="mono muted" font-size="13" text-anchor="middle">SQLite under TAG_HOME</text>
+
+  <text x="285" y="642" class="sans muted" font-size="15" text-anchor="middle">Pragmatic reach across ecosystems.</text>
+  <text x="700" y="642" class="sans muted" font-size="15" text-anchor="middle">The CLI is the stable product boundary.</text>
+  <text x="1115" y="642" class="sans muted" font-size="15" text-anchor="middle">Runtime complexity stays managed locally.</text>
+</svg>
