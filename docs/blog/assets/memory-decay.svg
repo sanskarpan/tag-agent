@@ -1,0 +1,64 @@
+<svg viewBox="0 0 1400 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Memory confidence decay by type</title>
+  <desc id="desc">A line chart showing conventions remaining stable while decisions, facts, and temporary memories decay.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10231f"/>
+      <stop offset="1" stop-color="#24362c"/>
+    </linearGradient>
+    <style>
+      .serif{font-family:Georgia,serif}
+      .sans{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}
+      .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+      .muted{fill:#a9b9b1}
+      .grid{stroke:#41544b;stroke-width:1}
+    </style>
+  </defs>
+  <rect width="1400" height="760" rx="34" fill="url(#bg)"/>
+  <text x="72" y="78" fill="#fff8ec" class="serif" font-size="36" font-weight="700">Memory confidence should decay unless it earns its way back</text>
+  <text x="72" y="114" class="sans muted" font-size="17">Conventions stay stable; decisions, facts, and temporary notes fade at different rates.</text>
+
+  <g transform="translate(128 176)">
+    <rect x="0" y="0" width="950" height="430" rx="24" fill="#132b25" stroke="#41544b"/>
+    <g class="grid">
+      <line x1="86" y1="58" x2="890" y2="58"/>
+      <line x1="86" y1="140" x2="890" y2="140"/>
+      <line x1="86" y1="222" x2="890" y2="222"/>
+      <line x1="86" y1="304" x2="890" y2="304"/>
+      <line x1="86" y1="360" x2="890" y2="360"/>
+      <line x1="86" y1="58" x2="86" y2="360"/>
+      <line x1="890" y1="58" x2="890" y2="360"/>
+    </g>
+    <g class="sans muted" font-size="13" text-anchor="end">
+      <text x="64" y="63">1.0</text>
+      <text x="64" y="145">0.75</text>
+      <text x="64" y="227">0.5</text>
+      <text x="64" y="309">0.25</text>
+      <text x="64" y="365">0</text>
+    </g>
+    <g class="sans muted" font-size="13" text-anchor="middle">
+      <text x="86" y="392">0</text>
+      <text x="218" y="392">60d</text>
+      <text x="352" y="392">120d</text>
+      <text x="486" y="392">180d</text>
+      <text x="890" y="392">365d</text>
+    </g>
+    <path d="M86 58 L890 58" fill="none" stroke="#f4c76b" stroke-width="4"/>
+    <path d="M86 58 C230 96, 360 145, 486 222 C650 285, 760 325, 890 346" fill="none" stroke="#8bd3bf" stroke-width="4"/>
+    <path d="M86 58 C230 136, 360 205, 486 262 C650 318, 760 345, 890 356" fill="none" stroke="#d98f72" stroke-width="4"/>
+    <path d="M86 58 C200 170, 330 260, 486 318 C650 354, 760 360, 890 360" fill="none" stroke="#a9a0d6" stroke-width="4"/>
+    <text x="128" y="46" fill="#f4c76b" class="sans" font-size="14" font-weight="800">convention</text>
+    <text x="902" y="348" fill="#8bd3bf" class="sans" font-size="14" font-weight="800">decision</text>
+    <text x="902" y="365" fill="#d98f72" class="sans" font-size="14" font-weight="800">fact/gotcha</text>
+    <text x="680" y="352" fill="#a9a0d6" class="sans" font-size="14" font-weight="800">temporary</text>
+  </g>
+
+  <g transform="translate(1130 238)" class="sans">
+    <rect x="0" y="0" width="190" height="245" rx="24" fill="#fff8ec"/>
+    <text x="34" y="48" fill="#14231f" class="serif" font-size="25" font-weight="700">Rule</text>
+    <circle cx="38" cy="86" r="7" fill="#f4c76b"/><text x="60" y="91" fill="#14231f" font-size="15">keep</text>
+    <circle cx="38" cy="126" r="7" fill="#8bd3bf"/><text x="60" y="131" fill="#14231f" font-size="15">age</text>
+    <circle cx="38" cy="166" r="7" fill="#d98f72"/><text x="60" y="171" fill="#14231f" font-size="15">decay</text>
+    <circle cx="38" cy="206" r="7" fill="#a9a0d6"/><text x="60" y="211" fill="#14231f" font-size="15">evict</text>
+  </g>
+</svg>
