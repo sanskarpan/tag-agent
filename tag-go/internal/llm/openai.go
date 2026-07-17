@@ -77,7 +77,7 @@ func streamOpenAICompatible(ctx context.Context, req Request, baseURL, apiKey, e
 	ch := make(chan Event, 16)
 	go func() {
 		defer resp.Body.Close()
-		parseOpenAISSE(resp.Body, ch)
+		parseOpenAISSE(resp.Body, ch, errLabel)
 	}()
 	return ch, nil
 }
@@ -143,7 +143,9 @@ func buildOpenAIBody(req Request) map[string]any {
 }
 
 // parseOpenAISSE decodes the Chat Completions event stream into Events.
-func parseOpenAISSE(r io.Reader, ch chan<- Event) {
+// errLabel prefixes any stream-level error so failures are attributed to the
+// right provider (e.g. "openai" vs "local").
+func parseOpenAISSE(r io.Reader, ch chan<- Event, errLabel string) {
 	defer close(ch)
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
@@ -207,7 +209,7 @@ func parseOpenAISSE(r io.Reader, ch chan<- Event) {
 		}
 		if chunk.Error != nil {
 			// A mid-stream error chunk must surface, not be silently finished.
-			ch <- Event{Type: EventError, Err: fmt.Errorf("openai stream error (%s): %s", chunk.Error.Type, chunk.Error.Message)}
+			ch <- Event{Type: EventError, Err: fmt.Errorf("%s stream error (%s): %s", errLabel, chunk.Error.Type, chunk.Error.Message)}
 			return
 		}
 		if chunk.Usage != nil {
@@ -238,7 +240,7 @@ func parseOpenAISSE(r io.Reader, ch chan<- Event) {
 		}
 	}
 	if err := sc.Err(); err != nil {
-		ch <- Event{Type: EventError, Err: fmt.Errorf("openai stream read: %w", err)}
+		ch <- Event{Type: EventError, Err: fmt.Errorf("%s stream read: %w", errLabel, err)}
 		return
 	}
 	flush()

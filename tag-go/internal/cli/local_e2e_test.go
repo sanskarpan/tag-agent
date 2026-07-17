@@ -55,9 +55,6 @@ func runWithEnv(t *testing.T, home string, extraEnv []string, args ...string) (s
 // chain: openai (no key) fails over to the local server.
 func TestE2ELocalProvider(t *testing.T) {
 	h := newHome(t)
-	if _, c := run(t, h, "bootstrap"); c != 0 {
-		t.Fatalf("bootstrap: %d", c)
-	}
 	srv := mockLocalServer(t, "served by local llama")
 	env := []string{"TAG_LOCAL_BASE_URL=" + srv.URL + "/v1"}
 
