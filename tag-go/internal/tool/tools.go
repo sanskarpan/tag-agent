@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +30,25 @@ type Options struct {
 	DisableBash bool
 	// MaxReadBytes caps read_file output.
 	MaxReadBytes int64
+	// Disabled is a tool-budget allowlist gate (hermes-octo trims ~20 toolsets by
+	// default and flips them on for deep sessions). A tool whose Def.Name is a key
+	// here is omitted from Register, keeping the model's tool list lean.
+	Disabled map[string]bool
+	// EnableExa turns on the Exa `web_search` tool (off by default — it needs an
+	// API key and adds to the tool budget).
+	EnableExa bool
+	// ExaAPIKey overrides EXA_API_KEY (mostly for tests). ExaBaseURL overrides the
+	// Exa endpoint (default https://api.exa.ai); ExaClient overrides the HTTP client.
+	ExaAPIKey  string
+	ExaBaseURL string
+	ExaClient  *http.Client
+}
+
+func (o Options) exaKey() string {
+	if o.ExaAPIKey != "" {
+		return o.ExaAPIKey
+	}
+	return os.Getenv("EXA_API_KEY")
 }
 
 // DefaultOptions returns safe defaults.
@@ -44,12 +64,22 @@ func Register(reg *agent.Registry, opts Options) {
 	if opts.MaxReadBytes == 0 {
 		opts.MaxReadBytes = 256 * 1024
 	}
-	if !opts.DisableBash {
-		reg.Add(bashTool(opts))
+	// add applies the tool-budget gate (Options.Disabled) uniformly.
+	add := func(t agent.Tool) {
+		if opts.Disabled[t.Def.Name] {
+			return
+		}
+		reg.Add(t)
 	}
-	reg.Add(readFileTool(opts))
-	reg.Add(writeFileTool(opts))
-	reg.Add(listDirTool(opts))
+	if !opts.DisableBash {
+		add(bashTool(opts))
+	}
+	add(readFileTool(opts))
+	add(writeFileTool(opts))
+	add(listDirTool(opts))
+	if opts.EnableExa && opts.exaKey() != "" {
+		add(exaSearchTool(opts))
+	}
 }
 
 // resolvePath confines rel to opts.Root (or cwd), rejecting traversal escapes
