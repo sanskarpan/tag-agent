@@ -1,0 +1,52 @@
+<svg viewBox="0 0 1400 820" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">TAG memory stack</title>
+  <desc id="desc">A clean layered memory architecture visual for TAG.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff8ec"/>
+      <stop offset="1" stop-color="#eef7f0"/>
+    </linearGradient>
+    <style>
+      .serif{font-family:Georgia,serif}
+      .sans{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}
+      .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+      .ink{fill:#14231f}
+      .muted{fill:#63756c}
+    </style>
+  </defs>
+  <rect width="1400" height="820" rx="34" fill="url(#bg)"/>
+  <text x="72" y="82" class="serif ink" font-size="38" font-weight="700">Memory became a subsystem, not a note bucket</text>
+  <text x="72" y="120" class="sans muted" font-size="17">Each layer answers a different retrieval question.</text>
+
+  <g class="sans" font-size="14">
+    <rect x="96" y="196" width="360" height="118" rx="24" fill="#f4dfbd" stroke="#d8bf8e"/>
+    <text x="128" y="238" class="serif ink" font-size="26" font-weight="700">Journal</text>
+    <text x="128" y="268" class="muted">Human-readable cross-session notes</text>
+    <text x="128" y="292" class="mono muted" font-size="12">tag memory-journal</text>
+
+    <rect x="520" y="196" width="360" height="118" rx="24" fill="#dff0e7" stroke="#aac5ba"/>
+    <text x="552" y="238" class="serif ink" font-size="26" font-weight="700">Semantic memory</text>
+    <text x="552" y="268" class="muted">Typed facts with confidence decay</text>
+    <text x="552" y="292" class="mono muted" font-size="12">tag mem / mem2 gc</text>
+
+    <rect x="944" y="196" width="360" height="118" rx="24" fill="#cfe3f4" stroke="#9ebcd5"/>
+    <text x="976" y="238" class="serif ink" font-size="26" font-weight="700">Temporal facts</text>
+    <text x="976" y="268" class="muted">Facts can change without erasing history</text>
+    <text x="976" y="292" class="mono muted" font-size="12">tag mem2 fact / tier</text>
+
+    <rect x="96" y="404" width="360" height="118" rx="24" fill="#ead9f1" stroke="#c5acd2"/>
+    <text x="128" y="446" class="serif ink" font-size="26" font-weight="700">Episodes</text>
+    <text x="128" y="476" class="muted">Runs become structured experience</text>
+    <text x="128" y="500" class="mono muted" font-size="12">tag mem2 episode</text>
+
+    <rect x="520" y="404" width="360" height="118" rx="24" fill="#dbe5c5" stroke="#bac99a"/>
+    <text x="552" y="446" class="serif ink" font-size="26" font-weight="700">Hybrid recall</text>
+    <text x="552" y="476" class="muted">Lexical and semantic search cooperate</text>
+    <text x="552" y="500" class="mono muted" font-size="12">tag mem2 store</text>
+
+    <rect x="944" y="404" width="360" height="118" rx="24" fill="#f1d2c5" stroke="#d8a895"/>
+    <text x="976" y="446" class="serif ink" font-size="26" font-weight="700">Entity graph</text>
+    <text x="976" y="476" class="muted">Project terms become relationships</text>
+    <text x="976" y="500" class="mono muted" font-size="12">tag graph</text>
+  </g>
+</svg>

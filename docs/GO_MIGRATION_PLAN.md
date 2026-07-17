@@ -4,6 +4,15 @@
 > the Python control-plane + bundled Python Hermes runtime to a **native single-static-binary Go**
 > harness that owns its runtime. Grounded in `GO_MIGRATION_RESEARCH.md`. Strangler-fig, never big-bang.
 
+> **Status (2026-07-08): implemented.** The native Go harness landed as [`tag-go/`](../tag-go/)
+> (87 top-level commands, 28 packages, both tracks done). Current per-subsystem status lives in
+> [`tag-go/MIGRATION_STATUS.md`](../tag-go/MIGRATION_STATUS.md); benchmarks and behavioral parity
+> vs the Python edition in [`COMPARISON_REPORT.md`](../COMPARISON_REPORT.md). The as-built layout
+> diverges from the plan below in one major way: the port went straight to a native runtime — the
+> transitional Python↔Go wire seam (`internal/runtime/`, `hack/hermes-runtimed/`) was never
+> needed. The managed-Hermes passthrough commands and desktop packaging were deliberately not
+> ported; live-model execution defaults to an offline `echo` provider.
+
 ## Approach
 
 Strangler-fig migration to a native single-static-binary Go harness that OWNS its runtime, sequenced so the distribution/UX win ships at the END of Phase 1 (~2 months) — before the runtime is fully ported — and the product never feature-freezes. Two tracks run in parallel: TRACK A (mechanical stdlib->Go control-plane ports of the ~72 features / 103 commands: cobra, modernc.org/sqlite, net/http+chi, yaml.v3, crypto, os/exec, goroutines) and TRACK B (genuinely NEW runtime ownership that TAG delegates to Hermes today: multi-provider LLM + streaming + tool-exec + agent loop + MCP client/server + permission gate). Two hard invariants govern every phase: (1) exactly ONE writer/owner of the SQLite state at all times — the Python<->Go seam is a wire protocol (JSON-RPC/HTTP over loopback|stdio), NEVER shared DB-file access, protecting the read-modify-write race hardening earned across three bug bashes; (2) all Hermes coupling flows through the three chokepoints in src/tag/core/profile.py (run_hermes L199, run_profile_hermes L210, run_profile_python L228), collapsed behind ONE versioned RuntimeService interface so replacement is localized, measurable, and the same typed schema backs both the transitional wire seam and the public huma HTTP API. The Go binary starts as a thin front-door wrapping today's Python+Hermes over that wire, then absorbs subsystems inward (LLM -> agent loop -> MCP/tools -> SQLite state -> servers/observability -> TUI), porting command-by-command behind a golden-transcript harness until Hermes and finally the Python control plane are deleted. Language is Go (decided): 95% of Rust's distribution win at materially higher velocity for a bus-factor-of-one maintainer, plus official GA anthropic-sdk-go + openai-go/v3 + Google-co-maintained MCP go-sdk that de-risk runtime ownership to a PORT, not research. Parity is proven by golden transcripts PLUS isolated-TAG_HOME sandbox runs (the v0.8.1 audit found ~30 dispatch-layer bugs masked by green unit tests) — never by the unit suite alone.

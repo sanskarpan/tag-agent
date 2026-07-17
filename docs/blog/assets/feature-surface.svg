@@ -1,0 +1,75 @@
+<svg viewBox="0 0 1400 860" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">TAG feature surface</title>
+  <desc id="desc">A card-based feature cluster map for the Python TAG implementation.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10231f"/>
+      <stop offset="1" stop-color="#24362f"/>
+    </linearGradient>
+    <style>
+      .serif{font-family:Georgia,serif}
+      .sans{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}
+      .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+      .muted{fill:#a9b9b1}
+      .card{fill:#fff8ec}
+      .small{font-size:13px}
+    </style>
+  </defs>
+  <rect width="1400" height="860" rx="34" fill="url(#bg)"/>
+  <text x="74" y="78" fill="#fff8ec" class="serif" font-size="38" font-weight="700">The surface grew into an agent operating system</text>
+  <text x="74" y="114" class="sans muted" font-size="17">Implemented Python-era surface from docs/FEATURES.md.</text>
+
+  <g class="sans">
+    <rect x="74" y="160" width="360" height="132" rx="24" fill="#fff8ec"/>
+    <text x="108" y="214" fill="#123b35" class="serif" font-size="46" font-weight="700">103</text>
+    <text x="108" y="246" fill="#123b35" font-size="18" font-weight="800">live CLI commands</text>
+    <text x="108" y="270" fill="#63756c" class="mono" font-size="12">verified by command sweep</text>
+
+    <rect x="520" y="160" width="360" height="132" rx="24" fill="#dff0e7"/>
+    <text x="554" y="214" fill="#123b35" class="serif" font-size="46" font-weight="700">~72</text>
+    <text x="554" y="246" fill="#123b35" font-size="18" font-weight="800">implemented capabilities</text>
+    <text x="554" y="270" fill="#63756c" class="mono" font-size="12">PRD-001 through PRD-072</text>
+
+    <rect x="966" y="160" width="360" height="132" rx="24" fill="#f0dfc4"/>
+    <text x="1000" y="214" fill="#123b35" class="serif" font-size="46" font-weight="700">127</text>
+    <text x="1000" y="246" fill="#123b35" font-size="18" font-weight="800">PRDs cataloged</text>
+    <text x="1000" y="270" fill="#63756c" class="mono" font-size="12">implemented + planned</text>
+  </g>
+
+  <g class="sans" font-size="14">
+    <rect x="74" y="360" width="285" height="122" rx="22" fill="#f0c46d"/>
+    <text x="106" y="398" fill="#10231f" font-size="18" font-weight="900">CI/CD workflows</text>
+    <text x="106" y="430" fill="#10231f">PR review, issue solve</text>
+    <text x="106" y="454" fill="#10231f">test-gen, CI diagnose</text>
+
+    <rect x="392" y="360" width="285" height="122" rx="22" fill="#8bd3bf"/>
+    <text x="424" y="398" fill="#10231f" font-size="18" font-weight="900">Memory</text>
+    <text x="424" y="430" fill="#10231f">journal, semantic, tiers</text>
+    <text x="424" y="454" fill="#10231f">episodes, vector, graph</text>
+
+    <rect x="710" y="360" width="285" height="122" rx="22" fill="#d98f72"/>
+    <text x="742" y="398" fill="#10231f" font-size="18" font-weight="900">Guardrails</text>
+    <text x="742" y="430" fill="#10231f">security, sandbox</text>
+    <text x="742" y="454" fill="#10231f">budgets, personas, tools</text>
+
+    <rect x="1028" y="360" width="285" height="122" rx="22" fill="#a9a0d6"/>
+    <text x="1060" y="398" fill="#10231f" font-size="18" font-weight="900">Quality</text>
+    <text x="1060" y="430" fill="#10231f">evals, judge, datasets</text>
+    <text x="1060" y="454" fill="#10231f">CI gates, alerts</text>
+
+    <rect x="238" y="542" width="285" height="122" rx="22" fill="#90bde8"/>
+    <text x="270" y="580" fill="#10231f" font-size="18" font-weight="900">Observability</text>
+    <text x="270" y="612" fill="#10231f">costs, traces, replay</text>
+    <text x="270" y="636" fill="#10231f">cache, OTel, AgentOps</text>
+
+    <rect x="556" y="542" width="285" height="122" rx="22" fill="#dfe7c2"/>
+    <text x="588" y="580" fill="#10231f" font-size="18" font-weight="900">Orchestration</text>
+    <text x="588" y="612" fill="#10231f">queue, DAG, swarm</text>
+    <text x="588" y="636" fill="#10231f">cron, loop, webhooks</text>
+
+    <rect x="874" y="542" width="285" height="122" rx="22" fill="#ead9f1"/>
+    <text x="906" y="580" fill="#10231f" font-size="18" font-weight="900">Ecosystem and UI</text>
+    <text x="906" y="612" fill="#10231f">plugins, templates, MCP</text>
+    <text x="906" y="636" fill="#10231f">dashboard, DevUI, LSP</text>
+  </g>
+</svg>

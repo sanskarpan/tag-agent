@@ -1,0 +1,49 @@
+<svg viewBox="0 0 1400 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">TAG hardening loop</title>
+  <desc id="desc">A clean staged diagram of the adversarial CLI hardening loop without connector arrows.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff8ec"/><stop offset="1" stop-color="#eef7f0"/></linearGradient>
+    <style>.serif{font-family:Georgia,serif}.sans{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ink{fill:#14231f}.muted{fill:#63756c}.paper{fill:#fffdf8;stroke:#d8cfbf;stroke-width:1.4}.dark{fill:#123b35}</style>
+  </defs>
+  <rect width="1400" height="760" rx="34" fill="url(#bg)"/>
+  <text x="72" y="82" class="serif ink" font-size="38" font-weight="700">A green test suite was not enough</text>
+  <text x="72" y="120" class="sans muted" font-size="17">The bugs lived at the boundary users actually touch: the command-line binary.</text>
+
+  <rect x="92" y="230" width="260" height="252" rx="30" fill="#fff4f2" stroke="#d8a895"/>
+  <text x="222" y="282" fill="#9f3d2e" class="serif" font-size="30" font-weight="700" text-anchor="middle">Before</text>
+  <text x="222" y="330" class="sans ink" font-size="16" font-weight="900" text-anchor="middle">unit tests called libraries</text>
+  <text x="222" y="366" class="sans muted" font-size="14" text-anchor="middle">CLI dispatch stayed hidden</text>
+  <text x="222" y="422" class="mono muted" font-size="13" text-anchor="middle">green != operated</text>
+
+  <rect x="430" y="230" width="878" height="252" rx="34" fill="#f9f0dc" opacity=".75"/>
+  <text x="470" y="280" class="sans ink" font-size="16" font-weight="900">After: auditor agents tested the real binary</text>
+
+  <rect x="470" y="320" width="178" height="94" rx="22" class="paper"/>
+  <text x="559" y="355" class="sans ink" font-size="15" font-weight="900" text-anchor="middle">1. Run binary</text>
+  <text x="559" y="383" class="mono muted" font-size="12" text-anchor="middle">isolated TAG_HOME</text>
+
+  <text x="682" y="376" class="serif muted" font-size="36" font-weight="700" text-anchor="middle">›</text>
+
+  <rect x="716" y="320" width="178" height="94" rx="22" class="paper"/>
+  <text x="805" y="355" class="sans ink" font-size="15" font-weight="900" text-anchor="middle">2. Attack inputs</text>
+  <text x="805" y="383" class="sans muted" font-size="12" text-anchor="middle">missing files / dupes</text>
+
+  <text x="928" y="376" class="serif muted" font-size="36" font-weight="700" text-anchor="middle">›</text>
+
+  <rect x="962" y="320" width="178" height="94" rx="22" class="paper"/>
+  <text x="1051" y="355" class="sans ink" font-size="15" font-weight="900" text-anchor="middle">3. Verify</text>
+  <text x="1051" y="383" class="sans muted" font-size="12" text-anchor="middle">independent repros</text>
+
+  <text x="1174" y="376" class="serif muted" font-size="36" font-weight="700" text-anchor="middle">›</text>
+
+  <rect x="1208" y="320" width="78" height="94" rx="22" fill="#123b35"/>
+  <text x="1247" y="356" fill="#fff8ec" class="sans" font-size="14" font-weight="900" text-anchor="middle">Fix</text>
+  <text x="1247" y="382" fill="#cbdad4" class="sans" font-size="11" text-anchor="middle">seam</text>
+
+  <rect x="430" y="542" width="540" height="62" rx="31" class="dark"/>
+  <text x="700" y="568" fill="#fff8ec" class="sans" font-size="16" font-weight="900" text-anchor="middle">149 confirmed bugs in phase 3</text>
+  <text x="700" y="593" fill="#cbdad4" class="sans" font-size="14" text-anchor="middle">final sweep: 678 tests plus 103 command helps clean</text>
+
+  <text x="1170" y="548" class="sans muted" font-size="14" text-anchor="middle">Method changed:</text>
+  <text x="1170" y="574" class="sans muted" font-size="14" text-anchor="middle">test the real CLI boundary.</text>
+</svg>

@@ -1,0 +1,7 @@
+# no-mistakes gate config for the tag-agent repo.
+# The native Go harness lives in the tag-go/ subdirectory, so scope the
+# deterministic test/lint/format commands there instead of the repo root.
+commands:
+  test: "cd tag-go && go test -race ./..."
+  lint: "cd tag-go && go vet ./..."
+  format: "cd tag-go && gofmt -w ."
