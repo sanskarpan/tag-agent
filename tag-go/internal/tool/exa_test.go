@@ -130,9 +130,8 @@ func TestToolBudget(t *testing.T) {
 		t.Error("EnableExa + key should add web_search")
 	}
 	// EnableExa without a key does NOT add it
-	noKey := names(Options{EnableExa: true})
 	t.Setenv("EXA_API_KEY", "")
-	if names(Options{EnableExa: true})["web_search"] && noKey["web_search"] {
+	if names(Options{EnableExa: true})["web_search"] {
 		t.Error("web_search must not register without a key")
 	}
 }

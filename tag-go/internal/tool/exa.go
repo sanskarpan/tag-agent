@@ -112,8 +112,8 @@ func exaSearch(ctx context.Context, opts Options, key, query string, n int) (str
 
 func truncateOneLine(s string, max int) string {
 	s = strings.Join(strings.Fields(s), " ")
-	if len(s) > max {
-		return s[:max] + "…"
+	if r := []rune(s); len(r) > max {
+		return string(r[:max]) + "…"
 	}
 	return s
 }

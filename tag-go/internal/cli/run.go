@@ -51,6 +51,14 @@ func registerRun(root *cobra.Command, app *App) {
 				}
 			}
 			loop := &agent.Loop{Provider: prov}
+			if enableWeb {
+				switch {
+				case !withTools:
+					fmt.Fprintln(os.Stderr, "  warning: --web has no effect without --tools; web_search not registered")
+				case os.Getenv("EXA_API_KEY") == "":
+					fmt.Fprintln(os.Stderr, "  warning: --web set but EXA_API_KEY is empty; web_search not registered")
+				}
+			}
 			if withTools {
 				reg := agent.NewRegistry()
 				topts := tool.DefaultOptions()
