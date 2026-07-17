@@ -1,0 +1,23 @@
+# One-push deploy of the TAG OpenAI-compatible gateway to Render (render.com).
+# Render builds tag-go/Dockerfile and runs `tag gateway` on $PORT.
+services:
+  - type: web
+    name: tag-gateway
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8787"
+      - key: TAG_PROVIDER
+        value: openai
+      - key: TAG_GATEWAY_KEY
+        generateValue: true   # a random bearer token clients must present
+      - key: OPENAI_API_KEY
+        sync: false           # set in the Render dashboard (secret)
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: EXA_API_KEY
+        sync: false
