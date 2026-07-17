@@ -133,29 +133,59 @@ func buildFallbackProvider(app *App, primaryProv llm.Provider, primaryProvSlug, 
 	if primaryProvSlug != "" && !strings.Contains(primaryModel, "/") {
 		candidates = append(candidates, primaryProvSlug+"/"+primaryModel)
 	}
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(candidates)), ",")
-	qargs := []any{prof}
-	for _, c := range candidates {
-		qargs = append(qargs, c)
-	}
-	rows, err := db.Query(`SELECT fallback_model, condition FROM route_fallbacks
-		WHERE profile=? AND primary_model IN (`+placeholders+`) AND enabled=1 ORDER BY priority`, qargs...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	steps := []llm.FallbackStep{{Provider: primaryProv, Model: primaryModel}}
-	for rows.Next() {
-		var fm, cond string
-		if err := rows.Scan(&fm, &cond); err != nil {
-			return nil, err
-		}
-		p := providerForModel(fm, primaryProvSlug)
-		// Pass the bare model id to the adapter (the provider is resolved from the
-		// "provider/" prefix separately; adapters expect an unprefixed model).
-		steps = append(steps, llm.FallbackStep{Provider: p, Model: stripProviderPrefix(fm), Condition: cond})
+	// The stored route_fallbacks form a graph: a fallback can itself declare
+	// fallbacks, so primary->A->B is a valid depth-2 chain. Walk it transitively
+	// (DFS, priority order) rather than only reading the primary's direct edges,
+	// so every declared step is reachable at runtime. `visited` guards against
+	// re-adding a model (and against cycles, though `add` already rejects those).
+	visited := map[string]bool{}
+	for _, c := range candidates {
+		visited[c] = true
 	}
-	if err := rows.Err(); err != nil {
+	var walk func(models []string) error
+	walk = func(models []string) error {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(models)), ",")
+		qargs := []any{prof}
+		for _, m := range models {
+			qargs = append(qargs, m)
+		}
+		rows, err := db.Query(`SELECT fallback_model, condition FROM route_fallbacks
+			WHERE profile=? AND primary_model IN (`+placeholders+`) AND enabled=1 ORDER BY priority`, qargs...)
+		if err != nil {
+			return err
+		}
+		type edge struct{ model, cond string }
+		var edges []edge
+		for rows.Next() {
+			var fm, cond string
+			if err := rows.Scan(&fm, &cond); err != nil {
+				rows.Close()
+				return err
+			}
+			edges = append(edges, edge{fm, cond})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		for _, e := range edges {
+			if visited[e.model] {
+				continue
+			}
+			visited[e.model] = true
+			p := providerForModel(e.model, primaryProvSlug)
+			// Pass the bare model id to the adapter (the provider is resolved from
+			// the "provider/" prefix separately; adapters expect an unprefixed model).
+			steps = append(steps, llm.FallbackStep{Provider: p, Model: stripProviderPrefix(e.model), Condition: e.cond})
+			if err := walk([]string{e.model}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(candidates); err != nil {
 		return nil, err
 	}
 	if len(steps) < 2 {

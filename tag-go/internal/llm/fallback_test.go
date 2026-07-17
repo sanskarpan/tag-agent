@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // mockProvider is a test provider that either errors at Stream time, emits an
@@ -160,6 +161,43 @@ func TestFallbackAllExhausted(t *testing.T) {
 	}
 	if len(idx) != 1 || idx[0] != 0 {
 		t.Errorf("OnFallback should fire once for step 0, got %v", idx)
+	}
+}
+
+func TestFallbackSkipsNilProvider(t *testing.T) {
+	// A step whose provider slug isn't registered (nil Provider) must be skipped
+	// without hanging, so a later registered step still serves the request.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f := &FallbackProvider{Steps: []FallbackStep{
+			{Provider: nil, Model: "unregistered/x"},
+			{Provider: &mockProvider{name: "b", text: "served"}},
+		}}
+		ch, err := f.Stream(context.Background(), Request{})
+		if err != nil {
+			t.Errorf("unexpected err: %v", err)
+			return
+		}
+		if got, _ := collectText(t, ch); got != "served" {
+			t.Errorf("want served, got %q", got)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stream hung on a nil-provider step (infinite loop)")
+	}
+}
+
+func TestFallbackAllNilProvidersSurfacesError(t *testing.T) {
+	// A chain of only unregistered providers must terminate with an error, not spin.
+	f := &FallbackProvider{Steps: []FallbackStep{
+		{Provider: nil, Model: "a"},
+		{Provider: nil, Model: "b"},
+	}}
+	if _, err := f.Stream(context.Background(), Request{}); err == nil {
+		t.Fatal("expected an error when no step has a registered provider")
 	}
 }
 

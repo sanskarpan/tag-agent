@@ -66,6 +66,26 @@ func TestE2EFallbackChain(t *testing.T) {
 		t.Errorf("expected a fallback notice on the primary failure, got: %q", out)
 	}
 
+	// Multi-hop: a depth-2 chain (openai -> anthropic -> echo) must be walked
+	// transitively. openai and anthropic both hard-fail (no keys); only echo, two
+	// hops down, can serve — so reaching it proves the chain is followed past the
+	// primary's direct fallback.
+	runNoKeys(t, h, "set-model", "reviewer", "openai/gpt-4o-mini")
+	runNoKeys(t, h, "route-fallback", "add", "--profile", "reviewer",
+		"--primary", "openai/gpt-4o-mini", "--fallback", "anthropic/claude-haiku-4-5", "--condition", "always")
+	runNoKeys(t, h, "route-fallback", "add", "--profile", "reviewer",
+		"--primary", "anthropic/claude-haiku-4-5", "--fallback", "echo/local", "--condition", "always")
+	out, c = runNoKeys(t, h, "run", "deep hello", "--provider", "openai", "--profile", "reviewer", "--fallback")
+	if c != 0 {
+		t.Fatalf("expected multi-hop fallback success (exit 0), got %d: %q", c, out)
+	}
+	if !strings.Contains(out, "deep hello") {
+		t.Errorf("echo (2 hops down) should return the prompt, got: %q", out)
+	}
+	if !strings.Contains(out, "fallback: step 1") {
+		t.Errorf("expected the second hop (step 1) to also fall back, got: %q", out)
+	}
+
 	// A configured-but-condition-mismatched chain must NOT rescue: gate the
 	// fallback on rate_limit while the error is an auth/"not set" error.
 	runNoKeys(t, h, "route-fallback", "add", "--profile", "researcher",

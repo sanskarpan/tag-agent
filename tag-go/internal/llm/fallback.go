@@ -56,7 +56,7 @@ func (f *FallbackProvider) Stream(ctx context.Context, req Request) (<-chan Even
 		if step.Provider == nil {
 			// A configured fallback whose provider slug isn't registered — skip it.
 			lastErr = fmt.Errorf("fallback step %d has no registered provider", i)
-			i = f.nextEligible(i, lastErr, retry)
+			i++
 			continue
 		}
 		r := req
