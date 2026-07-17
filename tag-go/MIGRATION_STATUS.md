@@ -33,7 +33,7 @@ preserved intentionally (e.g. substring keyword matching in the entity graph;
 | mem / memory-journal | add, search, list, forget, stats; save/list/forget | `internal/memory` (BM25 decay) |
 | budget | set, get, list, remove | token_budgets |
 | persona | list, apply, stack, remove | personas / active_personas |
-| route-fallback | add, list, resolve (BFS cycle detection) | route_fallbacks |
+| route-fallback | add, list, resolve (BFS cycle detection); chain walked at runtime via `run --fallback` | route_fallbacks |
 | **routing** | **route, assignments, set-model, models** | config profiles |
 | cron | add, list, remove, next | `internal/cron` (hardened matcher) |
 | queue / dag | add, list, cancel; save, list | queue_jobs / queue_dags |
@@ -56,7 +56,7 @@ preserved intentionally (e.g. substring keyword matching in the entity graph;
 | **eval** | **list, show** | eval_runs / eval_cases (run path is Track-B) |
 | **swarm** | **list, status, results** | swarm_runs / swarm_tasks (run/abort are Track-B) |
 
-| **run** | (native agent loop) | `internal/agent` + `internal/tool`; drives a provider through tool turns, records usage to `runs` |
+| **run** | (native agent loop) | `internal/agent` + `internal/tool`; drives a provider through tool turns, records usage to `runs`; `--fallback` wraps the provider in `llm.FallbackProvider` to walk the profile's `route_fallbacks` chain on a retryable error |
 | **serve** | (HTTP dashboard) | `internal/server`; loopback dashboard + `/api/snapshot` + `/events` SSE |
 | **tool-index** | **index, search, status** | keyword retrieval over the embedded MCP registry |
 | **cache** | **stats** | prompt-cache hit rate + token totals per profile/model (from `runs`) |
@@ -99,7 +99,7 @@ on `alert delete` (Go enforces FKs; Python's sqlite3 defaults them off).
 
 | Package | State |
 |---|---|
-| `internal/llm` | **interface + 3 providers done.** Provider-neutral `Provider`/`Event`/`Request`; self-registering `EchoProvider` (offline) + **real `AnthropicProvider` and `OpenAIProvider`** (raw net/http SSE streaming, no SDK dep — keeps the binary lean). Both map the neutral Request onto their API shape (Anthropic hoists system + tool_result blocks; OpenAI keeps system + tool-role messages) and decode streamed text **and tool calls** (assembling streamed JSON args). SSE parsers + body builders are unit-tested offline against canned streams; `Stream` refuses without an API key so **no network call is ever made in tests** (protects the no-model-calls constraint). Selected via `tag run --provider anthropic|openai|echo`. |
+| `internal/llm` | **interface + 3 providers done.** Provider-neutral `Provider`/`Event`/`Request`; self-registering `EchoProvider` (offline) + **real `AnthropicProvider` and `OpenAIProvider`** (raw net/http SSE streaming, no SDK dep — keeps the binary lean). Both map the neutral Request onto their API shape (Anthropic hoists system + tool_result blocks; OpenAI keeps system + tool-role messages) and decode streamed text **and tool calls** (assembling streamed JSON args). SSE parsers + body builders are unit-tested offline against canned streams; `Stream` refuses without an API key so **no network call is ever made in tests** (protects the no-model-calls constraint). Selected via `tag run --provider anthropic|openai|echo`. A `FallbackProvider` composes an ordered chain of `(provider, model)` steps: on a retryable, condition-matched error that occurs before any content streams it advances to the next eligible step, and the winning provider streams through live (not buffered) — the runtime execution of the `route_fallbacks` config, wired into `run --fallback`. |
 | `internal/agent` | **agent loop done.** `Loop.Run` drives a `Provider` through tool-calling turns (execute → feed results → repeat) with a tool `Registry`, usage accumulation, unknown-tool handling, and a step cap. Fully tested offline via scripted/echo providers (4 tests); runs live through the real Anthropic/OpenAI providers. |
 | `internal/mcp` | **client + server + subprocess done.** JSON-RPC 2.0 over stdio: client (`Initialize`/`ListTools`/`CallTool`), server (`Register`/`Serve`), and `NewProcessClient` which spawns an external MCP server as a child process and speaks to it over its stdio. `tag mcp-serve` exposes TAG tools; `tag mcp-connect <cmd…>` consumes a third-party server; `tool.RegisterMCP` bridges external tools into `agent.Registry` (`mcp__<server>__<tool>`). Interop tested offline (in-process pipes + a real subprocess round-trip against our own `mcp-serve`) + agent-loop-over-MCP. |
 | `internal/tool` | **built-in tools done.** `bash` (timeout), `read_file`, `write_file`, `list_dir` — all confined to a tool root with a path-traversal guard. Plug into `agent.Registry`; tested end-to-end *through* the agent loop via a one-shot provider (5 tests). |
