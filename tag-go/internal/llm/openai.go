@@ -40,17 +40,28 @@ func (p OpenAIProvider) Stream(ctx context.Context, req Request) (<-chan Event, 
 	if base == "" {
 		base = "https://api.openai.com/v1"
 	}
+	return streamOpenAICompatible(ctx, req, base, p.key(), "openai", p.HTTPClient)
+}
+
+// streamOpenAICompatible POSTs an OpenAI-shaped chat-completions request to
+// baseURL and decodes the SSE response into provider-neutral events. apiKey may
+// be empty (for local servers that don't require auth); errLabel prefixes any
+// non-200 upstream error. Shared by OpenAIProvider and LocalProvider so both
+// use the identical body-builder and SSE parser.
+func streamOpenAICompatible(ctx context.Context, req Request, baseURL, apiKey, errLabel string, client *http.Client) (<-chan Event, error) {
 	b, err := json.Marshal(buildOpenAIBody(req))
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", base+"/chat/completions", bytes.NewReader(b))
+	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
 	httpReq.Header.Set("content-type", "application/json")
-	httpReq.Header.Set("authorization", "Bearer "+p.key())
-	client := p.HTTPClient
+	if apiKey != "" {
+		httpReq.Header.Set("authorization", "Bearer "+apiKey)
+	}
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Minute}
 	}
@@ -61,12 +72,12 @@ func (p OpenAIProvider) Stream(ctx context.Context, req Request) (<-chan Event, 
 	if resp.StatusCode != 200 {
 		defer resp.Body.Close()
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return nil, fmt.Errorf("openai API %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		return nil, fmt.Errorf("%s API %d: %s", errLabel, resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	ch := make(chan Event, 16)
 	go func() {
 		defer resp.Body.Close()
-		parseOpenAISSE(resp.Body, ch)
+		parseOpenAISSE(resp.Body, ch, errLabel)
 	}()
 	return ch, nil
 }
@@ -132,7 +143,9 @@ func buildOpenAIBody(req Request) map[string]any {
 }
 
 // parseOpenAISSE decodes the Chat Completions event stream into Events.
-func parseOpenAISSE(r io.Reader, ch chan<- Event) {
+// errLabel prefixes any stream-level error so failures are attributed to the
+// right provider (e.g. "openai" vs "local").
+func parseOpenAISSE(r io.Reader, ch chan<- Event, errLabel string) {
 	defer close(ch)
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
@@ -196,7 +209,7 @@ func parseOpenAISSE(r io.Reader, ch chan<- Event) {
 		}
 		if chunk.Error != nil {
 			// A mid-stream error chunk must surface, not be silently finished.
-			ch <- Event{Type: EventError, Err: fmt.Errorf("openai stream error (%s): %s", chunk.Error.Type, chunk.Error.Message)}
+			ch <- Event{Type: EventError, Err: fmt.Errorf("%s stream error (%s): %s", errLabel, chunk.Error.Type, chunk.Error.Message)}
 			return
 		}
 		if chunk.Usage != nil {
@@ -227,7 +240,7 @@ func parseOpenAISSE(r io.Reader, ch chan<- Event) {
 		}
 	}
 	if err := sc.Err(); err != nil {
-		ch <- Event{Type: EventError, Err: fmt.Errorf("openai stream read: %w", err)}
+		ch <- Event{Type: EventError, Err: fmt.Errorf("%s stream read: %w", errLabel, err)}
 		return
 	}
 	flush()

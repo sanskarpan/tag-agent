@@ -18,7 +18,7 @@ func TestOpenAISSETextStream(t *testing.T) {
 		`data: [DONE]`,
 	}, "\n")
 	ch := make(chan Event, 32)
-	go parseOpenAISSE(strings.NewReader(sse), ch)
+	go parseOpenAISSE(strings.NewReader(sse), ch, "openai")
 	text, calls, usage, finished := collect(ch)
 	if text != "Hello there" {
 		t.Errorf("text = %q", text)
@@ -44,7 +44,7 @@ func TestOpenAISSEToolCall(t *testing.T) {
 		`data: [DONE]`,
 	}, "\n")
 	ch := make(chan Event, 32)
-	go parseOpenAISSE(strings.NewReader(sse), ch)
+	go parseOpenAISSE(strings.NewReader(sse), ch, "openai")
 	_, calls, _, finished := collect(ch)
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 tool call, got %d", len(calls))
@@ -84,7 +84,7 @@ func TestOpenAISSETruncationSurfacesError(t *testing.T) {
 	sse := `data: {"choices":[{"delta":{"content":"partial"}}]}` + "\n"
 	r := io.MultiReader(strings.NewReader(sse), iotest.ErrReader(errors.New("connection reset")))
 	ch := make(chan Event, 32)
-	go parseOpenAISSE(r, ch)
+	go parseOpenAISSE(r, ch, "openai")
 	var gotErr error
 	finished := false
 	for ev := range ch {
