@@ -40,17 +40,28 @@ func (p OpenAIProvider) Stream(ctx context.Context, req Request) (<-chan Event, 
 	if base == "" {
 		base = "https://api.openai.com/v1"
 	}
+	return streamOpenAICompatible(ctx, req, base, p.key(), "openai", p.HTTPClient)
+}
+
+// streamOpenAICompatible POSTs an OpenAI-shaped chat-completions request to
+// baseURL and decodes the SSE response into provider-neutral events. apiKey may
+// be empty (for local servers that don't require auth); errLabel prefixes any
+// non-200 upstream error. Shared by OpenAIProvider and LocalProvider so both
+// use the identical body-builder and SSE parser.
+func streamOpenAICompatible(ctx context.Context, req Request, baseURL, apiKey, errLabel string, client *http.Client) (<-chan Event, error) {
 	b, err := json.Marshal(buildOpenAIBody(req))
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", base+"/chat/completions", bytes.NewReader(b))
+	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
 	httpReq.Header.Set("content-type", "application/json")
-	httpReq.Header.Set("authorization", "Bearer "+p.key())
-	client := p.HTTPClient
+	if apiKey != "" {
+		httpReq.Header.Set("authorization", "Bearer "+apiKey)
+	}
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Minute}
 	}
@@ -61,7 +72,7 @@ func (p OpenAIProvider) Stream(ctx context.Context, req Request) (<-chan Event, 
 	if resp.StatusCode != 200 {
 		defer resp.Body.Close()
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return nil, fmt.Errorf("openai API %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		return nil, fmt.Errorf("%s API %d: %s", errLabel, resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	ch := make(chan Event, 16)
 	go func() {
