@@ -3,6 +3,8 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,6 +23,7 @@ func registerRun(root *cobra.Command, app *App) {
 	var provider, system, profile string
 	var maxSteps int
 	var withTools bool
+	var useFallback bool
 
 	c := &cobra.Command{
 		Use:     "run <prompt>",
@@ -31,6 +34,19 @@ func registerRun(root *cobra.Command, app *App) {
 			prov, ok := llm.Registry[provider]
 			if !ok {
 				return fmt.Errorf("unknown provider %q (available: %v)", provider, providerNames())
+			}
+			primaryModel := app.Cfg.String("profiles."+app.profile(profile)+".config.model.default", "")
+			// When --fallback is set and the profile has a route_fallbacks chain for
+			// the primary model, wrap the provider so 429/401/timeout/overload during
+			// inference walks the declared chain (gap #2) instead of failing hard.
+			if useFallback {
+				fp, err := buildFallbackProvider(app, prov, provider, primaryModel, profile)
+				if err != nil {
+					return err
+				}
+				if fp != nil {
+					prov = fp
+				}
 			}
 			loop := &agent.Loop{Provider: prov}
 			if withTools {
@@ -87,7 +103,90 @@ func registerRun(root *cobra.Command, app *App) {
 	c.Flags().StringVar(&profile, "profile", "", "profile")
 	c.Flags().IntVar(&maxSteps, "max-steps", 8, "max agent-loop steps")
 	c.Flags().BoolVar(&withTools, "tools", false, "enable built-in tools (bash/read_file/write_file/list_dir)")
+	c.Flags().BoolVar(&useFallback, "fallback", false, "on a retryable provider error, walk the profile's route-fallback chain")
 	root.AddCommand(c)
+}
+
+// buildFallbackProvider constructs an llm.FallbackProvider from a profile's
+// route_fallbacks chain for the given primary model. It returns nil (no error)
+// when no chain is configured, so the caller keeps its single provider. Each
+// step's provider is resolved from the "provider/model" prefix (falling back to
+// the primary provider when a model has no prefix); a step whose provider slug
+// isn't registered is skipped so a partially-registered chain still runs.
+func buildFallbackProvider(app *App, primaryProv llm.Provider, primaryProvSlug, primaryModel, profile string) (*llm.FallbackProvider, error) {
+	if primaryModel == "" {
+		return nil, nil
+	}
+	db, err := app.OpenDB()
+	if err != nil {
+		return nil, err
+	}
+	// The primary model can be stored either bare ("gpt-4o-mini", as set-model
+	// splits it into model.default + model.provider) or prefixed
+	// ("openai/gpt-4o-mini", as a route-fallback --primary is typically typed).
+	// Match both forms so the chain resolves regardless of which the user used.
+	prof := app.profile(profile)
+	candidates := []string{primaryModel}
+	if mp := app.Cfg.String("profiles."+prof+".config.model.provider", ""); mp != "" && !strings.Contains(primaryModel, "/") {
+		candidates = append(candidates, mp+"/"+primaryModel)
+	}
+	if primaryProvSlug != "" && !strings.Contains(primaryModel, "/") {
+		candidates = append(candidates, primaryProvSlug+"/"+primaryModel)
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(candidates)), ",")
+	qargs := []any{prof}
+	for _, c := range candidates {
+		qargs = append(qargs, c)
+	}
+	rows, err := db.Query(`SELECT fallback_model, condition FROM route_fallbacks
+		WHERE profile=? AND primary_model IN (`+placeholders+`) AND enabled=1 ORDER BY priority`, qargs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	steps := []llm.FallbackStep{{Provider: primaryProv, Model: primaryModel}}
+	for rows.Next() {
+		var fm, cond string
+		if err := rows.Scan(&fm, &cond); err != nil {
+			return nil, err
+		}
+		p := providerForModel(fm, primaryProvSlug)
+		// Pass the bare model id to the adapter (the provider is resolved from the
+		// "provider/" prefix separately; adapters expect an unprefixed model).
+		steps = append(steps, llm.FallbackStep{Provider: p, Model: stripProviderPrefix(fm), Condition: cond})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(steps) < 2 {
+		return nil, nil // no fallbacks configured for this primary
+	}
+	return &llm.FallbackProvider{
+		Steps: steps,
+		OnFallback: func(i int, model string, err error) {
+			fmt.Fprintf(os.Stderr, "  fallback: step %d (%s) failed (%v) — trying next\n", i, model, err)
+		},
+	}, nil
+}
+
+// providerForModel resolves the llm.Provider for a "provider/model" ref, falling
+// back to the default provider slug when the ref has no prefix.
+func providerForModel(modelRef, defaultSlug string) llm.Provider {
+	slug := defaultSlug
+	if i := strings.IndexByte(modelRef, '/'); i > 0 {
+		slug = modelRef[:i]
+	}
+	return llm.Registry[slug] // may be nil (unregistered) — FallbackProvider skips it
+}
+
+// stripProviderPrefix returns the model id without its "provider/" prefix, since
+// provider adapters expect a bare model (e.g. "claude-haiku-4-5", not
+// "anthropic/claude-haiku-4-5").
+func stripProviderPrefix(modelRef string) string {
+	if i := strings.IndexByte(modelRef, '/'); i > 0 {
+		return modelRef[i+1:]
+	}
+	return modelRef
 }
 
 func providerNames() []string {
