@@ -133,6 +133,13 @@ The feature surface is ported. What is *deliberately* out of scope:
   provider is verified via unit tests and an E2E round-trip against a mock server.
 - Steps that need a live model or external system are honest stubs (issue-solve/review-pr
   remote fetch, split plan, context compress/trim, plugin install).
+- **Two hermes-octo parity gaps are deliberately deferred** (five of seven were shipped —
+  fallback chain #548, OpenAI gateway #549, local provider #550, Exa+tool-budget #551,
+  deploy recipe #552): a **Postgres/pgvector state backend** (gap #6 — contradicts the
+  single-static-binary + embedded-SQLite tenet; SQLite FTS5 search has no Postgres port)
+  and a **native Honcho live-recall backend** (gap #3 — TAG's own memory suite is already a
+  superset, and `import-honcho` covers credentials). Rationale + future-implementation
+  sketches: [`../docs/adr/0001-postgres-and-honcho-deferral.md`](../docs/adr/0001-postgres-and-honcho-deferral.md).
 
 **Constraint (still in force):** no live model calls in the test suite; all runtime work is
 built against the interface + echo/mock, verified offline. `go test ./...` never touches
