@@ -107,6 +107,7 @@ func NewRoot() *cobra.Command {
 	registerSwarm(root, app)
 	registerRun(root, app)
 	registerServe(root, app)
+	registerGateway(root, app)
 	registerToolIndex(root, app)
 	registerCache(root, app)
 	registerOtelExport(root, app)
