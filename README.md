@@ -243,9 +243,15 @@ tag route-fallback list --json
 
 # Test resolution for a given primary + condition
 tag route-fallback resolve --primary claude-opus-4 --condition error
+
+# Walk the chain live during inference (native Go harness): on a retryable
+# provider error before any content streams, fail over to the next step.
+tag run "Summarise this repo" --provider openai --fallback
 ```
 
 Supported conditions: `context_overflow`, `error`, `timeout`, `cost_limit`, `any`.
+
+`tag run --fallback` (native Go harness) executes the stored chain at runtime: it wraps the primary provider so a retryable error (429 / 401 / 400 / timeout / overload) that occurs *before* any content streams advances to the next declared step, honoring each edge's condition (a `rate_limit`-gated hop won't rescue an auth error) and streaming the winning provider live. It only fails over on transient/auth/model errors — deterministic malformed-request errors are not retried — and the chain is walked transitively (primary → A → B). The flag is opt-in; without it a single-provider run is unchanged.
 
 ---
 

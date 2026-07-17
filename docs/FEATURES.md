@@ -44,7 +44,7 @@
 |---|---|---|---|
 | ✅ | `route`, `assignments`, `models`, `set-model`, `submit`, `openrouter-models`, `runs` | Task routing, model assignment, submission, run history | — |
 | ✅ | `benchmark`, `compare` | Multi-model benchmarking & comparison | PRD-017 |
-| ✅ | `route-fallback` | Model fallback chains (with cycle detection) | PRD-031 |
+| ✅ | `route-fallback` | Model fallback chains (with cycle detection); walked at runtime by the Go harness via `run --fallback` | PRD-031 |
 
 ## 4. Memory subsystem
 
