@@ -14,10 +14,19 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/tag-agent/tag/internal/llm"
 )
+
+// idCounter makes response ids distinct within a process even when many
+// completions land in the same wall-clock second.
+var idCounter atomic.Uint64
+
+// maxRequestBytes caps the chat-completions request body to defend against
+// memory exhaustion from an oversized (possibly unauthenticated) request.
+const maxRequestBytes = 4 << 20 // 4 MiB
 
 // Options configures the gateway handler.
 type Options struct {
@@ -90,6 +99,7 @@ func Handler(opts Options) http.Handler {
 			writeErr(w, 401, "invalid_api_key", "missing or invalid bearer token")
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 		var req chatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeErr(w, 400, "invalid_request_error", "invalid JSON body: "+err.Error())
@@ -262,8 +272,11 @@ func writeErr(w http.ResponseWriter, code int, typ, msg string) {
 	writeJSON(w, code, map[string]any{"error": map[string]any{"message": msg, "type": typ}})
 }
 
-// randID derives a short, non-cryptographic id from the timestamp for response
-// ids (Math/rand is unavailable in some sandboxes; ids need only be unique-ish).
+// randID derives a short, non-cryptographic id for response ids by combining the
+// timestamp with a monotonic per-process counter, so distinct responses (even
+// within the same second, or concurrent) get distinct ids without depending on
+// math/rand (unavailable in some sandboxes).
 func randID(seed int64) string {
-	return strconv.FormatInt(seed, 36) + strconv.FormatInt(seed%97, 36)
+	n := idCounter.Add(1)
+	return strconv.FormatInt(seed, 36) + strconv.FormatUint(n, 36)
 }

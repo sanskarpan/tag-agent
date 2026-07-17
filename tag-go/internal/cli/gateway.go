@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -63,7 +64,16 @@ func registerGateway(root *cobra.Command, app *App) {
 			if k == "" {
 				fmt.Println("WARNING: no auth key set — accepting UNAUTHENTICATED requests (loopback only unless --allow-unauthenticated).")
 			}
-			return (&http.Server{Addr: addr, Handler: gateway.Handler(opts)}).ListenAndServe()
+			srv := &http.Server{
+				Addr:    addr,
+				Handler: gateway.Handler(opts),
+				// Defend the accept path against slow-header (Slowloris) exhaustion
+				// on a publicly-bindable server. WriteTimeout stays 0 so long-lived
+				// SSE streams are not cut off mid-completion.
+				ReadHeaderTimeout: 10 * time.Second,
+				IdleTimeout:       120 * time.Second,
+			}
+			return srv.ListenAndServe()
 		},
 	}
 	c.Flags().StringVar(&host, "host", "127.0.0.1", "bind host")
