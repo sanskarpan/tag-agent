@@ -24,6 +24,8 @@ func registerRun(root *cobra.Command, app *App) {
 	var maxSteps int
 	var withTools bool
 	var useFallback bool
+	var enableWeb bool
+	var disableTools []string
 
 	c := &cobra.Command{
 		Use:     "run <prompt>",
@@ -51,7 +53,17 @@ func registerRun(root *cobra.Command, app *App) {
 			loop := &agent.Loop{Provider: prov}
 			if withTools {
 				reg := agent.NewRegistry()
-				tool.Register(reg, tool.DefaultOptions())
+				topts := tool.DefaultOptions()
+				topts.EnableExa = enableWeb // Exa web_search (needs EXA_API_KEY)
+				if len(disableTools) > 0 {
+					topts.Disabled = map[string]bool{}
+					for _, name := range disableTools {
+						if n := strings.TrimSpace(name); n != "" {
+							topts.Disabled[n] = true
+						}
+					}
+				}
+				tool.Register(reg, topts)
 				loop.Tools = reg
 			}
 			started := time.Now().UTC()
@@ -103,6 +115,8 @@ func registerRun(root *cobra.Command, app *App) {
 	c.Flags().StringVar(&profile, "profile", "", "profile")
 	c.Flags().IntVar(&maxSteps, "max-steps", 8, "max agent-loop steps")
 	c.Flags().BoolVar(&withTools, "tools", false, "enable built-in tools (bash/read_file/write_file/list_dir)")
+	c.Flags().BoolVar(&enableWeb, "web", false, "add the Exa web_search tool (requires --tools and EXA_API_KEY)")
+	c.Flags().StringSliceVar(&disableTools, "disable-tools", nil, "tool-budget: comma-list of tool names to omit (e.g. bash,write_file)")
 	c.Flags().BoolVar(&useFallback, "fallback", false, "on a retryable provider error, walk the profile's route-fallback chain")
 	root.AddCommand(c)
 }
