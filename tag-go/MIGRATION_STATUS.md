@@ -4,7 +4,7 @@ Native Go port of the Python TAG control plane, per `../docs/GO_MIGRATION_PLAN.m
 Single static binary (`CGO_ENABLED=0`, ~18 MB), owns its own SQLite runtime
 (`modernc.org/sqlite`, FTS5, WAL, single-writer). Module: `github.com/tag-agent/tag`.
 
-**Status: feature-complete + adversarially audited.** 87 top-level commands · 28 packages ·
+**Status: feature-complete + adversarially audited.** 88 top-level commands · 29 packages ·
 289 test funcs · `gofmt`/`go vet` clean · `go test ./... -race` green · 364-invocation
 recursive `--help` sweep passes (0 failures).
 A 5-agent adversarial audit (read + RUN) found ~30 real bugs behind the green suite; all
@@ -58,6 +58,7 @@ preserved intentionally (e.g. substring keyword matching in the entity graph;
 
 | **run** | (native agent loop) | `internal/agent` + `internal/tool`; drives a provider through tool turns, records usage to `runs`; `--fallback` wraps the provider in `llm.FallbackProvider` to walk the profile's `route_fallbacks` chain on a retryable error |
 | **serve** | (HTTP dashboard) | `internal/server`; loopback dashboard + `/api/snapshot` + `/events` SSE |
+| **gateway** | (OpenAI-compatible chat API) | `internal/gateway`; serves the agent loop as `POST /v1/chat/completions` (stream + non-stream), `GET /v1/models`, `GET /health` behind optional bearer auth; resolves `provider/model` (or `--provider` default) and wraps in the `route_fallbacks` chain with `--fallback` |
 | **tool-index** | **index, search, status** | keyword retrieval over the embedded MCP registry |
 | **cache** | **stats** | prompt-cache hit rate + token totals per profile/model (from `runs`) |
 | **otel-export** | (single cmd) | spans → OTLP/JSON with OTel GenAI semconv attributes |
@@ -104,6 +105,7 @@ on `alert delete` (Go enforces FKs; Python's sqlite3 defaults them off).
 | `internal/mcp` | **client + server + subprocess done.** JSON-RPC 2.0 over stdio: client (`Initialize`/`ListTools`/`CallTool`), server (`Register`/`Serve`), and `NewProcessClient` which spawns an external MCP server as a child process and speaks to it over its stdio. `tag mcp-serve` exposes TAG tools; `tag mcp-connect <cmd…>` consumes a third-party server; `tool.RegisterMCP` bridges external tools into `agent.Registry` (`mcp__<server>__<tool>`). Interop tested offline (in-process pipes + a real subprocess round-trip against our own `mcp-serve`) + agent-loop-over-MCP. |
 | `internal/tool` | **built-in tools done.** `bash` (timeout), `read_file`, `write_file`, `list_dir` — all confined to a tool root with a path-traversal guard. Plug into `agent.Registry`; tested end-to-end *through* the agent loop via a one-shot provider (5 tests). |
 | `internal/server` | **HTTP `serve` + `devui` + `web` done.** Loopback dashboards + `/api/snapshot`, `/api/spans`, `/api/runs`, `/api/queue`, `/api/costs`, `/health` + SSE streams; no wildcard CORS. Pure `*store.DB` handlers, `httptest`-tested + smoke-tested live. `tag serve/devui/web`. |
+| `internal/gateway` | **OpenAI-compatible gateway done.** Serves the agent loop's provider turn as `POST /v1/chat/completions` (streaming `chat.completion.chunk` SSE ending in `[DONE]` + non-stream `chat.completion` with usage), `GET /v1/models`, `GET /health`, behind optional bearer auth (constant-time compare). Decoupled from cli/store via a `Resolve(model) → (provider, bareModel)` func, so it is fully `httptest`-able offline with a mock; body-capped and request-id-unique. Wired as `tag gateway`, which resolves `provider/`-prefixed models (else `--provider` default) and, with `--fallback`, wraps the provider in the `route_fallbacks` chain. A non-loopback bind without a key is refused unless `--allow-unauthenticated`. Verified with httptest units, a real-subprocess E2E round-trip, and live against OpenAI. Tool-calling multi-turn is a deliberate future extension. |
 | `internal/lsp` | **LSP server done.** JSON-RPC 2.0 with `Content-Length` header framing (correct split-read + back-to-back handling); initialize/initialized/shutdown/exit/textDocument-hover; `-32601` on unknown method. Wired as `tag lsp`; framing tested offline (9 tests) + smoke-tested live. |
 | `internal/tui` | **Charm TUI done.** bubbletea + lipgloss dashboard over the same snapshot (runs/queue/journal), refresh/quit keys, live ticker. `Model.Update`/`View` are pure and unit-tested offline (3 tests); `Run()` needs a TTY. Wired as `tag tui`. |
 | `internal/worker` | **execution worker done (#532).** Dep-aware atomic job claim; executes queued jobs and full DAG dependency chains through the native agent loop (`queue worker`, `dag run --execute`, `cron run --execute`). Offline via `echo` by default; verified live against OpenAI. |
@@ -114,10 +116,12 @@ on `alert delete` (Go enforces FKs; Python's sqlite3 defaults them off).
 ## Remaining
 
 The feature surface is ported. What is *deliberately* out of scope:
-- **Managed-Hermes runtime passthrough** (`chat`, `gateway`, `kanban`, `runtime`, `sessions`,
+- **Managed-Hermes runtime passthrough** (`chat`, `kanban`, `runtime`, `sessions`,
   `status`, `dashboard`, `config`, `profile`, `submit`, `update`, `skills`, `tools`) and
   **`desktop`** (OS packaging): the Go binary owns its own runtime instead of shipping the
-  Python Hermes checkout; `serve`/`devui`/`web` replace the dashboard.
+  Python Hermes checkout; `serve`/`devui`/`web` replace the dashboard. (The native
+  `gateway` command is *not* the Hermes passthrough — it serves TAG's own agent loop as
+  an OpenAI-compatible API; see the `internal/gateway` row above.)
 - **Offline-by-default execution:** every execution path (run, queue worker, swarm run,
   eval run/judge, split plan, issue-solve/swe-solve/review-pr, ci/loop) runs against the
   `echo` provider without keys; `--provider anthropic|openai` makes it live with an API key.
@@ -207,5 +211,5 @@ biggest behavioral gaps the benchmark identified:
   the binary, and closed (issues #520–#546). No data races (`go test ./... -race` green), no
   injection/SSRF/sandbox escapes.
 
-Final gates: `gofmt`/`go vet` clean, `go test ./... -race` green (28 packages, 289 test
+Final gates: `gofmt`/`go vet` clean, `go test ./... -race` green (29 packages, 289 test
 funcs), 364-invocation recursive `--help` sweep with 0 failures.

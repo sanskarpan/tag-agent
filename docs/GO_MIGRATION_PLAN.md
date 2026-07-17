@@ -5,7 +5,7 @@
 > harness that owns its runtime. Grounded in `GO_MIGRATION_RESEARCH.md`. Strangler-fig, never big-bang.
 
 > **Status (2026-07-08): implemented.** The native Go harness landed as [`tag-go/`](../tag-go/)
-> (87 top-level commands, 28 packages, both tracks done). Current per-subsystem status lives in
+> (88 top-level commands, 29 packages, both tracks done). Current per-subsystem status lives in
 > [`tag-go/MIGRATION_STATUS.md`](../tag-go/MIGRATION_STATUS.md); benchmarks and behavioral parity
 > vs the Python edition in [`COMPARISON_REPORT.md`](../COMPARISON_REPORT.md). The as-built layout
 > diverges from the plan below in one major way: the port went straight to a native runtime — the
