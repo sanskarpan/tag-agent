@@ -27,14 +27,18 @@ curl http://localhost:8787/v1/chat/completions \
   -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-`--fallback` is on in the container entrypoint, so a `route-fallback` chain (and
-a `local/` last-resort model) fails over automatically. Point `TAG_LOCAL_BASE_URL`
-at a sidecar llama.cpp/ollama server to keep answering when cloud providers fail.
+`--fallback` is on in the container entrypoint, so once you configure a
+`route-fallback` chain (e.g. a `local/` last-resort model) the gateway walks it
+when a provider fails. Out of the box no chain is configured, so nothing fails
+over until you add one. Point `TAG_LOCAL_BASE_URL` at a sidecar llama.cpp/ollama
+server to give that chain a local last resort.
 
 ## Render (render.com)
 
-Commit `deploy/render.yaml` and create a Blueprint, or point a new Docker web
-service at `tag-go/Dockerfile`. `TAG_GATEWAY_KEY` is auto-generated; set your
+Commit the repo-root `render.yaml` and create a Blueprint (Render auto-detects
+it only at the repo root), or point a new Docker web service at
+`tag-go/Dockerfile` with `tag-go/` as the build context. `TAG_GATEWAY_KEY` is
+auto-generated; set your
 provider keys (`OPENAI_API_KEY`, …) as secret env vars in the dashboard. Render
 health-checks `/health`.
 

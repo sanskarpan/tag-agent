@@ -1,11 +1,12 @@
 # One-push deploy of the TAG OpenAI-compatible gateway to Render (render.com).
-# Render builds tag-go/Dockerfile and runs `tag gateway` on $PORT.
+# Render auto-detects render.yaml at the repo root; it builds tag-go/Dockerfile
+# with tag-go/ as the build context and runs `tag gateway` on $PORT.
 services:
   - type: web
     name: tag-gateway
     runtime: docker
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
+    dockerfilePath: ./tag-go/Dockerfile
+    dockerContext: ./tag-go
     plan: free
     healthCheckPath: /health
     envVars:

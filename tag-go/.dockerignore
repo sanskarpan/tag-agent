@@ -1,6 +1,5 @@
 # Build artifacts and local state — keep the image build context lean.
 /tag
-/tag-go
 *.exe
 *.test
 *.out
