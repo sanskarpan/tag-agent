@@ -732,11 +732,12 @@ CGO_ENABLED=0 go build -o tag ./cmd/tag   # Go 1.25+
 go test ./...                             # fully offline; no API keys needed
 ```
 
-- **87 top-level commands across 28 packages** — the full control plane ported, plus a native runtime: a provider-neutral LLM interface with raw-HTTP SSE streaming for **Anthropic and OpenAI**, a tool-calling agent loop, sandboxed built-in tools, an MCP client + server, HTTP `serve`/`devui`/`web` dashboards, an LSP server, and a terminal TUI.
+- **88 top-level commands across 29 packages** — the full control plane ported, plus a native runtime: a provider-neutral LLM interface with raw-HTTP SSE streaming for **Anthropic and OpenAI**, a tool-calling agent loop, sandboxed built-in tools, an MCP client + server, HTTP `serve`/`devui`/`web` dashboards, an OpenAI-compatible chat gateway (`tag gateway`), an LSP server, and a terminal TUI.
 - **Offline by default:** execution paths run against a built-in `echo` provider so everything is testable without keys; pass `--provider anthropic|openai` to go live.
 - **Executes its own queue:** a native execution worker drives queued jobs and DAG dependency chains through the agent loop (`tag queue worker`, `tag dag run --execute`, `tag cron run --execute`).
+- **Serves an OpenAI-compatible API:** `tag gateway` fronts the agent loop with `POST /v1/chat/completions` (streaming SSE + non-stream), `GET /v1/models`, and `GET /health` behind optional bearer-token auth — point any OpenAI client at it. A request model may carry a `provider/` prefix (else `--provider` picks the default), and `--fallback` walks the profile's `route_fallbacks` chain at inference time. Loopback-only by default; a public bind requires `--key`/`TAG_GATEWAY_KEY` (or an explicit `--allow-unauthenticated`).
 - **~10× faster startup, ~30× faster cold bootstrap, 18 MB binary vs 170 MB venv** — see [`COMPARISON_REPORT.md`](COMPARISON_REPORT.md) for the full benchmark and behavioral comparison against the Python edition.
-- The managed-Hermes passthrough commands (`chat`, `gateway`, `kanban`, …) and desktop packaging are deliberately not ported; `serve`/`devui`/`web` replace the dashboard.
+- The managed-Hermes passthrough commands (`chat`, `kanban`, `sessions`, …) and desktop packaging are deliberately not ported; `serve`/`devui`/`web` replace the dashboard. (The native `tag gateway` above is a from-scratch OpenAI-compatible server, not the Hermes-passthrough `gateway`.)
 
 Per-subsystem status and audit history: [`tag-go/MIGRATION_STATUS.md`](tag-go/MIGRATION_STATUS.md).
 
