@@ -157,6 +157,33 @@ func (e *OpenAIEmbedder) Embed(ctx context.Context, inputs []string) ([][]float3
 	return out, nil
 }
 
+// embedBatchSize caps how many inputs are sent per embeddings request. OpenAI's
+// embeddings API rejects input arrays larger than ~2048 items and enforces a
+// per-request token cap; batching also keeps each response well under the 16 MiB
+// read limit in Embed.
+const embedBatchSize = 256
+
+// embedAll embeds inputs in fixed-size batches, preserving input order, so large
+// profiles don't exceed the embeddings API's array/token/response limits.
+func embedAll(ctx context.Context, e Embedder, inputs []string) ([][]float32, error) {
+	out := make([][]float32, 0, len(inputs))
+	for start := 0; start < len(inputs); start += embedBatchSize {
+		end := start + embedBatchSize
+		if end > len(inputs) {
+			end = len(inputs)
+		}
+		vecs, err := e.Embed(ctx, inputs[start:end])
+		if err != nil {
+			return nil, err
+		}
+		if len(vecs) != end-start {
+			return nil, fmt.Errorf("embeddings API returned %d vectors for %d inputs", len(vecs), end-start)
+		}
+		out = append(out, vecs...)
+	}
+	return out, nil
+}
+
 // ---- vector (de)serialization ----------------------------------------------
 
 // encodeVector packs a float32 vector into a little-endian BLOB for the
@@ -282,8 +309,9 @@ func StoreEmbedding(ctx context.Context, db *sql.DB, e Embedder, profile, id str
 }
 
 // RebuildEmbeddings embeds every memory in the profile that lacks a vector for
-// the active model (or, if force is true, all of them) in a single batched API
-// call. Returns the count embedded. Errors clearly when no backend is configured.
+// the active model (or, if force is true, all of them), sending inputs in
+// fixed-size batches. Returns the count embedded. Errors clearly when no backend
+// is configured.
 func RebuildEmbeddings(ctx context.Context, db *sql.DB, e Embedder, profile string, force bool) (int, error) {
 	if e == nil {
 		return 0, fmt.Errorf("no embedding backend configured (set OPENAI_API_KEY or TAG_EMBED_BASE_URL) — no embeddings written")
@@ -320,7 +348,7 @@ func RebuildEmbeddings(ctx context.Context, db *sql.DB, e Embedder, profile stri
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	vecs, err := e.Embed(ctx, contents)
+	vecs, err := embedAll(ctx, e, contents)
 	if err != nil {
 		return 0, err
 	}
@@ -346,10 +374,12 @@ func RebuildEmbeddings(ctx context.Context, db *sql.DB, e Embedder, profile stri
 }
 
 // SearchByVector embeds the query, cosine-ranks stored vectors, and returns the
-// top-limit hits. It transparently falls back to FTS Search when: no embedder is
-// configured, the query cannot be embedded, or no memories carry vectors yet —
-// so offline/keyless use still works. The bool reports whether vector ranking
-// was actually used (true) or FTS fallback (false).
+// top-limit hits. Only vectors stored under the active embed model are compared,
+// so a model switch never ranks against dimension-mismatched vectors. It
+// transparently falls back to FTS Search when: no embedder is configured, the
+// query cannot be embedded, or no memories carry vectors for the active model
+// yet — so offline/keyless use still works. The bool reports whether vector
+// ranking was actually used (true) or FTS fallback (false).
 func SearchByVector(ctx context.Context, db *sql.DB, e Embedder, profile, query string, limit int) ([]VectorHit, bool, error) {
 	if limit <= 0 {
 		limit = 10
@@ -386,7 +416,7 @@ func SearchByVector(ctx context.Context, db *sql.DB, e Embedder, profile, query 
 	queryVec := qv[0]
 
 	rows, err := db.Query(`SELECT id,profile,content,memory_type,confidence,created_at,accessed_at,access_count,source,embedding
-		FROM semantic_memories WHERE profile=? AND embedding IS NOT NULL`, profile)
+		FROM semantic_memories WHERE profile=? AND embedding IS NOT NULL AND embed_model=?`, profile, e.Model())
 	if err != nil {
 		return nil, false, err
 	}

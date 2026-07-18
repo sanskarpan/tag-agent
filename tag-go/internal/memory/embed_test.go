@@ -332,6 +332,111 @@ func TestSearchByVectorFallsBackWhenNoVectors(t *testing.T) {
 	}
 }
 
+// TestSearchByVectorIgnoresOtherModelVectors guards the model-mismatch pitfall:
+// vectors stored under one model must not be cosine-compared against a query
+// embedded with a different model. With only foreign-model vectors present,
+// search must fall back to FTS rather than rank against them.
+func TestSearchByVectorIgnoresOtherModelVectors(t *testing.T) {
+	db := memTestDB(t)
+	srv := newMockEmbedServer(t)
+	profile := "default"
+	Add(db, profile, "postgres database indexing", "fact", 0.9)
+
+	// Store all vectors under model A.
+	eA := &OpenAIEmbedder{BaseURL: srv.URL + "/v1", EmbedModel: "model-a"}
+	if n, err := RebuildEmbeddings(context.Background(), db, eA, profile, false); err != nil || n != 1 {
+		t.Fatalf("rebuild under model-a: n=%d err=%v", n, err)
+	}
+
+	// Search with model B: no model-B vectors exist -> must fall back to FTS.
+	eB := &OpenAIEmbedder{BaseURL: srv.URL + "/v1", EmbedModel: "model-b"}
+	hits, vectorUsed, err := SearchByVector(context.Background(), db, eB, profile, "database", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vectorUsed {
+		t.Fatal("expected FTS fallback when stored vectors are from a different model")
+	}
+	if len(hits) == 0 {
+		t.Fatal("expected FTS hits")
+	}
+
+	// Re-embedding under model B makes vector search work again.
+	if n, err := RebuildEmbeddings(context.Background(), db, eB, profile, false); err != nil || n != 1 {
+		t.Fatalf("rebuild under model-b: n=%d err=%v", n, err)
+	}
+	_, vectorUsed, err = SearchByVector(context.Background(), db, eB, profile, "database", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !vectorUsed {
+		t.Fatal("expected vector ranking after re-embedding under model-b")
+	}
+}
+
+// TestEmbedAllBatches verifies embedAll chunks inputs into multiple requests
+// (so large profiles don't exceed the embeddings API array/token/response caps)
+// while preserving order.
+func TestEmbedAllBatches(t *testing.T) {
+	var requests, maxInput int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Input []string `json:"input"`
+		}
+		_ = json.Unmarshal(body, &req)
+		requests++
+		if len(req.Input) > maxInput {
+			maxInput = len(req.Input)
+		}
+		type item struct {
+			Index     int       `json:"index"`
+			Embedding []float32 `json:"embedding"`
+		}
+		var data []item
+		for i, in := range req.Input {
+			data = append(data, item{Index: i, Embedding: mockVectorFor(in)})
+		}
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+	}))
+	defer srv.Close()
+
+	e := &OpenAIEmbedder{BaseURL: srv.URL + "/v1", EmbedModel: "mock"}
+	n := embedBatchSize*2 + 5
+	inputs := make([]string, n)
+	for i := range inputs {
+		if i%2 == 0 {
+			inputs[i] = "postgres database row"
+		} else {
+			inputs[i] = "python code row"
+		}
+	}
+	vecs, err := embedAll(context.Background(), e, inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vecs) != n {
+		t.Fatalf("got %d vectors want %d", len(vecs), n)
+	}
+	if requests < 3 {
+		t.Fatalf("expected batching into >=3 requests, got %d", requests)
+	}
+	if maxInput > embedBatchSize {
+		t.Fatalf("a batch exceeded %d inputs: %d", embedBatchSize, maxInput)
+	}
+	// Order preserved: even indices are DB-axis, odd are python-axis.
+	for i, v := range vecs {
+		axis := 0
+		if i%2 == 1 {
+			axis = 1
+		}
+		if v[axis] < 1 {
+			t.Fatalf("batched vector %d out of order: %v", i, v)
+		}
+	}
+}
+
 func TestStoreEmbeddingSingleAndErrors(t *testing.T) {
 	db := memTestDB(t)
 	srv := newMockEmbedServer(t)
