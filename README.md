@@ -448,15 +448,15 @@ tag workspace clear
 ### Profile Marketplace
 
 ```bash
-# Browse published profiles
+# List cached profiles
 tag marketplace list
-tag marketplace search "security"
 
-# Download and install
-tag marketplace install <profile-name>
+# Download a profile from a URL (SSRF-guarded)
+tag marketplace pull <url> --name coder
 
-# Publish your own
-tag marketplace publish --profile coder
+# Push a cached profile (Python: prints the Gist recipe;
+# the native Go harness POSTs it to `--url <endpoint>`)
+tag marketplace push coder
 ```
 
 ---
