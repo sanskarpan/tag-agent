@@ -119,6 +119,33 @@ func TestEmbedderFromEnv(t *testing.T) {
 	}
 }
 
+// TestEmbedderFromEnvIfaceNilSafe guards the boxed-nil-pointer pitfall: with no
+// config, the iface form must yield a genuine nil interface so e==nil guards in
+// the store/search functions fire instead of panicking on a nil *OpenAIEmbedder.
+func TestEmbedderFromEnvIfaceNilSafe(t *testing.T) {
+	t.Setenv("TAG_EMBED_BASE_URL", "")
+	t.Setenv("TAG_EMBED_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	e := EmbedderFromEnvIface()
+	if e != nil {
+		t.Fatalf("expected nil interface, got %#v", e)
+	}
+	db := memTestDB(t)
+	Add(db, "default", "postgres database indexing", "fact", 0.9)
+	// Must fall back to FTS, not panic.
+	hits, vectorUsed, err := SearchByVector(context.Background(), db, e, "default", "database", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vectorUsed || len(hits) == 0 {
+		t.Fatalf("expected FTS fallback hits, vectorUsed=%v n=%d", vectorUsed, len(hits))
+	}
+	// Store/rebuild must error clearly, not panic.
+	if _, err := RebuildEmbeddings(context.Background(), db, e, "default", false); err == nil {
+		t.Fatal("expected error rebuilding with nil-iface embedder")
+	}
+}
+
 // ---- mock embeddings server -------------------------------------------------
 
 // mockEmbedServer returns a deterministic 3-dim vector keyed on the presence of

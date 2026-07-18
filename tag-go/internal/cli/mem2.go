@@ -278,9 +278,16 @@ func registerMem2(root *cobra.Command, app *App) {
 			}
 			p := app.profile(profile)
 			// Resolve the embeddings backend from the environment. When no key /
-			// base URL is configured, embedder is nil and vector paths degrade to
-			// FTS (search) or error clearly (store/rebuild).
-			embedder, _ := memory.EmbedderFromEnv()
+			// base URL is configured, embedder stays a nil interface and vector
+			// paths degrade to FTS (search) or error clearly (store/rebuild).
+			// NOTE: keep this a nil *interface* — boxing a nil *OpenAIEmbedder into
+			// the interface would defeat the e==nil guards in the memory package.
+			var embedder memory.Embedder
+			model := memory.DefaultEmbedModel
+			if e, ok := memory.EmbedderFromEnv(); ok {
+				embedder = e
+				model = e.Model()
+			}
 			limit := storeLimit
 			if limit <= 0 {
 				limit = 10
@@ -295,9 +302,9 @@ func registerMem2(root *cobra.Command, app *App) {
 					return err
 				}
 				if flagJSON {
-					return emitJSON(map[string]any{"id": storeID, "profile": p, "dims": n, "model": embedder.Model()})
+					return emitJSON(map[string]any{"id": storeID, "profile": p, "dims": n, "model": model})
 				}
-				fmt.Printf("Stored embedding for %s (%d dims, model %s)\n", storeID, n, embedder.Model())
+				fmt.Printf("Stored embedding for %s (%d dims, model %s)\n", storeID, n, model)
 				return nil
 			case "search":
 				// Embed the query and cosine-rank stored vectors. Falls back to FTS
@@ -321,9 +328,9 @@ func registerMem2(root *cobra.Command, app *App) {
 					return err
 				}
 				if flagJSON {
-					return emitJSON(map[string]any{"profile": p, "embedded": n, "model": embedder.Model()})
+					return emitJSON(map[string]any{"profile": p, "embedded": n, "model": model})
 				}
-				fmt.Printf("Rebuilt embeddings: %d memories embedded (model %s)\n", n, embedder.Model())
+				fmt.Printf("Rebuilt embeddings: %d memories embedded (model %s)\n", n, model)
 				return nil
 			default:
 				return fmt.Errorf("Unknown store action: %q", args[0])

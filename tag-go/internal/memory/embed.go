@@ -45,6 +45,11 @@ type OpenAIEmbedder struct {
 // back to the standard OpenAI base and OPENAI_API_KEY. Returns (nil, false) when
 // no usable configuration exists (no override base and no OpenAI key) so callers
 // can degrade to FTS.
+//
+// The concrete *OpenAIEmbedder return keeps Model() reachable for CLI display;
+// callers passing it into the Embedder-typed functions below must first check
+// ok and pass a genuine nil interface when !ok (boxing a nil pointer would
+// defeat the e==nil guards). See EmbedderFromEnvIface for a nil-safe variant.
 func EmbedderFromEnv() (*OpenAIEmbedder, bool) {
 	base := strings.TrimSpace(os.Getenv("TAG_EMBED_BASE_URL"))
 	key := strings.TrimSpace(os.Getenv("TAG_EMBED_API_KEY"))
@@ -64,6 +69,17 @@ func EmbedderFromEnv() (*OpenAIEmbedder, bool) {
 		base = "https://api.openai.com/v1"
 	}
 	return &OpenAIEmbedder{APIKey: key, BaseURL: base, EmbedModel: model}, true
+}
+
+// EmbedderFromEnvIface is the nil-safe form of EmbedderFromEnv: it returns a
+// genuine nil Embedder interface (not a boxed nil pointer) when no backend is
+// configured, so callers can pass the result straight into StoreEmbedding /
+// RebuildEmbeddings / SearchByVector and have the e==nil guards fire correctly.
+func EmbedderFromEnvIface() Embedder {
+	if e, ok := EmbedderFromEnv(); ok {
+		return e
+	}
+	return nil
 }
 
 // Model returns the configured embedding model id.
