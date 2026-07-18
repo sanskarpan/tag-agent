@@ -10,10 +10,16 @@ import (
 	"github.com/tag-agent/tag/internal/sandbox"
 )
 
-// registerSandbox wires `tag sandbox` — a restricted command-execution backend
-// (Go port of src/tag/sandbox.py's `restricted` backend). It runs a shell
-// command confined to a working directory with a timeout and a minimal
-// environment, capturing stdout/stderr/exit.
+// registerSandbox wires `tag sandbox run` with two selectable backends
+// (`--backend`, default `restricted`):
+//   - restricted (Go port of src/tag/sandbox.py's `restricted` backend): runs a
+//     shell command confined to a working directory with a timeout and a minimal
+//     environment.
+//   - docker: runs the command inside a `docker run --rm` container with hardened
+//     resource/network defaults (`--memory/--cpus/--network`, `--image` required);
+//     see internal/sandbox/docker.go.
+//
+// Both capture stdout/stderr/exit and share the same Result shape.
 func registerSandbox(root *cobra.Command, app *App) {
 	c := &cobra.Command{Use: "sandbox", Short: "Run commands in a restricted sandbox", GroupID: "tools"}
 
