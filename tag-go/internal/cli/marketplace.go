@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -175,19 +176,70 @@ func registerMarketplace(root *cobra.Command, app *App) {
 	mktPull.Flags().StringVar(&mktPullName, "name", "", "local name for the profile (default: URL filename)")
 
 	// ---- push ----
+	var mktPushURL string
 	mktPush := &cobra.Command{
-		Use:   "push <name>",
-		Short: "Show how to push a cached profile to a GitHub Gist",
+		Use:   "push <name> --url <endpoint>",
+		Short: "Push a profile's config to a marketplace endpoint (SSRF-guarded)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
+			if err := validProfileName(name); err != nil {
+				return err
+			}
+			if mktPushURL == "" {
+				return fmt.Errorf("--url <endpoint> is required")
+			}
+
+			// Read the profile's runtime config.yaml — the same file `pull` writes.
 			pfile := mktProfileConfigPath(app, name)
-			fmt.Printf("Profile: %s\n", name)
-			fmt.Printf("  File: %s\n", pfile)
-			fmt.Printf("  To push: gh gist create --public --filename profile.yaml %s\n", pfile)
+			content, err := os.ReadFile(pfile)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return fmt.Errorf("profile %q has no config at %s", name, pfile)
+				}
+				return err
+			}
+			// Validate it's a YAML mapping and re-encode as JSON for the wire.
+			var pd map[string]any
+			if err := yaml.Unmarshal(content, &pd); err != nil || pd == nil {
+				return fmt.Errorf("invalid profile YAML: not a mapping")
+			}
+			body, err := json.Marshal(map[string]any{"name": name, "config": pd})
+			if err != nil {
+				return err
+			}
+
+			// Pre-flight the push URL with the SAME SSRF guard `pull` uses for
+			// fetch; PushJSON also enforces it at the socket level + on redirects.
+			if err := marketplace.ValidateFetchURL(mktPushURL); err != nil {
+				return fmt.Errorf("refused to push profile: %w", err)
+			}
+			res, err := marketplace.PushJSON(mktPushURL, body, 15*time.Second)
+			if err != nil {
+				if res != nil {
+					return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(res.Body)))
+				}
+				return fmt.Errorf("failed to push profile: %w", err)
+			}
+
+			if flagJSON {
+				return emitJSON(map[string]any{
+					"name":        name,
+					"url":         mktPushURL,
+					"status_code": res.StatusCode,
+					"response":    string(res.Body),
+				})
+			}
+			fmt.Printf("Pushed profile: %s\n", name)
+			fmt.Printf("  To: %s\n", mktPushURL)
+			fmt.Printf("  Server: %s\n", res.Status)
+			if len(res.Body) > 0 {
+				fmt.Printf("  Response: %s\n", strings.TrimSpace(string(res.Body)))
+			}
 			return nil
 		},
 	}
+	mktPush.Flags().StringVar(&mktPushURL, "url", "", "marketplace endpoint to POST the profile to (required)")
 
 	mkt.AddCommand(mktList, mktPull, mktPush)
 	root.AddCommand(mkt)

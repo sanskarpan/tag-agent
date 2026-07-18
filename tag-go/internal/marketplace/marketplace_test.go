@@ -1,6 +1,7 @@
 package marketplace
 
 import (
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -88,6 +89,90 @@ func TestFetchDirectLoopbackBlockedAtSocket(t *testing.T) {
 	defer srv.Close()
 	if _, err := Fetch(srv.URL, 5*time.Second); err == nil {
 		t.Error("Fetch must refuse a direct loopback connection")
+	}
+}
+
+func TestPushJSON_Success(t *testing.T) {
+	// Allow the loopback httptest server for this test only.
+	allowLoopbackForTest = true
+	defer func() { allowLoopbackForTest = false }()
+
+	var gotBody []byte
+	var gotCT, gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotCT = r.Header.Get("Content-Type")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	res, err := PushJSON(srv.URL, []byte(`{"name":"x"}`), 5*time.Second)
+	if err != nil {
+		t.Fatalf("PushJSON: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotCT != "application/json" {
+		t.Errorf("content-type = %q, want application/json", gotCT)
+	}
+	if string(gotBody) != `{"name":"x"}` {
+		t.Errorf("server got body %q", gotBody)
+	}
+	if res.StatusCode != http.StatusCreated {
+		t.Errorf("status = %d, want 201", res.StatusCode)
+	}
+	if !strings.Contains(string(res.Body), "ok") {
+		t.Errorf("response body = %q", res.Body)
+	}
+}
+
+func TestPushJSON_Non2xxReturnsError(t *testing.T) {
+	allowLoopbackForTest = true
+	defer func() { allowLoopbackForTest = false }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("nope"))
+	}))
+	defer srv.Close()
+
+	res, err := PushJSON(srv.URL, []byte(`{}`), 5*time.Second)
+	if err == nil {
+		t.Fatal("expected error on non-2xx")
+	}
+	if res == nil || res.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected PushResult carrying 400, got %+v", res)
+	}
+	if !strings.Contains(string(res.Body), "nope") {
+		t.Errorf("expected server message in body, got %q", res.Body)
+	}
+}
+
+func TestPushJSON_BlocksLoopbackAtSocket(t *testing.T) {
+	// With the guard active (default), pushing to a loopback server is refused.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	if _, err := PushJSON(srv.URL, []byte(`{}`), 5*time.Second); err == nil {
+		t.Error("PushJSON must refuse a direct loopback connection")
+	}
+}
+
+func TestPushJSON_BlocksRedirectToLoopback(t *testing.T) {
+	allowLoopbackForTest = true
+	defer func() { allowLoopbackForTest = false }()
+	// The redirect target is a private (non-loopback) address that stays blocked
+	// even with the loopback exemption on — proving redirect re-validation.
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://10.0.0.1/internal", http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+	if _, err := PushJSON(redirector.URL, []byte(`{}`), 5*time.Second); err == nil {
+		t.Error("PushJSON must refuse a redirect to a private address")
 	}
 }
 

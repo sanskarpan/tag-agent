@@ -4,6 +4,7 @@
 package marketplace
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"syscall"
 	"time"
 )
@@ -61,9 +63,21 @@ func ValidateFetchURL(raw string) error {
 	return nil
 }
 
+// allowLoopbackForTest, when true, exempts loopback addresses from the SSRF
+// guard so tests can point Fetch/PushJSON at an httptest server (which always
+// binds 127.0.0.1). It defaults to false and is ONLY ever enabled from tests —
+// either by setting this var directly (in-process unit tests) or via the
+// TAG_MARKETPLACE_ALLOW_LOOPBACK=1 env var (for the subprocess CLI E2E, which
+// can't reach this variable). Production never sets either, so loopback stays
+// blocked. Only loopback is exempted; private/link-local/reserved stay blocked.
+var allowLoopbackForTest = os.Getenv("TAG_MARKETPLACE_ALLOW_LOOPBACK") == "1"
+
 // isBlockedIP reports whether ip is a non-public (SSRF-sensitive) address.
 func isBlockedIP(ip net.IP) bool {
 	if ip == nil {
+		return false
+	}
+	if allowLoopbackForTest && ip.IsLoopback() {
 		return false
 	}
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
@@ -109,30 +123,7 @@ const maxFetchBytes = 8 * 1024 * 1024
 // (TOCTOU) holes that a pre-flight URL check alone can't — and every redirect
 // hop is re-validated. The body is size-capped.
 func Fetch(rawURL string, timeout time.Duration) ([]byte, error) {
-	dialer := &net.Dialer{
-		Timeout: timeout,
-		Control: func(network, address string, _ syscall.RawConn) error {
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				return err
-			}
-			if ip := net.ParseIP(host); ip != nil && isBlockedIP(ip) {
-				return fmt.Errorf("refusing to connect to non-public address %s", ip)
-			}
-			return nil
-		},
-	}
-	transport := &http.Transport{DialContext: dialer.DialContext}
-	client := &http.Client{
-		Timeout:   timeout,
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("stopped after 10 redirects")
-			}
-			return ValidateFetchURL(req.URL.String())
-		},
-	}
+	client := guardedClient(timeout)
 	resp, err := client.Get(rawURL)
 	if err != nil {
 		return nil, err
@@ -149,6 +140,81 @@ func Fetch(rawURL string, timeout time.Duration) ([]byte, error) {
 		return nil, fmt.Errorf("fetch failed: response body exceeds %d bytes", maxFetchBytes)
 	}
 	return b, nil
+}
+
+// guardedClient builds the SSRF-hardened *http.Client shared by Fetch (GET) and
+// PushJSON (POST). Its socket-level Control hook rejects any IP the connection
+// actually dials — closing redirect-to-internal and DNS-rebinding (TOCTOU) holes
+// a pre-flight URL check alone can't — and every redirect hop is re-validated.
+func guardedClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{
+		Timeout: timeout,
+		Control: func(network, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			if ip := net.ParseIP(host); ip != nil && isBlockedIP(ip) {
+				return fmt.Errorf("refusing to connect to non-public address %s", ip)
+			}
+			return nil
+		},
+	}
+	transport := &http.Transport{DialContext: dialer.DialContext}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			return ValidateFetchURL(req.URL.String())
+		},
+	}
+}
+
+// PushResult is the outcome of a PushJSON call: the server's HTTP status and its
+// (size-capped) response body, so the caller can report what the endpoint said.
+type PushResult struct {
+	StatusCode int
+	Status     string
+	Body       []byte
+}
+
+// PushJSON POSTs body (as application/json) to rawURL under the SAME SSRF
+// protections as Fetch: block loopback/internal/reserved IPs at the socket level
+// and re-validate on every redirect. The URL MUST already have passed
+// ValidateFetchURL (the caller pre-flights it, mirroring pull); PushJSON also
+// defends in depth via the shared guarded client. The response body is
+// size-capped. A non-2xx status is returned as an error but still carries the
+// PushResult so the caller can surface the server's message.
+func PushJSON(rawURL string, body []byte, timeout time.Duration) (*PushResult, error) {
+	client := guardedClient(timeout)
+	req, err := http.NewRequest(http.MethodPost, rawURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxFetchBytes {
+		return nil, fmt.Errorf("push failed: response body exceeds %d bytes", maxFetchBytes)
+	}
+	res := &PushResult{StatusCode: resp.StatusCode, Status: resp.Status, Body: b}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return res, fmt.Errorf("push failed: HTTP %d", resp.StatusCode)
+	}
+	return res, nil
 }
 
 // SHA256Hex returns the lowercase hex sha256 of b.
