@@ -1,12 +1,19 @@
 package cli
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
+	"github.com/tag-agent/tag/internal/agent"
+	"github.com/tag-agent/tag/internal/llm"
 	"github.com/tag-agent/tag/internal/store"
 )
 
@@ -58,10 +65,10 @@ func splitEnsureSchema(db *store.DB) error {
 //	split list          -> list_split_runs  (read-only)
 //	split show <run_id> -> get_split_run     (read-only, id-prefix resolution)
 //
-// The write/execute path (`split plan`, which drives the architect agent loop
-// / LLM to decompose a task, or persists a supplied spec) is an honest stub:
-// it needs the agent loop that Track-B stubs out and would make live API calls,
-// which is out of scope here.
+// The write/execute path (`split plan`) drives the native architect agent loop
+// (Track B) to decompose a task into a change spec, or persists a supplied
+// --spec-json. It defaults to the offline `echo` provider (no keys, no network);
+// `--provider openai|anthropic` selects a real adapter.
 func registerSplit(root *cobra.Command, app *App) {
 	c := &cobra.Command{Use: "split", Short: "Architect/Editor agent split execution", GroupID: "tools"}
 
@@ -229,22 +236,165 @@ func registerSplit(root *cobra.Command, app *App) {
 			return nil
 		}}
 
-	// plan: honest stub for the write/execute path (agent loop / LLM).
-	var planArchitect, planEditor, planProfile, planSpecJSON string
-	plan := &cobra.Command{Use: "plan <task>", Short: "Create a split run plan (requires the agent loop; not available offline)", Args: cobra.ExactArgs(1),
+	// plan: native architect agent loop (Track B) that decomposes a task into a
+	// change spec and persists it to split_runs (+ split_items).
+	var planArchitect, planEditor, planProfile, planSpecJSON, planProvider string
+	plan := &cobra.Command{Use: "plan <task>", Short: "Decompose a task into a split run plan (echo default; --provider for real)", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			msg := "split plan requires the architect agent loop (LLM) and is not available in the offline Go port"
-			if flagJSON {
-				_ = emitJSON(map[string]any{"error": msg})
-				return fmt.Errorf("split plan unavailable offline")
-			}
-			return fmt.Errorf("%s", msg)
+			return splitPlan(app, args[0], planProvider, planArchitect, planEditor, planProfile, planSpecJSON)
 		}}
 	plan.Flags().StringVar(&planArchitect, "architect", "claude-opus-4", "architect model")
 	plan.Flags().StringVar(&planEditor, "editor", "claude-haiku-4-5", "editor model")
 	plan.Flags().StringVar(&planProfile, "profile", "", "profile (default: master profile)")
 	plan.Flags().StringVar(&planSpecJSON, "spec-json", "", "optional pre-built spec JSON")
+	plan.Flags().StringVar(&planProvider, "provider", "echo", "llm provider for the architect loop (echo = offline)")
 
 	c.AddCommand(list, show, plan)
 	root.AddCommand(c)
+}
+
+// splitItem is one change in a split spec (parity with split_agent.ChangeItem).
+type splitItem struct {
+	ID          string `json:"id"`
+	File        string `json:"file"`
+	Description string `json:"description"`
+	Action      string `json:"action"`
+}
+
+// splitSpec is the architect's change specification (parity with
+// split_agent.ChangeSpec: task + rationale + items).
+type splitSpec struct {
+	Task      string      `json:"task"`
+	Rationale string      `json:"rationale"`
+	Items     []splitItem `json:"items"`
+}
+
+var jsonObjectRe = regexp.MustCompile(`(?s)\{.*\}`)
+
+// architectPrompt instructs the architect model to emit a JSON change spec. The
+// offline echo provider replays the last user message verbatim, so this prompt
+// itself embeds a valid example spec — parseSpec extracts it and the deterministic
+// fallback guarantees a usable plan even when a model returns prose.
+func architectPrompt(task string) string {
+	return "Decompose the following software task into a JSON change specification.\n" +
+		"Respond with ONLY a JSON object of the form " +
+		`{"task": "...", "rationale": "...", "items": [{"id": "item-1", "file": "path", "description": "...", "action": "modify"}]}.` +
+		"\n\nTask: " + task
+}
+
+// parseSpec extracts a splitSpec from model output. It tolerates surrounding
+// prose by grabbing the first {...} block. On any failure it returns a
+// single-item deterministic fallback so `split plan` always produces a usable,
+// persisted plan (offline-safe).
+func parseSpec(task, output string) splitSpec {
+	if m := jsonObjectRe.FindString(output); m != "" {
+		var s splitSpec
+		if err := json.Unmarshal([]byte(m), &s); err == nil && len(s.Items) > 0 {
+			return normalizeSpec(task, s)
+		}
+	}
+	// Fallback: one item describing the whole task.
+	return normalizeSpec(task, splitSpec{
+		Task:      task,
+		Rationale: "single-step plan (architect returned no structured spec)",
+		Items: []splitItem{{
+			ID: "item-1", File: "TBD", Description: task, Action: "modify",
+		}},
+	})
+}
+
+// normalizeSpec fills defaults (task, item ids, actions) so persistence and
+// rendering are consistent regardless of what the architect emitted.
+func normalizeSpec(task string, s splitSpec) splitSpec {
+	if strings.TrimSpace(s.Task) == "" {
+		s.Task = task
+	}
+	for i := range s.Items {
+		if strings.TrimSpace(s.Items[i].ID) == "" {
+			s.Items[i].ID = fmt.Sprintf("item-%d", i+1)
+		}
+		if strings.TrimSpace(s.Items[i].Action) == "" {
+			s.Items[i].Action = "modify"
+		}
+		if strings.TrimSpace(s.Items[i].File) == "" {
+			s.Items[i].File = "TBD"
+		}
+	}
+	return s
+}
+
+// splitPlan drives the architect agent loop to build a change spec (or uses a
+// supplied --spec-json), then persists it to split_runs + split_items.
+func splitPlan(app *App, task, provider, architect, editor, profileFlag, specJSON string) error {
+	profile := app.profile(profileFlag)
+	db, err := app.OpenDB()
+	if err != nil {
+		return err
+	}
+	if err := splitEnsureSchema(db); err != nil {
+		return err
+	}
+
+	var spec splitSpec
+	if strings.TrimSpace(specJSON) != "" {
+		// Supplied spec: parse strictly (a bad --spec-json is a usage error).
+		if err := json.Unmarshal([]byte(specJSON), &spec); err != nil {
+			return usageErrorf("invalid --spec-json: %v", err)
+		}
+		spec = normalizeSpec(task, spec)
+		if len(spec.Items) == 0 {
+			return usageErrorf("--spec-json has no items")
+		}
+	} else {
+		prov, ok := llm.Registry[provider]
+		if !ok {
+			return fmt.Errorf("unknown provider %q (available: %v)", provider, providerNames())
+		}
+		loop := &agent.Loop{Provider: prov}
+		res, err := loop.Run(context.Background(), architectPrompt(task), agent.Options{
+			Model:  architect,
+			System: "You are a software architect. Decompose tasks into a JSON change specification.",
+		})
+		if err != nil {
+			return err
+		}
+		spec = parseSpec(task, res.FinalText)
+	}
+
+	runID := uuid.NewString()[:16]
+	now := time.Now().UTC().Format(time.RFC3339)
+	specBytes, _ := json.Marshal(spec)
+	if _, err := db.Exec(`INSERT INTO split_runs
+		(id,task,architect_model,editor_model,profile,spec_json,status,items_total,items_done,items_rejected,created_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		runID, task, architect, editor, profile, string(specBytes), "planned", len(spec.Items), 0, 0, now, now); err != nil {
+		return fmt.Errorf("recording split run: %w", err)
+	}
+	for _, it := range spec.Items {
+		itemID := uuid.NewString()[:16]
+		if _, err := db.Exec(`INSERT INTO split_items
+			(id,run_id,item_id,file,description,action,status,created_at)
+			VALUES(?,?,?,?,?,?,?,?)`,
+			itemID, runID, it.ID, it.File, it.Description, it.Action, "pending", now); err != nil {
+			return fmt.Errorf("recording split item: %w", err)
+		}
+	}
+
+	if flagJSON {
+		return emitJSON(map[string]any{
+			"run_id": runID, "task": task, "provider": provider,
+			"architect_model": architect, "editor_model": editor,
+			"status": "planned", "items_total": len(spec.Items), "spec": spec,
+		})
+	}
+	fmt.Printf("Planned split run %s (%s)\n", runID, provider)
+	fmt.Printf("Task:      %s\n", task)
+	fmt.Printf("Architect: %s\n", architect)
+	fmt.Printf("Editor:    %s\n", editor)
+	fmt.Printf("Items:     %d\n", len(spec.Items))
+	for _, it := range spec.Items {
+		fmt.Printf("  - [%-6s] %-40s  %s\n", it.Action, it.File, truncate(it.Description, 50))
+	}
+	fmt.Printf("\nRun `tag split show %s` for details.\n", runID)
+	return nil
 }
