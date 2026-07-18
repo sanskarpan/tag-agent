@@ -7,11 +7,11 @@ E2E testing, one gated PR per cluster. Checked when implemented **and** E2E-test
 Legend: `[ ]` todo · `[~]` in progress · `[x]` done (impl + E2E + merged) · `[!]` needs a design decision (flagged to user)
 
 ## Cluster 1 — Agentic solvers (real git + gh integration)  · branch `feat/stub-solvers`
-- [ ] **swe-solve** — enable built-in tools confined to `--repo` (read/write/bash) so the agent actually reads+edits files; `--run-tests`. (`internal/solver/solver.go:70,110`, `cli/swesolve.go`)
-- [ ] **issue-solve** — fetch a live issue via `gh issue view` / `gh api` when the input is a reference (`#123`, `owner/repo#N`, URL). (`solver.go:158`, `cli/issuesolve.go`)
-- [ ] **review-pr** — fetch the PR diff via `gh pr diff`; optionally post review via `gh pr comment`/`review` with `--post`. (`solver.go:171`, `cli/reviewpr.go`)
-- [ ] **agentic-ci** — run a real check→fix loop (build/test command), not just N echo passes. (`cli/agenticci.go`)
-- E2E: temp git repos, a fake `gh` on PATH, echo-provider loops; live smoke with `--provider`.
+- [x] **swe-solve** — `--tools` (requires `--repo`) registers the root-confined built-in file tools (`read_file`/`write_file`/`list_dir`) so a real `--provider` agent reads+edits files under `--repo`; `--allow-bash` adds the bash tool (unrestricted host exec, cwd = `--repo`); `--run-tests <cmd>` runs a command after the loop (cwd = `--repo`) and reports pass/fail in `Result.TestResult`. Echo default preserved (tools register but echo emits no tool calls, so it stays inert offline). (`internal/solver/solver.go`, `cli/swesolve.go`)
+- [x] **issue-solve** — a GitHub reference (`#123`, `owner/repo#N`, or a GitHub URL; `--repo` supplies owner/repo for a bare `#123`) is fetched via `gh issue view --json title,body`; if `gh` is missing/unauthenticated the raw reference is passed through and the solver records an honest "could not fetch" note rather than faking it. (`solver.go`, `cli/issuesolve.go`)
+- [x] **review-pr** — `--pr <n>` fetches the diff via `gh pr diff`; `--post` posts the review as a PR comment via `gh pr comment` (guarded: `--post` requires `--pr` and refuses `provider=echo`), otherwise a dry-run note is emitted. (`solver.go`, `cli/reviewpr.go`)
+- [x] **agentic-ci** — `--check <cmd>` (+ optional `--repo` working dir) runs a real check→fix→re-check loop: run the check, on failure feed its output to the agent loop for a fix suggestion, re-check, up to `--max-iters`, reporting `Result.Iterations` / `Converged`; without `--check` it drives the loop over the task text. (`cli/agenticci.go`, `solver.go`)
+- E2E: 12 hermetic tests — a fake `gh` on PATH, temp git repos, a stub SSE provider emitting `write_file` — plus solver unit tests; live smoke with `--provider`. (`cli/solvers_e2e_test.go`, `internal/solver/solver_test.go`, `internal/solver/scripted_test.go`) — impl + E2E done on branch, merge pending.
 
 ## Cluster 2 — Native runtime stubs (no Hermes dependency)  · branch `feat/stub-runtime`
 - [x] **context compress / trim** — native context assembly (`assembleSession`: run prompt + step turns + profile `memory_journal`) + summarize/trim pass via the agent loop; persists to a self-ensured `context_compressions` table. Echo default, `--provider` for real. (`cli/context.go`, `internal/contextwin/compress.go`)

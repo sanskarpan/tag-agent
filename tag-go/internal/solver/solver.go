@@ -6,17 +6,22 @@
 // result.
 //
 // The default provider is the offline, deterministic "echo" adapter, so the
-// whole package is exercisable without API keys or network access. Where a
-// faithful implementation would require a live model or an external system
-// (applying code edits, fetching a GitHub issue/PR, posting review comments),
-// the solver is HONEST: it records a note describing what was skipped rather
+// whole package is exercisable without API keys or network access. When a
+// live provider is selected AND tools are enabled, swe-solve confines the
+// built-in file tools (internal/tool) to --repo so the agent actually reads
+// and edits files; --run-tests runs a command afterwards and reports pass/fail;
+// agentic-ci runs a real check→fix→re-check loop. Where a step genuinely
+// cannot run offline (e.g. fetching a live issue/PR when the gh CLI is absent),
+// the solver stays HONEST: it records a note describing what was skipped rather
 // than pretending the step succeeded.
 package solver
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -26,6 +31,7 @@ import (
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/llm"
 	"github.com/tag-agent/tag/internal/store"
+	"github.com/tag-agent/tag/internal/tool"
 )
 
 // Kind identifies which agentic-solver command produced a result.
@@ -48,8 +54,41 @@ type Options struct {
 	RepoPath string
 	// MaxSteps caps the agent loop steps per pass (default 8).
 	MaxSteps int
-	// MaxIters is the number of agent-loop passes for agentic-ci (default 1).
+	// MaxIters is the number of check→fix passes for agentic-ci (default 1).
 	MaxIters int
+
+	// EnableTools registers the root-confined built-in file tools (read_file,
+	// write_file, list_dir) so the agent can actually read and edit files under
+	// RepoPath. Off by default: the offline echo provider never emits tool calls,
+	// so this is opt-in depth for real (--provider) or scripted solves.
+	EnableTools bool
+	// EnableBash additionally registers the bash tool (unrestricted host exec,
+	// working dir = RepoPath). Opt-in on top of EnableTools.
+	EnableBash bool
+	// RunTests, when set, is a shell command run after the loop (working dir =
+	// RepoPath) whose pass/fail is reported in Result.TestResult.
+	RunTests string
+	// CheckCmd is the agentic-ci check command (build/test). When set, Solve runs
+	// it, and on failure feeds the output to the loop for a fix, re-checking up to
+	// MaxIters times. Reported in Result.Iterations / Converged.
+	CheckCmd string
+	// CmdTimeout bounds RunTests / CheckCmd execution (default 2m).
+	CmdTimeout time.Duration
+}
+
+// CmdOutcome is the result of running a shell command (tests or a CI check).
+type CmdOutcome struct {
+	Command string `json:"command"`
+	Passed  bool   `json:"passed"`
+	Output  string `json:"output"`
+}
+
+// Iteration records one agentic-ci check→fix pass.
+type Iteration struct {
+	Iteration int    `json:"iteration"`
+	Passed    bool   `json:"passed"`
+	Output    string `json:"output"`
+	Fix       string `json:"fix,omitempty"`
 }
 
 // Result is the structured outcome of a Solve call.
@@ -62,12 +101,19 @@ type Result struct {
 	Steps    int      `json:"steps"`
 	Stopped  string   `json:"stopped"`
 	Notes    []string `json:"notes,omitempty"`
+
+	// TestResult is set when RunTests ran (swe-solve --run-tests).
+	TestResult *CmdOutcome `json:"test_result,omitempty"`
+	// Iterations / Converged describe an agentic-ci check→fix loop.
+	Iterations []Iteration `json:"iterations,omitempty"`
+	Converged  bool        `json:"converged,omitempty"`
 }
 
 // Solve gathers context for opts.Kind, drives the native agent loop through the
 // given provider, records the run (best-effort; skipped when db is nil), and
 // returns a structured Result. It performs NO live API calls unless the caller
-// passes a live provider, and NO external-system access (git, gh, network).
+// passes a live provider. External-system access (running the repo's tests, a CI
+// check) happens only when the caller explicitly opts in via RunTests/CheckCmd.
 func Solve(ctx context.Context, db *store.DB, prov llm.Provider, model string, opts Options) (*Result, error) {
 	if prov == nil {
 		return nil, fmt.Errorf("solver: nil provider")
@@ -78,6 +124,9 @@ func Solve(ctx context.Context, db *store.DB, prov llm.Provider, model string, o
 	if opts.MaxIters <= 0 {
 		opts.MaxIters = 1
 	}
+	if opts.CmdTimeout <= 0 {
+		opts.CmdTimeout = 2 * time.Minute
+	}
 
 	system, userMsg, notes, err := buildContext(opts)
 	if err != nil {
@@ -85,7 +134,44 @@ func Solve(ctx context.Context, db *store.DB, prov llm.Provider, model string, o
 	}
 
 	loop := &agent.Loop{Provider: prov}
+	// Enable the root-confined file tools for swe-solve when requested. The echo
+	// provider never requests tools, so this is inert offline; a real/scripted
+	// provider can now read_file/write_file/list_dir under RepoPath.
+	if opts.EnableTools && opts.Kind == KindSWE {
+		reg := agent.NewRegistry()
+		topts := tool.DefaultOptions()
+		topts.Root = opts.RepoPath
+		topts.DisableBash = !opts.EnableBash
+		tool.Register(reg, topts)
+		loop.Tools = reg
+		if opts.EnableBash {
+			notes = append(notes, "bash tool enabled: it runs UNRESTRICTED host commands (not confined to --repo); the working dir is --repo only.")
+		}
+	}
+
 	started := time.Now().UTC()
+	id := uuid.NewString()[:16]
+
+	// agentic-ci with a real --check command runs its own check→fix loop.
+	if opts.Kind == KindCI && strings.TrimSpace(opts.CheckCmd) != "" {
+		res, cerr := runCILoop(ctx, loop, model, system, opts)
+		if cerr != nil {
+			return nil, cerr
+		}
+		res.ID = id
+		res.Kind = string(opts.Kind)
+		res.Provider = prov.Name()
+		res.Notes = append(notes, res.Notes...)
+		if prov.Name() == "echo" {
+			res.Notes = append(res.Notes, echoNote)
+		}
+		if db != nil {
+			if rerr := recordRun(db, id, string(opts.Kind), model, userMsg, started); rerr != nil {
+				return nil, fmt.Errorf("recording run: %w", rerr)
+			}
+		}
+		return res, nil
+	}
 
 	var final string
 	var steps int
@@ -104,19 +190,12 @@ func Solve(ctx context.Context, db *store.DB, prov llm.Provider, model string, o
 		stopped = res.Stopped
 	}
 
-	id := uuid.NewString()[:16]
 	summary := summarize(opts.Kind, final)
 	if prov.Name() == "echo" {
-		notes = append(notes, "provider=echo is offline and deterministic: it echoes context rather than reasoning; select --provider openai|anthropic (with credentials) for a real solve.")
+		notes = append(notes, echoNote)
 	}
 
-	if db != nil {
-		if rerr := recordRun(db, id, string(opts.Kind), model, userMsg, started); rerr != nil {
-			return nil, fmt.Errorf("recording run: %w", rerr)
-		}
-	}
-
-	return &Result{
+	result := &Result{
 		ID:       id,
 		Kind:     string(opts.Kind),
 		Provider: prov.Name(),
@@ -125,7 +204,82 @@ func Solve(ctx context.Context, db *store.DB, prov llm.Provider, model string, o
 		Steps:    steps,
 		Stopped:  stopped,
 		Notes:    notes,
-	}, nil
+	}
+
+	// swe-solve --run-tests: run the test command after the loop and report.
+	if opts.Kind == KindSWE && strings.TrimSpace(opts.RunTests) != "" {
+		outcome := runCmd(ctx, opts.RepoPath, opts.RunTests, opts.CmdTimeout)
+		result.TestResult = &outcome
+	}
+
+	if db != nil {
+		if rerr := recordRun(db, id, string(opts.Kind), model, userMsg, started); rerr != nil {
+			return nil, fmt.Errorf("recording run: %w", rerr)
+		}
+	}
+
+	return result, nil
+}
+
+const echoNote = "provider=echo is offline and deterministic: it echoes context rather than reasoning; select --provider openai|anthropic (with credentials) for a real solve."
+
+// runCILoop runs a real check→fix→re-check loop: run CheckCmd; if it fails, feed
+// its output to the agent loop for a fix suggestion (surfaced in each Iteration's
+// Fix; agentic-ci does not register file tools, so it never edits files itself),
+// then re-run CheckCmd. Repeats up to MaxIters times. Converged is true once the
+// check passes.
+func runCILoop(ctx context.Context, loop *agent.Loop, model, system string, opts Options) (*Result, error) {
+	res := &Result{Stopped: "done"}
+	var lastFix string
+	for i := 0; i < opts.MaxIters; i++ {
+		outcome := runCmd(ctx, opts.RepoPath, opts.CheckCmd, opts.CmdTimeout)
+		it := Iteration{Iteration: i + 1, Passed: outcome.Passed, Output: outcome.Output}
+		if outcome.Passed {
+			res.Iterations = append(res.Iterations, it)
+			res.Converged = true
+			res.Output = fmt.Sprintf("check %q passed on iteration %d", opts.CheckCmd, i+1)
+			res.Summary = summarize(KindCI, res.Output)
+			return res, nil
+		}
+		// Check failed: ask the loop for a fix, feeding it the failure output.
+		userMsg := "# CI task\n" + strings.TrimSpace(opts.Task) +
+			"\n\n# Failing check\n$ " + opts.CheckCmd +
+			"\n\n# Output\n" + truncate(outcome.Output, 8000)
+		lres, rerr := loop.Run(ctx, userMsg, agent.Options{Model: model, System: system, MaxSteps: opts.MaxSteps})
+		if rerr != nil {
+			return nil, rerr
+		}
+		lastFix = lres.FinalText
+		res.Steps += len(lres.Steps)
+		res.Stopped = lres.Stopped
+		it.Fix = lastFix
+		res.Iterations = append(res.Iterations, it)
+	}
+	res.Converged = false
+	res.Output = fmt.Sprintf("check %q still failing after %d iteration(s)", opts.CheckCmd, opts.MaxIters)
+	res.Summary = summarize(KindCI, res.Output)
+	res.Notes = append(res.Notes, fmt.Sprintf("agentic-ci did not converge in %d iteration(s); the last fix suggestion was recorded but the check still fails.", opts.MaxIters))
+	return res, nil
+}
+
+// runCmd runs a shell command (dir = repo, or cwd when empty) and reports pass
+// (exit 0) or fail with combined output.
+func runCmd(ctx context.Context, dir, command string, timeout time.Duration) CmdOutcome {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	c := exec.CommandContext(cctx, "sh", "-c", command)
+	if dir != "" {
+		c.Dir = dir
+	}
+	var buf bytes.Buffer
+	c.Stdout = &buf
+	c.Stderr = &buf
+	err := c.Run()
+	out := buf.String()
+	if cctx.Err() == context.DeadlineExceeded {
+		return CmdOutcome{Command: command, Passed: false, Output: out + "\n(timed out after " + timeout.String() + ")"}
+	}
+	return CmdOutcome{Command: command, Passed: err == nil, Output: out}
 }
 
 // buildContext assembles the system prompt, the user message and any honesty
@@ -144,7 +298,11 @@ func buildContext(opts Options) (system, userMsg string, notes []string, err err
 				return "", "", nil, lerr
 			}
 			repoInfo = "\n\n# Repository contents (" + opts.RepoPath + ")\n" + listing
-			notes = append(notes, "swe-solve gathered a shallow repo listing only; actually reading/editing files and running tests requires the tool-enabled loop with a live model.")
+			if opts.EnableTools {
+				repoInfo += "\n\nUse the read_file/write_file/list_dir tools (confined to the repo) to inspect and edit files."
+			} else {
+				notes = append(notes, "swe-solve gathered a shallow repo listing only; pass --tools (with a real --provider) to let the agent actually read and edit files.")
+			}
 		} else {
 			notes = append(notes, "no --repo given: swe-solve reasoned about the task text alone (no repo context gathered).")
 		}
@@ -155,7 +313,7 @@ func buildContext(opts Options) (system, userMsg string, notes []string, err err
 
 	case KindIssue:
 		if looksLikeIssueRef(task) {
-			notes = append(notes, "input looks like an issue reference ("+truncate(task, 40)+"); fetching it from GitHub/Linear needs network + a token. Pass the issue body inline or via --file for an offline solve.")
+			notes = append(notes, "input still looks like an issue reference ("+truncate(task, 40)+"): fetching it via the gh CLI was not done here. Pass the issue body inline or via --file, or ensure gh is installed and authenticated.")
 		}
 		system = "You are solving a software issue. Analyze it, then provide: (1) a clear fix plan, " +
 			"(2) the specific files and changes needed, (3) edge cases to consider."
@@ -168,7 +326,6 @@ func buildContext(opts Options) (system, userMsg string, notes []string, err err
 		return system, userMsg, notes, nil
 
 	case KindReview:
-		notes = append(notes, "review-pr reviewed the supplied diff only; fetching a live PR diff/metadata and posting comments needs the gh CLI + network and was not attempted.")
 		system = "You are a meticulous code reviewer. Review the unified diff for correctness bugs, " +
 			"security issues, and style. Report findings grouped by severity, with file:line references."
 		userMsg = "# Diff under review\n" + task
