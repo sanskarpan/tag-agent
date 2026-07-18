@@ -36,6 +36,9 @@ func registerReviewPR(root *cobra.Command, app *App) {
 			if post && prNum == 0 {
 				return fmt.Errorf("--post requires --pr <n> (refusing to post a review with no target PR)")
 			}
+			if post && provider == "echo" {
+				return fmt.Errorf("--post refuses provider=echo: it echoes the diff rather than reviewing it; pass a real --provider (e.g. openai|anthropic) to post a genuine review")
+			}
 			if prNum != 0 && diffFile != "" {
 				return fmt.Errorf("use either --pr or --diff, not both")
 			}

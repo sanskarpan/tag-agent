@@ -224,9 +224,10 @@ func Solve(ctx context.Context, db *store.DB, prov llm.Provider, model string, o
 const echoNote = "provider=echo is offline and deterministic: it echoes context rather than reasoning; select --provider openai|anthropic (with credentials) for a real solve."
 
 // runCILoop runs a real check→fix→re-check loop: run CheckCmd; if it fails, feed
-// its output to the agent loop for a fix suggestion (and, with tools, an actual
-// edit), then re-run CheckCmd. Repeats up to MaxIters times. Converged is true
-// once the check passes.
+// its output to the agent loop for a fix suggestion (surfaced in each Iteration's
+// Fix; agentic-ci does not register file tools, so it never edits files itself),
+// then re-run CheckCmd. Repeats up to MaxIters times. Converged is true once the
+// check passes.
 func runCILoop(ctx context.Context, loop *agent.Loop, model, system string, opts Options) (*Result, error) {
 	res := &Result{Stopped: "done"}
 	var lastFix string

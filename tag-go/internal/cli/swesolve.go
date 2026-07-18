@@ -76,6 +76,9 @@ func emitSolveResult(res *solver.Result) error {
 			status = "PASS"
 		}
 		fmt.Printf("  iter %d: check %s\n", it.Iteration, status)
+		if it.Fix != "" {
+			fmt.Printf("    fix suggestion: %s\n", it.Fix)
+		}
 	}
 	if len(res.Iterations) > 0 {
 		if res.Converged {

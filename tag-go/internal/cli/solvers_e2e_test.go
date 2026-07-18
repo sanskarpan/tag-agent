@@ -94,6 +94,25 @@ func startWriteFileServer(t *testing.T, relPath, content string) *httptest.Serve
 	return srv
 }
 
+// startTextServer stands up a fake OpenAI-compatible SSE endpoint that streams a
+// fixed final text (no tool calls), so tests can drive the loop through a real
+// provider that produces genuine output rather than the echoed context.
+func startTextServer(t *testing.T, text string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%s}}]}\n\n", jsonString(text))
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"delta":{},"finish_reason":"stop"}]}`)
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 // jsonString double-encodes s as a JSON string literal (so it can be embedded as
 // the value of an "arguments" field which is itself a JSON string).
 func jsonString(s string) string {
@@ -256,6 +275,20 @@ func TestE2EReviewPRPostGuard(t *testing.T) {
 	}
 }
 
+func TestE2EReviewPRPostRefusesEcho(t *testing.T) {
+	h := newHome(t)
+	// --post with the offline echo provider must be refused before any fetch/post:
+	// echo echoes the diff rather than reviewing it, so publishing it would be
+	// misleading. No gh on PATH is needed since the guard precedes the fetch.
+	out, code := run(t, h, "review-pr", "--post", "--pr", "9")
+	if code == 0 {
+		t.Errorf("--post with provider=echo should fail: %q", out)
+	}
+	if !strings.Contains(out, "echo") {
+		t.Errorf("expected an echo-refusal message: %q", out)
+	}
+}
+
 func TestE2EReviewPRPostCallsGH(t *testing.T) {
 	h := newHome(t)
 	marker := filepath.Join(t.TempDir(), "posted.txt")
@@ -271,7 +304,11 @@ case "$1 $2" in
   *) echo "unexpected gh call: $@" >&2; exit 1 ;;
 esac
 `, marker))
-	out, code := runEnv(t, h, []string{pathWith(ghDir)}, "review-pr", "--pr", "5", "--repo", "acme/repo", "--post")
+	// --post is refused for provider=echo, so exercise the gh-comment path with a
+	// real (stub local) provider that emits a genuine review.
+	srv := startTextServer(t, "LGTM: no blocking issues found.")
+	env := []string{pathWith(ghDir), "TAG_LOCAL_BASE_URL=" + srv.URL + "/v1", "TAG_LOCAL_API_KEY=x"}
+	out, code := runEnv(t, h, env, "review-pr", "--pr", "5", "--repo", "acme/repo", "--post", "--provider", "local")
 	if code != 0 {
 		t.Fatalf("review-pr --post exit %d: %q", code, out)
 	}
