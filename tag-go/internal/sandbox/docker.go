@@ -3,6 +3,8 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -53,10 +55,12 @@ func lookDockerPath() (string, error) {
 
 // dockerArgs builds the `docker run` argument vector (excluding the leading
 // "docker" binary name) for opts, applying hardened defaults. It is pure and
-// deterministic so it can be unit-tested without invoking docker.
+// deterministic so it can be unit-tested without invoking docker. When name is
+// non-empty it is passed as --name so the container can be torn down out of
+// band on timeout.
 //
-// Layout: run --rm --memory <m> --cpus <c> --network <n> [--workdir <d>] <image> sh -c <command>
-func dockerArgs(opts DockerOptions) []string {
+// Layout: run --rm [--name <name>] --memory <m> --cpus <c> --network <n> [--workdir <d>] <image> sh -c <command>
+func dockerArgs(opts DockerOptions, name string) []string {
 	mem := opts.Memory
 	if strings.TrimSpace(mem) == "" {
 		mem = DefaultDockerMemory
@@ -70,17 +74,30 @@ func dockerArgs(opts DockerOptions) []string {
 		network = DefaultDockerNetwork
 	}
 
-	args := []string{
-		"run", "--rm",
+	args := []string{"run", "--rm"}
+	if strings.TrimSpace(name) != "" {
+		args = append(args, "--name", name)
+	}
+	args = append(args,
 		"--memory", mem,
 		"--cpus", cpus,
 		"--network", network,
-	}
+	)
 	if strings.TrimSpace(opts.Dir) != "" {
 		args = append(args, "--workdir", opts.Dir)
 	}
 	args = append(args, opts.Image, "sh", "-c", opts.Command)
 	return args
+}
+
+// containerName generates a unique, docker-safe container name so the container
+// started by ExecDocker can be force-removed on timeout.
+func containerName() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("tag-sandbox-%d", time.Now().UnixNano())
+	}
+	return "tag-sandbox-" + hex.EncodeToString(b[:])
 }
 
 // ExecDocker runs opts.Command inside a container via `docker run --rm` with
@@ -109,10 +126,19 @@ func ExecDocker(ctx context.Context, opts DockerOptions) (*Result, error) {
 	cctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
 
-	// exec.CommandContext kills the docker CLI process on timeout; docker run
-	// (without -d) proxies the container lifecycle, so killing the client with
-	// SIGKILL stops the attached container as well. --rm cleans it up.
-	cmd := exec.CommandContext(cctx, dockerPath, dockerArgs(opts)...)
+	// Give the container a known name and, on timeout/cancel, force-remove it out
+	// of band. SIGKILL-ing the attached docker CLI does NOT stop the
+	// daemon-managed container (SIGKILL cannot be proxied), so without this the
+	// container would be orphaned and --rm would never fire.
+	name := containerName()
+	cmd := exec.CommandContext(cctx, dockerPath, dockerArgs(opts, name)...)
+	cmd.Cancel = func() error {
+		rmCtx, rmCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer rmCancel()
+		_ = exec.CommandContext(rmCtx, dockerPath, "rm", "-f", name).Run()
+		return cmd.Process.Kill()
+	}
+	cmd.WaitDelay = 15 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

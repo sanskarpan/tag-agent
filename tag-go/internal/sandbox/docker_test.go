@@ -32,7 +32,7 @@ func hasArg(args []string, a string) bool {
 // (--rm, --memory 512m, --cpus 1, --network none) and terminates in
 // `<image> sh -c <command>` — WITHOUT invoking docker.
 func TestDockerArgsDefaults(t *testing.T) {
-	args := dockerArgs(DockerOptions{Command: "echo hi", Image: "alpine:3.20"})
+	args := dockerArgs(DockerOptions{Command: "echo hi", Image: "alpine:3.20"}, "")
 
 	if args[0] != "run" {
 		t.Fatalf("expected first arg 'run', got %q (full: %v)", args[0], args)
@@ -70,7 +70,7 @@ func TestDockerArgsOverrides(t *testing.T) {
 		Memory:  "256m",
 		CPUs:    "0.5",
 		Network: "bridge",
-	})
+	}, "")
 	if !containsPair(args, "--memory", "256m") {
 		t.Errorf("missing --memory 256m in %v", args)
 	}
@@ -82,6 +82,30 @@ func TestDockerArgsOverrides(t *testing.T) {
 	}
 	if !containsPair(args, "--workdir", "/work") {
 		t.Errorf("missing --workdir /work in %v", args)
+	}
+}
+
+// TestDockerArgsName verifies a non-empty name is threaded through as --name so
+// the container can be force-removed on timeout, and omitted when empty.
+func TestDockerArgsName(t *testing.T) {
+	named := dockerArgs(DockerOptions{Command: "echo hi", Image: "alpine:3.20"}, "tag-sandbox-abc")
+	if !containsPair(named, "--name", "tag-sandbox-abc") {
+		t.Errorf("missing --name tag-sandbox-abc in %v", named)
+	}
+	anon := dockerArgs(DockerOptions{Command: "echo hi", Image: "alpine:3.20"}, "")
+	if hasArg(anon, "--name") {
+		t.Errorf("unexpected --name when name empty: %v", anon)
+	}
+}
+
+// TestContainerNameUnique verifies generated names are distinct and prefixed.
+func TestContainerNameUnique(t *testing.T) {
+	a, b := containerName(), containerName()
+	if a == b {
+		t.Errorf("expected distinct container names, got %q twice", a)
+	}
+	if !strings.HasPrefix(a, "tag-sandbox-") {
+		t.Errorf("name %q missing tag-sandbox- prefix", a)
 	}
 }
 
