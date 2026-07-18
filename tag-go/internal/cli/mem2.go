@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -267,6 +268,8 @@ func registerMem2(root *cobra.Command, app *App) {
 	extract.Flags().StringVar(&profile, "profile", "", "profile")
 
 	var storeQuery, storeID string
+	var storeForce bool
+	var storeLimit int
 	store := &cobra.Command{Use: "store <store|search|rebuild>", Short: "Store or search vector embeddings", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			db, err := app.OpenDB()
@@ -274,41 +277,61 @@ func registerMem2(root *cobra.Command, app *App) {
 				return err
 			}
 			p := app.profile(profile)
+			// Resolve the embeddings backend from the environment. When no key /
+			// base URL is configured, embedder stays a nil interface and vector
+			// paths degrade to FTS (search) or error clearly (store/rebuild).
+			// NOTE: keep this a nil *interface* — boxing a nil *OpenAIEmbedder into
+			// the interface would defeat the e==nil guards in the memory package.
+			var embedder memory.Embedder
+			model := memory.DefaultEmbedModel
+			if e, ok := memory.EmbedderFromEnv(); ok {
+				embedder = e
+				model = e.Model()
+			}
+			limit := storeLimit
+			if limit <= 0 {
+				limit = 10
+			}
 			switch args[0] {
 			case "store":
 				if storeID == "" {
 					return fmt.Errorf("--id required for store")
 				}
-				var content string
-				if err := db.QueryRow(`SELECT content FROM semantic_memories WHERE id=? AND profile=?`, storeID, p).Scan(&content); err != nil {
-					return fmt.Errorf("Memory not found: %q (profile %q)", storeID, p)
-				}
-				// The embedding backend (sentence-transformers) is not part of the
-				// offline Go build, mirroring Python's "backend unavailable" path.
-				return fmt.Errorf("Embedding backend unavailable — install sentence-transformers.")
-			case "search":
-				// The vector backend is unavailable, so — exactly like Python's
-				// search_by_vector, which falls back to search_memories() when
-				// embed_text() returns None — degrade to FTS text search rather than
-				// dropping real hits. Python always prints the JSON list here.
-				q := strings.TrimSpace(storeQuery)
-				var res []memory.Mem
-				if q == "" {
-					// Empty query in Python's LIKE fallback matches everything,
-					// ranked by confidence — mirror with List.
-					res, err = memory.List(db.DB, p, "", 10)
-				} else {
-					res, err = memory.Search(db.DB, p, q, 10, "")
-				}
+				n, err := memory.StoreEmbedding(context.Background(), db.DB, embedder, p, storeID)
 				if err != nil {
 					return err
 				}
-				if res == nil {
-					res = []memory.Mem{}
+				if flagJSON {
+					return emitJSON(map[string]any{"id": storeID, "profile": p, "dims": n, "model": model})
 				}
-				return emitJSON(res)
+				fmt.Printf("Stored embedding for %s (%d dims, model %s)\n", storeID, n, model)
+				return nil
+			case "search":
+				// Embed the query and cosine-rank stored vectors. Falls back to FTS
+				// transparently when no embedding key is configured, the query can't
+				// be embedded, or no memories carry vectors yet (mirrors Python's
+				// search_by_vector). Always prints the JSON list.
+				hits, vectorUsed, err := memory.SearchByVector(context.Background(), db.DB, embedder, p, strings.TrimSpace(storeQuery), limit)
+				if err != nil {
+					return err
+				}
+				if hits == nil {
+					hits = []memory.VectorHit{}
+				}
+				if flagJSON {
+					return emitJSON(map[string]any{"mode": searchMode(vectorUsed), "results": hits})
+				}
+				return emitJSON(hits)
 			case "rebuild":
-				return fmt.Errorf("No embeddings written — embedding backend unavailable (install sentence-transformers) or no memories to embed.")
+				n, err := memory.RebuildEmbeddings(context.Background(), db.DB, embedder, p, storeForce)
+				if err != nil {
+					return err
+				}
+				if flagJSON {
+					return emitJSON(map[string]any{"profile": p, "embedded": n, "model": model})
+				}
+				fmt.Printf("Rebuilt embeddings: %d memories embedded (model %s)\n", n, model)
+				return nil
 			default:
 				return fmt.Errorf("Unknown store action: %q", args[0])
 			}
@@ -316,9 +339,20 @@ func registerMem2(root *cobra.Command, app *App) {
 	store.Flags().StringVar(&profile, "profile", "", "profile")
 	store.Flags().StringVar(&storeQuery, "query", "", "query text (for search)")
 	store.Flags().StringVar(&storeID, "id", "", "memory id (for store)")
+	store.Flags().BoolVar(&storeForce, "force", false, "re-embed all memories, not just those missing a vector (rebuild)")
+	store.Flags().IntVar(&storeLimit, "limit", 10, "max results (search)")
 
 	m.AddCommand(gc, tier, episode, fact, extract, store)
 	root.AddCommand(m)
+}
+
+// searchMode labels how mem2 store search produced its results, so callers can
+// tell semantic ranking from the FTS fallback.
+func searchMode(vectorUsed bool) string {
+	if vectorUsed {
+		return "vector"
+	}
+	return "fts"
 }
 
 func upper(s string) string {
