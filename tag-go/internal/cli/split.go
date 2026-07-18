@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
@@ -269,7 +268,45 @@ type splitSpec struct {
 	Items     []splitItem `json:"items"`
 }
 
-var jsonObjectRe = regexp.MustCompile(`(?s)\{.*\}`)
+// extractJSONObject returns the first brace-balanced {...} block in s, or "".
+// Unlike a greedy regex, it stops at the matching close brace (not the last one
+// in the string), so trailing braces a model may emit after the spec don't
+// corrupt the captured span. Braces inside JSON string literals are ignored.
+func extractJSONObject(s string) string {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	inStr := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
+}
 
 // architectPrompt instructs the architect model to emit a JSON change spec. The
 // offline echo provider replays the last user message verbatim, so this prompt
@@ -287,7 +324,7 @@ func architectPrompt(task string) string {
 // single-item deterministic fallback so `split plan` always produces a usable,
 // persisted plan (offline-safe).
 func parseSpec(task, output string) splitSpec {
-	if m := jsonObjectRe.FindString(output); m != "" {
+	if m := extractJSONObject(output); m != "" {
 		var s splitSpec
 		if err := json.Unmarshal([]byte(m), &s); err == nil && len(s.Items) > 0 {
 			return normalizeSpec(task, s)
@@ -364,7 +401,12 @@ func splitPlan(app *App, task, provider, architect, editor, profileFlag, specJSO
 	runID := uuid.NewString()[:16]
 	now := time.Now().UTC().Format(time.RFC3339)
 	specBytes, _ := json.Marshal(spec)
-	if _, err := db.Exec(`INSERT INTO split_runs
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("recording split run: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO split_runs
 		(id,task,architect_model,editor_model,profile,spec_json,status,items_total,items_done,items_rejected,created_at,updated_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 		runID, task, architect, editor, profile, string(specBytes), "planned", len(spec.Items), 0, 0, now, now); err != nil {
@@ -372,12 +414,15 @@ func splitPlan(app *App, task, provider, architect, editor, profileFlag, specJSO
 	}
 	for _, it := range spec.Items {
 		itemID := uuid.NewString()[:16]
-		if _, err := db.Exec(`INSERT INTO split_items
+		if _, err := tx.Exec(`INSERT INTO split_items
 			(id,run_id,item_id,file,description,action,status,created_at)
 			VALUES(?,?,?,?,?,?,?,?)`,
 			itemID, runID, it.ID, it.File, it.Description, it.Action, "pending", now); err != nil {
 			return fmt.Errorf("recording split item: %w", err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("recording split run: %w", err)
 	}
 
 	if flagJSON {
