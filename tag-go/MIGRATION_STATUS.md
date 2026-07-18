@@ -54,7 +54,7 @@ preserved intentionally (e.g. substring keyword matching in the entity graph;
 | **mcp-registry** | **list, install, enable, disable** | embedded 10-server catalog; profile config.yaml read/write |
 | **template** | **export, import** | profile-home .env/config.yaml; secret redaction, 0600, traversal guard |
 | **compare** | **list, show** | benchmark_comparisons / benchmark_results (run path is Track-B) |
-| **plugin** | **list, enable, disable** | embedded plugin catalog; TAG_PLUGIN_*_ENABLED in profile .env |
+| **plugin** | **list, install, enable, disable** | embedded plugin catalog; TAG_PLUGIN_*_ENABLED in profile .env; native `install` = record (self-ensured `plugins_installed`) + enable (no pip; refuses when `requires_env` secrets absent) |
 | **eval** | **list, show** | eval_runs / eval_cases (run path is Track-B) |
 | **swarm** | **list, status, results** | swarm_runs / swarm_tasks (run/abort are Track-B) |
 
@@ -69,7 +69,7 @@ preserved intentionally (e.g. substring keyword matching in the entity graph;
 | **mcp-serve** | (MCP server) | `internal/mcp` server side; exposes echo/now/tag_profiles over JSON-RPC stdio |
 | **eval-ci** | **scaffold, run** | `internal/ciauto`; GitHub Actions YAML scaffold (byte-identical to Python); run is dry-run offline |
 | **ci / loop** | (agent-loop drivers) | drive `internal/agent` loop via a provider (echo default, offline) |
-| **marketplace** | **list, pull, push** | `internal/marketplace`; SSRF-guarded fetch, cache table |
+| **marketplace** | **list, pull, push** | `internal/marketplace`; SSRF-guarded `Fetch` (pull) + `PushJSON` (push `<name> --url` POSTs the profile config), shared `guardedClient`, cache table |
 | **agentops** | (session observability) | rollup over `runs` (per-profile runs/tokens/cost/status) |
 | **shell** | (native REPL) | reads stdin line-by-line and runs each through the native agent loop (like `run`); echo default, `--provider` for real; pipe-friendly |
 
@@ -133,7 +133,9 @@ The feature surface is ported. What is *deliberately* out of scope:
   provider is verified via unit tests and an E2E round-trip against a mock server.
 - Live external fetches are now real via the `gh` CLI (`issue-solve` GitHub-reference
   fetch, `review-pr --pr`/`--post`), degrading to an honest note when `gh` is
-  missing/unauthenticated; `plugin install` remains an honest stub. `split plan` and
+  missing/unauthenticated. `plugin install` is native (record + enable, no pip; refuses
+  when a plugin's `requires_env` secrets are absent) and `marketplace push` POSTs the
+  profile config to a `--url` endpoint under the same SSRF guard as `pull`. `split plan` and
   `context compress/trim` are native agent-loop paths (offline `echo` by default;
   `--provider` for real).
 - **Two hermes-octo parity gaps are deliberately deferred** (five of seven were shipped —
