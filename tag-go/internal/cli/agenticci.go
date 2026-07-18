@@ -11,15 +11,17 @@ import (
 )
 
 // registerAgenticCI wires `tag agentic-ci <task>` — the CI-automation agentic
-// solver (parity roadmap #527). It drives the native agent loop over a CI task
-// for up to --max-iters passes, records the run, and prints a structured
-// result. Defaults to the offline `echo` provider.
+// solver (parity roadmap #527). With --check it runs a real check→fix→re-check
+// loop: run the check command; on failure feed the output to the agent loop for
+// a fix, then re-check, up to --max-iters, reporting converged/failed. Without
+// --check it drives the loop over the task text for --max-iters passes. Defaults
+// to the offline `echo` provider.
 func registerAgenticCI(root *cobra.Command, app *App) {
-	var provider string
+	var provider, check, repo string
 	var maxIters int
 	c := &cobra.Command{
 		Use:     "agentic-ci <task>",
-		Short:   "Run the CI-automation agent loop over a task",
+		Short:   "Run a CI check→fix loop (or the agent loop over a task)",
 		GroupID: "orch",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -33,6 +35,8 @@ func registerAgenticCI(root *cobra.Command, app *App) {
 				Kind:     solver.KindCI,
 				Task:     args[0],
 				MaxIters: maxIters,
+				CheckCmd: check,
+				RepoPath: repo,
 			})
 			if err != nil {
 				return err
@@ -41,6 +45,8 @@ func registerAgenticCI(root *cobra.Command, app *App) {
 		},
 	}
 	c.Flags().StringVar(&provider, "provider", "echo", "llm provider (echo = offline)")
-	c.Flags().IntVar(&maxIters, "max-iters", 1, "number of agent-loop passes")
+	c.Flags().IntVar(&maxIters, "max-iters", 1, "max check→fix iterations")
+	c.Flags().StringVar(&check, "check", "", "check command (build/test); enables the real check→fix loop")
+	c.Flags().StringVar(&repo, "repo", "", "working directory for the check command")
 	root.AddCommand(c)
 }
