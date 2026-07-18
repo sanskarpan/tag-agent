@@ -14,10 +14,10 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (impl + E2E + merged) · `
 - E2E: temp git repos, a fake `gh` on PATH, echo-provider loops; live smoke with `--provider`.
 
 ## Cluster 2 — Native runtime stubs (no Hermes dependency)  · branch `feat/stub-runtime`
-- [ ] **context compress / trim** — native context assembly + summarize/trim pass via the agent loop; persist. (`cli/context.go:100-111`)
-- [ ] **split plan** — drive an architect/editor agent loop to produce+persist a `split_runs` spec. (`cli/split.go:232-239`)
-- [ ] **shell** — real REPL: read a line → run through the agent loop → print; echo default, `--provider` for real. (`cli/shell.go:16,29,41`)
-- E2E: subprocess drives compress/trim/plan/shell with echo; asserts persisted rows + output.
+- [~] **context compress / trim** — native context assembly (`assembleSession`: run prompt + step turns + profile `memory_journal`) + summarize/trim pass via the agent loop; persists to a self-ensured `context_compressions` table. Echo default, `--provider` for real. (`cli/context.go`, `internal/contextwin/compress.go`)
+- [~] **split plan** — drives the architect agent loop to decompose a task into a `{task,rationale,items[]}` spec (tolerates prose around the JSON, deterministic single-item fallback, or strict `--spec-json`); persists to `split_runs`(status=planned) + `split_items`. Echo default, `--provider` for real. (`cli/split.go`)
+- [~] **shell** — real REPL: read a line → run through the agent loop → print; echo default, `--provider` for real. (`cli/shell.go`)
+- E2E: subprocess drives compress/trim/plan/shell with echo; asserts persisted rows + output. (`cli/runtime_stub_e2e_test.go`, `cli/split_plan_test.go`, `internal/contextwin/compress_test.go`) — impl + E2E done on branch, merge pending.
 
 ## Cluster 3 — Sandbox docker backend  · branch `feat/stub-sandbox-docker`
 - [ ] **sandbox run --backend docker** — `docker run --rm` with `--memory/--cpus/--network none` limits; capture stdout/stderr/exit; keep `restricted` default. (`internal/sandbox/sandbox.go`, `cli/sandbox.go`)

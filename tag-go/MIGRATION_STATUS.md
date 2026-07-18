@@ -71,7 +71,7 @@ preserved intentionally (e.g. substring keyword matching in the entity graph;
 | **ci / loop** | (agent-loop drivers) | drive `internal/agent` loop via a provider (echo default, offline) |
 | **marketplace** | **list, pull, push** | `internal/marketplace`; SSRF-guarded fetch, cache table |
 | **agentops** | (session observability) | rollup over `runs` (per-profile runs/tokens/cost/status) |
-| **shell** | (stub REPL) | reads stdin line-by-line; pipe-friendly stub |
+| **shell** | (native REPL) | reads stdin line-by-line and runs each through the native agent loop (like `run`); echo default, `--provider` for real; pipe-friendly |
 
 **Bold** = ported this pass. **~45 command groups / 62 top-level commands**, 132 Go test funcs,
 16 tested packages, full `go test ./...`
@@ -114,7 +114,7 @@ on `alert delete` (Go enforces FKs; Python's sqlite3 defaults them off).
 | `internal/worker` | **execution worker done (#532).** Dep-aware atomic job claim; executes queued jobs and full DAG dependency chains through the native agent loop (`queue worker`, `dag run --execute`, `cron run --execute`). Offline via `echo` by default; verified live against OpenAI. |
 | `internal/webhook` | **listener done.** HMAC verify (GitHub/Slack/Linear), rule match, enqueue into the queue the worker drains. |
 | `internal/solver` | **solver harness done.** Backs `swe-solve` / `issue-solve` / `review-pr` / `agentic-ci`; drives the agent loop, honest stubs where a step needs a live external fetch. |
-| `internal/benchmark` / `internal/sandbox` / `internal/evaljudge` / `internal/contextwin` | **wave-1/2 backends done.** Benchmark suite runner, sandboxed code execution, LLM-as-judge scoring (verified live), context-window budget accounting. |
+| `internal/benchmark` / `internal/sandbox` / `internal/evaljudge` / `internal/contextwin` | **wave-1/2 backends done.** Benchmark suite runner, sandboxed code execution, LLM-as-judge scoring (verified live), context-window budget accounting plus session assembly + token/keep-last helpers backing native `context compress`/`trim` (summarize-or-trim pass through the agent loop, persisted to `context_compressions`). |
 
 ## Remaining
 
@@ -131,8 +131,9 @@ The feature surface is ported. What is *deliberately* out of scope:
   and `--provider local` targets a keyless local OpenAI-compatible server (llama.cpp/ollama/…).
   Both cloud providers were verified live once (see `../COMPARISON_REPORT.md`); the `local`
   provider is verified via unit tests and an E2E round-trip against a mock server.
-- Steps that need a live model or external system are honest stubs (issue-solve/review-pr
-  remote fetch, split plan, context compress/trim, plugin install).
+- Steps that need a live external system are honest stubs (issue-solve/review-pr
+  remote fetch, plugin install). `split plan` and `context compress/trim` are now native
+  agent-loop paths (offline `echo` by default; `--provider` for real).
 - **Two hermes-octo parity gaps are deliberately deferred** (five of seven were shipped —
   fallback chain #548, OpenAI gateway #549, local provider #550, Exa+tool-budget #551,
   deploy recipe #552): a **Postgres/pgvector state backend** (gap #6 — contradicts the
