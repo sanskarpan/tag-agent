@@ -18,7 +18,7 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	tagBin = filepath.Join(dir, "tag")
-	build := exec.Command("go", "build", "-o", tagBin, "../../cmd/tag")
+	build := exec.Command("go", "build", "-tags", "ssrf_testhook", "-o", tagBin, "../../cmd/tag")
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := build.CombinedOutput(); err != nil {
 		panic("build failed: " + string(out))
