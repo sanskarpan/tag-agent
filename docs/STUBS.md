@@ -24,8 +24,10 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (impl + E2E + merged) · `
 - E2E: skip if docker absent, else real `docker run alpine echo`; resource-limit + network-deny assertions.
 
 ## Cluster 4 — mem2 embeddings + vector search  · branch `feat/stub-mem2-embed`
-- [ ] **mem2 store / store search (vector) / rebuild / extract** — real embeddings provider (OpenAI `/v1/embeddings` + config), vector store (BLOB), cosine similarity; FTS fallback when no key. (`internal/memory/`, `cli/mem2.go:261,287-311`)
-- E2E: mock embeddings server (deterministic vectors) + a live smoke; assert vector recall ranks correctly.
+- [x] **mem2 store / store search (vector) / rebuild** — real embeddings provider (`internal/memory/embed.go`: `Embedder` interface + `OpenAIEmbedder` POSTing to `{base}/embeddings`, default model `text-embedding-3-small`), resolved from `TAG_EMBED_BASE_URL`/`TAG_EMBED_API_KEY`/`TAG_EMBED_MODEL` then `OPENAI_API_KEY`. Vectors persist as little-endian float32 BLOBs on `semantic_memories.embedding` (+`embed_model`), columns self-ensured via `pragma_table_info`-guarded `ALTER`. `store store --id` embeds one memory; `store rebuild` batch-embeds all missing (`--force` re-embeds all); `store search --query` embeds the query and cosine-ranks stored vectors top-`--limit`, with transparent FTS fallback when no key / no vectors (`--json` reports `mode` = `vector|fts`). No backend → store/rebuild error clearly, search degrades to FTS. (`internal/memory/embed.go`, `cli/mem2.go`)
+- [ ] **mem2 extract** — still an honest stub: needs the in-process LLM runtime (Phase-2 cutover), out of scope for this cluster. (`cli/mem2.go`)
+- E2E: mock embeddings server (deterministic orthogonal vectors) asserts rebuild embeds all + search ranks the semantically-closest memory first (`mode=vector`), keyless FTS fallback (`mode=fts`), and clear store/rebuild errors with no key; a live smoke against real OpenAI `text-embedding-3-small` persisted a 1536-dim vector. Unit tests cover cosine, float32 BLOB round-trip, env precedence, ranking, both FTS-fallback paths, and schema-ensure idempotency. — impl + E2E done on branch, merge pending.
+- Limitation: linear cosine scan (no ANN index) — fine at TAG scale, matches the Python port.
 
 ## Cluster 5 — plugin install + marketplace push  · branch `feat/stub-plugin-marketplace`
 - [ ] **marketplace push** — POST the profile config to a configurable marketplace URL (SSRF-guarded like `pull`); real round-trip. (`cli/marketplace.go`)

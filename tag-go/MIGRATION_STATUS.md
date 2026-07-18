@@ -48,7 +48,7 @@ preserved intentionally (e.g. substring keyword matching in the entity graph;
 | **alert** | **create, list, check, firings, delete** | alert_rules / alert_firings (cooldown-suppressed) |
 | **annotate** | **add, next, label, skip, stats, export** | annotation_tasks (atomic priority claim, jsonl/csv) |
 | **eval-dataset** | **create, add-case, list, export, delete** | eval_datasets / eval_dataset_cases (YAML export, C022) |
-| **mem2** | **gc, tier, episode, fact** | `internal/memory/{gc,episode,fact}.go` (evict/merge/promote; episodes; temporal fact versioning) |
+| **mem2** | **gc, tier, episode, fact, store** | `internal/memory/{gc,episode,fact,embed}.go` (evict/merge/promote; episodes; temporal fact versioning; vector store/search/rebuild via an OpenAI-compatible embeddings backend + brute-force cosine, float32 BLOB vectors, FTS fallback when no key) |
 | **diff-context** | (single cmd) | `internal/diffcontext` (git-exec, secret/binary filter, token estimate) |
 | **hooks** | **list, log, test** | config `hooks` section + hook_log; shell-safe {{var}} interpolation |
 | **mcp-registry** | **list, install, enable, disable** | embedded 10-server catalog; profile config.yaml read/write |
