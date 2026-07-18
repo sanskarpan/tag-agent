@@ -215,20 +215,30 @@ func registerMarketplace(root *cobra.Command, app *App) {
 				return fmt.Errorf("refused to push profile: %w", err)
 			}
 			res, err := marketplace.PushJSON(mktPushURL, body, 15*time.Second)
+			// A non-2xx returns both a non-nil error AND res (carrying the
+			// server's status/body); only a transport-level failure has res==nil.
+			// For machine consumers (--json), still emit the structured payload —
+			// with status_code — on non-2xx, which is exactly the case they need
+			// to parse; a non-nil return keeps the exit code non-zero.
+			if flagJSON && res != nil {
+				if e := emitJSON(map[string]any{
+					"name":        name,
+					"url":         mktPushURL,
+					"status_code": res.StatusCode,
+					"response":    string(res.Body),
+				}); e != nil {
+					return e
+				}
+				if err != nil {
+					return fmt.Errorf("push failed: HTTP %d", res.StatusCode)
+				}
+				return nil
+			}
 			if err != nil {
 				if res != nil {
 					return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(res.Body)))
 				}
 				return fmt.Errorf("failed to push profile: %w", err)
-			}
-
-			if flagJSON {
-				return emitJSON(map[string]any{
-					"name":        name,
-					"url":         mktPushURL,
-					"status_code": res.StatusCode,
-					"response":    string(res.Body),
-				})
 			}
 			fmt.Printf("Pushed profile: %s\n", name)
 			fmt.Printf("  To: %s\n", mktPushURL)

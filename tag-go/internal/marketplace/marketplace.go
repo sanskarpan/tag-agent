@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"syscall"
 	"time"
 )
@@ -65,12 +64,14 @@ func ValidateFetchURL(raw string) error {
 
 // allowLoopbackForTest, when true, exempts loopback addresses from the SSRF
 // guard so tests can point Fetch/PushJSON at an httptest server (which always
-// binds 127.0.0.1). It defaults to false and is ONLY ever enabled from tests —
-// either by setting this var directly (in-process unit tests) or via the
-// TAG_MARKETPLACE_ALLOW_LOOPBACK=1 env var (for the subprocess CLI E2E, which
-// can't reach this variable). Production never sets either, so loopback stays
-// blocked. Only loopback is exempted; private/link-local/reserved stay blocked.
-var allowLoopbackForTest = os.Getenv("TAG_MARKETPLACE_ALLOW_LOOPBACK") == "1"
+// binds 127.0.0.1). It defaults to false and is ONLY ever enabled from tests:
+// in-process unit tests set it directly, and the subprocess CLI E2E flips it
+// via TAG_MARKETPLACE_ALLOW_LOOPBACK=1 — but that env hook is compiled in ONLY
+// under the `ssrf_testhook` build tag (see marketplace_loopback_testhook.go).
+// Production builds omit that tag, so the shipped binary has no runtime switch
+// to disable the loopback guard. Only loopback is exempted; private/link-local/
+// reserved stay blocked even when it is on.
+var allowLoopbackForTest = false
 
 // isBlockedIP reports whether ip is a non-public (SSRF-sensitive) address.
 func isBlockedIP(ip net.IP) bool {

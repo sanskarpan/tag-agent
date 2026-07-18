@@ -124,16 +124,24 @@ func registerPlugin(root *cobra.Command, app *App) {
 
 			// Honesty guard: a plugin may declare requires_env secrets that we
 			// genuinely can't represent natively. If any are missing, refuse and
-			// name exactly what's needed — do NOT record a fake install.
+			// name exactly what's needed — do NOT record a fake install. A secret
+			// counts as present if it's exported in this process OR persisted in
+			// the profile .env — the same source the runtime loads secrets from
+			// (and where enable/disable write), so the guard matches runtime reality.
+			penv := profileEnvKeys(app, profile)
 			var missing []string
 			for _, e := range asSlice(im["requires_env"]) {
 				key := str(e)
 				if key == "" {
 					continue
 				}
-				if _, present := os.LookupEnv(key); !present {
-					missing = append(missing, key)
+				if _, present := os.LookupEnv(key); present {
+					continue
 				}
+				if penv[key] {
+					continue
+				}
+				missing = append(missing, key)
 			}
 			if len(missing) > 0 {
 				return fmt.Errorf("plugin %q requires environment variable(s) not set: %s; set them and re-run (not installed)",
@@ -150,6 +158,15 @@ func registerPlugin(root *cobra.Command, app *App) {
 			if _, err := db.Exec(pluginEnsureTable); err != nil {
 				return err
 			}
+
+			// Enable it via the existing TAG_PLUGIN_<NAME>_ENABLED env mechanism
+			// BEFORE recording, so a failure here records nothing (no
+			// recorded-but-not-enabled state). setPluginEnabled prints
+			// "Enabled plugin ...".
+			if err := setPluginEnabled(app, profile, name, true); err != nil {
+				return err
+			}
+
 			now := time.Now().UTC().Format(time.RFC3339)
 			if _, err := db.Exec(`INSERT INTO plugins_installed(profile, name, pypi, installed_at)
 				VALUES(?,?,?,?)
@@ -159,10 +176,9 @@ func registerPlugin(root *cobra.Command, app *App) {
 				return err
 			}
 
-			// Enable it via the existing TAG_PLUGIN_<NAME>_ENABLED env mechanism.
-			// setPluginEnabled prints "Enabled plugin ...", so add an install line.
+			// Only claim success once both the enable and the record landed.
 			fmt.Printf("Installed plugin '%s' (%s) for profile '%s'\n", name, pypi, profile)
-			return setPluginEnabled(app, profile, name, true)
+			return nil
 		}}
 	install.Flags().StringVar(&instProfile, "profile", "", "profile (default master)")
 
@@ -194,6 +210,34 @@ func installedPlugins(app *App, profile string) (map[string]bool, error) {
 		out[n] = true
 	}
 	return out, rows.Err()
+}
+
+// profileEnvKeys returns the set of keys present in the profile's .env — the
+// same file the runtime loads secrets from (and where enable/disable persist
+// state). Returns an empty set if the file is absent/unreadable. Used by the
+// install honesty guard so it checks the source the runtime actually consumes.
+func profileEnvKeys(app *App, profile string) map[string]bool {
+	keys := map[string]bool{}
+	homeDir := app.Cfg.String("runtime.home_dir", "")
+	envFile := filepath.Join(paths.ProfileHome(homeDir, profile), ".env")
+	b, err := os.ReadFile(envFile)
+	if err != nil {
+		return keys
+	}
+	for _, ln := range strings.Split(string(b), "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || strings.HasPrefix(ln, "#") || !strings.Contains(ln, "=") {
+			continue
+		}
+		if strings.HasPrefix(ln, "export ") || strings.HasPrefix(ln, "export\t") {
+			ln = strings.TrimLeft(ln[len("export"):], " \t")
+		}
+		k, _, _ := strings.Cut(ln, "=")
+		if k = strings.TrimSpace(k); k != "" {
+			keys[k] = true
+		}
+	}
+	return keys
 }
 
 var pluginEnvSanitize = regexp.MustCompile(`[^A-Z0-9]`)

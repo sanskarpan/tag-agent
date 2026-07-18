@@ -12,21 +12,9 @@ import (
 	"testing"
 )
 
-// runEnv is like run() but with extra env vars (KEY=VALUE) appended. Used to
-// flip TAG_MARKETPLACE_ALLOW_LOOPBACK for the mock-server E2E, which the
-// production SSRF guard would otherwise refuse (httptest binds 127.0.0.1).
-func runEnv(t *testing.T, home string, extraEnv []string, args ...string) (string, int) {
-	t.Helper()
-	cmd := exec.Command(tagBin, args...)
-	cmd.Env = append(os.Environ(), "TAG_HOME="+home)
-	cmd.Env = append(cmd.Env, extraEnv...)
-	out, err := cmd.CombinedOutput()
-	code := 0
-	if ee, ok := err.(*exec.ExitError); ok {
-		code = ee.ExitCode()
-	}
-	return string(out), code
-}
+// runEnv (shared helper, defined in solvers_e2e_test.go) is used here to flip
+// TAG_MARKETPLACE_ALLOW_LOOPBACK for the mock-server E2E, which the production
+// SSRF guard would otherwise refuse (httptest binds 127.0.0.1).
 
 // TestE2EMarketplacePushRoundTrip drives the real binary: pull a profile from a
 // mock marketplace, then push it to another mock endpoint. Asserts the push
