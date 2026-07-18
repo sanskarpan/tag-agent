@@ -113,7 +113,7 @@ on `alert delete` (Go enforces FKs; Python's sqlite3 defaults them off).
 | `internal/tui` | **Charm TUI done.** bubbletea + lipgloss dashboard over the same snapshot (runs/queue/journal), refresh/quit keys, live ticker. `Model.Update`/`View` are pure and unit-tested offline (3 tests); `Run()` needs a TTY. Wired as `tag tui`. |
 | `internal/worker` | **execution worker done (#532).** Dep-aware atomic job claim; executes queued jobs and full DAG dependency chains through the native agent loop (`queue worker`, `dag run --execute`, `cron run --execute`). Offline via `echo` by default; verified live against OpenAI. |
 | `internal/webhook` | **listener done.** HMAC verify (GitHub/Slack/Linear), rule match, enqueue into the queue the worker drains. |
-| `internal/solver` | **solver harness done.** Backs `swe-solve` / `issue-solve` / `review-pr` / `agentic-ci`; drives the agent loop, honest stubs where a step needs a live external fetch. |
+| `internal/solver` | **solver harness done.** Backs `swe-solve` / `issue-solve` / `review-pr` / `agentic-ci`; drives the agent loop. Real depth is opt-in: `swe-solve --tools` enables the root-confined file tools (edits under `--repo`) plus `--run-tests`; `issue-solve` fetches a GitHub reference via `gh issue view`; `review-pr --pr` fetches the diff via `gh pr diff` and `--post` comments via `gh pr comment`; `agentic-ci --check` runs a real check→fix→re-check loop. Where a step genuinely cannot run offline (e.g. a live fetch when the `gh` CLI is absent) the solver stays honest and records a note rather than faking it. |
 | `internal/benchmark` / `internal/sandbox` / `internal/evaljudge` / `internal/contextwin` | **wave-1/2 backends done.** Benchmark suite runner, sandboxed code execution, LLM-as-judge scoring (verified live), context-window budget accounting plus session assembly + token/keep-last helpers backing native `context compress`/`trim` (summarize-or-trim pass through the agent loop, persisted to `context_compressions`). |
 
 ## Remaining
@@ -131,9 +131,11 @@ The feature surface is ported. What is *deliberately* out of scope:
   and `--provider local` targets a keyless local OpenAI-compatible server (llama.cpp/ollama/…).
   Both cloud providers were verified live once (see `../COMPARISON_REPORT.md`); the `local`
   provider is verified via unit tests and an E2E round-trip against a mock server.
-- Steps that need a live external system are honest stubs (issue-solve/review-pr
-  remote fetch, plugin install). `split plan` and `context compress/trim` are now native
-  agent-loop paths (offline `echo` by default; `--provider` for real).
+- Live external fetches are now real via the `gh` CLI (`issue-solve` GitHub-reference
+  fetch, `review-pr --pr`/`--post`), degrading to an honest note when `gh` is
+  missing/unauthenticated; `plugin install` remains an honest stub. `split plan` and
+  `context compress/trim` are native agent-loop paths (offline `echo` by default;
+  `--provider` for real).
 - **Two hermes-octo parity gaps are deliberately deferred** (five of seven were shipped —
   fallback chain #548, OpenAI gateway #549, local provider #550, Exa+tool-budget #551,
   deploy recipe #552): a **Postgres/pgvector state backend** (gap #6 — contradicts the
