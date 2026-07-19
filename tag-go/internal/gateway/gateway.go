@@ -155,6 +155,9 @@ func serveComplete(w http.ResponseWriter, ctx context.Context, opts Options, mod
 			}
 		case llm.EventError:
 			if ev.Err != nil {
+				// Abandoning ch here would leave the producer goroutine blocked on
+				// a full buffered channel; drain it so it unblocks promptly (#565).
+				go drainEvents(ch)
 				writeErr(w, 502, "upstream_error", ev.Err.Error())
 				return
 			}
@@ -207,7 +210,12 @@ func serveStream(w http.ResponseWriter, r *http.Request, opts Options, model str
 	for ev := range ch {
 		select {
 		case <-r.Context().Done():
-			return // client disconnected
+			// Client disconnected. The producer (SSE parser) sends to a buffered
+			// channel with no ctx awareness, so returning here without draining can
+			// leave it blocked on a full buffer until the request timeout under a
+			// disconnect flood. Drain in the background so it always unblocks (#565).
+			go drainEvents(ch)
+			return
 		default:
 		}
 		switch ev.Type {
@@ -230,6 +238,15 @@ func serveStream(w http.ResponseWriter, r *http.Request, opts Options, model str
 	chunk(map[string]any{}, "stop")
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+// drainEvents consumes a provider event channel to completion. It is used on the
+// disconnect / early-return paths so the SSE producer goroutine — which sends to
+// a buffered channel with no ctx awareness — always unblocks and terminates
+// instead of stalling on a full buffer until the request timeout (#565).
+func drainEvents(ch <-chan llm.Event) {
+	for range ch {
+	}
 }
 
 func authOK(opts Options, r *http.Request) bool {
