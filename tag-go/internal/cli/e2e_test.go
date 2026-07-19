@@ -1074,6 +1074,51 @@ func TestE2EJSONHonoredWhereItWasIgnored(t *testing.T) {
 	}
 }
 
+// TestE2EJSONErrorPaths covers #561: error paths that ran under --json emitted
+// plain `error: ...` text on stderr instead of a parseable {"error":...} object
+// on stdout. Both must now emit JSON on the error path (and still exit nonzero).
+func TestE2EJSONErrorPaths(t *testing.T) {
+	h := newHome(t)
+
+	// dag save with a malformed --steps under --json
+	out, code := run(t, h, "dag", "save", "bad", "--steps", "{not json", "--json")
+	if code == 0 {
+		t.Errorf("dag save bad steps should exit nonzero: %q", out)
+	}
+	if !jsonErrorObject(t, out) {
+		t.Errorf("dag save --json error must be a JSON {error:...} object: %q", out)
+	}
+
+	// mem2 store with no --id under --json
+	out, code = run(t, h, "mem2", "store", "store", "--json")
+	if code == 0 {
+		t.Errorf("mem2 store without --id should exit nonzero: %q", out)
+	}
+	if !jsonErrorObject(t, out) {
+		t.Errorf("mem2 store --json error must be a JSON {error:...} object: %q", out)
+	}
+}
+
+// jsonErrorObject reports whether out contains a JSON {"error":...} object
+// (the combined stdout+stderr may also carry the "error: ..." stderr line, so
+// scan line-by-line for a parseable error object).
+func jsonErrorObject(t *testing.T, out string) bool {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var obj map[string]any
+		if json.Unmarshal([]byte(line), &obj) == nil {
+			if _, ok := obj["error"]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func TestE2EDagValidation(t *testing.T) {
 	h := newHome(t)
 	if _, c := run(t, h, "dag", "save", "d", "--steps", `[{"task":""}]`); c == 0 {

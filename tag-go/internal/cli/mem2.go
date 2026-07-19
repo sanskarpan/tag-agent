@@ -306,7 +306,7 @@ func registerMem2(root *cobra.Command, app *App) {
 			switch args[0] {
 			case "store":
 				if storeID == "" {
-					return fmt.Errorf("--id required for store")
+					return jsonErrorMaybe(fmt.Errorf("--id required for store"))
 				}
 				n, err := memory.StoreEmbedding(context.Background(), db.DB, embedder, p, storeID)
 				if err != nil {
@@ -344,7 +344,7 @@ func registerMem2(root *cobra.Command, app *App) {
 				fmt.Printf("Rebuilt embeddings: %d memories embedded (model %s)\n", n, model)
 				return nil
 			default:
-				return fmt.Errorf("Unknown store action: %q", args[0])
+				return jsonErrorMaybe(fmt.Errorf("Unknown store action: %q", args[0]))
 			}
 		}}
 	store.Flags().StringVar(&profile, "profile", "", "profile")

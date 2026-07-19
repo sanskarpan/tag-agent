@@ -324,11 +324,11 @@ func registerQueue(root *cobra.Command, app *App) {
 	save := &cobra.Command{Use: "save NAME", Short: "Save a DAG spec", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(args[0]) == "" {
-				return fmt.Errorf("DAG name must not be empty")
+				return jsonErrorMaybe(fmt.Errorf("DAG name must not be empty"))
 			}
 			var steps []map[string]any
 			if err := json.Unmarshal([]byte(specJSON), &steps); err != nil {
-				return fmt.Errorf("invalid --steps JSON: %w", err)
+				return jsonErrorMaybe(fmt.Errorf("invalid --steps JSON: %w", err))
 			}
 			// Validate each step (mirrors dag.py:validate_dag_spec, incl. C032:
 			// reject unknown dependency-alias keys that would silently drop edges).
@@ -341,11 +341,11 @@ func registerQueue(root *cobra.Command, app *App) {
 			for i, s := range steps {
 				taskVal, ok := s["task"]
 				if !ok {
-					return fmt.Errorf("step %d is missing required non-empty 'task'", i)
+					return jsonErrorMaybe(fmt.Errorf("step %d is missing required non-empty 'task'", i))
 				}
 				taskStr, isStr := taskVal.(string)
 				if !isStr || strings.TrimSpace(taskStr) == "" {
-					return fmt.Errorf("step %d 'task' must be a non-empty string", i)
+					return jsonErrorMaybe(fmt.Errorf("step %d 'task' must be a non-empty string", i))
 				}
 				// Reject any unrecognized key; give the dependency-alias hint when the
 				// unknown key is a known alias (it would silently drop the edge).
@@ -354,9 +354,9 @@ func registerQueue(root *cobra.Command, app *App) {
 						continue
 					}
 					if depAliases[k] {
-						return fmt.Errorf("step %d uses unrecognized dependency key %q; use 'depends_on' instead", i, k)
+						return jsonErrorMaybe(fmt.Errorf("step %d uses unrecognized dependency key %q; use 'depends_on' instead", i, k))
 					}
-					return fmt.Errorf("step %d has unrecognized key %q; allowed keys are [depends_on name profile task task_type]", i, k)
+					return jsonErrorMaybe(fmt.Errorf("step %d has unrecognized key %q; allowed keys are [depends_on name profile task task_type]", i, k))
 				}
 			}
 			db, err := app.OpenDB()
