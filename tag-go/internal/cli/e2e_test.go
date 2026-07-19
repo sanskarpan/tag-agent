@@ -1003,6 +1003,31 @@ func TestE2EDoctorJSON(t *testing.T) {
 	}
 }
 
+// TestE2EEmptyJSONListsAreArrays covers #559: `--json` on an empty result set
+// must emit `[]`, never `null`. Before the fix these commands marshaled a nil
+// slice → `null`, breaking `--json` consumers that iterate the result.
+func TestE2EEmptyJSONListsAreArrays(t *testing.T) {
+	h := newHome(t)
+	run(t, h, "mem", "stats") // touch DB so schema/tables exist
+	cases := [][]string{
+		{"swarm", "list", "--json"},
+		{"trace", "list", "--json"},
+		{"webhook", "rule-list", "--json"},
+		{"notify", "list", "--json"},
+		{"memory-journal", "list", "--json"},
+	}
+	for _, c := range cases {
+		out, code := run(t, h, c...)
+		if code != 0 {
+			t.Errorf("%v exit %d: %q", c, code, out)
+		}
+		trimmed := strings.TrimSpace(out)
+		if trimmed != "[]" {
+			t.Errorf("%v empty --json must be [] not %q", c, trimmed)
+		}
+	}
+}
+
 func TestE2EDagValidation(t *testing.T) {
 	h := newHome(t)
 	if _, c := run(t, h, "dag", "save", "d", "--steps", `[{"task":""}]`); c == 0 {

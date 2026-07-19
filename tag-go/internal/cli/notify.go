@@ -85,6 +85,9 @@ func registerNotify(root *cobra.Command, app *App) {
 			if err != nil {
 				return err
 			}
+			if hooks == nil {
+				hooks = []map[string]any{}
+			}
 			if flagJSON {
 				return emitJSON(hooks)
 			}

@@ -75,6 +75,9 @@ func registerWebhook(root *cobra.Command, app *App) {
 			if err != nil {
 				return err
 			}
+			if rules == nil {
+				rules = []webhook.Rule{}
+			}
 			if flagJSON {
 				return emitJSON(rules)
 			}
