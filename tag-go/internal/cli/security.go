@@ -72,7 +72,9 @@ func registerSecurity(root *cobra.Command, app *App) {
 			for rows.Next() {
 				var p, st, ts string
 				var fc int
-				rows.Scan(&p, &fc, &st, &ts)
+				if err := rows.Scan(&p, &fc, &st, &ts); err != nil {
+					return err
+				}
 				fmt.Printf("%s  %d findings  [%s]  %s\n", p, fc, st, ts)
 			}
 			return nil
