@@ -1119,6 +1119,25 @@ func jsonErrorObject(t *testing.T, out string) bool {
 	return false
 }
 
+// TestE2ECompletionBadShell covers #562: `tag completion badshell` (and a bare
+// `tag completion`) used to print help and exit 0. An unknown or missing shell
+// must be a usage error (exit 2); a valid shell still generates a script (exit 0).
+func TestE2ECompletionBadShell(t *testing.T) {
+	h := newHome(t)
+	if _, code := run(t, h, "completion", "badshell"); code != 2 {
+		t.Errorf("completion badshell must exit 2, got %d", code)
+	}
+	if _, code := run(t, h, "completion"); code != 2 {
+		t.Errorf("bare completion must exit 2, got %d", code)
+	}
+	for _, sh := range []string{"bash", "zsh", "fish", "powershell"} {
+		out, code := run(t, h, "completion", sh)
+		if code != 0 || len(strings.TrimSpace(out)) == 0 {
+			t.Errorf("completion %s should emit a script and exit 0: code=%d", sh, code)
+		}
+	}
+}
+
 func TestE2EDagValidation(t *testing.T) {
 	h := newHome(t)
 	if _, c := run(t, h, "dag", "save", "d", "--steps", `[{"task":""}]`); c == 0 {

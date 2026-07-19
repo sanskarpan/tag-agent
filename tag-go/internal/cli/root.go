@@ -137,12 +137,44 @@ func NewRoot() *cobra.Command {
 	registerContext(root, app)
 	registerSplit(root, app)
 
+	// #562: cobra adds its `completion` command lazily at Execute() time, after
+	// NewRoot() runs — so enforceUnknownSubcommand never walks it, and both a
+	// missing shell (`tag completion`) and an unknown shell (`tag completion
+	// badshell`) silently printed help and exited 0. Force the completion command
+	// to materialize now, then constrain it to the known shells so a bad/missing
+	// shell is a usage error (exit 2).
+	root.InitDefaultCompletionCmd()
+	enforceCompletionShell(root)
+
 	// #535: give every pure group command (has subcommands, no Run/RunE of its
 	// own) a RunE so an unknown SUBCOMMAND becomes a usage error (exit 2) while a
 	// bare group still prints help (exit 0). Done generically so we never edit
 	// each group's file.
 	enforceUnknownSubcommand(root)
 	return root
+}
+
+// enforceCompletionShell makes `tag completion` require exactly one of the known
+// shell names as its argument. Without a valid shell (missing or unknown) it
+// returns a usage error, which isUsageError() maps to exit 2 — instead of
+// cobra's default of printing help and exiting 0 (#562).
+func enforceCompletionShell(root *cobra.Command) {
+	for _, c := range root.Commands() {
+		if c.Name() != "completion" {
+			continue
+		}
+		valid := make([]string, 0, len(c.Commands()))
+		for _, sub := range c.Commands() {
+			valid = append(valid, sub.Name())
+		}
+		c.RunE = func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return usageErrorf("completion requires a shell argument, one of: %v", valid)
+			}
+			return usageErrorf("unknown shell %q for completion; expected one of: %v", args[0], valid)
+		}
+		return
+	}
 }
 
 // enforceUnknownSubcommand walks the command tree and, for each command that
