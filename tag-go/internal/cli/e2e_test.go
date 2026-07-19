@@ -1028,6 +1028,52 @@ func TestE2EEmptyJSONListsAreArrays(t *testing.T) {
 	}
 }
 
+// TestE2EJSONHonoredWhereItWasIgnored covers #560: env, `persona stack`, and
+// `mem2 tier` printed human text under --json. Each must now emit valid JSON.
+func TestE2EJSONHonoredWhereItWasIgnored(t *testing.T) {
+	h := newHome(t)
+
+	// env --json → object with TAG_HOME + HOME
+	out, code := run(t, h, "env", "--json")
+	if code != 0 {
+		t.Fatalf("env --json exit %d: %q", code, out)
+	}
+	var envObj map[string]any
+	if err := json.Unmarshal([]byte(out), &envObj); err != nil {
+		t.Errorf("env --json not valid JSON: %q err=%v", out, err)
+	} else if _, ok := envObj["TAG_HOME"]; !ok {
+		t.Errorf("env --json missing TAG_HOME: %q", out)
+	}
+
+	// persona stack --json → object with a stack array (empty here)
+	run(t, h, "persona", "apply", "terse-engineer", "--profile", "orchestrator")
+	out, code = run(t, h, "persona", "stack", "--profile", "orchestrator", "--json")
+	if code != 0 {
+		t.Fatalf("persona stack --json exit %d: %q", code, out)
+	}
+	var stackObj struct {
+		Stack []map[string]any `json:"stack"`
+	}
+	if err := json.Unmarshal([]byte(out), &stackObj); err != nil {
+		t.Errorf("persona stack --json not valid JSON: %q err=%v", out, err)
+	} else if len(stackObj.Stack) != 1 {
+		t.Errorf("persona stack --json want 1 entry: %q", out)
+	}
+
+	// mem2 tier --json → object keyed by tier
+	run(t, h, "mem", "add", "a durable fact", "--type", "fact", "--confidence", "0.95")
+	out, code = run(t, h, "mem2", "tier", "--json")
+	if code != 0 {
+		t.Fatalf("mem2 tier --json exit %d: %q", code, out)
+	}
+	var tierObj map[string]any
+	if err := json.Unmarshal([]byte(out), &tierObj); err != nil {
+		t.Errorf("mem2 tier --json not valid JSON: %q err=%v", out, err)
+	} else if _, ok := tierObj["core"]; !ok {
+		t.Errorf("mem2 tier --json missing core tier key: %q", out)
+	}
+}
+
 func TestE2EDagValidation(t *testing.T) {
 	h := newHome(t)
 	if _, c := run(t, h, "dag", "save", "d", "--steps", `[{"task":""}]`); c == 0 {

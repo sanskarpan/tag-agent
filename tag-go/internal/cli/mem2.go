@@ -88,6 +88,17 @@ func registerMem2(root *cobra.Command, app *App) {
 			for _, mm := range mems {
 				byTier[memory.Tier(mm.Confidence, mm.CreatedAt)] = append(byTier[memory.Tier(mm.Confidence, mm.CreatedAt)], mm)
 			}
+			if flagJSON {
+				out := map[string]any{}
+				for _, t := range tiers {
+					group := byTier[t]
+					if group == nil {
+						group = []memory.Mem{}
+					}
+					out[t] = group
+				}
+				return emitJSON(out)
+			}
 			for _, t := range tiers {
 				group := byTier[t]
 				fmt.Printf("\n=== %s (%d) ===\n", upper(t), len(group))

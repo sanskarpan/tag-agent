@@ -185,17 +185,29 @@ func registerPersona(root *cobra.Command, app *App) {
 				return err
 			}
 			defer rows.Close()
-			n := 0
+			type stackEntry struct {
+				Name     string `json:"name"`
+				Position int    `json:"position"`
+			}
+			entries := []stackEntry{}
 			for rows.Next() {
 				var nm string
 				var pos int
 				if err := rows.Scan(&nm, &pos); err != nil {
 					return err
 				}
-				fmt.Printf("[%d] %s\n", pos, nm)
-				n++
+				entries = append(entries, stackEntry{Name: nm, Position: pos})
 			}
-			if n == 0 {
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			if flagJSON {
+				return emitJSON(map[string]any{"profile": app.profile(profile), "stack": entries})
+			}
+			for _, e := range entries {
+				fmt.Printf("[%d] %s\n", e.Position, e.Name)
+			}
+			if len(entries) == 0 {
 				fmt.Printf("No personas applied to '%s'.\n", app.profile(profile))
 			}
 			return nil
