@@ -1138,6 +1138,35 @@ func TestE2ECompletionBadShell(t *testing.T) {
 	}
 }
 
+// TestE2EMem2Extract covers #563: `mem2 extract <run-id>` read run text ONLY
+// from the never-populated `steps` table, so it returned "Run not found or has
+// no recorded output" (exit 1) for EVERY valid run. A valid run must now yield
+// the honest offline "Extracted 0 memories" (exit 0); only a genuinely missing
+// run id errors.
+func TestE2EMem2Extract(t *testing.T) {
+	h := newHome(t)
+	// record a real run via the offline echo provider
+	out, _ := run(t, h, "run", "extract me", "--json")
+	var r struct {
+		RunID string `json:"run_id"`
+	}
+	if err := json.Unmarshal([]byte(out), &r); err != nil || r.RunID == "" {
+		t.Fatalf("could not parse run_id: %q err=%v", out, err)
+	}
+	// valid run → honest exit 0 with "Extracted 0 memories" (not "not found")
+	out, code := run(t, h, "mem2", "extract", r.RunID)
+	if code != 0 || !strings.Contains(out, "Extracted 0 memories") {
+		t.Errorf("extract valid run must exit 0 with honest message: %q code=%d", out, code)
+	}
+	if strings.Contains(strings.ToLower(out), "not found") {
+		t.Errorf("valid run must not report 'not found': %q", out)
+	}
+	// a genuinely missing run id still errors
+	if o, c := run(t, h, "mem2", "extract", "deadbeefdeadbeef"); c == 0 || !strings.Contains(o, "not found") {
+		t.Errorf("missing run id must error with 'not found': %q code=%d", o, c)
+	}
+}
+
 func TestE2EDagValidation(t *testing.T) {
 	h := newHome(t)
 	if _, c := run(t, h, "dag", "save", "d", "--steps", `[{"task":""}]`); c == 0 {
