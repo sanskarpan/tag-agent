@@ -148,13 +148,36 @@ func buildFallbackProvider(app *App, primaryProv llm.Provider, primaryProvSlug, 
 	// ("openai/gpt-4o-mini", as a route-fallback --primary is typically typed).
 	// Match both forms so the chain resolves regardless of which the user used.
 	prof := app.profile(profile)
-	candidates := []string{primaryModel}
-	if mp := app.Cfg.String("profiles."+prof+".config.model.provider", ""); mp != "" && !strings.Contains(primaryModel, "/") {
-		candidates = append(candidates, mp+"/"+primaryModel)
+	cfgProv := app.Cfg.String("profiles."+prof+".config.model.provider", "")
+	// modelCandidates expands a model ref into every stored form it could match:
+	// the ref as given, plus — for a bare ref — its provider-prefixed forms (from
+	// the profile's configured provider and the primary provider slug), and — for
+	// a prefixed ref — its bare form. A route_fallbacks graph may store the same
+	// logical model under either form at different depths, so matching only the
+	// exact edge string (as walk() did before) dead-links a depth-2 chain whose
+	// edges use mixed prefix forms (openai/gpt-x vs gpt-x). See #564.
+	modelCandidates := func(model string) []string {
+		out := []string{model}
+		seen := map[string]bool{model: true}
+		add := func(m string) {
+			if m != "" && !seen[m] {
+				seen[m] = true
+				out = append(out, m)
+			}
+		}
+		if strings.Contains(model, "/") {
+			add(stripProviderPrefix(model))
+		} else {
+			if cfgProv != "" {
+				add(cfgProv + "/" + model)
+			}
+			if primaryProvSlug != "" {
+				add(primaryProvSlug + "/" + model)
+			}
+		}
+		return out
 	}
-	if primaryProvSlug != "" && !strings.Contains(primaryModel, "/") {
-		candidates = append(candidates, primaryProvSlug+"/"+primaryModel)
-	}
+	candidates := modelCandidates(primaryModel)
 	steps := []llm.FallbackStep{{Provider: primaryProv, Model: primaryModel}}
 	// The stored route_fallbacks form a graph: a fallback can itself declare
 	// fallbacks, so primary->A->B is a valid depth-2 chain. Walk it transitively
@@ -196,12 +219,19 @@ func buildFallbackProvider(app *App, primaryProv llm.Provider, primaryProvSlug, 
 			if visited[e.model] {
 				continue
 			}
-			visited[e.model] = true
+			// Mark every equivalent prefix form visited so the same logical model
+			// reached via a different form (bare vs prefixed) isn't re-added.
+			childForms := modelCandidates(e.model)
+			for _, cf := range childForms {
+				visited[cf] = true
+			}
 			p := providerForModel(e.model, primaryProvSlug)
 			// Pass the bare model id to the adapter (the provider is resolved from
 			// the "provider/" prefix separately; adapters expect an unprefixed model).
 			steps = append(steps, llm.FallbackStep{Provider: p, Model: stripProviderPrefix(e.model), Condition: e.cond})
-			if err := walk([]string{e.model}); err != nil {
+			// Recurse across all prefix forms of this edge, so a child edge stored
+			// under a different form than e.model is still discovered (#564).
+			if err := walk(childForms); err != nil {
 				return err
 			}
 		}
