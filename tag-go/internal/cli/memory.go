@@ -53,7 +53,7 @@ func registerMemory(root *cobra.Command, app *App) {
 				return err
 			}
 			defer rows.Close()
-			var items []map[string]string
+			items := []map[string]string{}
 			for rows.Next() {
 				var k, v string
 				if err := rows.Scan(&k, &v); err != nil {

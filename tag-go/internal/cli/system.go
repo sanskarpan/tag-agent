@@ -66,6 +66,9 @@ func registerSystem(root *cobra.Command, app *App) {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			rt := app.Cfg.Section("runtime")
 			home, _ := rt["home_dir"].(string)
+			if flagJSON {
+				return emitJSON(map[string]any{"TAG_HOME": paths.Home(), "HOME": paths.RuntimeHome(home)})
+			}
 			fmt.Printf("TAG_HOME=%s\n", paths.Home())
 			fmt.Printf("HOME=%s\n", paths.RuntimeHome(home))
 			return nil

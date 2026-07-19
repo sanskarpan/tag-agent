@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tag-agent/tag/internal/llm"
 )
@@ -234,6 +235,70 @@ func TestBadRequests(t *testing.T) {
 		t.Errorf("GET should be 405, got %d", r3.StatusCode)
 	}
 	r3.Body.Close()
+}
+
+// blockingProvider streams events on a buffered channel until either its total
+// budget is exhausted or ctx is done, then closes `done` to signal the producer
+// goroutine terminated. It deliberately does NOT watch ctx while blocked on a
+// channel send, reproducing the real SSE parsers (parseOpenAISSE /
+// parseAnthropicSSE) which send with no ctx awareness (#565). The producer can
+// only unblock if the consumer drains the channel.
+type blockingProvider struct {
+	total int
+	done  chan struct{}
+}
+
+func (p *blockingProvider) Name() string { return "blocking" }
+func (p *blockingProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event, error) {
+	ch := make(chan llm.Event, 4) // small buffer so it fills fast
+	go func() {
+		defer close(ch)
+		defer close(p.done)
+		for i := 0; i < p.total; i++ {
+			// Plain send — no <-ctx.Done() select. Blocks once the buffer fills and
+			// the consumer stops reading, exactly like the production parsers.
+			ch <- llm.Event{Type: llm.EventTextDelta, Text: "x"}
+		}
+	}()
+	return ch, nil
+}
+
+// TestStreamClientDisconnectUnblocksProducer covers #565: when the client
+// disconnects mid-stream, serveStream must drain the provider channel so the
+// producer goroutine terminates promptly instead of blocking on a full buffer
+// until the request timeout. Before the fix, serveStream returned WITHOUT
+// draining and this test would hang (producer never closes `done`).
+func TestStreamClientDisconnectUnblocksProducer(t *testing.T) {
+	done := make(chan struct{})
+	prov := &blockingProvider{total: 100000, done: done}
+	srv := newTestServer(t, Options{
+		AllowUnauthenticated: true,
+		Resolve: func(model string) (llm.Provider, string, error) {
+			return prov, model, nil
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, "POST", srv.URL+"/v1/chat/completions",
+		strings.NewReader(`{"stream":true,"messages":[{"role":"user","content":"go"}]}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	// Read one chunk so the stream is live, then simulate a client disconnect.
+	buf := make([]byte, 256)
+	_, _ = resp.Body.Read(buf)
+	cancel()
+	resp.Body.Close()
+
+	// The producer must terminate (drain lets its blocked send proceed). If the
+	// fix is absent, `done` never closes and this times out → the test fails.
+	select {
+	case <-done:
+		// producer goroutine exited — success
+	case <-time.After(5 * time.Second):
+		t.Fatal("producer goroutine did not terminate after client disconnect (#565: serveStream must drain the channel)")
+	}
 }
 
 func TestUpstreamError(t *testing.T) {

@@ -377,7 +377,9 @@ func computeMetricSnapshot(db *store.DB, profile string) (map[string]float64, er
 		var durs []float64
 		for drows.Next() {
 			var d sql.NullInt64
-			drows.Scan(&d)
+			if err := drows.Scan(&d); err != nil {
+				continue
+			}
 			if d.Valid {
 				durs = append(durs, float64(d.Int64))
 			}

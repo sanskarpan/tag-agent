@@ -32,7 +32,7 @@ func registerSwarm(root *cobra.Command, app *App) {
 				Tasks   int     `json:"task_count"`
 				Cost    float64 `json:"total_cost_usd"`
 			}
-			var out []run
+			out := []run{}
 			for rows.Next() {
 				var r run
 				var cost sql.NullFloat64

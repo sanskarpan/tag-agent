@@ -88,6 +88,17 @@ func registerMem2(root *cobra.Command, app *App) {
 			for _, mm := range mems {
 				byTier[memory.Tier(mm.Confidence, mm.CreatedAt)] = append(byTier[memory.Tier(mm.Confidence, mm.CreatedAt)], mm)
 			}
+			if flagJSON {
+				out := map[string]any{}
+				for _, t := range tiers {
+					group := byTier[t]
+					if group == nil {
+						group = []memory.Mem{}
+					}
+					out[t] = group
+				}
+				return emitJSON(out)
+			}
 			for _, t := range tiers {
 				group := byTier[t]
 				fmt.Printf("\n=== %s (%d) ===\n", upper(t), len(group))
@@ -237,12 +248,30 @@ func registerMem2(root *cobra.Command, app *App) {
 			if err != nil {
 				return err
 			}
-			rows, err := db.Query(`SELECT output FROM steps WHERE run_id=? ORDER BY id`, args[0])
+			// Source the run text from the runs row (id-prefix resolved, mirroring
+			// how context.go:assembleSession and `runs show` read a run). The prior
+			// implementation read only the `steps` table, which the native runtime
+			// never populates, so extract errored "Run not found" for EVERY valid
+			// run. runs.prompt is NOT NULL, so a real run always yields text; any
+			// recorded step outputs are appended when present.
+			var runID, prompt string
+			err = db.QueryRow(`SELECT id, prompt FROM runs WHERE id LIKE ?||'%' ORDER BY created_at DESC LIMIT 1`, args[0]).
+				Scan(&runID, &prompt)
+			if err == sql.ErrNoRows {
+				return fmt.Errorf("Run not found: %q", args[0])
+			}
+			if err != nil {
+				return err
+			}
+			var parts []string
+			if prompt != "" {
+				parts = append(parts, prompt)
+			}
+			rows, err := db.Query(`SELECT output FROM steps WHERE run_id=? ORDER BY id`, runID)
 			if err != nil {
 				return err
 			}
 			defer rows.Close()
-			var parts []string
 			for rows.Next() {
 				var o sql.NullString
 				if err := rows.Scan(&o); err != nil {
@@ -255,13 +284,12 @@ func registerMem2(root *cobra.Command, app *App) {
 			if err := rows.Err(); err != nil {
 				return err
 			}
-			if len(parts) == 0 {
-				return fmt.Errorf("Run not found or has no recorded output: %q", args[0])
-			}
 			// Extraction invokes the managed TAG runtime (LLM) to mine memories
-			// from the output. That backend is unavailable in the offline Go build,
+			// from the run text. That backend is unavailable in the offline Go build,
 			// so — exactly as the Python path does when the runtime can't be
-			// reached — no memories are extracted.
+			// reached — no memories are extracted. A valid run now honestly reports
+			// "Extracted 0 memories" (exit 0) instead of a false "not found".
+			_ = parts
 			fmt.Println("Extracted 0 memories")
 			return nil
 		}}
@@ -295,7 +323,7 @@ func registerMem2(root *cobra.Command, app *App) {
 			switch args[0] {
 			case "store":
 				if storeID == "" {
-					return fmt.Errorf("--id required for store")
+					return jsonErrorMaybe(fmt.Errorf("--id required for store"))
 				}
 				n, err := memory.StoreEmbedding(context.Background(), db.DB, embedder, p, storeID)
 				if err != nil {
@@ -333,7 +361,7 @@ func registerMem2(root *cobra.Command, app *App) {
 				fmt.Printf("Rebuilt embeddings: %d memories embedded (model %s)\n", n, model)
 				return nil
 			default:
-				return fmt.Errorf("Unknown store action: %q", args[0])
+				return jsonErrorMaybe(fmt.Errorf("Unknown store action: %q", args[0]))
 			}
 		}}
 	store.Flags().StringVar(&profile, "profile", "", "profile")

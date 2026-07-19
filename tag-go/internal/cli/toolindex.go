@@ -72,7 +72,9 @@ func registerToolIndex(root *cobra.Command, app *App) {
 			var tools []tool
 			for rows.Next() {
 				var tl tool
-				rows.Scan(&tl.Name, &tl.Description, &tl.Server)
+				if err := rows.Scan(&tl.Name, &tl.Description, &tl.Server); err != nil {
+					continue
+				}
 				tools = append(tools, tl)
 			}
 			rows.Close()

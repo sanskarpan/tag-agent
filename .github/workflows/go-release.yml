@@ -1,0 +1,88 @@
+# Cross-platform release for the native Go harness (tag-go/).
+#
+# Triggered by a `go-v*` tag (e.g. `go-v0.9.0`) — deliberately NOT `v*`, so it
+# does not collide with the Python `release.yml` (which fires on `v*`). Builds
+# static CGO-free binaries for darwin/linux/windows × amd64/arm64, and attaches
+# them (with SHA-256 checksums) to a GitHub Release.
+name: go-release
+
+on:
+  push:
+    tags:
+      - "go-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing go-v* tag to (re)build a release for"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tag-go/go.mod
+          cache-dependency-path: tag-go/go.sum
+      - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+        working-directory: tag-go
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          out="tag"
+          [ "$GOOS" = "windows" ] && out="tag.exe"
+          go build -trimpath -ldflags="-s -w" -o "dist/$out" ./cmd/tag
+          base="tag_${TAG}_${GOOS}_${GOARCH}"
+          cd dist
+          if [ "$GOOS" = "windows" ]; then
+            zip "${base}.zip" "$out"
+            shasum -a 256 "${base}.zip" > "${base}.zip.sha256"
+          else
+            tar czf "${base}.tar.gz" "$out"
+            shasum -a 256 "${base}.tar.gz" > "${base}.tar.gz.sha256"
+          fi
+          rm -f "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: tag-go/dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Aggregate checksums
+        run: cat dist/*.sha256 > dist/SHA256SUMS.txt || true
+      - name: Create/upload GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          gh release create "$TAG" \
+            --title "TAG Go harness $TAG" \
+            --notes "Cross-platform static binaries for the native Go TAG harness (\`tag-go\`). Download the archive for your OS/arch, extract, and put \`tag\` on your PATH. Verify with SHA256SUMS.txt." \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt \
+          || gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt --clobber

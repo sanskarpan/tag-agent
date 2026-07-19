@@ -1003,6 +1003,170 @@ func TestE2EDoctorJSON(t *testing.T) {
 	}
 }
 
+// TestE2EEmptyJSONListsAreArrays covers #559: `--json` on an empty result set
+// must emit `[]`, never `null`. Before the fix these commands marshaled a nil
+// slice → `null`, breaking `--json` consumers that iterate the result.
+func TestE2EEmptyJSONListsAreArrays(t *testing.T) {
+	h := newHome(t)
+	run(t, h, "mem", "stats") // touch DB so schema/tables exist
+	cases := [][]string{
+		{"swarm", "list", "--json"},
+		{"trace", "list", "--json"},
+		{"webhook", "rule-list", "--json"},
+		{"notify", "list", "--json"},
+		{"memory-journal", "list", "--json"},
+	}
+	for _, c := range cases {
+		out, code := run(t, h, c...)
+		if code != 0 {
+			t.Errorf("%v exit %d: %q", c, code, out)
+		}
+		trimmed := strings.TrimSpace(out)
+		if trimmed != "[]" {
+			t.Errorf("%v empty --json must be [] not %q", c, trimmed)
+		}
+	}
+}
+
+// TestE2EJSONHonoredWhereItWasIgnored covers #560: env, `persona stack`, and
+// `mem2 tier` printed human text under --json. Each must now emit valid JSON.
+func TestE2EJSONHonoredWhereItWasIgnored(t *testing.T) {
+	h := newHome(t)
+
+	// env --json → object with TAG_HOME + HOME
+	out, code := run(t, h, "env", "--json")
+	if code != 0 {
+		t.Fatalf("env --json exit %d: %q", code, out)
+	}
+	var envObj map[string]any
+	if err := json.Unmarshal([]byte(out), &envObj); err != nil {
+		t.Errorf("env --json not valid JSON: %q err=%v", out, err)
+	} else if _, ok := envObj["TAG_HOME"]; !ok {
+		t.Errorf("env --json missing TAG_HOME: %q", out)
+	}
+
+	// persona stack --json → object with a stack array (empty here)
+	run(t, h, "persona", "apply", "terse-engineer", "--profile", "orchestrator")
+	out, code = run(t, h, "persona", "stack", "--profile", "orchestrator", "--json")
+	if code != 0 {
+		t.Fatalf("persona stack --json exit %d: %q", code, out)
+	}
+	var stackObj struct {
+		Stack []map[string]any `json:"stack"`
+	}
+	if err := json.Unmarshal([]byte(out), &stackObj); err != nil {
+		t.Errorf("persona stack --json not valid JSON: %q err=%v", out, err)
+	} else if len(stackObj.Stack) != 1 {
+		t.Errorf("persona stack --json want 1 entry: %q", out)
+	}
+
+	// mem2 tier --json → object keyed by tier
+	run(t, h, "mem", "add", "a durable fact", "--type", "fact", "--confidence", "0.95")
+	out, code = run(t, h, "mem2", "tier", "--json")
+	if code != 0 {
+		t.Fatalf("mem2 tier --json exit %d: %q", code, out)
+	}
+	var tierObj map[string]any
+	if err := json.Unmarshal([]byte(out), &tierObj); err != nil {
+		t.Errorf("mem2 tier --json not valid JSON: %q err=%v", out, err)
+	} else if _, ok := tierObj["core"]; !ok {
+		t.Errorf("mem2 tier --json missing core tier key: %q", out)
+	}
+}
+
+// TestE2EJSONErrorPaths covers #561: error paths that ran under --json emitted
+// plain `error: ...` text on stderr instead of a parseable {"error":...} object
+// on stdout. Both must now emit JSON on the error path (and still exit nonzero).
+func TestE2EJSONErrorPaths(t *testing.T) {
+	h := newHome(t)
+
+	// dag save with a malformed --steps under --json
+	out, code := run(t, h, "dag", "save", "bad", "--steps", "{not json", "--json")
+	if code == 0 {
+		t.Errorf("dag save bad steps should exit nonzero: %q", out)
+	}
+	if !jsonErrorObject(t, out) {
+		t.Errorf("dag save --json error must be a JSON {error:...} object: %q", out)
+	}
+
+	// mem2 store with no --id under --json
+	out, code = run(t, h, "mem2", "store", "store", "--json")
+	if code == 0 {
+		t.Errorf("mem2 store without --id should exit nonzero: %q", out)
+	}
+	if !jsonErrorObject(t, out) {
+		t.Errorf("mem2 store --json error must be a JSON {error:...} object: %q", out)
+	}
+}
+
+// jsonErrorObject reports whether out contains a JSON {"error":...} object
+// (the combined stdout+stderr may also carry the "error: ..." stderr line, so
+// scan line-by-line for a parseable error object).
+func jsonErrorObject(t *testing.T, out string) bool {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var obj map[string]any
+		if json.Unmarshal([]byte(line), &obj) == nil {
+			if _, ok := obj["error"]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestE2ECompletionBadShell covers #562: `tag completion badshell` (and a bare
+// `tag completion`) used to print help and exit 0. An unknown or missing shell
+// must be a usage error (exit 2); a valid shell still generates a script (exit 0).
+func TestE2ECompletionBadShell(t *testing.T) {
+	h := newHome(t)
+	if _, code := run(t, h, "completion", "badshell"); code != 2 {
+		t.Errorf("completion badshell must exit 2, got %d", code)
+	}
+	if _, code := run(t, h, "completion"); code != 2 {
+		t.Errorf("bare completion must exit 2, got %d", code)
+	}
+	for _, sh := range []string{"bash", "zsh", "fish", "powershell"} {
+		out, code := run(t, h, "completion", sh)
+		if code != 0 || len(strings.TrimSpace(out)) == 0 {
+			t.Errorf("completion %s should emit a script and exit 0: code=%d", sh, code)
+		}
+	}
+}
+
+// TestE2EMem2Extract covers #563: `mem2 extract <run-id>` read run text ONLY
+// from the never-populated `steps` table, so it returned "Run not found or has
+// no recorded output" (exit 1) for EVERY valid run. A valid run must now yield
+// the honest offline "Extracted 0 memories" (exit 0); only a genuinely missing
+// run id errors.
+func TestE2EMem2Extract(t *testing.T) {
+	h := newHome(t)
+	// record a real run via the offline echo provider
+	out, _ := run(t, h, "run", "extract me", "--json")
+	var r struct {
+		RunID string `json:"run_id"`
+	}
+	if err := json.Unmarshal([]byte(out), &r); err != nil || r.RunID == "" {
+		t.Fatalf("could not parse run_id: %q err=%v", out, err)
+	}
+	// valid run → honest exit 0 with "Extracted 0 memories" (not "not found")
+	out, code := run(t, h, "mem2", "extract", r.RunID)
+	if code != 0 || !strings.Contains(out, "Extracted 0 memories") {
+		t.Errorf("extract valid run must exit 0 with honest message: %q code=%d", out, code)
+	}
+	if strings.Contains(strings.ToLower(out), "not found") {
+		t.Errorf("valid run must not report 'not found': %q", out)
+	}
+	// a genuinely missing run id still errors
+	if o, c := run(t, h, "mem2", "extract", "deadbeefdeadbeef"); c == 0 || !strings.Contains(o, "not found") {
+		t.Errorf("missing run id must error with 'not found': %q code=%d", o, c)
+	}
+}
+
 func TestE2EDagValidation(t *testing.T) {
 	h := newHome(t)
 	if _, c := run(t, h, "dag", "save", "d", "--steps", `[{"task":""}]`); c == 0 {
