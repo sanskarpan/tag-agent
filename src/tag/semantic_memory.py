@@ -119,7 +119,15 @@ def search_memories(
     min_confidence: float = 0.0,
     memory_type: str | None = None,
 ) -> list[dict]:
-    """Full-text search over memories, sorted by effective confidence."""
+    """Full-text search over memories, sorted by effective confidence.
+
+    The FTS5 tokenizer only matches whole (stemmed) tokens, so it misses
+    partial-word queries (e.g. "moji" inside "émoji") and non-tokenizable
+    scripts such as CJK (issue #567). To preserve recall we ALWAYS supplement
+    the FTS candidate set with a case-insensitive ``LIKE '%query%'`` substring
+    scan over content. FTS still drives ranking for normal queries; the LIKE
+    pass only adds rows FTS would otherwise drop.
+    """
     ensure_schema(conn)
     # FTS query to get candidate IDs
     try:
@@ -129,18 +137,30 @@ def search_memories(
         ).fetchall()
         candidate_ids = {r[0] for r in fts_rows}
     except Exception:
-        # FTS5 not available or query error — fallback to LIKE
-        candidate_ids = None
+        # FTS5 not available or query error (e.g. FTS special syntax) — the LIKE
+        # substring pass below still provides recall.
+        candidate_ids = set()
 
-    if candidate_ids is not None:
-        if not candidate_ids:
-            return []
-        placeholders = ",".join("?" * len(candidate_ids))
-        base_where = f"id IN ({placeholders})"
-        base_params: list = list(candidate_ids)
-    else:
-        base_where = "content LIKE ?"
-        base_params = [f"%{query}%"]
+    # Always-on substring fallback/supplement. LIKE matches Unicode codepoints
+    # verbatim (so CJK substrings work) and is ASCII case-insensitive, which
+    # covers partial-word queries the tokenizer misses. Parameterized to avoid
+    # SQL injection; the caller-supplied query is only ever bound, never
+    # interpolated. LIKE wildcards (%,_) in the query are escaped so they match
+    # literally rather than acting as wildcards.
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like_rows = conn.execute(
+        "SELECT id FROM semantic_memories WHERE profile=? "
+        "AND content LIKE ? ESCAPE '\\' LIMIT 200",
+        (profile, f"%{escaped}%"),
+    ).fetchall()
+    candidate_ids |= {r[0] for r in like_rows}
+
+    if not candidate_ids:
+        return []
+
+    placeholders = ",".join("?" * len(candidate_ids))
+    base_where = f"id IN ({placeholders})"
+    base_params: list = list(candidate_ids)
 
     type_clause = " AND memory_type=?" if memory_type else ""
     type_params: list = [memory_type] if memory_type else []
@@ -344,13 +364,23 @@ def search_memories_hybrid(
     except Exception:
         fts_id_rank = {}
 
-    if not fts_id_rank and mode != "bm25":
-        # Fallback: grab all profile memories and do LIKE filter
-        fallback_rows = conn.execute(
-            "SELECT id FROM semantic_memories WHERE profile=? AND content LIKE ?",
-            (profile, f"%{query}%"),
+    if mode != "bm25":
+        # Always-on LIKE substring supplement so partial-word and CJK queries
+        # (issue #567) that the FTS tokenizer misses still surface. Any ids not
+        # already ranked by FTS are appended after the FTS-ranked ones (they
+        # keep a lower fusion weight via their higher rank index). Wildcards in
+        # the query are escaped so they match literally.
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like_rows = conn.execute(
+            "SELECT id FROM semantic_memories WHERE profile=? "
+            "AND content LIKE ? ESCAPE '\\' LIMIT 200",
+            (profile, f"%{escaped}%"),
         ).fetchall()
-        fts_id_rank = {r[0]: i for i, r in enumerate(fallback_rows)}
+        next_rank = len(fts_id_rank)
+        for (mid,) in like_rows:
+            if mid not in fts_id_rank:
+                fts_id_rank[mid] = next_rank
+                next_rank += 1
 
     candidate_ids = set(fts_id_rank.keys())
     if not candidate_ids and mode in ("fts", "hybrid"):
