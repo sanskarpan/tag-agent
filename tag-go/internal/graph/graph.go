@@ -12,9 +12,17 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"github.com/tag-agent/tag/internal/store"
 )
+
+// DBTX is the query surface the graph package needs. Both *store.DB (which
+// embeds *sql.DB) and *sql.Tx satisfy it, so a caller can run a whole
+// Reset+rebuild inside ONE transaction rather than a sequence of autocommit
+// statements that a concurrent `graph build` can interleave with.
+type DBTX interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
 
 var techKeywords = map[string]bool{
 	"python": true, "javascript": true, "typescript": true, "rust": true, "go": true,
@@ -93,31 +101,31 @@ func ExtractEntities(content string) []rawEntity {
 
 // addEntity upserts an entity by (profile, name COLLATE NOCASE), bumping
 // mention_count and keeping the max confidence. Returns the entity id.
-func addEntity(db *store.DB, name, etype, profile string, confidence float64) (string, error) {
+//
+// This is a SINGLE atomic INSERT … ON CONFLICT DO UPDATE. The previous
+// implementation read mention_count and wrote back count+1 in two separate
+// statements, which is a classic lost update: two concurrent `graph build`
+// processes could both read N and both write N+1. The upsert increments
+// server-side (mention_count = mention_count + 1) so the count can never be
+// lost, and RETURNING gives us the surviving row's id in the same round trip.
+// The conflict target relies on the UNIQUE index
+// idx_ent_name_unique(profile, name COLLATE NOCASE) created by the schema.
+func addEntity(db DBTX, name, etype, profile string, confidence float64) (string, error) {
 	var id string
-	var count int
-	var conf float64
-	err := db.QueryRow(`SELECT id, mention_count, confidence FROM entities WHERE profile=? AND name=? COLLATE NOCASE`,
-		profile, name).Scan(&id, &count, &conf)
-	if err == nil {
-		newConf := conf
-		if confidence > newConf {
-			newConf = confidence
-		}
-		_, err = db.Exec(`UPDATE entities SET mention_count=?, confidence=? WHERE id=?`, count+1, newConf, id)
-		return id, err
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	err := db.QueryRow(`INSERT INTO entities(id,name,entity_type,description,confidence,profile,created_at,mention_count)
+		VALUES(?,?,?,'',?,?,?,1)
+		ON CONFLICT(profile, name COLLATE NOCASE) DO UPDATE SET
+			mention_count = entities.mention_count + 1,
+			confidence    = MAX(entities.confidence, excluded.confidence)
+		RETURNING id`, uuid.NewString()[:12], name, etype, confidence, profile, now()).Scan(&id)
+	if err != nil {
 		return "", err
 	}
-	id = uuid.NewString()[:12]
-	_, err = db.Exec(`INSERT INTO entities(id,name,entity_type,description,confidence,profile,created_at,mention_count)
-		VALUES(?,?,?,'',?,?,?,1)`, id, name, etype, confidence, profile, now())
-	return id, err
+	return id, nil
 }
 
 // addRelation idempotently inserts a (source,target,type) relation.
-func addRelation(db *store.DB, srcID, tgtID, relType string, confidence float64, memoryID string) error {
+func addRelation(db DBTX, srcID, tgtID, relType string, confidence float64, memoryID string) error {
 	var existing string
 	err := db.QueryRow(`SELECT id FROM relations WHERE source_entity_id=? AND target_entity_id=? AND relation_type=?`,
 		srcID, tgtID, relType).Scan(&existing)
@@ -133,40 +141,31 @@ func addRelation(db *store.DB, srcID, tgtID, relType string, confidence float64,
 }
 
 // Reset clears all graph state for a profile (idempotent rebuild — C021).
-func Reset(db *store.DB, profile string) error {
-	rows, err := db.Query(`SELECT id FROM entities WHERE profile=?`, profile)
-	if err != nil {
+//
+// Every statement is a WRITE (the relation purge uses a correlated subquery
+// instead of first SELECTing the ids). That matters when Reset runs as the
+// opening statement of a transaction: a leading SELECT would pin a WAL read
+// snapshot, and the following DELETE would then have to UPGRADE the tx to a
+// writer — an upgrade SQLite fails with SQLITE_BUSY_SNAPSHOT *without*
+// consulting busy_timeout, so concurrent `graph build` runs died instantly.
+// Writing first takes the write lock up front, where busy_timeout does apply.
+func Reset(db DBTX, profile string) error {
+	if _, err := db.Exec(`DELETE FROM relations
+		WHERE source_entity_id IN (SELECT id FROM entities WHERE profile=?)
+		   OR target_entity_id IN (SELECT id FROM entities WHERE profile=?)`, profile, profile); err != nil {
 		return err
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-	for _, id := range ids {
-		if _, err := db.Exec(`DELETE FROM relations WHERE source_entity_id=? OR target_entity_id=?`, id, id); err != nil {
-			return err
-		}
 	}
 	if _, err := db.Exec(`DELETE FROM entities WHERE profile=?`, profile); err != nil {
 		return err
 	}
+	var err error
 	_, err = db.Exec(`DELETE FROM entity_communities WHERE profile=?`, profile)
 	return err
 }
 
 // ExtractAndStore extracts entities + co-occurrence relations from one memory.
 // Returns (entitiesAdded, relationsAdded).
-func ExtractAndStore(db *store.DB, memoryID, content, profile string) (int, int, error) {
+func ExtractAndStore(db DBTX, memoryID, content, profile string) (int, int, error) {
 	raw := ExtractEntities(content)
 	var ids []string
 	for _, e := range raw {
@@ -227,7 +226,7 @@ func unionFind(nodes []string, edges [][2]string) map[string]string {
 }
 
 // DetectCommunities groups profile entities via union-find over in-profile relations.
-func DetectCommunities(db *store.DB, profile string) ([]Community, error) {
+func DetectCommunities(db DBTX, profile string) ([]Community, error) {
 	rows, err := db.Query(`SELECT id, name, mention_count FROM entities WHERE profile=?`, profile)
 	if err != nil {
 		return nil, err
@@ -313,7 +312,7 @@ type Entity struct {
 }
 
 // Query returns profile entities (optionally name-filtered) ranked by mentions.
-func Query(db *store.DB, profile, nameFilter string, limit int) ([]Entity, error) {
+func Query(db DBTX, profile, nameFilter string, limit int) ([]Entity, error) {
 	q := `SELECT id,name,entity_type,mention_count,confidence FROM entities WHERE profile=?`
 	args := []any{profile}
 	if nameFilter != "" {
@@ -351,7 +350,7 @@ type Relation struct {
 // endpoints must be entities in profile), mirroring Python query_graph's
 // relations set. Pass empty entityIDs to get all in-profile relations. The
 // result is always non-nil so JSON emits [] not null (parity, issue #528).
-func Relations(db *store.DB, profile string, entityIDs []string) ([]Relation, error) {
+func Relations(db DBTX, profile string, entityIDs []string) ([]Relation, error) {
 	out := []Relation{}
 	q := `SELECT r.id,r.source_entity_id,r.target_entity_id,r.relation_type,r.confidence
 		FROM relations r
@@ -384,7 +383,7 @@ func Relations(db *store.DB, profile string, entityIDs []string) ([]Relation, er
 }
 
 // Summary returns (entities, relations, communities) counts for a profile.
-func Summary(db *store.DB, profile string) (int, int, int, error) {
+func Summary(db DBTX, profile string) (int, int, int, error) {
 	var nEnt, nRel int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM entities WHERE profile=?`, profile).Scan(&nEnt); err != nil {
 		return 0, 0, 0, err

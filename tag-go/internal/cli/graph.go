@@ -81,25 +81,41 @@ func registerGraph(root *cobra.Command, app *App) {
 				return err
 			}
 			p := app.profile(profile)
-			// Idempotent rebuild: clear prior state so mention_count isn't re-inflated (C021).
-			if err := graph.Reset(db, p); err != nil {
-				return err
-			}
+			// Read the source memories BEFORE opening the write transaction: the
+			// store pins MaxOpenConns(1), so a query issued on db while a tx holds
+			// that single connection would deadlock.
 			mems, err := memory.List(db.DB, p, "", 10000)
 			if err != nil {
 				return err
 			}
+			// Reset + rebuild must be ONE transaction. Run as separate autocommit
+			// statements, a concurrent `graph build` could observe the half-cleared
+			// graph and re-extract on top of it, inflating mention_count. The first
+			// statement inside the tx is Reset's DELETE, so SQLite takes the write
+			// lock up front (no read-then-upgrade deadlock) and builds serialize.
+			tx, err := db.Begin()
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback() //nolint:errcheck // no-op once Commit has succeeded
+			// Idempotent rebuild: clear prior state so mention_count isn't re-inflated (C021).
+			if err := graph.Reset(tx, p); err != nil {
+				return err
+			}
 			entCount, relCount := 0, 0
 			for _, m := range mems {
-				e, r, err := graph.ExtractAndStore(db, m.ID, m.Content, p)
+				e, r, err := graph.ExtractAndStore(tx, m.ID, m.Content, p)
 				if err != nil {
 					return err
 				}
 				entCount += e
 				relCount += r
 			}
-			comms, err := graph.DetectCommunities(db, p)
+			comms, err := graph.DetectCommunities(tx, p)
 			if err != nil {
+				return err
+			}
+			if err := tx.Commit(); err != nil {
 				return err
 			}
 			outJSON(map[string]any{"memories": len(mems), "entities": entCount, "relations": relCount, "communities": len(comms)},
