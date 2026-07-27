@@ -129,33 +129,22 @@ func TestSbplProfileRuleOrder(t *testing.T) {
 // TestValidateRunDirRejectsBroadDirs is the unit half of the "broad run dir
 // re-opens every denial" regression: a run dir at or above a protected tree is
 // refused outright, while an ordinary scratch dir under $HOME is accepted.
+//
+// The table now lives in rundir_test.go (darwinRunDirCases) because the check
+// itself is shared with Linux; this test pins that the RUNTIME entry point --
+// validateRunDir, i.e. what buildIsolation calls -- still selects the darwin
+// tables on a darwin host.
 func TestValidateRunDirRejectsBroadDirs(t *testing.T) {
-	const home = "/Users/nobody"
-	reject := []string{
-		"/", "/Users", "/Users/", "/home", "/Volumes", "/System", "/System/Volumes/Data",
-		"/private", "/var", "/private/var", "/etc", "/private/etc", "/var/db", "/usr",
-		"/Library",
-		home, home + "/", // $HOME itself
-		home + "/.ssh", home + "/.ssh/keys", home + "/.aws", home + "/Library/Keychains",
-		home + "/Library",                        // ancestor of ~/Library/Keychains
-		"/System/Volumes/Data/Users/nobody",      // firmlink spelling of $HOME
-		"/System/Volumes/Data/Users/nobody/.ssh", // firmlink spelling of a secret tree
-	}
-	for _, d := range reject {
-		if err := validateRunDir(d, home); err == nil {
+	c := darwinRunDirCases()
+	for _, d := range c.reject {
+		if err := validateRunDir(d, c.home); err == nil {
 			t.Fatalf("validateRunDir(%q) accepted a run dir at/above a protected boundary", d)
 		} else if !strings.Contains(err.Error(), "--backend docker") {
 			t.Fatalf("validateRunDir(%q) error should name the escape hatch, got %q", d, err)
 		}
 	}
-	accept := []string{
-		home + "/scratch", home + "/scratch/deep", home + "/Documents/proj",
-		"/private/tmp/x", "/private/var/folders/ab/cd/T/go-build123", "/Volumes/Ext/proj",
-		"/usr/local/build", "/opt/work",
-		"/System/Volumes/Data/Users/nobody/scratch", // firmlink spelling of a scratch dir
-	}
-	for _, d := range accept {
-		if err := validateRunDir(d, home); err != nil {
+	for _, d := range c.accept {
+		if err := validateRunDir(d, c.home); err != nil {
 			t.Fatalf("validateRunDir(%q) rejected an ordinary run dir: %v", d, err)
 		}
 	}

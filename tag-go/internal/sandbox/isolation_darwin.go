@@ -34,111 +34,13 @@ func darwinIsolationString(weakened []string) string {
 	return darwinIsolationBase + "; WEAKENED: " + strings.Join(weakened, "; ")
 }
 
-// sensitiveHomeDirs are credential locations denied for BOTH read and write.
-var sensitiveHomeDirs = []string{
-	".ssh", ".aws", ".gnupg", ".config", ".gcloud", ".kube", ".docker",
-	"Library/Keychains",
-}
-
 // systemWriteRoots are made read-only by the profile.
 var systemWriteRoots = []string{"/usr", "/bin", "/sbin", "/System", "/Library"}
 
-// dataFirmlinkPrefix is the APFS firmlink root: /System/Volumes/Data/Users/x and
-// /Users/x are the same directory. EvalSymlinks does NOT collapse it (a firmlink
-// is not a symlink), so run-dir validation normalises it away -- otherwise
-// `--dir /System/Volumes/Data/Users/<me>` would spell $HOME past a string check.
-const dataFirmlinkPrefix = "/System/Volumes/Data"
-
-// runDirTooBroadMsg is the fail-closed message for a run dir that is itself a
-// sensitive boundary. It mirrors the sandbox-exec-missing path (exit 127) and
-// names the escape hatch.
-func runDirTooBroadMsg(runDir, why string) string {
-	return fmt.Sprintf("sandbox: refusing to run with %s as the run directory: %s. "+
-		"The run directory is the sandbox's read/write boundary, so it must be a specific "+
-		"working directory (e.g. a scratch dir under your home), never a sensitive tree or "+
-		"one of its ancestors. Pass --dir <subdirectory>, or use --backend docker for "+
-		"isolated execution.", runDir, why)
-}
-
-// normalizeRunDir strips the APFS data-volume firmlink prefix and any trailing
-// slash so path comparisons see the canonical spelling.
-func normalizeRunDir(p string) string {
-	if p != dataFirmlinkPrefix && strings.HasPrefix(p, dataFirmlinkPrefix+"/") {
-		p = strings.TrimPrefix(p, dataFirmlinkPrefix)
-	}
-	if len(p) > 1 {
-		p = strings.TrimRight(p, "/")
-	}
-	if p == "" {
-		p = "/"
-	}
-	return p
-}
-
-// isAtOrUnder reports whether p is dir itself or lives inside it.
-func isAtOrUnder(p, dir string) bool {
-	if dir == "/" {
-		return true
-	}
-	return p == dir || strings.HasPrefix(p, dir+"/")
-}
-
-// isAtOrAbove reports whether p is dir itself or an ancestor of it: exactly the
-// relationship that lets `(allow ... (subpath p))` cancel a denial of dir.
-func isAtOrAbove(p, dir string) bool {
-	return isAtOrUnder(dir, p)
-}
-
-// validateRunDir rejects run directories that are at or above a sensitive
-// boundary.
-//
-// This is the primary fix for the "broad run dir re-opens every denial" class:
-// because the run dir is re-allowed for read+write, a run dir of `/`, `/Users`
-// or `$HOME` would hand back exactly the trees the profile exists to deny (and
-// `--dir` defaults to the current working directory, so `cd ~ && tag sandbox
-// run` used to be enough). A run dir is the confinement boundary, so requiring
-// it to be a specific directory is the control working, not a limitation.
-//
-// It also rejects run dirs *inside* a secret tree (e.g. ~/.ssh/keys), which the
-// profile would deny anyway -- refusing up front is clearer than a run that
-// cannot read its own cwd.
-func validateRunDir(runDir, home string) error {
-	p := normalizeRunDir(runDir)
-
-	// Trees whose contents are secret: being at or under them is disqualifying.
-	secretTrees := []string{"/etc", "/private/etc", "/var/db", "/private/var/db"}
-	// Boundaries that must never be re-opened wholesale: being at or above them
-	// is disqualifying.
-	boundaries := []string{
-		"/", "/Users", "/home", "/Volumes", "/System", dataFirmlinkPrefix,
-		"/Library", "/private", "/var", "/private/var", "/usr", "/etc", "/private/etc",
-		"/var/db", "/private/var/db",
-	}
-	if home != "" {
-		h := normalizeRunDir(home)
-		boundaries = append(boundaries, h)
-		for _, d := range sensitiveHomeDirs {
-			s := h + "/" + d
-			boundaries = append(boundaries, s)
-			secretTrees = append(secretTrees, s)
-		}
-	}
-	for _, s := range secretTrees {
-		if isAtOrUnder(p, s) {
-			return fmt.Errorf("%s", runDirTooBroadMsg(runDir, "it is inside the protected tree "+s))
-		}
-	}
-	for _, b := range boundaries {
-		if isAtOrAbove(p, b) {
-			why := "it is the protected path " + b
-			if p != b {
-				why = "it contains the protected path " + b
-			}
-			return fmt.Errorf("%s", runDirTooBroadMsg(runDir, why))
-		}
-	}
-	return nil
-}
+// The run-dir boundary check (validateRunDir, normalizeRunDir, the darwin
+// boundary tables and sensitiveHomeDirs) lives in rundir.go: Linux has the same
+// class of flaw -- Landlock makes the run dir the only writable tree -- so the
+// logic is shared and only the tables vary per platform.
 
 // sbplQuote renders p as an SBPL string literal body, escaping the two
 // characters that are meaningful inside one (`\` and `"`).
@@ -275,7 +177,7 @@ func buildIsolation(runDir string, _ time.Duration) (*isolationPlan, *Result, er
 		return nil, &Result{
 			Exit:      127,
 			Stderr:    err.Error(),
-			Isolation: "none (failed closed: run directory too broad to confine)",
+			Isolation: runDirTooBroadIsolation,
 		}, nil
 	}
 	profile, weakened, err := sbplProfile(runDir, home)
