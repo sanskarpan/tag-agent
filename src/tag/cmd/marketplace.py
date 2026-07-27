@@ -556,7 +556,10 @@ def cmd_sandbox(args: argparse.Namespace) -> int:
     sub = getattr(args, "sandbox_subcommand", "list")
 
     try:
-        from tag.sandbox import run_in_sandbox, list_sandbox_runs, get_sandbox_run
+        from tag.sandbox import (
+            ShellMetacharacterError, run_in_sandbox, list_sandbox_runs,
+            get_sandbox_run,
+        )
     except ImportError as exc:
         db.close()
         print_error(f"tag.sandbox not available: {exc}")
@@ -574,6 +577,12 @@ def cmd_sandbox(args: argparse.Namespace) -> int:
 
         try:
             result = run_in_sandbox(db, command, backend=backend, image=image, timeout=timeout)
+        except ShellMetacharacterError as exc:
+            # Malformed COMMAND argument — a usage error, so exit 2 per the
+            # project's exit-code contract (2 = usage, 1 = runtime failure).
+            db.close()
+            print_error(str(exc))
+            return 2
         except ValueError as exc:
             db.close()
             print_error(str(exc))
@@ -835,8 +844,19 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     sb_cmd = sub.add_parser("sandbox", help="Isolated code execution (restricted subprocess or Docker)")
     sb_sub = sb_cmd.add_subparsers(dest="sandbox_subcommand")
 
-    sb_run = sb_sub.add_parser("run", help="Run a command in the sandbox")
-    sb_run.add_argument("command", metavar="COMMAND", help="Shell command to run")
+    sb_run = sb_sub.add_parser(
+        "run", help="Run a command in the sandbox",
+        description="Run a single program in the sandbox. The command is split "
+                    "into arguments with shell-style quoting, but it is executed "
+                    "directly WITHOUT a shell: pipes, redirections, globs, "
+                    "command substitution and ';'/'&&' chains are rejected "
+                    "rather than silently passed as literal arguments. To use "
+                    "shell syntax, invoke a shell explicitly (it stays inside "
+                    "the same sandbox), e.g. \"sh -c 'echo hi > out.txt'\".",
+    )
+    sb_run.add_argument("command", metavar="COMMAND",
+                        help="Program and arguments to run (no shell; quote shell "
+                             "metacharacters or use \"sh -c '...'\")")
     sb_run.add_argument("--backend", choices=["restricted", "docker"], default="restricted")
     sb_run.add_argument("--image", default="python:3.12-slim", help="Docker image (for --backend docker)")
     sb_run.add_argument("--timeout", type=int, default=60, metavar="SECONDS")

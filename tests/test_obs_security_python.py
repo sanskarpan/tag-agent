@@ -450,3 +450,254 @@ class TestPricingTable:
         assert cost == pytest.approx(want_cost), (
             f"{model}: computed ${cost}, expected ${want_cost}"
         )
+
+
+# ---------------------------------------------------------------------------
+# #9 — Python `security scan` missed hardcoded passwords the Go scanner catches
+# ---------------------------------------------------------------------------
+
+class TestGenericSecretPattern:
+    """Pre-fix: security.py had no `generic_secret` pattern (Go's scan.go does),
+    so `PASSWORD = "..."` / `DB_PASSWORD=...` lines fell below the 4.5-bit
+    entropy threshold and a directory full of them scanned as clean."""
+
+    # All values below are obviously-fake placeholders.
+    @pytest.mark.parametrize(
+        "line",
+        [
+            'PASSWORD = "notarealpassword123"',
+            "DB_PASSWORD=notarealpassword123",
+            'api_key: "placeholderplaceholder"',
+            "SECRET = 'fakefakefakefakefake'",
+            'auth_token = "totallyfakevalue1234"',
+        ],
+    )
+    def test_hardcoded_credentials_are_reported(self, line, tmp_path):
+        from tag import security
+
+        findings = security.scan_text(line, tmp_path / "app.py")
+        assert findings, f"no finding for {line!r}"
+        assert findings[0].pattern_name == "generic_secret"
+
+    def test_ordinary_code_is_not_flagged(self, tmp_path):
+        from tag import security
+
+        benign = "\n".join([
+            "def main():",
+            "    print('hello world')",
+            "    return 0",
+            "password = get_password()",   # no literal assigned
+            "TOKEN_LENGTH = 16",           # too short / not a credential
+        ])
+        assert security.scan_text(benign, tmp_path / "ok.py") == []
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "    OPENROUTER_API_KEY: your-openrouter-api-key",  # shipped tag.yaml
+            'API_KEY = "<redacted-by-the-scrubber>"',
+            "password: changeme-please-now",
+            'token = "${MY_TOKEN_FROM_ENV}"',
+        ],
+    )
+    def test_documentation_placeholders_are_not_flagged(self, line, tmp_path):
+        """The generic pattern must not make every fresh install scan dirty."""
+        from tag import security
+
+        assert security.scan_text(line, tmp_path / "tag.yaml") == []
+
+    def test_directory_scan_reports_planted_password(self, tmp_path):
+        from tag import security
+
+        (tmp_path / "app.py").write_text('PASSWORD = "notarealpassword123"\n')
+        findings = list(security.scan_directory(tmp_path))
+        assert [f.pattern_name for f in findings] == ["generic_secret"]
+
+    def test_vendor_specific_patterns_still_win(self, tmp_path):
+        """generic_secret is last in the list, so more precise names survive."""
+        from tag import security
+
+        findings = security.scan_text(
+            'api_key = "sk-ant-AAAAAAAAAAAAAAAAAAAAAAAAAAAA"', tmp_path / "k.py"
+        )
+        assert findings and findings[0].pattern_name == "anthropic_api_key"
+
+    def test_skip_lists_reconciled_with_go(self):
+        """Python skip-lists gained vendor/.db/.sqlite3; Go skip-dirs gained
+        dist/build/venv."""
+        from tag import security
+
+        assert "vendor" in security._SKIP_DIRS
+        assert {".db", ".sqlite3"} <= security._SKIP_EXTS
+
+        go_scan = (
+            Path(__file__).resolve().parents[1]
+            / "tag-go" / "internal" / "security" / "scan.go"
+        )
+        if go_scan.exists():
+            src = go_scan.read_text()
+            skip_dirs_line = next(
+                ln for ln in src.splitlines() if ln.startswith("var skipDirs")
+            )
+            for d in ("dist", "build", "venv"):
+                assert f'"{d}": true' in skip_dirs_line, f"Go skipDirs missing {d}"
+
+    def test_generic_secret_regex_matches_go_source(self):
+        """The ported pattern is the same regex the Go implementation uses."""
+        from tag import security
+
+        by_name = dict(security._PATTERNS)
+        assert "generic_secret" in by_name
+        go_scan = (
+            Path(__file__).resolve().parents[1]
+            / "tag-go" / "internal" / "security" / "scan.go"
+        )
+        if go_scan.exists():
+            assert "generic_secret" in go_scan.read_text()
+
+
+# ---------------------------------------------------------------------------
+# #15 — `swarm run` returned exit code 2 (usage) for a RUNTIME failure
+# ---------------------------------------------------------------------------
+
+class TestSwarmRunExitCodes:
+    """Contract: usage/arg errors exit 2, runtime failures exit 1.
+
+    Pre-fix: a coordinator that failed at runtime (SwarmManifestError — e.g. no
+    API key, model returned no usable JSON) returned 2, misreporting a runtime
+    failure as CLI misuse."""
+
+    def _args(self, **over):
+        import argparse
+
+        base = dict(
+            swarm_subcommand="run", config=None, goal="do a thing",
+            coordinator_profile=None, max_agents=2, failure_policy="best_effort",
+            timeout_per_agent=5, approve=False, sequential=True, dry_run=False,
+            json=False,
+        )
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def test_runtime_coordinator_failure_exits_1(self, tmp_path, monkeypatch, capsys):
+        import tag.swarm as swarm_mod
+        from tag.cmd import swarm as swarm_cmd
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        def _boom(self, goal, swarm_id, max_agents):
+            raise swarm_mod.SwarmManifestError(
+                "Coordinator produced no usable JSON output after 2 attempts"
+            )
+
+        monkeypatch.setattr(swarm_mod.SwarmCoordinator, "produce_manifest", _boom)
+
+        rc = swarm_cmd.cmd_swarm_context(self._args())
+        err = capsys.readouterr().err
+        assert "coordinator failed" in err
+        assert rc == 1, f"runtime failure must exit 1, got {rc}"
+
+    def test_missing_required_arg_still_exits_2(self):
+        """A genuine usage error (missing --goal) keeps argparse's exit code 2."""
+        import argparse
+
+        from tag.cmd import swarm as swarm_cmd
+
+        parser = argparse.ArgumentParser(prog="tag")
+        sub = parser.add_subparsers(dest="command")
+        swarm_cmd.register(sub)
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(["swarm", "run"])
+        assert exc.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# #16 — `sandbox run` advertised a "Shell command" but split into argv
+# ---------------------------------------------------------------------------
+
+class TestSandboxShellMetacharacters:
+    """Pre-fix: `tag sandbox run "echo hi > /tmp/x"` printed `hi > /tmp/x` and
+    created no file — the redirection was passed to echo as literal argv words
+    while the help text promised a "Shell command". The fix rejects unquoted
+    shell metacharacters (rather than spawning an unconfined shell) and says so
+    in the help text."""
+
+    @pytest.mark.parametrize(
+        "command,meta",
+        [
+            ("echo hi > /tmp/x", ">"),
+            ("cat f | wc -l", "|"),
+            ("ls *.py", "*"),
+            ("echo a && echo b", "&"),
+            ("echo a; echo b", ";"),
+            ("echo $HOME", "$"),
+            ("echo `id`", "`"),
+        ],
+    )
+    def test_metacharacters_detected(self, command, meta):
+        from tag.sandbox import find_shell_metacharacters
+
+        assert meta in find_shell_metacharacters(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo hello",
+            "python -c 'print(2 * 3)'",          # metachar inside single quotes
+            'sh -c "echo hi > out.txt"',          # explicit, still jailed, shell
+            "grep -n foo bar.txt",
+        ],
+    )
+    def test_quoted_or_plain_commands_are_allowed(self, command):
+        from tag.sandbox import find_shell_metacharacters
+
+        assert find_shell_metacharacters(command) == []
+
+    def test_run_in_sandbox_rejects_redirection(self, tmp_path):
+        from tag.sandbox import ShellMetacharacterError, run_in_sandbox
+
+        conn = sqlite3.connect(tmp_path / "t.db")
+        with pytest.raises(ShellMetacharacterError) as exc:
+            run_in_sandbox(conn, "echo hi > /tmp/tag_sbx_probe.txt")
+        msg = str(exc.value)
+        assert "'>'" in msg and "no shell" in msg
+        # The rejected command must not be recorded as a run.
+        assert conn.execute("SELECT COUNT(*) FROM sandbox_runs").fetchone()[0] == 0
+        conn.close()
+        assert not Path("/tmp/tag_sbx_probe.txt").exists()
+
+    def test_shell_metacharacter_error_is_value_error(self):
+        from tag.sandbox import ShellMetacharacterError
+
+        assert issubclass(ShellMetacharacterError, ValueError)
+
+    def test_help_text_no_longer_claims_shell(self):
+        import argparse
+
+        from tag.cmd import marketplace
+
+        parser = argparse.ArgumentParser(prog="tag")
+        sub = parser.add_subparsers(dest="command")
+        marketplace.register(sub)
+        sb_run = sub.choices["sandbox"]._subparsers._group_actions[0].choices["run"]
+        help_text = sb_run.format_help()
+        assert "Shell command to run" not in help_text
+        assert "without a shell" in help_text.lower()
+
+    def test_cli_returns_usage_exit_code_for_metacharacters(self, tmp_path, monkeypatch, capsys):
+        import argparse
+
+        from tag.cmd import marketplace
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        args = argparse.Namespace(
+            sandbox_subcommand="run", command="echo hi > /tmp/tag_sbx_probe2.txt",
+            backend="restricted", image="python:3.12-slim", timeout=10,
+            json=False, config=None,
+        )
+        rc = marketplace.cmd_sandbox(args)
+        assert rc == 2, f"malformed COMMAND is a usage error (2), got {rc}"
+        assert "metacharacter" in capsys.readouterr().err
+        assert not Path("/tmp/tag_sbx_probe2.txt").exists()

@@ -20,6 +20,66 @@ from pathlib import Path
 
 BACKENDS = {"restricted", "docker", "modal"}
 
+# ---------------------------------------------------------------------------
+# Shell-metacharacter handling
+# ---------------------------------------------------------------------------
+# `tag sandbox run` takes a COMMAND that is tokenised with shlex and exec'd
+# directly — there is no shell in the loop. Pipes, redirections, globs, command
+# substitution and `;`/`&&` chains therefore used to be passed through as
+# *literal argv words* (e.g. `echo hi > /tmp/x` printed "hi > /tmp/x" and never
+# created the file), which silently did something other than what the help text
+# ("Shell command to run") promised.
+#
+# Design decision: REJECT unquoted shell metacharacters instead of spawning
+# `/bin/sh -c`. Running a shell would be the more featureful option, but it
+# weakens the isolation this backend provides:
+#   * on Linux the only confinement is the rlimits installed by preexec_fn on
+#     the direct child, and a shell turns one supervised process into an
+#     arbitrary process tree with redirections that can write anywhere the
+#     user can write — outside the intended workdir;
+#   * with --backend docker the chosen image is not guaranteed to contain a
+#     shell at all, so behaviour would diverge per image;
+#   * exit codes / "command not found" reporting get masked by the shell.
+# Rejecting is explicit and preserves the existing (working) isolation. Users
+# who need shell features can run `sh -c '<script>'` themselves, which is then
+# confined by exactly the same jail as any other command.
+_SHELL_METACHARS = "|&;<>()`$*?[]{}!\n\r"
+
+
+def find_shell_metacharacters(command_str: str) -> list[str]:
+    """Return the distinct shell metacharacters that appear *unquoted*.
+
+    Characters inside single or double quotes, or backslash-escaped, are not
+    reported: they survive shlex tokenisation as literal text and are handed to
+    the program unchanged, which is exactly what a real shell would do too.
+    """
+    found: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for ch in command_str:
+        if escaped:
+            escaped = False
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"':
+                escaped = True
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            continue
+        if ch in _SHELL_METACHARS and ch not in found:
+            found.append(ch)
+    return found
+
+
+class ShellMetacharacterError(ValueError):
+    """Raised when a command contains unquoted shell metacharacters."""
+
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript("""
@@ -192,6 +252,21 @@ def run_in_sandbox(
     if timeout <= 0:
         raise ValueError(f"timeout must be > 0 seconds, got {timeout}")
 
+    # Reject shell syntax up-front (see _SHELL_METACHARS above) rather than
+    # passing `>`/`|`/`*` to the program as literal arguments. Checked before
+    # the audit row is written so a rejected command is not recorded as a run.
+    meta = find_shell_metacharacters(command_str)
+    if meta:
+        raise ShellMetacharacterError(
+            "command contains unquoted shell metacharacter(s): "
+            + " ".join(repr(m) for m in meta)
+            + ". `tag sandbox run` executes a single program directly (no shell), "
+            "so pipes, redirections, globs and command substitution are not "
+            "interpreted. Quote them to pass them literally, or run them "
+            "explicitly via a shell inside the sandbox, e.g.: "
+            "tag sandbox run \"sh -c 'echo hi > out.txt'\""
+        )
+
     run_id = uuid.uuid4().hex[:12]
     now = _utc_now()
 
@@ -210,7 +285,11 @@ def run_in_sandbox(
             (str(exc), _utc_now(), run_id),
         )
         conn.commit()
-        return {"id": run_id, "status": "failed", "error": str(exc)}
+        # exit_code is always present so callers can format the result without
+        # a KeyError on this early-failure path.
+        return {"id": run_id, "command": command_str, "backend": backend,
+                "status": "failed", "exit_code": 1, "output": "",
+                "error": str(exc)}
 
     if backend == "docker":
         exit_code, stdout, stderr = _run_docker(cmd, image, timeout=timeout)

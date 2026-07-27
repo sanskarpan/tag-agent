@@ -414,7 +414,11 @@ def _cmd_swarm_run(args: argparse.Namespace) -> int:
     except SwarmManifestError as exc:
         db.close()
         print(f"error: coordinator failed: {exc}", file=sys.stderr)
-        return 2
+        # Runtime failure (the coordinator model errored / produced no usable
+        # manifest) — exit 1. Exit 2 is reserved for usage/argument errors and
+        # is emitted by argparse; returning it here misreported a runtime
+        # failure as CLI misuse.
+        return 1
 
     manifest["coordinator_profile"] = coordinator_profile
 
