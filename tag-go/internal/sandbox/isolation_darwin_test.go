@@ -2,6 +2,8 @@ package sandbox
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -32,13 +34,23 @@ func TestSbplQuote(t *testing.T) {
 			t.Fatalf("sbplQuote(%q) accepted a control character; it must be rejected", bad)
 		}
 	}
+	// Invalid UTF-8 must be rejected, not silently transliterated: ranging over
+	// a string yields utf8.RuneError per bad byte, so escaping would write
+	// U+FFFD and the profile would describe a DIFFERENT path than the process
+	// actually runs in.
+	for _, bad := range []string{"/tmp/a\xffb", "/tmp/\x80\x81", "/tmp/caf\xe9"} {
+		got, err := sbplQuote(bad)
+		if err == nil {
+			t.Fatalf("sbplQuote(%q) accepted invalid UTF-8 and produced %q; it must be rejected", bad, got)
+		}
+	}
 }
 
 // TestSbplProfileInjection: a run dir crafted to close the literal and append
 // its own rules must not produce a profile with a real `(allow network*)` rule.
 func TestSbplProfileInjection(t *testing.T) {
 	evil := `/tmp/pwn") (allow network*) (allow file-read* (subpath "/`
-	prof, err := sbplProfile(evil, "/Users/nobody")
+	prof, _, err := sbplProfile(evil, "/Users/nobody")
 	if err != nil {
 		return // rejecting the path is also acceptable
 	}
@@ -57,33 +69,181 @@ func TestSbplProfileInjection(t *testing.T) {
 	}
 }
 
-// TestSbplProfileRuleOrder: the run-dir re-allow must come after the $HOME
-// read denial, otherwise a scratch dir under $HOME is unreadable (SBPL is
-// last-match-wins).
+// TestSbplProfileRuleOrder pins the CORRECTED invariant. SBPL is
+// last-match-wins, so the run-dir re-allow must come BEFORE every denial: when
+// it came last, a run dir at or above a protected path silently cancelled that
+// path's denial (`--dir "$HOME"` re-opened ~/.ssh; `--dir /` re-opened /etc).
+//
+// The earlier version of this test asserted the opposite (allowRun > denyHome)
+// -- i.e. it asserted the vulnerability -- because the $HOME carve-out for a
+// scratch dir was done by ordering. It is now done by (require-not (subpath
+// rundir)) inside the denial itself, which is scoped instead of cancelling.
 func TestSbplProfileRuleOrder(t *testing.T) {
-	prof, err := sbplProfile("/Users/nobody/scratch", "/Users/nobody")
+	prof, weakened, err := sbplProfile("/Users/nobody/scratch", "/Users/nobody")
 	if err != nil {
 		t.Fatalf("sbplProfile: %v", err)
 	}
-	denyHome := strings.Index(prof, `(deny file-read* (subpath "/Users/nobody"))`)
-	allowRun := strings.Index(prof, `(allow file-read* file-write* (subpath "/Users/nobody/scratch"))`)
-	if denyHome < 0 || allowRun < 0 {
-		t.Fatalf("expected rules missing from profile:\n%s", prof)
+	if len(weakened) != 0 {
+		t.Fatalf("unexpected weakened rules for an ordinary run dir: %v", weakened)
 	}
-	if allowRun < denyHome {
-		t.Fatalf("run-dir re-allow precedes the $HOME denial; a scratch dir under $HOME would be unreadable:\n%s", prof)
+	allowRun := strings.Index(prof, `(allow file-read* file-write* (subpath "/Users/nobody/scratch"))`)
+	if allowRun < 0 {
+		t.Fatalf("run-dir allowance missing from profile:\n%s", prof)
+	}
+	// Every denial must outrank the run-dir allowance.
+	for _, deny := range []string{
+		"(deny network*)",
+		`(deny file-read* file-write* (subpath "/etc")`,
+		`(deny file-read* (require-all (subpath "/Users/nobody")`,
+		`(deny file-read* file-write* (subpath "/Users/nobody/.ssh")`,
+		`(deny file-write* (subpath "/usr")`,
+	} {
+		i := strings.Index(prof, deny)
+		if i < 0 {
+			t.Fatalf("profile missing denial %q:\n%s", deny, prof)
+		}
+		if deny == "(deny network*)" {
+			continue // network denial legitimately precedes everything
+		}
+		if i < allowRun {
+			t.Fatalf("denial %q precedes the run-dir allowance; a broad run dir could cancel it:\n%s", deny, prof)
+		}
+	}
+	// The scratch dir under $HOME is carved out of the home denial by scope,
+	// not by ordering.
+	if !strings.Contains(prof, `(require-not (subpath "/Users/nobody/scratch"))`) {
+		t.Fatalf("home denial does not carve out the run dir; a scratch dir under $HOME would be unreadable:\n%s", prof)
 	}
 	for _, want := range []string{
-		"(deny network*)",
 		`(subpath "/private/etc")`,
 		`(literal "/private/etc/master.passwd")`,
 		`(subpath "/Users/nobody/.ssh")`,
 		`(subpath "/Users/nobody/Library/Keychains")`,
-		`(deny file-write* (subpath "/usr")`,
 	} {
 		if !strings.Contains(prof, want) {
 			t.Fatalf("profile missing %q:\n%s", want, prof)
 		}
+	}
+}
+
+// TestValidateRunDirRejectsBroadDirs is the unit half of the "broad run dir
+// re-opens every denial" regression: a run dir at or above a protected tree is
+// refused outright, while an ordinary scratch dir under $HOME is accepted.
+func TestValidateRunDirRejectsBroadDirs(t *testing.T) {
+	const home = "/Users/nobody"
+	reject := []string{
+		"/", "/Users", "/Users/", "/home", "/Volumes", "/System", "/System/Volumes/Data",
+		"/private", "/var", "/private/var", "/etc", "/private/etc", "/var/db", "/usr",
+		"/Library",
+		home, home + "/", // $HOME itself
+		home + "/.ssh", home + "/.ssh/keys", home + "/.aws", home + "/Library/Keychains",
+		home + "/Library",                        // ancestor of ~/Library/Keychains
+		"/System/Volumes/Data/Users/nobody",      // firmlink spelling of $HOME
+		"/System/Volumes/Data/Users/nobody/.ssh", // firmlink spelling of a secret tree
+	}
+	for _, d := range reject {
+		if err := validateRunDir(d, home); err == nil {
+			t.Fatalf("validateRunDir(%q) accepted a run dir at/above a protected boundary", d)
+		} else if !strings.Contains(err.Error(), "--backend docker") {
+			t.Fatalf("validateRunDir(%q) error should name the escape hatch, got %q", d, err)
+		}
+	}
+	accept := []string{
+		home + "/scratch", home + "/scratch/deep", home + "/Documents/proj",
+		"/private/tmp/x", "/private/var/folders/ab/cd/T/go-build123", "/Volumes/Ext/proj",
+		"/usr/local/build", "/opt/work",
+		"/System/Volumes/Data/Users/nobody/scratch", // firmlink spelling of a scratch dir
+	}
+	for _, d := range accept {
+		if err := validateRunDir(d, home); err != nil {
+			t.Fatalf("validateRunDir(%q) rejected an ordinary run dir: %v", d, err)
+		}
+	}
+}
+
+// TestSbplProfileRejectsBroadRunDirs: the profile builder itself refuses a
+// boundary run dir, so no caller can construct a self-cancelling policy.
+func TestSbplProfileRejectsBroadRunDirs(t *testing.T) {
+	for _, d := range []string{"/", "/Users", "/Users/nobody", "/System/Volumes/Data", "/private"} {
+		if prof, _, err := sbplProfile(d, "/Users/nobody"); err == nil {
+			t.Fatalf("sbplProfile(%q) built a policy that re-opens its own denials:\n%s", d, prof)
+		}
+	}
+}
+
+// TestExecRejectsBroadRunDirs is the end-to-end half: `--dir /`, `--dir /Users`,
+// `--dir $HOME` (and the default `--dir` == cwd when cwd is $HOME) must fail
+// closed with exit 127 -- and must NOT be able to read /etc/passwd or ~/.ssh.
+//
+// Before the fix each of these ran with exit 0 and printed the secret while
+// Result.Isolation still claimed those exact paths were denied.
+func TestExecRejectsBroadRunDirs(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home directory available")
+	}
+	probes := map[string]string{
+		"etc_passwd": "cat /etc/passwd",
+		"home_ssh":   `cat ` + home + `/.ssh/* 2>/dev/null | head -c 64`,
+		"rel_ssh":    `head -c 64 .ssh/id_* 2>/dev/null`,
+	}
+	for _, dir := range []string{"/", "/Users", home, "/System/Volumes/Data", "/private"} {
+		for name, probe := range probes {
+			t.Run(filepath.Base(dir)+"_"+name, func(t *testing.T) {
+				res, err := Exec(context.Background(), Options{Command: probe, Dir: dir, Timeout: 20 * time.Second})
+				if err != nil {
+					return // rejected outright: also fail-closed, acceptable
+				}
+				if res.Exit == 127 && strings.Contains(res.Stderr, "--backend docker") {
+					return // the expected fail-closed answer
+				}
+				if res.Exit == 0 || strings.TrimSpace(res.Stdout) != "" {
+					t.Fatalf("run dir %q leaked with probe %q: exit=%d stdout=%q isolation=%q",
+						dir, probe, res.Exit, res.Stdout, res.Isolation)
+				}
+			})
+		}
+	}
+}
+
+// TestIsolationStringIsConditional: Result.Isolation is documented as never
+// being an aspirational claim, but it used to be a compile-time constant that
+// listed guarantees regardless of what the profile actually contained. Any rule
+// the builder had to weaken must now show up in the reported string.
+func TestIsolationStringIsConditional(t *testing.T) {
+	// Fully-enforced profile: no weakening, the plain guarantee.
+	if _, weakened, err := sbplProfile("/Users/nobody/scratch", "/Users/nobody"); err != nil || len(weakened) != 0 {
+		t.Fatalf("ordinary run dir should be fully enforced: weakened=%v err=%v", weakened, err)
+	}
+	if got := darwinIsolationString(nil); strings.Contains(got, "WEAKENED") {
+		t.Fatalf("unweakened isolation string should not mention weakening: %q", got)
+	}
+
+	// No home resolvable: the $HOME read denial cannot be emitted at all, and
+	// the string must admit it rather than keep claiming it.
+	_, weakened, err := sbplProfile("/private/tmp/x", "")
+	if err != nil {
+		t.Fatalf("sbplProfile: %v", err)
+	}
+	if len(weakened) == 0 || !strings.Contains(strings.Join(weakened, " "), "$HOME read denial NOT applied") {
+		t.Fatalf("a profile with no $HOME denial still claims one: weakened=%v", weakened)
+	}
+	if !strings.Contains(darwinIsolationString(weakened), "WEAKENED") {
+		t.Fatal("weakened rules are not surfaced in the isolation string")
+	}
+
+	// Run dir inside a read-only system root: it must stay writable, and that
+	// exception must be reported instead of hidden behind "/usr ... read-only".
+	prof, weakened, err := sbplProfile("/usr/local/build", "/Users/nobody")
+	if err != nil {
+		t.Fatalf("sbplProfile: %v", err)
+	}
+	if !strings.Contains(prof, `(require-not (subpath "/usr/local/build"))`) {
+		t.Fatalf("run dir inside /usr is not carved out of the read-only denial:\n%s", prof)
+	}
+	joined := strings.Join(weakened, " ")
+	if !strings.Contains(joined, "/usr is read-only EXCEPT the run dir /usr/local/build") {
+		t.Fatalf("the /usr write exception is not reported: weakened=%v", weakened)
 	}
 }
 
@@ -123,16 +283,78 @@ func TestExecDeniesPrivateEtcPasswd(t *testing.T) {
 
 // TestExecDeniesHomeSecretRead: a file under $HOME outside the run dir must be
 // unreadable even though the process runs as the same user.
+//
+// The previous version globbed /Users/*/.ssh/* and only asserted stdout == "".
+// On a host with no ~/.ssh that passes with ZERO isolation (verified: with
+// buildIsolation neutered to a plain `sh -c` it still went green), so the test
+// now plants its own canary and asserts the canary's contents are absent -- and
+// proves the canary is genuinely readable outside the sandbox first.
 func TestExecDeniesHomeSecretRead(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home directory available")
+	}
+	// A credential-shaped directory under $HOME, created and removed by the test
+	// so the assertion never depends on the host having real secrets.
+	credDir, err := os.MkdirTemp(home, "tag-sbx-cred-")
+	if err != nil {
+		t.Skipf("cannot create a canary dir under %s: %v", home, err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(credDir) })
+	const canary = "CANARY-8f3a1c2e-home-secret-must-not-leak"
+	secret := filepath.Join(credDir, "id_canary")
+	if err := os.WriteFile(secret, []byte(canary+"\n"), 0o600); err != nil {
+		t.Fatalf("writing canary: %v", err)
+	}
+	// Precondition: the canary IS readable unsandboxed, so a clean stdout below
+	// can only mean the sandbox denied it.
+	if b, err := os.ReadFile(secret); err != nil || !strings.Contains(string(b), canary) {
+		t.Fatalf("canary is not readable on the host, the test would prove nothing: %v", err)
+	}
+
 	res, err := Exec(context.Background(), Options{
-		Command: `ls "$(dirname "$PWD")" >/dev/null 2>&1; cat /Users/*/.ssh/* 2>/dev/null | head -c 32`,
+		Command: "cat " + secret + " 2>&1",
 		Dir:     t.TempDir(),
 		Timeout: 20 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
-	if strings.TrimSpace(res.Stdout) != "" {
-		t.Fatalf("~/.ssh material leaked into the sandbox: %q", res.Stdout)
+	if strings.Contains(res.Stdout, canary) {
+		t.Fatalf("a secret under $HOME leaked into the sandbox: %q (isolation %q)", res.Stdout, res.Isolation)
+	}
+	if res.Exit == 0 {
+		t.Fatalf("reading a $HOME secret SUCCEEDED inside the sandbox: stdout=%q", res.Stdout)
+	}
+}
+
+// TestExecDeniesCredentialDirWrite covers the read+write half of the credential
+// denial: the sandbox must not be able to append to ~/.ssh (which would mean
+// persistent host compromise via authorized_keys).
+func TestExecDeniesCredentialDirWrite(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home directory available")
+	}
+	sshDir := filepath.Join(home, ".ssh")
+	if st, err := os.Stat(sshDir); err != nil || !st.IsDir() {
+		t.Skipf("no %s on this host; cannot prove the write denial", sshDir)
+	}
+	target := filepath.Join(sshDir, "tag-sbx-write-canary")
+	t.Cleanup(func() { _ = os.Remove(target) })
+	res, err := Exec(context.Background(), Options{
+		Command: "echo PWNED > " + target,
+		Dir:     t.TempDir(),
+		Timeout: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if _, statErr := os.Stat(target); statErr == nil {
+		t.Fatalf("the sandbox WROTE into %s (exit=%d, isolation=%q): persistent host compromise",
+			sshDir, res.Exit, res.Isolation)
+	}
+	if res.Exit == 0 {
+		t.Fatalf("writing into %s reported success inside the sandbox", sshDir)
 	}
 }

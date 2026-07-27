@@ -200,6 +200,106 @@ func TestExecRunDirWithHostilePunctuation(t *testing.T) {
 	}
 }
 
+// pgrepCount returns how many processes match the given full-command pattern.
+func pgrepCount(t *testing.T, pattern string) int {
+	t.Helper()
+	out, _ := exec.Command("pgrep", "-f", pattern).Output()
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.TrimSpace(line) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// TestExecTimeoutKillsProcessGroup is the regression for a --timeout that did
+// not actually terminate the run: CommandContext only kills the direct child
+// (`sandbox-exec`), so a backgrounded grandchild kept the stdout pipe open,
+// cmd.Wait blocked FOREVER and `tag` never returned -- while the grandchild was
+// re-parented to init and kept running on the host.
+//
+// The command backgrounds a long sleep with a marker only this test uses, so
+// the orphan check cannot collide with unrelated processes.
+func TestExecTimeoutKillsProcessGroup(t *testing.T) {
+	if _, err := exec.LookPath("pgrep"); err != nil {
+		t.Skip("pgrep not available; cannot check for orphans")
+	}
+	dir := t.TempDir()
+	// The backgrounded sleep deliberately INHERITS stdout/stderr: that is what
+	// used to wedge cmd.Wait forever. The unusual duration doubles as the
+	// orphan-search key.
+	script := "sleep 97 & echo started"
+
+	done := make(chan *Result, 1)
+	go func() {
+		res, err := Exec(context.Background(), Options{Command: script, Dir: dir, Timeout: 1 * time.Second})
+		if err != nil {
+			done <- nil
+			return
+		}
+		done <- res
+	}()
+	select {
+	case res := <-done:
+		if res == nil {
+			t.Fatal("Exec returned an error for a timing-out command")
+		}
+		if !res.TimedOut || res.Exit != 124 {
+			t.Fatalf("expected a 124/timed-out result, got %+v", res)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Exec did not return within 20s for a --timeout 1 run: the timeout does not terminate the run")
+	}
+	// The whole process group must be gone: no orphaned `sleep 97`.
+	time.Sleep(500 * time.Millisecond)
+	if n := pgrepCount(t, "sleep 97"); n > 0 {
+		_ = exec.Command("pkill", "-f", "sleep 97").Run()
+		t.Fatalf("%d orphaned `sleep 97` process(es) survived the timeout: the process group was not reaped", n)
+	}
+}
+
+// TestExecReapsBackgroundedChildOnCleanExit: even without a timeout, a command
+// that backgrounds something and exits must not leak that grandchild onto the
+// host (it used to be re-parented to init and keep running).
+func TestExecReapsBackgroundedChildOnCleanExit(t *testing.T) {
+	if _, err := exec.LookPath("pgrep"); err != nil {
+		t.Skip("pgrep not available; cannot check for orphans")
+	}
+	res, err := Exec(context.Background(), Options{
+		Command: "sleep 93 >/dev/null 2>&1 </dev/null & echo started",
+		Dir:     t.TempDir(),
+		Timeout: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if strings.TrimSpace(res.Stdout) != "started" {
+		t.Fatalf("unexpected stdout %q", res.Stdout)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n := pgrepCount(t, "sleep 93"); n > 0 {
+		_ = exec.Command("pkill", "-f", "sleep 93").Run()
+		t.Fatalf("%d orphaned `sleep 93` process(es) leaked from a completed sandbox run", n)
+	}
+}
+
+// TestExecTimeoutSimpleCommand pins the plain case that already worked, so the
+// process-group change cannot regress it.
+func TestExecTimeoutSimpleCommand(t *testing.T) {
+	start := time.Now()
+	res, err := Exec(context.Background(), Options{Command: "sleep 5", Dir: t.TempDir(), Timeout: 1 * time.Second})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if !res.TimedOut || res.Exit != 124 {
+		t.Fatalf("expected timed_out with exit 124, got %+v", res)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("a 1s timeout took %s to return", elapsed)
+	}
+}
+
 // TestExecRejectsControlCharsInRunDir: a path we cannot safely encode into a
 // policy must be refused, never run unconfined.
 func TestExecRejectsControlCharsInRunDir(t *testing.T) {
