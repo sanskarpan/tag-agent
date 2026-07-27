@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +19,21 @@ import (
 	"github.com/tag-agent/tag/internal/llm"
 	"github.com/tag-agent/tag/internal/worker"
 )
+
+// depRefString renders a DAG dependency reference for an error message.
+//
+// Dependencies are step INDEXES the user writes as JSON integers, but they are
+// decoded into `any` as float64, and %v switches float64 to scientific notation
+// past ~1e7 — so `depends_on: [999999999]` was echoed back as "9.99999999e+08",
+// which matches nothing in the user's input. Integral values are therefore
+// printed as integers; everything else keeps its natural rendering so a
+// genuinely malformed reference (1.5, true, {}) is still shown verbatim.
+func depRefString(ref any) string {
+	if f, ok := ref.(float64); ok && f == math.Trunc(f) && !math.IsInf(f, 0) {
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	return fmt.Sprintf("%v", ref)
+}
 
 // queueHexID returns a dash-free hex job id of the given length (mirrors
 // Python dag.add_job's uuid.uuid4().hex[:n]).
@@ -536,6 +553,14 @@ func registerQueue(root *cobra.Command, app *App) {
 						var idx int
 						switch v := ref.(type) {
 						case float64:
+							// A dependency is a step INDEX, so only integral values
+							// are meaningful. int(1.5) used to truncate to 1 and the
+							// step silently depended on the wrong (or on itself).
+							// Out-of-int-range values are rejected here too, since
+							// int(v) would otherwise be implementation-defined.
+							if v != math.Trunc(v) || v < math.MinInt32 || v > math.MaxInt32 {
+								return fmt.Errorf("DAG %q step %d has an invalid dependency %s", args[0], i, depRefString(ref))
+							}
 							idx = int(v)
 						case string:
 							j, ok := nameToIdx[v]
@@ -544,13 +569,13 @@ func registerQueue(root *cobra.Command, app *App) {
 							}
 							idx = j
 						default:
-							return fmt.Errorf("DAG %q step %d has an invalid dependency %v", args[0], i, ref)
+							return fmt.Errorf("DAG %q step %d has an invalid dependency %s", args[0], i, depRefString(ref))
 						}
 						if idx == i {
 							return fmt.Errorf("DAG %q step %d cannot depend on itself", args[0], i)
 						}
 						if idx < 0 || idx >= i {
-							return fmt.Errorf("DAG %q step %d depends on step %v, which is not an earlier step", args[0], i, ref)
+							return fmt.Errorf("DAG %q step %d depends on step %s, which is not an earlier step", args[0], i, depRefString(ref))
 						}
 						depIdx = append(depIdx, idx)
 					}
