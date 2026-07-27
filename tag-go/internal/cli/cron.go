@@ -33,10 +33,24 @@ func registerCron(root *cobra.Command, app *App) {
 				return err
 			}
 			id := uuid.NewString()[:8]
-			_, err = db.Exec(`INSERT INTO cron_jobs(id,name,schedule,task,profile,enabled,created_at,run_count) VALUES(?,?,?,?,?,1,?,0)`,
-				id, name, schedule, args[0], app.profile(profile), time.Now().UTC().Format(time.RFC3339))
+			// A cron NAME identifies a schedule, so it must be unique — Python has
+			// rejected duplicates since PRD-022 (cmd/ci_loop.py) while Go happily
+			// created a second row, leaving `cron` name lookups ambiguous.
+			//
+			// The check is folded into the INSERT (rather than a separate SELECT)
+			// so two concurrent `cron add` processes cannot both pass a pre-check
+			// and both insert. A UNIQUE(name) constraint is deliberately NOT added
+			// to the schema: schema.sql is applied with CREATE TABLE IF NOT EXISTS
+			// on every open, so a TAG_HOME that already contains duplicates written
+			// by an older build must keep opening cleanly.
+			res, err := db.Exec(`INSERT INTO cron_jobs(id,name,schedule,task,profile,enabled,created_at,run_count)
+				SELECT ?,?,?,?,?,1,?,0 WHERE NOT EXISTS (SELECT 1 FROM cron_jobs WHERE name=?)`,
+				id, name, schedule, args[0], app.profile(profile), time.Now().UTC().Format(time.RFC3339), name)
 			if err != nil {
 				return err
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return jsonErrorMaybe(fmt.Errorf("A cron job named '%s' already exists (names must be unique)", name))
 			}
 			outJSON(map[string]any{"id": id, "name": name}, fmt.Sprintf("cron job added: %s  %q  [%s]", id, name, schedule))
 			return nil
