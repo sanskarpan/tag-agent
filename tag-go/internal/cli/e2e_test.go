@@ -1191,3 +1191,35 @@ func TestE2EDagValidation(t *testing.T) {
 		t.Errorf("valid DAG with depends_on should save: %q code=%d", o, c)
 	}
 }
+
+// TestE2ETemplateExportUnknownProfile pins F7: `template export --profile
+// <nonexistent>` used to exit 0 with an empty template — a fake success — while
+// its siblings `models`/`set-model` correctly errored. An empty template is
+// worse than an error: it looks like a valid artifact and can be imported.
+func TestE2ETemplateExportUnknownProfile(t *testing.T) {
+	h := newHome(t)
+	if _, c := run(t, h, "bootstrap"); c != 0 {
+		t.Fatal("bootstrap failed")
+	}
+	out, code := run(t, h, "template", "export", "--profile", "definitely-not-a-profile")
+	if code == 0 {
+		t.Fatalf("exporting an unknown profile must fail, got exit 0: %q", out)
+	}
+	if !strings.Contains(out, `unknown profile "definitely-not-a-profile"`) {
+		t.Errorf("error should match the models/set-model wording: %q", out)
+	}
+	if !strings.Contains(out, "Available:") {
+		t.Errorf("error should list the available profiles: %q", out)
+	}
+	if strings.Contains(out, "version:") {
+		t.Errorf("no template body may be emitted: %q", out)
+	}
+	// A real profile still exports.
+	if o, c := run(t, h, "template", "export", "--profile", "coder"); c != 0 || !strings.Contains(o, "name: coder") {
+		t.Errorf("template export coder regressed: %q code=%d", o, c)
+	}
+	// The default (no --profile) still works.
+	if o, c := run(t, h, "template", "export"); c != 0 || !strings.Contains(o, "version:") {
+		t.Errorf("default template export regressed: %q code=%d", o, c)
+	}
+}
