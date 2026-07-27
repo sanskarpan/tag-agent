@@ -10,6 +10,29 @@ import (
 	"github.com/tag-agent/tag/internal/sandbox"
 )
 
+// EXIT-CODE CONVENTION for `tag sandbox run`: the process exits with the
+// sandboxed command's own exit status, so the shell sees what the command saw.
+// In particular the documented security codes now reach the process: 127 when
+// the sandbox failed closed (no sandbox-exec, or a run dir too broad to
+// confine) and 124 on timeout. Previously RunE always returned nil, so
+// `tag sandbox run ... && next-step` ran next-step even when the sandbox had
+// refused to isolate. Output (including --json) is unchanged; only the process
+// status is new.
+//
+// sandboxExitErr maps a Result.Exit onto that process exit status. Zero means
+// success. A negative value (child killed by a signal, ExitCode() == -1) is
+// normalised to 1 rather than wrapping to 255 through os.Exit.
+func sandboxExitErr(code int) error {
+	switch {
+	case code == 0:
+		return nil
+	case code < 0 || code > 255:
+		return exitCodeErr{code: 1}
+	default:
+		return exitCodeErr{code: code}
+	}
+}
+
 // registerSandbox wires `tag sandbox run` with two selectable backends
 // (`--backend`, default `restricted`):
 //   - restricted (Go port of src/tag/sandbox.py's `restricted` backend): runs a
@@ -23,7 +46,8 @@ import (
 //     resource/network defaults (`--memory/--cpus/--network`, `--image` required);
 //     see internal/sandbox/docker.go.
 //
-// Both capture stdout/stderr/exit and share the same Result shape.
+// Both capture stdout/stderr/exit and share the same Result shape, and both
+// propagate the command's exit status to the process (see sandboxExitErr).
 func registerSandbox(root *cobra.Command, app *App) {
 	c := &cobra.Command{Use: "sandbox", Short: "Run commands in an OS-isolated sandbox", GroupID: "tools"}
 
@@ -63,13 +87,16 @@ func registerSandbox(root *cobra.Command, app *App) {
 				return err
 			}
 			if flagJSON {
-				return emitJSON(map[string]any{
+				if err := emitJSON(map[string]any{
 					"stdout":    res.Stdout,
 					"stderr":    res.Stderr,
 					"exit":      res.Exit,
 					"timed_out": res.TimedOut,
 					"isolation": res.Isolation,
-				})
+				}); err != nil {
+					return err
+				}
+				return sandboxExitErr(res.Exit)
 			}
 			if res.Stdout != "" {
 				fmt.Print(res.Stdout)
@@ -85,7 +112,7 @@ func registerSandbox(root *cobra.Command, app *App) {
 			if res.Isolation != "" {
 				fmt.Printf("(isolation: %s)\n", res.Isolation)
 			}
-			return nil
+			return sandboxExitErr(res.Exit)
 		}}
 	run.Flags().IntVar(&timeoutSec, "timeout", 60, "timeout in seconds (must be > 0)")
 	run.Flags().StringVar(&dir, "dir", "", "working directory (default: current dir; container workdir for docker)")

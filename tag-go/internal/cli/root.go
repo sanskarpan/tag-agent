@@ -21,6 +21,15 @@ func jsonErrorMaybe(err error) error {
 	return err
 }
 
+// exitCodeErr carries an explicit process exit status out of a RunE. It is used
+// where the exit code IS the contract (e.g. `tag sandbox run`, whose fail-closed
+// 127 is a documented security property): the command has already reported
+// everything the user needs on stdout/stderr, so Execute must not print an
+// additional "error:" line -- it only has to carry the number.
+type exitCodeErr struct{ code int }
+
+func (e exitCodeErr) Error() string { return fmt.Sprintf("exit status %d", e.code) }
+
 // parsePassed is set once cobra has resolved the target command, parsed its
 // flags, and validated its args (the root PersistentPreRunE only runs after all
 // of that succeeds). Usage errors — unknown command, bad flag, arg-count —
@@ -206,6 +215,12 @@ func enforceUnknownSubcommand(cmd *cobra.Command) {
 // Execute runs the root command.
 func Execute() int {
 	if err := NewRoot().Execute(); err != nil {
+		// An explicit exit code is already-reported: pass the number through
+		// without a duplicate error line.
+		var ec exitCodeErr
+		if errors.As(err, &ec) {
+			return ec.code
+		}
 		// #537(d): translate raw SQLite open failures (e.g. a read-only TAG_HOME
 		// yielding "unable to open database file (14)") into a friendly, actionable
 		// message before they reach the user.
