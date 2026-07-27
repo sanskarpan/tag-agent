@@ -5,6 +5,7 @@ package sandbox
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -130,5 +131,208 @@ func TestLandlockAllowListWritesOnlyRunDir(t *testing.T) {
 				t.Fatalf("allow-list contains %q; it must stay denied", denied)
 			}
 		}
+	}
+}
+
+// TestLandlockClaimDisclosesProcExposure is FIX 2: the allow-list grants read
+// over ALL of /proc, so another same-uid process's /proc/<pid>/environ (API keys
+// and all) is readable from inside the sandbox. Landlock cannot scope that
+// per-pid, so the claim must at minimum SAY so -- it previously talked only
+// about $HOME and /root and was silent on /proc.
+func TestLandlockClaimDisclosesProcExposure(t *testing.T) {
+	runDir := t.TempDir()
+	rules := landlockAllowList(runDir)
+	if !grantsProcRead(rules) {
+		t.Skip("/proc is no longer granted; the disclosure requirement is moot")
+	}
+	plan, failClosed, err := buildIsolation(runDir, 10*time.Second)
+	if err != nil || failClosed != nil {
+		t.Fatalf("buildIsolation: err=%v failClosed=%+v", err, failClosed)
+	}
+	if !strings.Contains(plan.Isolation, "Landlock ABI") {
+		t.Skipf("no Landlock on this kernel (%s); nothing claims a filesystem policy", plan.Isolation)
+	}
+	if !strings.Contains(plan.Isolation, procReadDisclosure) {
+		t.Fatalf("the allow-list grants read over all of /proc but the isolation string does not "+
+			"disclose it: %q", plan.Isolation)
+	}
+	// Both plans go out to users; the weak (no-netns) one must disclose too.
+	if plan.Alt != nil && !strings.Contains(plan.Alt.Isolation, procReadDisclosure) {
+		t.Fatalf("the fallback plan hides the /proc exposure: %q", plan.Alt.Isolation)
+	}
+}
+
+// TestBuildIsolationCarriesTheFailClosedContract is FIX 3: when a Landlock
+// helper is in the argv, the plan must know that exit 126 + the helper marker
+// means "the policy was never installed", and the string it reports then must
+// claim nothing. Start() has already succeeded at that point, so runPlan never
+// falls back to Alt and this is the only thing standing between the user and a
+// description of a ruleset that does not exist.
+func TestBuildIsolationCarriesTheFailClosedContract(t *testing.T) {
+	plan, failClosed, err := buildIsolation(t.TempDir(), 10*time.Second)
+	if err != nil || failClosed != nil {
+		t.Fatalf("buildIsolation: err=%v failClosed=%+v", err, failClosed)
+	}
+	if len(plan.Prefix) == 0 {
+		t.Skip("no Landlock helper on this kernel; there is no post-Start failure mode to report")
+	}
+	for name, p := range map[string]*isolationPlan{"strong": plan, "weak": plan.Alt} {
+		if p == nil {
+			continue
+		}
+		if p.FailClosedExit != helperExitPolicy || p.FailClosedMarker != helperFailMarker {
+			t.Fatalf("%s plan does not recognise a helper failure: exit=%d marker=%q",
+				name, p.FailClosedExit, p.FailClosedMarker)
+		}
+		got := resolveIsolation(p, helperExitPolicy, helperFailMarker+" landlock_restrict_self: EPERM")
+		if strings.Contains(got, "Landlock ABI") {
+			t.Fatalf("%s plan still claims a Landlock ABI after the policy failed to install: %q", name, got)
+		}
+		if !strings.Contains(got, "none (failed closed") {
+			t.Fatalf("%s plan does not fail closed in its isolation string: %q", name, got)
+		}
+		// A command that exits 126 on its own must keep the real claim.
+		if own := resolveIsolation(p, helperExitPolicy, "sh: ./x: Permission denied"); own != p.Isolation {
+			t.Fatalf("%s plan mislabels a command's own 126 as a helper failure: %q", name, own)
+		}
+	}
+}
+
+// TestLandlockAllowListMarksRunDirRequired is FIX 4's data half: exactly one
+// rule -- the run dir -- may be required, because it is the only one whose
+// absence breaks the sandbox instead of tightening it.
+func TestLandlockAllowListMarksRunDirRequired(t *testing.T) {
+	const runDir = "/tmp/scratch-xyz"
+	rules := landlockAllowList(runDir)
+	var required []string
+	for _, r := range rules {
+		if r.required {
+			required = append(required, r.path)
+		}
+	}
+	if len(required) != 1 || required[0] != runDir {
+		t.Fatalf("required rules = %v, want exactly [%s]", required, runDir)
+	}
+}
+
+// TestCheckRequiredPathsRejectsAMissingRunDir is FIX 4's behaviour half. A
+// missing run dir used to `continue` past the rule, leaving the sandbox with NO
+// writable tree while still claiming "writes confined to the run dir"; it must
+// now be a hard error the helper turns into a fail-closed 126.
+func TestCheckRequiredPathsRejectsAMissingRunDir(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "definitely-not-here")
+	p := llPolicy{abi: 1, rules: landlockAllowList(missing)}
+	err := p.checkRequiredPaths()
+	if err == nil {
+		t.Fatal("a run dir that cannot be opened was accepted; the sandbox would have no writable tree")
+	}
+	if !strings.Contains(err.Error(), missing) || !strings.Contains(err.Error(), "run directory") {
+		t.Fatalf("error does not name the run directory: %v", err)
+	}
+	// apply() must refuse for the same reason, before installing anything.
+	if err := p.apply(); err == nil {
+		t.Fatal("apply() installed a policy with no writable tree")
+	}
+	// An OPTIONAL path that is missing stays a silent tightening.
+	ok := llPolicy{abi: 1, rules: []llRule{{path: missing, access: llFSRead}}}
+	if err := ok.checkRequiredPaths(); err != nil {
+		t.Fatalf("a missing optional path must be skipped, not fatal: %v", err)
+	}
+}
+
+// TestPolicyEncodeRoundTripsRequired: the required flag is what makes the run
+// dir fatal, and it crosses a process boundary as text. A path containing ':'
+// must survive too, since the encoding now has two leading fields.
+func TestPolicyEncodeRoundTripsRequired(t *testing.T) {
+	in := llPolicy{abi: 5, blockNet: true, rules: []llRule{
+		{path: "/tmp/run:dir/x", access: llHandledFS(5), required: true},
+		{path: "/usr", access: llFSRead | llFSExecute},
+	}}
+	spec, err := in.encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	out, err := decodePolicy(spec)
+	if err != nil {
+		t.Fatalf("decode(%q): %v", spec, err)
+	}
+	if out.abi != in.abi || out.blockNet != in.blockNet || len(out.rules) != len(in.rules) {
+		t.Fatalf("policy head lost in transit: %+v vs %+v", out, in)
+	}
+	for i, r := range out.rules {
+		if r != in.rules[i] {
+			t.Fatalf("rule %d round-tripped as %+v, want %+v", i, r, in.rules[i])
+		}
+	}
+}
+
+// TestRlimitClaimMatchesThisShell is FIX 1 end-to-end on the real host: the
+// claim in the plan must be the claim for what /bin/sh here was actually
+// observed to do, never the unconditional "applied" string.
+func TestRlimitClaimMatchesThisShell(t *testing.T) {
+	const timeout = 10 * time.Second
+	plan, failClosed, err := buildIsolation(t.TempDir(), timeout)
+	if err != nil || failClosed != nil {
+		t.Fatalf("buildIsolation: err=%v failClosed=%+v", err, failClosed)
+	}
+	cpuOK, asOK := rlimitSupport()
+	want := rlimitClaim(timeout, cpuOK, asOK)
+	if !strings.Contains(plan.Isolation, want) {
+		t.Fatalf("isolation %q does not carry the probed rlimit claim %q", plan.Isolation, want)
+	}
+	if !cpuOK || !asOK {
+		if !strings.Contains(plan.Isolation, "NOT applied") {
+			t.Fatalf("this shell did not apply every rlimit (cpu=%v as=%v) but the claim hides it: %q",
+				cpuOK, asOK, plan.Isolation)
+		}
+	}
+	// Most Linux hosts run dash/bash, both of which honour these; a host where
+	// neither sticks is worth surfacing in the log rather than failing on.
+	if !cpuOK || !asOK {
+		t.Logf("this host's /bin/sh honoured cpu=%v as=%v", cpuOK, asOK)
+	}
+}
+
+// TestExecReportsAFailClosedIsolationWhenTheHelperCannotInstall drives the real
+// helper: an intact argv marker with a policy that cannot possibly install must
+// yield exit 126 AND an isolation string that claims nothing.
+func TestExecReportsAFailClosedIsolationWhenTheHelperCannotInstall(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Skipf("cannot locate own executable: %v", err)
+	}
+	// A required run dir that does not exist: apply() refuses, the helper exits
+	// 126 with the marker, and the command never runs.
+	missing := filepath.Join(t.TempDir(), "gone")
+	policy := llPolicy{abi: 1, rules: landlockAllowList(missing)}
+	spec, err := policy.encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	plan := &isolationPlan{
+		Prefix:              []string{self, helperArg},
+		ExtraEnv:            []string{helperEnv + "=" + spec},
+		Isolation:           "Landlock ABI v1: writes confined to the run dir",
+		FailClosedExit:      helperExitPolicy,
+		FailClosedMarker:    helperFailMarker,
+		FailClosedIsolation: landlockFailClosedIsolation,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	res, err := runPlan(ctx, plan, t.TempDir(), "echo LEAKED")
+	if err != nil {
+		t.Fatalf("runPlan: %v", err)
+	}
+	if res.Exit != helperExitPolicy {
+		t.Fatalf("helper failure exit = %d, want %d (stderr %q)", res.Exit, helperExitPolicy, res.Stderr)
+	}
+	if strings.Contains(res.Stdout, "LEAKED") {
+		t.Fatalf("the command RAN despite the policy failing to install: %q", res.Stdout)
+	}
+	if strings.Contains(res.Isolation, "Landlock ABI") {
+		t.Fatalf("isolation still describes a policy that was never installed: %q", res.Isolation)
+	}
+	if res.Isolation != landlockFailClosedIsolation {
+		t.Fatalf("isolation = %q, want the fail-closed string %q", res.Isolation, landlockFailClosedIsolation)
 	}
 }
