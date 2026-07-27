@@ -215,9 +215,14 @@ func init() {
 	if len(os.Args) < 3 || os.Args[1] != helperArg {
 		return
 	}
+	// argv[1] is our private marker, so reaching here means WE spawned this
+	// process to install a policy. A missing/empty policy env var therefore means
+	// the policy was lost in transit -- falling through to normal CLI flow would
+	// run the command with NO Landlock at all, so fail closed instead.
 	spec := os.Getenv(helperEnv)
 	if spec == "" {
-		return
+		fmt.Fprintln(os.Stderr, "sandbox: Landlock helper invoked without a policy; refusing to run unconfined")
+		os.Exit(helperExitPolicy)
 	}
 	policy, err := decodePolicy(spec)
 	if err != nil {
