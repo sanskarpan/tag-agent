@@ -462,12 +462,23 @@ def cmd_webhook_server(args: argparse.Namespace) -> int:
             port = getattr(args, "port", 8765)
             host = getattr(args, "host", "127.0.0.1")
             secret = getattr(args, "secret", None) or os.environ.get("TAG_WEBHOOK_SECRET") or None
+            allow_unsigned = bool(getattr(args, "allow_unsigned", False))
+            if secret is None and not allow_unsigned:
+                # Without a secret every anonymous POST could enqueue agent work,
+                # so refuse to start unless the operator explicitly opts in.
+                print_error(
+                    "refusing to start without an HMAC secret: set --secret or "
+                    "TAG_WEBHOOK_SECRET, or pass --allow-unsigned to accept "
+                    "unauthenticated events"
+                )
+                return 1
             conn.close()  # WebhookServer opens its own connection from db_path
-            server = WebhookServer(db_path=str(db_path), cfg=cfg, host=host, port=port, secret=secret)
+            server = WebhookServer(db_path=str(db_path), cfg=cfg, host=host, port=port,
+                                   secret=secret, allow_unsigned=allow_unsigned)
             if secret is None:
                 print_warning(
-                    "No TAG_WEBHOOK_SECRET set — unsigned webhooks will be accepted. "
-                    "Bind is localhost-only; set a secret before exposing the port."
+                    "running with --allow-unsigned and no secret — events are "
+                    "UNAUTHENTICATED and can enqueue jobs."
                 )
             print(f"Webhook server listening on {host}:{port} — Ctrl+C to stop")
             server.start()
@@ -978,6 +989,8 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     wh_listen.add_argument("--profile", default=None)
     wh_listen.add_argument("--secret", default=None,
                            help="HMAC secret to verify signatures (or set TAG_WEBHOOK_SECRET)")
+    wh_listen.add_argument("--allow-unsigned", action="store_true", dest="allow_unsigned",
+                           help="accept unauthenticated events when no secret is set (INSECURE)")
     wh_rule_add = wh_sub.add_parser("rule-add", help="Add a trigger rule")
     wh_rule_add.add_argument("--platform", required=True, choices=["github", "linear", "slack"])
     wh_rule_add.add_argument("--event", required=True)

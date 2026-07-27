@@ -9,13 +9,23 @@ import hashlib
 import hmac
 import http.server
 import json
+import os
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# Maximum allowed age (or clock skew) of a Slack request timestamp. Slack
+# mandates rejecting stale timestamps so a captured signed payload cannot be
+# replayed forever. Mirrors tag-go/internal/webhook/webhook.go.
+SLACK_TIMESTAMP_TOLERANCE_SECONDS = 300
+
+# Bounds the in-memory replay-protection set of seen delivery IDs.
+MAX_SEEN_DELIVERY_IDS = 4096
 
 
 class WebhookPlatform:
@@ -115,6 +125,15 @@ def verify_signature(
         if not timestamp:
             # Slack always sends X-Slack-Request-Timestamp; without it we cannot
             # reconstruct the signed base string, so verification must fail.
+            return False
+        # Reject stale/skewed timestamps: without this bound a captured
+        # Slack-signed payload stays replayable forever.
+        try:
+            ts_seconds = int(timestamp.strip())
+        except (TypeError, ValueError):
+            return False
+        age = time.time() - ts_seconds
+        if abs(age) > SLACK_TIMESTAMP_TOLERANCE_SECONDS:
             return False
         sig_hex = signature_header[3:]
         base_string = b"v0:" + timestamp.encode("utf-8") + b":" + payload_bytes
@@ -292,6 +311,32 @@ def list_events(
     ]
 
 
+class DeliveryCache:
+    """Bounded, thread-safe set of recently seen webhook delivery IDs.
+
+    Used to reject replays of captured (validly signed) payloads: a webhook
+    signature stays valid forever, so without de-duplication an attacker who
+    captures one delivery can resend it repeatedly to enqueue agent work.
+    """
+
+    def __init__(self, max_ids: int = MAX_SEEN_DELIVERY_IDS) -> None:
+        self._lock = threading.Lock()
+        self._seen: set[str] = set()
+        self._order: list[str] = []
+        self._max_ids = max_ids
+
+    def mark_seen(self, delivery_id: str) -> bool:
+        """Record delivery_id; return True if new, False if it is a replay."""
+        with self._lock:
+            if delivery_id in self._seen:
+                return False
+            self._seen.add(delivery_id)
+            self._order.append(delivery_id)
+            if len(self._order) > self._max_ids:
+                self._seen.discard(self._order.pop(0))
+            return True
+
+
 class _WebhookHandler(http.server.BaseHTTPRequestHandler):
     # Cap inbound webhook bodies to avoid unbounded reads/memory (10 MiB).
     _MAX_BODY_BYTES = 10 * 1024 * 1024
@@ -307,12 +352,28 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorized(self) -> bool:
+        """Bearer-token check for the introspection routes.
+
+        When a secret is configured it doubles as the bearer token guarding
+        /webhooks/rules and /webhooks/events; those routes expose trigger rules
+        and received event metadata and must not be world-readable.
+        """
+        secret = getattr(self.server, "_secret", None) or ""
+        if not secret:
+            return True
+        header = self.headers.get("Authorization", "") or ""
+        token = header[len("Bearer "):] if header.startswith("Bearer ") else header
+        return hmac.compare_digest(token, secret)
+
     def do_GET(self) -> None:
         db_path = self.server._db_path
         conn = sqlite3.connect(str(db_path))
         try:
             if self.path == "/health":
                 self._send_json(200, {"status": "ok"})
+            elif not self._authorized():
+                self._send_json(401, {"error": "unauthorized"})
             elif self.path.startswith("/webhooks/events"):
                 events = list_events(conn, limit=20)
                 self._send_json(200, [
@@ -333,6 +394,20 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
             conn.close()
 
     def do_POST(self) -> None:
+        """Dispatch a webhook POST, never leaking a traceback to the client.
+
+        Any unexpected error must produce a clean 500 rather than killing the
+        connection mid-response (which the client sees as an empty reply).
+        """
+        try:
+            self._handle_post()
+        except Exception:
+            try:
+                self._send_json(500, {"error": "internal error"})
+            except Exception:
+                pass
+
+    def _handle_post(self) -> None:
         path_parts = self.path.strip("/").split("/")
         if len(path_parts) < 2 or path_parts[0] != "webhook":
             self._send_json(404, {"error": "unknown path"})
@@ -366,9 +441,30 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
         # Enforce the signature: when a secret is configured, reject a request
         # that fails HMAC verification BEFORE parsing/matching/enqueuing.
         # Without this gate a forged request could enqueue arbitrary agent work.
-        if secret and not valid:
+        if not secret:
+            # No secret configured: refuse unless the operator explicitly opted in
+            # to unauthenticated events. This prevents anonymous job injection.
+            if not getattr(self.server, "_allow_unsigned", False):
+                self._send_json(401, {
+                    "error": "webhook receiver requires an HMAC secret; "
+                             "set --secret/TAG_WEBHOOK_SECRET or start with --allow-unsigned"
+                })
+                return
+        elif not valid:
             self._send_json(401, {"error": "invalid signature"})
             return
+
+        # Replay protection: a signature stays valid forever, so reject a
+        # delivery ID we have already processed.
+        delivery_id = (
+            self.headers.get("X-GitHub-Delivery", "")
+            or self.headers.get("Linear-Delivery", "")
+        )
+        if delivery_id:
+            deliveries = getattr(self.server, "_deliveries", None)
+            if deliveries is not None and not deliveries.mark_seen(f"{platform}:{delivery_id}"):
+                self._send_json(409, {"error": "duplicate delivery"})
+                return
 
         try:
             payload = json.loads(body_bytes.decode("utf-8"))
@@ -388,12 +484,15 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
             event_id = uuid.uuid4().hex[:12]
             now = _utc_now()
             ensure_schema(conn)
+            # Record the event as 'pending' first. Marking it 'processed' before
+            # the enqueue below would make the DB claim a job that was never
+            # created when enqueuing fails.
             conn.execute(
                 """INSERT INTO webhook_events(id,platform,event_type,payload_json,
                    received_at,signature_valid,matched_rules,status)
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (event_id, platform, event_type, json.dumps(payload),
-                 now, int(valid), json.dumps(rule_ids), "processed"),
+                 now, int(valid), json.dumps(rule_ids), "pending"),
             )
             conn.commit()
 
@@ -403,31 +502,56 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
             # the same one the `tag queue add` CLI uses. Both write/read the same
             # runtime DB, so a worker launched here finds the row we insert.
             from tag.core.db import (
+                ensure_queue_schema,
                 queue_insert_job,
                 queue_update_pid,
                 launch_queue_worker,
             )
 
+            # This connection is opened straight from the DB path and never went
+            # through open_db(), so the queue schema may not exist yet on a fresh
+            # install. Guarantee it before inserting a job.
+            ensure_queue_schema(conn)
+
             cfg = getattr(self.server, "_cfg", None)
-            for rule in rules:
-                job_id = uuid.uuid4().hex[:8]
-                task_text = _build_task_text(platform, event_type, event_info)
-                queue_insert_job(
-                    conn,
-                    job_id,
-                    rule.profile,
-                    task_text,
-                    task_type=(rule.action or "mixed"),
+            try:
+                for rule in rules:
+                    job_id = uuid.uuid4().hex[:8]
+                    task_text = _build_task_text(platform, event_type, event_info)
+                    queue_insert_job(
+                        conn,
+                        job_id,
+                        rule.profile,
+                        task_text,
+                        task_type=(rule.action or "mixed"),
+                    )
+                    # Job row is now persisted (this is the dispatch of record).
+                    # Launching the worker subprocess is best-effort: if it fails the
+                    # queued row can still be picked up later, so don't fail the POST.
+                    if cfg is not None:
+                        try:
+                            pid = launch_queue_worker(cfg, job_id)
+                            queue_update_pid(conn, job_id, pid)
+                        except Exception:
+                            pass
+            except Exception:
+                # A matched rule failed to enqueue: the dispatch is incomplete,
+                # so record the failure and report 500 rather than a false success.
+                conn.execute(
+                    "UPDATE webhook_events SET status=? WHERE id=?", ("failed", event_id)
                 )
-                # Job row is now persisted (this is the dispatch of record).
-                # Launching the worker subprocess is best-effort: if it fails the
-                # queued row can still be picked up later, so don't fail the POST.
-                if cfg is not None:
-                    try:
-                        pid = launch_queue_worker(cfg, job_id)
-                        queue_update_pid(conn, job_id, pid)
-                    except Exception:
-                        pass
+                conn.commit()
+                self._send_json(500, {
+                    "error": "failed to enqueue job for matched rule",
+                    "event_id": event_id,
+                })
+                return
+
+            # Every matched rule enqueued successfully — now it is truly processed.
+            conn.execute(
+                "UPDATE webhook_events SET status=? WHERE id=?", ("processed", event_id)
+            )
+            conn.commit()
 
             self._send_json(200, {
                 "event_id": event_id,
@@ -438,6 +562,29 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
             conn.close()
 
 
+class _ThreadingWebhookServer(http.server.ThreadingHTTPServer):
+    """Threaded HTTP server with a per-connection read timeout.
+
+    A single-threaded server lets one stalled client (e.g. a peer that opens a
+    socket and never sends a request line) wedge the entire receiver, so even
+    /health stops answering. Threading plus a socket timeout bounds that.
+    """
+
+    daemon_threads = True
+    timeout = 30
+
+
+class _TimeoutWebhookHandler(_WebhookHandler):
+    """Webhook handler that bounds how long a slow client may hold a thread.
+
+    socketserver.StreamRequestHandler.setup() applies this `timeout` to the
+    accepted connection, so a client that opens a socket and never sends a
+    request line is dropped instead of occupying its thread forever.
+    """
+
+    timeout = 30
+
+
 class WebhookServer:
     def __init__(
         self,
@@ -446,8 +593,8 @@ class WebhookServer:
         host: str = "127.0.0.1",
         port: int = 8080,
         secret: str | None = None,
+        allow_unsigned: bool = False,
     ) -> None:
-        import os
         self._db_path = Path(db_path)
         self._cfg = cfg
         self._host = host
@@ -455,12 +602,17 @@ class WebhookServer:
         # Allow the signing secret to be supplied via the environment so
         # verification is reachable even when the CLI does not pass secret=.
         self._secret = secret or os.environ.get("TAG_WEBHOOK_SECRET") or None
+        self._allow_unsigned = allow_unsigned
         self._server: http.server.HTTPServer | None = None
 
     def start(self) -> None:
-        self._server = http.server.HTTPServer((self._host, self._port), _WebhookHandler)
+        self._server = _ThreadingWebhookServer(
+            (self._host, self._port), _TimeoutWebhookHandler
+        )
         self._server._db_path = self._db_path
         self._server._secret = self._secret
+        self._server._allow_unsigned = self._allow_unsigned
+        self._server._deliveries = DeliveryCache()
         # Expose cfg to the request handler so matched rules can launch the
         # detached queue worker via launch_queue_worker(cfg, job_id).
         self._server._cfg = self._cfg
