@@ -7,10 +7,13 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -56,9 +59,48 @@ type chatRequest struct {
 	MaxTokens int           `json:"max_tokens"`
 }
 
+// chatMessage keeps Content raw because OpenAI defines it two ways: a plain
+// string, and an array of "content parts" ([{"type":"text","text":"…"}, …]).
+// The array form is the normative shape emitted by LangChain, Open WebUI, the
+// OpenAI JS SDK and most proxies, so decoding straight into a string made
+// "OpenAI-compatible" untrue for the majority of real clients.
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+// contentPart is one element of the array form. Only text parts carry anything
+// this gateway can forward; multimodal parts (image_url, input_audio, file) are
+// skipped rather than rejected, so a client that attaches an image still gets
+// its text answered instead of a hard 400.
+type contentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// text flattens Content to a plain string, accepting both encodings. A false
+// second return means the value was neither, and the request is invalid.
+func (m chatMessage) text() (string, bool) {
+	raw := bytes.TrimSpace(m.Content)
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", true
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s, true
+	}
+	var parts []contentPart
+	if json.Unmarshal(raw, &parts) != nil {
+		return "", false
+	}
+	var texts []string
+	for _, p := range parts {
+		// Tolerate a part that omits "type" but carries "text" — some proxies do.
+		if (p.Type == "text" || p.Type == "") && p.Text != "" {
+			texts = append(texts, p.Text)
+		}
+	}
+	return strings.Join(texts, "\n"), true
 }
 
 type usage struct {
@@ -102,7 +144,7 @@ func Handler(opts Options) http.Handler {
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 		var req chatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, 400, "invalid_request_error", "invalid JSON body: "+err.Error())
+			writeErr(w, 400, "invalid_request_error", "invalid JSON body: "+sanitizeDecodeError(err))
 			return
 		}
 		if len(req.Messages) == 0 {
@@ -122,7 +164,12 @@ func Handler(opts Options) http.Handler {
 		if maxTok <= 0 {
 			maxTok = opts.MaxTokens
 		}
-		llmReq := llm.Request{Model: sendModel, Messages: toLLMMessages(req.Messages), MaxTokens: maxTok}
+		msgs, err := toLLMMessages(req.Messages)
+		if err != nil {
+			writeErr(w, 400, "invalid_request_error", err.Error())
+			return
+		}
+		llmReq := llm.Request{Model: sendModel, Messages: msgs, MaxTokens: maxTok}
 
 		if req.Stream {
 			serveStream(w, r, opts, model, prov, llmReq)
@@ -262,9 +309,12 @@ func authOK(opts Options, r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(opts.Key)) == 1
 }
 
-func toLLMMessages(in []chatMessage) []llm.Message {
+// toLLMMessages maps the OpenAI messages onto provider-neutral ones, flattening
+// both accepted encodings of `content`. An error names the offending index in
+// client terms, never in Go-type terms.
+func toLLMMessages(in []chatMessage) ([]llm.Message, error) {
 	out := make([]llm.Message, 0, len(in))
-	for _, m := range in {
+	for i, m := range in {
 		role := llm.RoleUser
 		switch strings.ToLower(m.Role) {
 		case "system":
@@ -274,9 +324,39 @@ func toLLMMessages(in []chatMessage) []llm.Message {
 		case "tool":
 			role = llm.RoleTool
 		}
-		out = append(out, llm.Message{Role: role, Content: m.Content})
+		content, ok := m.text()
+		if !ok {
+			return nil, fmt.Errorf("messages[%d].content must be a string or an array of content parts", i)
+		}
+		out = append(out, llm.Message{Role: role, Content: content})
 	}
-	return out
+	return out, nil
+}
+
+// sanitizeDecodeError turns a json decode failure into a client-facing message.
+// The raw error exposes Go struct paths and type names (…"into Go struct field
+// chatMessage.messages.content of type string"), which leaks internals and is
+// meaningless to an API consumer.
+func sanitizeDecodeError(err error) string {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		return fmt.Sprintf("request body exceeds the %d-byte limit", maxRequestBytes)
+	}
+	var syn *json.SyntaxError
+	if errors.As(err, &syn) {
+		return fmt.Sprintf("malformed JSON at byte offset %d", syn.Offset)
+	}
+	var ute *json.UnmarshalTypeError
+	if errors.As(err, &ute) {
+		if ute.Field != "" {
+			return fmt.Sprintf("field %q has the wrong type (got a JSON %s)", ute.Field, ute.Value)
+		}
+		return fmt.Sprintf("request body has the wrong type (got a JSON %s)", ute.Value)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "request body is empty or truncated"
+	}
+	return "request body could not be parsed"
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

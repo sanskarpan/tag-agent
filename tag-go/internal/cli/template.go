@@ -36,6 +36,16 @@ func registerTemplate(root *cobra.Command, app *App) {
 			}
 			homeDir := app.Cfg.String("runtime.home_dir", "")
 			dir := paths.ProfileHome(homeDir, profile)
+			// Exporting an unknown profile used to emit an empty template and
+			// exit 0 — a fake success, and worse than a plain error because the
+			// result looks like a valid, importable artifact. A profile counts
+			// as real if it has a runtime dir OR a config entry; the wording
+			// matches the sibling commands (models, set-model).
+			if _, statErr := os.Stat(dir); statErr != nil {
+				if err := ensureProfileExists(app.Cfg, profile); err != nil {
+					return err
+				}
+			}
 
 			tmpl := map[string]any{
 				"name":        profile,

@@ -1976,6 +1976,23 @@ class TestProfileTemplates:
         out = capsys.readouterr().out
         assert "orchestrator" in out
 
+    def test_cmd_template_export_unknown_profile(self, tmp_path, capsys):
+        """F7 (Python parity): exporting a nonexistent profile must fail, not
+        emit an empty template with rc 0. The Go side and the sibling
+        models/set-model commands both error; this one silently succeeded."""
+        import argparse
+        out_file = tmp_path / "template.yaml"
+        args = argparse.Namespace(
+            template_subcommand="export", profile="definitely-not-a-profile",
+            output=str(out_file), config=None,
+        )
+        with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
+            rc = TAG.cmd_template(args)
+        assert rc != 0, "unknown profile must not fake-succeed"
+        assert not out_file.exists(), "no template artifact may be written"
+        err = capsys.readouterr()
+        assert "definitely-not-a-profile" in (err.out + err.err)
+
     def test_cmd_template_import(self, tmp_path):
         import argparse, yaml
         tmpl = {"name": "test-imported", "version": "1", "env": {"MODEL_ID": "gpt-4o"}, "config": {}}

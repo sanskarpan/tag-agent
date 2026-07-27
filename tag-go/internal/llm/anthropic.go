@@ -33,15 +33,28 @@ func (p AnthropicProvider) key() string {
 	return os.Getenv("ANTHROPIC_API_KEY")
 }
 
+// base resolves the API root: the struct field, then ANTHROPIC_BASE_URL (the
+// override the Anthropic SDKs honour, and what every proxy/gateway expects),
+// then the public API. The env override is also what makes this adapter
+// exercisable offline against a local mock. Note the root does NOT include
+// /v1 — Stream appends /v1/messages.
+func (p AnthropicProvider) base() string {
+	b := p.BaseURL
+	if b == "" {
+		b = strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL"))
+	}
+	if b == "" {
+		return "https://api.anthropic.com"
+	}
+	return strings.TrimRight(b, "/")
+}
+
 // Stream sends the request and decodes the SSE response into provider-neutral events.
 func (p AnthropicProvider) Stream(ctx context.Context, req Request) (<-chan Event, error) {
 	if p.key() == "" {
 		return nil, fmt.Errorf("ANTHROPIC_API_KEY is not set")
 	}
-	base := p.BaseURL
-	if base == "" {
-		base = "https://api.anthropic.com"
-	}
+	base := p.base()
 	version := p.Version
 	if version == "" {
 		version = "2023-06-01"
@@ -72,6 +85,11 @@ func (p AnthropicProvider) Stream(ctx context.Context, req Request) (<-chan Even
 		defer resp.Body.Close()
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		return nil, fmt.Errorf("anthropic API %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	// A 200 is not proof of a stream — see checkStreamResponse.
+	if err := checkStreamResponse(resp, "anthropic"); err != nil {
+		resp.Body.Close()
+		return nil, err
 	}
 	ch := make(chan Event, 16)
 	go func() {
@@ -189,13 +207,21 @@ func parseAnthropicSSE(r io.Reader, ch chan<- Event) {
 		curToolJSON.Reset()
 	}
 
+	// A stream is only "successful" if it actually was a stream: at least one
+	// SSE data frame AND a terminator (message_stop). Without both, emitting
+	// EventFinish turns an upstream failure into a silent empty success and
+	// stops the fallback chain from ever firing.
+	sawFrame, sawTerminator := false, false
+
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || !strings.HasPrefix(line, "data:") {
 			continue
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		sawFrame = true
 		if data == "[DONE]" {
+			sawTerminator = true
 			break
 		}
 		var ev struct {
@@ -281,6 +307,16 @@ func parseAnthropicSSE(r io.Reader, ch chan<- Event) {
 	}
 	if err := sc.Err(); err != nil {
 		ch <- Event{Type: EventError, Err: fmt.Errorf("anthropic stream read: %w", err)}
+		return
+	}
+	if !sawFrame {
+		ch <- Event{Type: EventError, Err: fmt.Errorf(
+			"anthropic stream contained no SSE data frames (the HTTP 200 body was not an event stream)")}
+		return
+	}
+	if !sawTerminator {
+		ch <- Event{Type: EventError, Err: fmt.Errorf(
+			"anthropic stream ended without a message_stop event (truncated response)")}
 		return
 	}
 	flushTool()

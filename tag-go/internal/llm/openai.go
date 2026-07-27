@@ -30,16 +30,26 @@ func (p OpenAIProvider) key() string {
 	return os.Getenv("OPENAI_API_KEY")
 }
 
+// base resolves the API root: the struct field, then OPENAI_BASE_URL (the
+// convention shared by the OpenAI SDKs and every OpenAI-compatible gateway —
+// LiteLLM, Helicone, Azure), then the public API. The env override is also what
+// makes this adapter exercisable offline against a local mock.
+func (p OpenAIProvider) base() string {
+	if p.BaseURL != "" {
+		return p.BaseURL
+	}
+	if v := strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")); v != "" {
+		return v
+	}
+	return "https://api.openai.com/v1"
+}
+
 // Stream sends the request and decodes the SSE response into provider-neutral events.
 func (p OpenAIProvider) Stream(ctx context.Context, req Request) (<-chan Event, error) {
 	if p.key() == "" {
 		return nil, fmt.Errorf("OPENAI_API_KEY is not set")
 	}
-	base := p.BaseURL
-	if base == "" {
-		base = "https://api.openai.com/v1"
-	}
-	return streamOpenAICompatible(ctx, req, base, p.key(), "openai", p.HTTPClient)
+	return streamOpenAICompatible(ctx, req, p.base(), p.key(), "openai", p.HTTPClient)
 }
 
 // streamOpenAICompatible POSTs an OpenAI-shaped chat-completions request to
@@ -74,6 +84,11 @@ func streamOpenAICompatible(ctx context.Context, req Request, baseURL, apiKey, e
 		defer resp.Body.Close()
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		return nil, fmt.Errorf("%s API %d: %s", errLabel, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	// A 200 is not proof of a stream — see checkStreamResponse.
+	if err := checkStreamResponse(resp, errLabel); err != nil {
+		resp.Body.Close()
+		return nil, err
 	}
 	ch := make(chan Event, 16)
 	go func() {
@@ -172,13 +187,21 @@ func parseOpenAISSE(r io.Reader, ch chan<- Event, errLabel string) {
 		order = nil
 	}
 
+	// A stream is only "successful" if it actually was a stream: at least one
+	// SSE data frame AND a terminator. Without both, emitting EventFinish turns
+	// an upstream failure into a silent empty success and stops the fallback
+	// chain from ever firing.
+	sawFrame, sawTerminator := false, false
+
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || !strings.HasPrefix(line, "data:") {
 			continue
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		sawFrame = true
 		if data == "[DONE]" {
+			sawTerminator = true
 			break
 		}
 		var chunk struct {
@@ -235,13 +258,28 @@ func parseOpenAISSE(r io.Reader, ch chan<- Event, errLabel string) {
 				}
 				a.args.WriteString(tc.Function.Arguments)
 			}
-			if c.FinishReason != nil && *c.FinishReason == "tool_calls" {
-				flush()
+			// A non-null finish_reason also terminates the turn: several
+			// OpenAI-compatible servers close right after it without [DONE].
+			if c.FinishReason != nil && *c.FinishReason != "" {
+				sawTerminator = true
+				if *c.FinishReason == "tool_calls" {
+					flush()
+				}
 			}
 		}
 	}
 	if err := sc.Err(); err != nil {
 		ch <- Event{Type: EventError, Err: fmt.Errorf("%s stream read: %w", errLabel, err)}
+		return
+	}
+	if !sawFrame {
+		ch <- Event{Type: EventError, Err: fmt.Errorf(
+			"%s stream contained no SSE data frames (the HTTP 200 body was not an event stream)", errLabel)}
+		return
+	}
+	if !sawTerminator {
+		ch <- Event{Type: EventError, Err: fmt.Errorf(
+			"%s stream ended without a [DONE] terminator or finish_reason (truncated response)", errLabel)}
 		return
 	}
 	flush()

@@ -80,7 +80,8 @@ func registerToolIndex(root *cobra.Command, app *App) {
 			rows.Close()
 			// keyword score: number of query terms appearing in name+description
 			terms := strings.Fields(strings.ToLower(query))
-			var scored []tool
+			// Non-nil so an empty result marshals to `[]`, not `null` (#559).
+			scored := []tool{}
 			for _, tl := range tools {
 				text := strings.ToLower(tl.Name + " " + tl.Description)
 				s := 0

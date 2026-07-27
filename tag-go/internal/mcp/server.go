@@ -10,12 +10,15 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 )
 
 // JSON-RPC error codes used by the server.
 const (
+	errParse          = -32700
+	errInvalidRequest = -32600
 	errMethodNotFound = -32601
 	errInvalidParams  = -32602
 	errInternal       = -32603
@@ -65,7 +68,9 @@ func (s *Server) Register(name, description string, schema map[string]any, h Han
 func (s *Server) Serve(r io.Reader, w io.Writer) error {
 	br := bufio.NewReader(r)
 	for {
-		line, err := br.ReadBytes('\n')
+		// Bounded read: a peer must not be able to OOM us with a newline-less
+		// stream (see maxFrameBytes).
+		line, err := readFrame(br)
 		if len(line) > 0 {
 			if werr := s.handleLine(line, w); werr != nil {
 				return werr
@@ -100,12 +105,34 @@ type serverResponse struct {
 
 // handleLine parses one frame and writes its response frame (unless it's a notification).
 func (s *Server) handleLine(line []byte, w io.Writer) error {
+	// A blank/whitespace-only frame is not a message at all — no response.
+	if len(bytes.TrimSpace(line)) == 0 {
+		return nil
+	}
 	var req serverRequest
 	if err := json.Unmarshal(line, &req); err != nil {
-		return nil // skip unparseable frames, mirroring the client
+		// JSON-RPC 2.0 §5.1: a parse error MUST be answered with id:null and
+		// code -32700. Silently dropping the frame hangs a conforming client —
+		// TAG's own client sits for its full 120s timeout — and desynchronises
+		// the response stream.
+		return writeFrame(w, serverResponse{
+			JSONRPC: "2.0",
+			ID:      json.RawMessage("null"),
+			Error:   &rpcError{Code: errParse, Message: "Parse error: " + err.Error()},
+		})
 	}
 	if req.Method == "" {
-		return nil // not a valid request/notification
+		// Valid JSON but not a request. With an id it is an Invalid Request and
+		// must be answered; without one it is indistinguishable from a
+		// notification, so stay silent.
+		if len(req.ID) == 0 || string(req.ID) == "null" {
+			return nil
+		}
+		return writeFrame(w, serverResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error:   &rpcError{Code: errInvalidRequest, Message: "Invalid Request: missing method"},
+		})
 	}
 	// A notification has no id — dispatch for side effects but send NO response
 	// (responding to a notification violates JSON-RPC 2.0; real MCP clients send
@@ -126,6 +153,11 @@ func (s *Server) handleLine(line []byte, w io.Writer) error {
 			resp.Result = b
 		}
 	}
+	return writeFrame(w, resp)
+}
+
+// writeFrame marshals one response and writes it as a newline-delimited frame.
+func writeFrame(w io.Writer, resp serverResponse) error {
 	out, err := json.Marshal(resp)
 	if err != nil {
 		return err

@@ -4,7 +4,9 @@
 package tool
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/sandbox"
 )
 
 // Options bounds tool side effects.
@@ -141,6 +144,11 @@ func strArg(in map[string]any, key string) string {
 	return ""
 }
 
+// bashWaitDelay bounds how long Wait may block on the output pipe after the
+// process itself is gone — a backgrounded grandchild inherits that pipe and
+// would otherwise hold Wait open indefinitely.
+const bashWaitDelay = 2 * time.Second
+
 func bashTool(opts Options) agent.Tool {
 	return agent.Tool{
 		Def: llm.ToolDef{
@@ -159,14 +167,44 @@ func bashTool(opts Options) agent.Tool {
 			if opts.Root != "" {
 				c.Dir = opts.Root
 			}
-			out, err := c.CombinedOutput()
+			// The timeout must bind the whole process tree, not just `sh`.
+			// CommandContext's default kill reaches only the direct child, so a
+			// backgrounded grandchild (`sleep 40 & wait`, `npm run dev &`) survives
+			// AND keeps the output pipe open — CombinedOutput then blocks until the
+			// grandchild exits, i.e. 40s for a 2s cap and forever for an unbounded
+			// child. That is reachable straight from untrusted model output.
+			// Same pattern as internal/sandbox: own process group + group-wide
+			// SIGKILL on cancel + a WaitDelay so a lingering pipe-holder cannot
+			// stall Wait.
+			sandbox.SetProcGroup(c, nil)
+			c.Cancel = func() error { return sandbox.KillProcessGroup(c) }
+			c.WaitDelay = bashWaitDelay
+
+			var buf bytes.Buffer
+			c.Stdout = &buf
+			c.Stderr = &buf
+			if err := c.Start(); err != nil {
+				return "", fmt.Errorf("exit error: %v", err)
+			}
+			runErr := c.Wait()
+			// Reap survivors even on the happy path: a grandchild that outlives its
+			// parent would otherwise be re-parented to init and keep running.
+			_ = sandbox.KillProcessGroup(c)
+			out := buf.String()
 			if cctx.Err() == context.DeadlineExceeded {
-				return string(out), fmt.Errorf("command timed out after %s", opts.BashTimeout)
+				return out, fmt.Errorf("command timed out after %s", opts.BashTimeout)
 			}
-			if err != nil {
-				return string(out), fmt.Errorf("exit error: %v", err)
+			if runErr != nil {
+				// ErrWaitDelay means the command itself finished but something it
+				// spawned held the pipe past the delay. Report the real exit status.
+				if errors.Is(runErr, exec.ErrWaitDelay) {
+					if c.ProcessState != nil && c.ProcessState.ExitCode() == 0 {
+						return out, nil
+					}
+				}
+				return out, fmt.Errorf("exit error: %v", runErr)
 			}
-			return string(out), nil
+			return out, nil
 		},
 	}
 }

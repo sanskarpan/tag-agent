@@ -74,7 +74,8 @@ func registerMarketplace(root *cobra.Command, app *App) {
 				SHA256       string `json:"sha256"`
 				DownloadedAt string `json:"downloaded_at"`
 			}
-			var out []mktRow
+			// Non-nil so an empty result marshals to `[]`, not `null` (#559).
+			out := []mktRow{}
 			for rows.Next() {
 				var r mktRow
 				if err := rows.Scan(&r.Name, &r.SourceURL, &r.SHA256, &r.DownloadedAt); err != nil {

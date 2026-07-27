@@ -3,7 +3,10 @@ package llm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -226,5 +229,33 @@ func TestBuildAnthropicBodyToolUseLinkage(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("assistant message must render a tool_use block for tu1: %+v", msgs)
+	}
+}
+
+// TestAnthropicBaseURLEnvOverride pins F9: ANTHROPIC_BASE_URL must repoint the
+// adapter at a gateway/proxy — and at a local mock so the Anthropic path is
+// exercisable offline.
+func TestAnthropicBaseURLEnvOverride(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"via proxy\"}}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer srv.Close()
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	ch, err := AnthropicProvider{}.Stream(context.Background(), Request{Model: "claude-x"})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	text, _, _, finished := collect(ch)
+	if text != "via proxy" || !finished {
+		t.Fatalf("text=%q finished=%v", text, finished)
+	}
+	if gotPath != "/v1/messages" {
+		t.Errorf("path = %q", gotPath)
 	}
 }

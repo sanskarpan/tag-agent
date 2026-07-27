@@ -79,7 +79,9 @@ func NewClient(w io.Writer, r io.Reader) *Client {
 // any read error it records it and fails all current + future waiters.
 func (c *Client) readLoop() {
 	for {
-		line, err := c.r.ReadBytes('\n')
+		// Bounded read: an untrusted peer must not be able to OOM us with a
+		// newline-less stream (see maxFrameBytes).
+		line, err := readFrame(c.r)
 		if err != nil {
 			c.mu.Lock()
 			c.readErr = err

@@ -353,6 +353,15 @@ def cmd_template(args: argparse.Namespace) -> int:
         # Read the profile's real config/env from where the runtime stores them
         # (runtime_home/.hermes/profiles/<profile>), not the phantom tag_home dir.
         profile_dir = _profile_home(cfg, profile)
+        # Exporting an unknown profile used to emit an empty template and return
+        # 0 -- a fake success, and worse than an error because the result looks
+        # like a valid, importable artifact. A profile counts as real if it has
+        # a runtime dir OR a config entry; the sibling commands (models,
+        # set-model) already error the same way.
+        if not profile_dir.exists() and profile not in (cfg.get("profiles") or {}):
+            available = ", ".join(sorted((cfg.get("profiles") or {})))
+            print_error(f"Unknown profile '{profile}'. Available: {available}")
+            return 1
         env_file = profile_dir / ".env"
         cfg_file = profile_dir / "config.yaml"
 

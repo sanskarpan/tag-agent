@@ -203,8 +203,8 @@ func runPlan(cctx context.Context, plan *isolationPlan, runDir, command string) 
 	// default only kills the direct child (`sandbox-exec`), so anything the
 	// command backgrounded survives the timeout, keeps the pipe open and hangs
 	// Wait indefinitely.
-	setProcGroup(cmd, plan.SysProcAttr)
-	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	SetProcGroup(cmd, plan.SysProcAttr)
+	cmd.Cancel = func() error { return KillProcessGroup(cmd) }
 	cmd.WaitDelay = waitDelay
 
 	var stdout, stderr bytes.Buffer
@@ -218,7 +218,7 @@ func runPlan(cctx context.Context, plan *isolationPlan, runDir, command string) 
 	// Reap anything the command left behind even on the happy path: a
 	// backgrounded grandchild that outlives its parent would otherwise be
 	// re-parented to init and keep running unconfined-looking on the host.
-	_ = killProcessGroup(cmd)
+	_ = KillProcessGroup(cmd)
 	res := &Result{Stdout: stdout.String(), Stderr: stderr.String(), Isolation: plan.Isolation}
 	// Isolation can only be settled once the exit status is known: a helper that
 	// failed to install its policy reports that via the status + a stderr marker.

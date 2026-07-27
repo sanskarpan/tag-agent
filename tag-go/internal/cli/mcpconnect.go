@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -15,6 +16,10 @@ import (
 // servers over stdio.
 func registerMCPConnect(root *cobra.Command, app *App) {
 	var call string
+	// mcp.Client defaults to 120s, which suits a long-lived agent session but
+	// not an interactive command: an unresponsive server blocked the CLI for two
+	// minutes with no progress output and no way to shorten the wait.
+	timeout := 30 * time.Second
 	c := &cobra.Command{
 		Use:     "mcp-connect <command> [args...]",
 		Short:   "Connect to an external MCP server subprocess and list its tools",
@@ -27,6 +32,9 @@ func registerMCPConnect(root *cobra.Command, app *App) {
 				return err
 			}
 			defer pc.Close()
+			if timeout > 0 {
+				pc.Timeout = timeout
+			}
 			if err := pc.Initialize("tag"); err != nil {
 				return fmt.Errorf("MCP initialize failed: %w", err)
 			}
@@ -53,5 +61,6 @@ func registerMCPConnect(root *cobra.Command, app *App) {
 		},
 	}
 	c.Flags().StringVar(&call, "call", "", "call this tool (no args) instead of listing")
+	c.Flags().DurationVar(&timeout, "timeout", timeout, "per-request timeout waiting for the server (0 = wait forever)")
 	root.AddCommand(c)
 }
