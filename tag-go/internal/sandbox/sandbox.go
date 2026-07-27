@@ -1,13 +1,29 @@
 // Package sandbox provides a restricted command-execution backend (Go port of
-// src/tag/sandbox.py's `restricted` backend). It runs a shell command confined
-// to a working directory with a timeout and a minimal environment, capturing
-// stdout/stderr/exit. It reuses the path-confinement idea from internal/tool
-// (EvalSymlinks guard) to resolve the working directory to a real path.
+// src/tag/sandbox.py's `restricted` backend) plus a docker backend.
 //
-// This is a best-effort restriction on the host: it constrains cwd, env and
-// runtime, but it is not a full OS-level jail (Python's version wraps macOS in
-// sandbox-exec / Linux in rlimits — those platform jails are not reproduced
-// here; see the parity note in the CLI wiring).
+// The restricted backend applies real OS-level confinement, not just a cwd and
+// a trimmed environment. What is enforced depends on the platform, and the
+// enforced set is always reported back to the caller in Result.Isolation so a
+// user can tell exactly what they got:
+//
+//   - darwin: the command is wrapped in `sandbox-exec` with an SBPL profile that
+//     denies all network access, denies read/write of /etc, /private/etc,
+//     /var/db, /private/var/db and master.passwd, denies reads of the invoking
+//     user's home tree (with credential dirs such as ~/.ssh and ~/.aws denied for
+//     write too), re-allows read/write under the resolved run directory, and
+//     makes /usr, /bin, /sbin, /System and /Library read-only. If sandbox-exec is
+//     missing the run FAILS CLOSED with exit 127 (matching Python).
+//   - linux: RLIMIT_CPU and RLIMIT_AS are applied via a shell `ulimit` prologue,
+//     Landlock (ABI v1+, no CGO) confines the filesystem to an allow-list that
+//     excludes /etc/passwd and the user's home, and network egress is blocked
+//     via Landlock ABI v4 TCP scoping and/or an unprivileged network namespace.
+//     Layers that the running kernel cannot provide are DEGRADED, never faked --
+//     the reduced guarantee is spelled out in Result.Isolation.
+//   - everything else: FAILS CLOSED, pointing at `--backend docker`.
+//
+// The path-confinement idea (EvalSymlinks guard) is reused from internal/tool so
+// the working directory resolves to a real path before it is baked into a
+// policy.
 package sandbox
 
 import (
@@ -18,6 +34,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -32,11 +49,34 @@ type Options struct {
 }
 
 // Result is the captured outcome of a sandboxed run.
+//
+// The stdout/stderr/exit/timed_out shape is unchanged and backward compatible;
+// Isolation is additive and describes the confinement that was actually applied.
 type Result struct {
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 	Exit     int    `json:"exit"`
 	TimedOut bool   `json:"timed_out"`
+	// Isolation is a human-readable description of the confinement layers that
+	// were actually active for this run (never an aspirational claim).
+	Isolation string `json:"isolation"`
+}
+
+// isolationPlan is how a platform asks Exec to launch the command.
+type isolationPlan struct {
+	// Prefix is argv prepended before the `sh -c <script>` invocation.
+	Prefix []string
+	// Prologue is prepended to the shell script (e.g. `ulimit` calls).
+	Prologue string
+	// ExtraEnv is appended to the child's environment.
+	ExtraEnv []string
+	// SysProcAttr, when set, is applied to the child process.
+	SysProcAttr *syscall.SysProcAttr
+	// Isolation describes the guarantees this plan delivers.
+	Isolation string
+	// Alt is a weaker fallback plan used only when the process cannot be
+	// started with this plan (e.g. unprivileged netns denied by the kernel).
+	Alt *isolationPlan
 }
 
 // confineDir resolves dir to a real absolute path, following symlinks so the
@@ -45,7 +85,11 @@ type Result struct {
 // guard idea from internal/tool.resolvePath.
 func confineDir(dir string) (string, error) {
 	if dir == "" {
-		return os.Getwd()
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		dir = wd
 	}
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -65,8 +109,12 @@ func confineDir(dir string) (string, error) {
 	return real, nil
 }
 
-// Exec runs opts.Command in a restricted subprocess and returns its result. A
+// Exec runs opts.Command in an OS-confined subprocess and returns its result. A
 // timeout yields Exit=124 with TimedOut=true (matching Python's convention).
+//
+// If the platform cannot provide isolation, Exec fails closed: it returns a
+// Result with a non-zero exit and an explanatory stderr rather than running the
+// command unconfined.
 func Exec(ctx context.Context, opts Options) (*Result, error) {
 	if strings.TrimSpace(opts.Command) == "" {
 		return nil, errors.New("empty command")
@@ -79,27 +127,58 @@ func Exec(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 
+	plan, failClosed, err := buildIsolation(runDir, opts.Timeout)
+	if err != nil {
+		return nil, err
+	}
+	if failClosed != nil {
+		return failClosed, nil
+	}
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	cctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cctx, "sh", "-c", opts.Command)
+	for {
+		res, startErr := runPlan(cctx, plan, runDir, opts.Command)
+		if startErr != nil && plan.Alt != nil {
+			// The kernel refused this confinement (e.g. user namespaces
+			// disabled). Degrade to the weaker, honestly-labelled plan.
+			plan = plan.Alt
+			continue
+		}
+		if startErr != nil {
+			return nil, startErr
+		}
+		return res, nil
+	}
+}
+
+// runPlan launches one isolationPlan. A non-nil error means the process could
+// not be started at all (the caller may then try plan.Alt).
+func runPlan(cctx context.Context, plan *isolationPlan, runDir, command string) (*Result, error) {
+	argv := append(append([]string{}, plan.Prefix...), "sh", "-c", plan.Prologue+command)
+	cmd := exec.CommandContext(cctx, argv[0], argv[1:]...)
 	cmd.Dir = runDir
 	// Minimal, confined environment: a fixed PATH and HOME pinned to the run dir
 	// (mirrors Python's restricted backend env), so the command cannot lean on
 	// the caller's HOME-relative secrets.
-	cmd.Env = []string{
+	cmd.Env = append([]string{
 		"PATH=/usr/bin:/bin:/usr/local/bin:/usr/sbin:/sbin",
 		"HOME=" + runDir,
-	}
+	}, plan.ExtraEnv...)
+	cmd.SysProcAttr = plan.SysProcAttr
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	runErr := cmd.Run()
-	res := &Result{Stdout: stdout.String(), Stderr: stderr.String()}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	runErr := cmd.Wait()
+	res := &Result{Stdout: stdout.String(), Stderr: stderr.String(), Isolation: plan.Isolation}
 
 	if cctx.Err() == context.DeadlineExceeded {
 		res.TimedOut = true
@@ -112,7 +191,6 @@ func Exec(ctx context.Context, opts Options) (*Result, error) {
 			res.Exit = ee.ExitCode()
 			return res, nil
 		}
-		// Failed to start (e.g. sh missing): surface as error.
 		return nil, runErr
 	}
 	res.Exit = 0

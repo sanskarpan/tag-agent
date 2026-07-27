@@ -40,6 +40,15 @@ const (
 	DefaultDockerNetwork = "none"
 )
 
+// orDefault returns v, or def when v is blank. Shared by dockerArgs and the
+// reported isolation string so the two can never disagree.
+func orDefault(v, def string) string {
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	return v
+}
+
 // dockerBinary is the docker executable name (overridable in tests).
 var dockerBinary = "docker"
 
@@ -61,18 +70,9 @@ func lookDockerPath() (string, error) {
 //
 // Layout: run --rm [--name <name>] --memory <m> --cpus <c> --network <n> [--workdir <d>] <image> sh -c <command>
 func dockerArgs(opts DockerOptions, name string) []string {
-	mem := opts.Memory
-	if strings.TrimSpace(mem) == "" {
-		mem = DefaultDockerMemory
-	}
-	cpus := opts.CPUs
-	if strings.TrimSpace(cpus) == "" {
-		cpus = DefaultDockerCPUs
-	}
-	network := opts.Network
-	if strings.TrimSpace(network) == "" {
-		network = DefaultDockerNetwork
-	}
+	mem := orDefault(opts.Memory, DefaultDockerMemory)
+	cpus := orDefault(opts.CPUs, DefaultDockerCPUs)
+	network := orDefault(opts.Network, DefaultDockerNetwork)
 
 	args := []string{"run", "--rm"}
 	if strings.TrimSpace(name) != "" {
@@ -144,7 +144,15 @@ func ExecDocker(ctx context.Context, opts DockerOptions) (*Result, error) {
 	cmd.Stderr = &stderr
 
 	runErr := cmd.Run()
-	res := &Result{Stdout: stdout.String(), Stderr: stderr.String()}
+	res := &Result{
+		Stdout: stdout.String(),
+		Stderr: stderr.String(),
+		// Report the confinement the container actually got, so `isolation` is
+		// meaningful for both backends (network=none only when so configured).
+		Isolation: fmt.Sprintf("docker container: image=%s network=%s memory=%s cpus=%s",
+			opts.Image, orDefault(opts.Network, DefaultDockerNetwork),
+			orDefault(opts.Memory, DefaultDockerMemory), orDefault(opts.CPUs, DefaultDockerCPUs)),
+	}
 
 	if cctx.Err() == context.DeadlineExceeded {
 		res.TimedOut = true

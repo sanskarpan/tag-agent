@@ -13,15 +13,19 @@ import (
 // registerSandbox wires `tag sandbox run` with two selectable backends
 // (`--backend`, default `restricted`):
 //   - restricted (Go port of src/tag/sandbox.py's `restricted` backend): runs a
-//     shell command confined to a working directory with a timeout and a minimal
-//     environment.
+//     shell command under real OS-level confinement -- `sandbox-exec` with an
+//     SBPL profile on macOS, Landlock + rlimits (+ a network namespace when the
+//     kernel permits) on Linux -- confined to a working directory with a timeout
+//     and a minimal environment. Platforms with no confinement primitive fail
+//     closed instead of running the command unprotected. The confinement that
+//     was actually applied is reported back as `isolation`.
 //   - docker: runs the command inside a `docker run --rm` container with hardened
 //     resource/network defaults (`--memory/--cpus/--network`, `--image` required);
 //     see internal/sandbox/docker.go.
 //
 // Both capture stdout/stderr/exit and share the same Result shape.
 func registerSandbox(root *cobra.Command, app *App) {
-	c := &cobra.Command{Use: "sandbox", Short: "Run commands in a restricted sandbox", GroupID: "tools"}
+	c := &cobra.Command{Use: "sandbox", Short: "Run commands in an OS-isolated sandbox", GroupID: "tools"}
 
 	var timeoutSec int
 	var dir string
@@ -64,6 +68,7 @@ func registerSandbox(root *cobra.Command, app *App) {
 					"stderr":    res.Stderr,
 					"exit":      res.Exit,
 					"timed_out": res.TimedOut,
+					"isolation": res.Isolation,
 				})
 			}
 			if res.Stdout != "" {
@@ -77,11 +82,18 @@ func registerSandbox(root *cobra.Command, app *App) {
 			} else {
 				fmt.Printf("\n(sandbox: exit %d)\n", res.Exit)
 			}
+			if res.Isolation != "" {
+				fmt.Printf("(isolation: %s)\n", res.Isolation)
+			}
 			return nil
 		}}
 	run.Flags().IntVar(&timeoutSec, "timeout", 60, "timeout in seconds (must be > 0)")
 	run.Flags().StringVar(&dir, "dir", "", "working directory (default: current dir; container workdir for docker)")
-	run.Flags().StringVar(&backend, "backend", "restricted", "sandbox backend: 'restricted' (host sh) or 'docker'")
+	run.Flags().StringVar(&backend, "backend", "restricted",
+		"sandbox backend: 'restricted' (macOS: sandbox-exec profile - no network, no /etc or $HOME reads, "+
+			"run dir writable; Linux: Landlock filesystem allow-list + rlimits, network blocked only when the "+
+			"kernel allows a user namespace or Landlock ABI>=4 - see the reported 'isolation' line; other OSes: "+
+			"unsupported, fails closed) or 'docker'")
 	run.Flags().StringVar(&image, "image", "", "container image (required for --backend docker)")
 	run.Flags().StringVar(&memory, "memory", sandbox.DefaultDockerMemory, "docker memory limit (docker backend)")
 	run.Flags().StringVar(&cpus, "cpus", sandbox.DefaultDockerCPUs, "docker CPU limit (docker backend)")
