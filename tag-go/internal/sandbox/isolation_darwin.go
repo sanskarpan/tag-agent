@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // sandboxExecMissingMsg matches src/tag/sandbox.py's wording so the Python and
@@ -13,16 +15,129 @@ import (
 const sandboxExecMissingMsg = "sandbox-exec not available: cannot isolate on this platform. " +
 	"Use --backend docker for isolated execution."
 
-// darwinIsolation is the guarantee string reported in Result.Isolation.
-const darwinIsolation = "sandbox-exec (SBPL): network denied; /etc, /private/etc, /var/db, " +
+// darwinIsolationBase is the guarantee string for a run where every rule below
+// was emitted unweakened. It is never reported verbatim unless that is true:
+// see darwinIsolationString.
+const darwinIsolationBase = "sandbox-exec (SBPL): network denied; /etc, /private/etc, /var/db, " +
 	"/private/var/db and master.passwd unreadable; $HOME reads denied (~/.ssh, ~/.aws, " +
 	"~/.gnupg, ~/.config, ~/.gcloud, ~/.kube, ~/.docker, ~/Library/Keychains denied for " +
 	"read+write); run dir read/write allowed; /usr, /bin, /sbin, /System, /Library read-only"
+
+// darwinIsolationString renders the honest guarantee for one run. Result.Isolation
+// is documented as never being an aspirational claim, so any rule that had to be
+// weakened (or could not be emitted at all) is appended verbatim rather than
+// silently dropped from a compile-time constant.
+func darwinIsolationString(weakened []string) string {
+	if len(weakened) == 0 {
+		return darwinIsolationBase
+	}
+	return darwinIsolationBase + "; WEAKENED: " + strings.Join(weakened, "; ")
+}
 
 // sensitiveHomeDirs are credential locations denied for BOTH read and write.
 var sensitiveHomeDirs = []string{
 	".ssh", ".aws", ".gnupg", ".config", ".gcloud", ".kube", ".docker",
 	"Library/Keychains",
+}
+
+// systemWriteRoots are made read-only by the profile.
+var systemWriteRoots = []string{"/usr", "/bin", "/sbin", "/System", "/Library"}
+
+// dataFirmlinkPrefix is the APFS firmlink root: /System/Volumes/Data/Users/x and
+// /Users/x are the same directory. EvalSymlinks does NOT collapse it (a firmlink
+// is not a symlink), so run-dir validation normalises it away -- otherwise
+// `--dir /System/Volumes/Data/Users/<me>` would spell $HOME past a string check.
+const dataFirmlinkPrefix = "/System/Volumes/Data"
+
+// runDirTooBroadMsg is the fail-closed message for a run dir that is itself a
+// sensitive boundary. It mirrors the sandbox-exec-missing path (exit 127) and
+// names the escape hatch.
+func runDirTooBroadMsg(runDir, why string) string {
+	return fmt.Sprintf("sandbox: refusing to run with %s as the run directory: %s. "+
+		"The run directory is the sandbox's read/write boundary, so it must be a specific "+
+		"working directory (e.g. a scratch dir under your home), never a sensitive tree or "+
+		"one of its ancestors. Pass --dir <subdirectory>, or use --backend docker for "+
+		"isolated execution.", runDir, why)
+}
+
+// normalizeRunDir strips the APFS data-volume firmlink prefix and any trailing
+// slash so path comparisons see the canonical spelling.
+func normalizeRunDir(p string) string {
+	if p != dataFirmlinkPrefix && strings.HasPrefix(p, dataFirmlinkPrefix+"/") {
+		p = strings.TrimPrefix(p, dataFirmlinkPrefix)
+	}
+	if len(p) > 1 {
+		p = strings.TrimRight(p, "/")
+	}
+	if p == "" {
+		p = "/"
+	}
+	return p
+}
+
+// isAtOrUnder reports whether p is dir itself or lives inside it.
+func isAtOrUnder(p, dir string) bool {
+	if dir == "/" {
+		return true
+	}
+	return p == dir || strings.HasPrefix(p, dir+"/")
+}
+
+// isAtOrAbove reports whether p is dir itself or an ancestor of it: exactly the
+// relationship that lets `(allow ... (subpath p))` cancel a denial of dir.
+func isAtOrAbove(p, dir string) bool {
+	return isAtOrUnder(dir, p)
+}
+
+// validateRunDir rejects run directories that are at or above a sensitive
+// boundary.
+//
+// This is the primary fix for the "broad run dir re-opens every denial" class:
+// because the run dir is re-allowed for read+write, a run dir of `/`, `/Users`
+// or `$HOME` would hand back exactly the trees the profile exists to deny (and
+// `--dir` defaults to the current working directory, so `cd ~ && tag sandbox
+// run` used to be enough). A run dir is the confinement boundary, so requiring
+// it to be a specific directory is the control working, not a limitation.
+//
+// It also rejects run dirs *inside* a secret tree (e.g. ~/.ssh/keys), which the
+// profile would deny anyway -- refusing up front is clearer than a run that
+// cannot read its own cwd.
+func validateRunDir(runDir, home string) error {
+	p := normalizeRunDir(runDir)
+
+	// Trees whose contents are secret: being at or under them is disqualifying.
+	secretTrees := []string{"/etc", "/private/etc", "/var/db", "/private/var/db"}
+	// Boundaries that must never be re-opened wholesale: being at or above them
+	// is disqualifying.
+	boundaries := []string{
+		"/", "/Users", "/home", "/Volumes", "/System", dataFirmlinkPrefix,
+		"/Library", "/private", "/var", "/private/var", "/usr", "/etc", "/private/etc",
+		"/var/db", "/private/var/db",
+	}
+	if home != "" {
+		h := normalizeRunDir(home)
+		boundaries = append(boundaries, h)
+		for _, d := range sensitiveHomeDirs {
+			s := h + "/" + d
+			boundaries = append(boundaries, s)
+			secretTrees = append(secretTrees, s)
+		}
+	}
+	for _, s := range secretTrees {
+		if isAtOrUnder(p, s) {
+			return fmt.Errorf("%s", runDirTooBroadMsg(runDir, "it is inside the protected tree "+s))
+		}
+	}
+	for _, b := range boundaries {
+		if isAtOrAbove(p, b) {
+			why := "it is the protected path " + b
+			if p != b {
+				why = "it contains the protected path " + b
+			}
+			return fmt.Errorf("%s", runDirTooBroadMsg(runDir, why))
+		}
+	}
+	return nil
 }
 
 // sbplQuote renders p as an SBPL string literal body, escaping the two
@@ -33,8 +148,14 @@ var sensitiveHomeDirs = []string{
 // directory name terminate the literal and inject arbitrary SBPL (e.g.
 // re-allowing network). Control characters (including newline) are rejected
 // outright rather than escaped, because SBPL's escape handling for them is not
-// something we want to depend on.
+// something we want to depend on. Invalid UTF-8 is rejected for a related
+// reason: ranging over a string yields utf8.RuneError for a bad byte, so
+// escaping it would silently write U+FFFD and describe a DIFFERENT path than
+// the one the process actually runs in.
 func sbplQuote(p string) (string, error) {
+	if !utf8.ValidString(p) {
+		return "", fmt.Errorf("sandbox: refusing to build a policy for a path that is not valid UTF-8: %q", p)
+	}
 	for _, r := range p {
 		if r < 0x20 || r == 0x7f {
 			return "", fmt.Errorf("sandbox: refusing to build a policy for a path containing a control character: %q", p)
@@ -51,17 +172,33 @@ func sbplQuote(p string) (string, error) {
 	return b.String(), nil
 }
 
-// sbplProfile builds the seatbelt profile for a run confined to runDir.
+// sbplProfile builds the seatbelt profile for a run confined to runDir, and
+// reports any rule it had to weaken so Result.Isolation can say so.
 //
-// Rule order matters: SBPL is last-match-wins, so the re-allow of runDir must
-// come AFTER the blanket home denial for a scratch dir under $HOME to work.
-func sbplProfile(runDir, home string) (string, error) {
+// Rule order is the security-critical part. SBPL is last-match-wins, so the
+// run-dir re-allow used to cancel every denial that came before it whenever the
+// run dir sat at or above one of them. The denials therefore come LAST and can
+// no longer be cancelled:
+//
+//	(allow default) -> (deny network*) -> (allow rw runDir) -> all denials
+//
+// A scratch dir under $HOME still works because the $HOME read denial carves
+// the run dir back out with (require-not (subpath runDir)) instead of relying
+// on rule order. That carve-out is safe only because validateRunDir has already
+// guaranteed the run dir is strictly below $HOME, never $HOME itself.
+func sbplProfile(runDir, home string) (string, []string, error) {
 	dir, err := sbplQuote(runDir)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
+	if err := validateRunDir(runDir, home); err != nil {
+		return "", nil, err
+	}
+	var weakened []string
 	var b strings.Builder
 	b.WriteString("(version 1)\n(allow default)\n(deny network*)\n")
+	// The run dir is allowed FIRST; every denial below outranks it.
+	fmt.Fprintf(&b, "(allow file-read* file-write* (subpath \"%s\"))\n", dir)
 	b.WriteString(`(deny file-read* file-write*` +
 		` (subpath "/etc") (subpath "/private/etc")` +
 		` (subpath "/var/db") (subpath "/private/var/db")` +
@@ -69,31 +206,55 @@ func sbplProfile(runDir, home string) (string, error) {
 	if home != "" {
 		h, err := sbplQuote(home)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
-		// Deny reading the user's home tree by default (protects secrets).
-		fmt.Fprintf(&b, "(deny file-read* (subpath \"%s\"))\n", h)
-		// Explicitly deny sensitive credential dirs for reads AND writes.
+		// Deny reading the user's home tree by default (protects secrets). When
+		// the run dir lives under $HOME, carve exactly that subtree back out --
+		// a scoped exception, not a re-ordering that cancels the whole rule.
+		if isAtOrUnder(normalizeRunDir(runDir), normalizeRunDir(home)) {
+			fmt.Fprintf(&b, "(deny file-read* (require-all (subpath \"%s\") (require-not (subpath \"%s\"))))\n", h, dir)
+		} else {
+			fmt.Fprintf(&b, "(deny file-read* (subpath \"%s\"))\n", h)
+		}
+		// Explicitly deny sensitive credential dirs for reads AND writes. These
+		// are unconditional: validateRunDir guarantees the run dir is neither
+		// inside one nor an ancestor of one.
 		var parts []string
 		for _, d := range sensitiveHomeDirs {
 			q, err := sbplQuote(home + "/" + d)
 			if err != nil {
-				return "", err
+				return "", nil, err
 			}
 			parts = append(parts, fmt.Sprintf("(subpath \"%s\")", q))
 		}
 		fmt.Fprintf(&b, "(deny file-read* file-write* %s)\n", strings.Join(parts, " "))
+	} else {
+		weakened = append(weakened, "$HOME read denial NOT applied (no home directory could be resolved)")
 	}
-	// Re-allow the run directory (must follow the home denial above).
-	fmt.Fprintf(&b, "(allow file-read* file-write* (subpath \"%s\"))\n", dir)
-	b.WriteString(`(deny file-write*` +
-		` (subpath "/usr") (subpath "/bin") (subpath "/sbin")` +
-		` (subpath "/System") (subpath "/Library"))` + "\n")
-	return b.String(), nil
+	// System trees are read-only. If the run dir is inside one (e.g.
+	// /usr/local/build) it is carved back out, since the run dir must stay
+	// writable -- and that exception is reported rather than hidden.
+	var sysParts []string
+	inSystem := ""
+	for _, root := range systemWriteRoots {
+		sysParts = append(sysParts, fmt.Sprintf("(subpath \"%s\")", root))
+		if isAtOrUnder(normalizeRunDir(runDir), root) {
+			inSystem = root
+		}
+	}
+	if inSystem != "" {
+		fmt.Fprintf(&b, "(deny file-write* (require-all (require-any %s) (require-not (subpath \"%s\"))))\n",
+			strings.Join(sysParts, " "), dir)
+		weakened = append(weakened, fmt.Sprintf("%s is read-only EXCEPT the run dir %s, which stays writable", inSystem, runDir))
+	} else {
+		fmt.Fprintf(&b, "(deny file-write* %s)\n", strings.Join(sysParts, " "))
+	}
+	return b.String(), weakened, nil
 }
 
 // buildIsolation wraps the command in sandbox-exec. If sandbox-exec is not on
-// PATH the run fails closed with exit 127 rather than executing unconfined.
+// PATH, or the run dir is too broad to confine, the run fails closed with exit
+// 127 rather than executing unconfined.
 func buildIsolation(runDir string, _ time.Duration) (*isolationPlan, *Result, error) {
 	se, err := exec.LookPath("sandbox-exec")
 	if err != nil {
@@ -104,12 +265,25 @@ func buildIsolation(runDir string, _ time.Duration) (*isolationPlan, *Result, er
 		}, nil
 	}
 	home, _ := os.UserHomeDir()
-	profile, err := sbplProfile(runDir, home)
+	if home != "" {
+		// Match confineDir's resolution so a symlinked home compares equal.
+		if real, err := filepath.EvalSymlinks(home); err == nil {
+			home = real
+		}
+	}
+	if err := validateRunDir(runDir, home); err != nil {
+		return nil, &Result{
+			Exit:      127,
+			Stderr:    err.Error(),
+			Isolation: "none (failed closed: run directory too broad to confine)",
+		}, nil
+	}
+	profile, weakened, err := sbplProfile(runDir, home)
 	if err != nil {
 		return nil, nil, err
 	}
 	return &isolationPlan{
 		Prefix:    []string{se, "-p", profile},
-		Isolation: darwinIsolation,
+		Isolation: darwinIsolationString(weakened),
 	}, nil, nil
 }
