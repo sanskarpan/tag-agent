@@ -92,6 +92,38 @@ func TestAnthropicPricesMatchPublishedRates(t *testing.T) {
 	}
 }
 
+// TestPricingCoversGPT54 pins the one shipped default the earlier "cover shipped
+// models" pass missed: `gpt-5.4` is the master/orchestrator default in
+// src/tag/config/default.yaml, yet `tag pricing get --model gpt-5.4` returned
+// `model not found: "gpt-5.4"` and every cost rollup for the default profile
+// silently priced it at $0.
+func TestPricingCoversGPT54(t *testing.T) {
+	got := costOf(t, "gpt-5.4", 1_000_000, 1_000_000)
+	if math.Abs(got-11.25) > 1e-9 {
+		t.Errorf("gpt-5.4: cost = %v, want 11.25", got)
+	}
+}
+
+// TestLookupPriceResolvesUnknownVendorPrefix covers the runtime-flavoured ids
+// TAG actually writes (README/config use "openai-codex/gpt-5.4"). "openai-codex/"
+// is not a key prefix in the table, so the id fell straight through to
+// `model not found` and the span contributed $0 to `tag costs`.
+func TestLookupPriceResolvesUnknownVendorPrefix(t *testing.T) {
+	for _, m := range []string{"openai-codex/gpt-5.4", "openai/gpt-5.4", "gpt-5.4"} {
+		p, ok := lookupPrice(m)
+		if !ok {
+			t.Fatalf("model not found: %q", m)
+		}
+		if p != [2]float64{1.25, 10.0} {
+			t.Errorf("%s: got %v, want [1.25 10]", m, p)
+		}
+	}
+	// The fallback must not turn genuinely unknown models into a price.
+	if _, ok := lookupPrice("somevendor/not-a-real-model-xyz"); ok {
+		t.Error("unknown prefixed model unexpectedly resolved")
+	}
+}
+
 func TestLookupPriceUnknownModelStillFails(t *testing.T) {
 	// A model with no authoritative published price must NOT be silently
 	// invented; it stays a lookup failure.

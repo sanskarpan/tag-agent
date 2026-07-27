@@ -131,10 +131,13 @@ func traceSpanTokens(m map[string]any) int {
 // models TAG ships in its own default config (src/tag/config/default.yaml), which
 // previously all reported "model not found".
 var pricingTable = map[string][2]float64{ // {input, output} $/1M
-	"openai/gpt-4o":               {2.5, 10.0},
-	"openai/gpt-4o-mini":          {0.15, 0.6},
-	"gpt-4o":                      {2.5, 10.0},
-	"gpt-4o-mini":                 {0.15, 0.6},
+	"openai/gpt-4o":      {2.5, 10.0},
+	"openai/gpt-4o-mini": {0.15, 0.6},
+	"gpt-4o":             {2.5, 10.0},
+	"gpt-4o-mini":        {0.15, 0.6},
+	// TAG's own default master/orchestrator model. It was missing here and in
+	// src/tag/assets/pricing.yaml, so the shipped default profile priced at $0.
+	"openai/gpt-5.4":              {1.25, 10.0},
 	"anthropic/claude-opus-4-8":   {5.0, 25.0},
 	"anthropic/claude-sonnet-4-6": {3.0, 15.0},
 	"anthropic/claude-haiku-4-5":  {1.0, 5.0},
@@ -165,6 +168,19 @@ func lookupPrice(model string) ([2]float64, bool) {
 			if p, ok := pricingTable[prefix+model]; ok {
 				return p, true
 			}
+		}
+		return [2]float64{}, false
+	}
+	// A vendor namespace we do not carry in the table (TAG ships runtime-flavoured
+	// ids such as "openai-codex/gpt-5.4"): retry on the bare alias, then on that
+	// alias under each known prefix, so the model is priced rather than skipped.
+	bare := model[strings.LastIndex(model, "/")+1:]
+	if p, ok := pricingTable[bare]; ok {
+		return p, true
+	}
+	for _, prefix := range knownProviderPrefixes {
+		if p, ok := pricingTable[prefix+bare]; ok {
+			return p, true
 		}
 	}
 	return [2]float64{}, false

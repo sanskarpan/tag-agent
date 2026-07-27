@@ -75,6 +75,15 @@ models:
 
   # ── OpenAI GPT ──────────────────────────────────────────────────────────────
 
+  # GPT-5.4 — the model TAG ships as the `orchestrator`/master profile default
+  # (src/tag/config/default.yaml). It was absent from this table, so `tag pricing
+  # get gpt-5.4` and every cost rollup for the default profile reported
+  # "Model not found" / $0.
+  - model_id: gpt-5.4
+    input_usd_per_1m: 1.25
+    output_usd_per_1m: 10.00
+    cache_read_multiplier: 0.1
+
   # GPT-4o — latest multimodal flagship
   - model_id: gpt-4o
     input_usd_per_1m: 2.50
