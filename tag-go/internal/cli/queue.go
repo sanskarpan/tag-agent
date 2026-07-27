@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -605,7 +604,13 @@ func registerQueue(root *cobra.Command, app *App) {
 					return err
 				}
 				opts.OnlyJobs = submitted
-				s, err := worker.Drain(context.Background(), db.DB, opts)
+				// Cancel on SIGINT/SIGTERM, exactly as `queue worker` does. With a
+				// bare context.Background() a SIGTERM killed the process outright and
+				// left the in-flight job stranded in 'running' for the full 30-minute
+				// staleClaimLease, blocking every dependent job behind it.
+				ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+				defer stop()
+				s, err := worker.Drain(ctx, db.DB, opts)
 				if err != nil {
 					return err
 				}
