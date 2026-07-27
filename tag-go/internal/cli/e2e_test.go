@@ -1015,6 +1015,9 @@ func TestE2EEmptyJSONListsAreArrays(t *testing.T) {
 		{"webhook", "rule-list", "--json"},
 		{"notify", "list", "--json"},
 		{"memory-journal", "list", "--json"},
+		// F5: two commands the #559 sweep missed — both still emitted `null`.
+		{"marketplace", "list", "--json"},
+		{"tool-index", "search", "foo", "--json"},
 	}
 	for _, c := range cases {
 		out, code := run(t, h, c...)
