@@ -405,3 +405,48 @@ class TestLoopbackBindGuard:
         assert rc == 1
         out = capsys.readouterr()
         assert "non-loopback" in (out.out + out.err)
+
+
+# ---------------------------------------------------------------------------
+# #5 — `tag pricing` reported wrong costs for shipped Anthropic models
+# ---------------------------------------------------------------------------
+
+class TestPricingTable:
+    """Pre-fix: claude-opus-4-8 was listed at 15/75 (a 3x overcharge, $90 for
+    1M/1M instead of $30) and claude-haiku-4-5 at 0.80/4.00 ($4.80 vs $6.00)."""
+
+    @pytest.mark.parametrize(
+        "model,want_in,want_out",
+        [
+            ("claude-opus-4-8", 5.00, 25.00),
+            ("claude-sonnet-4-6", 3.00, 15.00),
+            ("claude-haiku-4-5", 1.00, 5.00),
+            ("claude-haiku-4-5-20251001", 1.00, 5.00),
+        ],
+    )
+    def test_published_rates(self, model, want_in, want_out):
+        from tag.cost_table import list_all_models, reload_pricing_table
+
+        reload_pricing_table()
+        by_id = {m.model_id: m for m in list_all_models()}
+        assert model in by_id, f"{model} missing from pricing table"
+        entry = by_id[model]
+        assert entry.input_usd_per_1m == want_in
+        assert entry.output_usd_per_1m == want_out
+
+    @pytest.mark.parametrize(
+        "model,want_cost",
+        [
+            ("claude-opus-4-8", 30.00),
+            ("claude-sonnet-4-6", 18.00),
+            ("claude-haiku-4-5", 6.00),
+        ],
+    )
+    def test_cost_for_1m_in_1m_out(self, model, want_cost):
+        from tag.cost_table import compute_cost, reload_pricing_table
+
+        reload_pricing_table()
+        cost = compute_cost(model, 1_000_000, 1_000_000)
+        assert cost == pytest.approx(want_cost), (
+            f"{model}: computed ${cost}, expected ${want_cost}"
+        )

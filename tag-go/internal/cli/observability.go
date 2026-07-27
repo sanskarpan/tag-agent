@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tag-agent/tag/internal/store"
@@ -99,14 +100,47 @@ func traceSpanTokens(m map[string]any) int {
 }
 
 // pricingTable is the embedded per-1M-token USD cost (gen_ai cost attribution).
+// Kept in sync with src/tag/assets/pricing.yaml — in particular it must cover the
+// models TAG ships in its own default config (src/tag/config/default.yaml), which
+// previously all reported "model not found".
 var pricingTable = map[string][2]float64{ // {input, output} $/1M
 	"openai/gpt-4o":               {2.5, 10.0},
 	"openai/gpt-4o-mini":          {0.15, 0.6},
+	"gpt-4o":                      {2.5, 10.0},
+	"gpt-4o-mini":                 {0.15, 0.6},
 	"anthropic/claude-opus-4-8":   {5.0, 25.0},
 	"anthropic/claude-sonnet-4-6": {3.0, 15.0},
 	"anthropic/claude-haiku-4-5":  {1.0, 5.0},
 	"google/gemini-2.5-pro":       {1.25, 5.0},
 	"google/gemini-2.5-flash":     {0.075, 0.3},
+	// Models TAG ships as profile defaults.
+	"deepseek/deepseek-v4-flash": {0.14, 0.28},
+	"deepseek/deepseek-v4-pro":   {0.27, 1.10},
+	"deepseek/deepseek-r1":       {0.55, 2.19},
+	"qwen/qwen3-coder":           {0.50, 2.00},
+	"qwen/qwen-plus":             {0.40, 1.20},
+}
+
+// knownProviderPrefixes are the vendor namespaces used in pricingTable keys. A
+// bare model alias (e.g. "claude-sonnet-4-6") is the form users type and the form
+// run.go treats as distinct from the prefixed id, so resolve it by trying each
+// prefix rather than reporting "model not found".
+var knownProviderPrefixes = []string{"anthropic/", "openai/", "google/", "deepseek/", "qwen/"}
+
+// lookupPrice resolves a model id to its {input, output} $/1M price, accepting
+// either the fully prefixed id or the bare alias.
+func lookupPrice(model string) ([2]float64, bool) {
+	if p, ok := pricingTable[model]; ok {
+		return p, true
+	}
+	if !strings.Contains(model, "/") {
+		for _, prefix := range knownProviderPrefixes {
+			if p, ok := pricingTable[prefix+model]; ok {
+				return p, true
+			}
+		}
+	}
+	return [2]float64{}, false
 }
 
 func registerObservability(root *cobra.Command, app *App) {
@@ -121,12 +155,43 @@ func registerObservability(root *cobra.Command, app *App) {
 			if err := db.QueryRow(`SELECT COALESCE(SUM(prompt_tokens),0),COALESCE(SUM(completion_tokens),0) FROM spans`).Scan(&pt, &ct); err != nil {
 				return err
 			}
-			out := map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+			// Dollar cost: prefer the persisted cost_usd column, and fall back to
+			// the embedded pricing table for spans that recorded a model + tokens
+			// but no cost. Previously `costs` printed tokens only, despite having
+			// both a pricing table and a cost_usd column available.
+			var storedCost float64
+			if err := db.QueryRow(`SELECT COALESCE(SUM(cost_usd),0) FROM spans`).Scan(&storedCost); err != nil {
+				return err
+			}
+			costUSD := storedCost
+			rows, err := db.Query(`SELECT COALESCE(model,''), COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0)
+				FROM spans WHERE cost_usd IS NULL AND model IS NOT NULL AND model <> ''`)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var model string
+				var p, c int64
+				if err := rows.Scan(&model, &p, &c); err != nil {
+					return err
+				}
+				if price, ok := lookupPrice(model); ok {
+					costUSD += float64(p)/1e6*price[0] + float64(c)/1e6*price[1]
+				}
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			out := map[string]any{
+				"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct,
+				"cost_usd": costUSD,
+			}
 			if flagJSON {
 				b, _ := json.Marshal(map[string]any{"totals": out})
 				fmt.Println(string(b))
 			} else {
-				fmt.Printf("prompt=%d completion=%d total=%d tokens\n", pt, ct, pt+ct)
+				fmt.Printf("prompt=%d completion=%d total=%d tokens  cost=$%.6f\n", pt, ct, pt+ct, costUSD)
 			}
 			return nil
 		}}
@@ -152,7 +217,7 @@ func registerObservability(root *cobra.Command, app *App) {
 			if inTok < 0 || outTok < 0 {
 				return fmt.Errorf("token counts must be >= 0")
 			}
-			p, ok := pricingTable[model]
+			p, ok := lookupPrice(model)
 			if !ok {
 				return fmt.Errorf("model not found: %q", model)
 			}
