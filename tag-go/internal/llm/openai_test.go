@@ -3,7 +3,10 @@ package llm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -141,5 +144,33 @@ func TestBuildOpenAIBodyToolCallLinkage(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("assistant message must carry a tool_calls array: %+v", msgs)
+	}
+}
+
+// TestOpenAIBaseURLEnvOverride pins F9: OPENAI_BASE_URL must repoint the
+// adapter at a gateway/proxy (LiteLLM, Helicone, Azure) — and, just as
+// importantly, at a local mock, so the OpenAI path is exercisable offline.
+func TestOpenAIBaseURLEnvOverride(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"via proxy\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	t.Setenv("OPENAI_API_KEY", "sk-test")
+	t.Setenv("OPENAI_BASE_URL", srv.URL+"/v1")
+
+	ch, err := OpenAIProvider{}.Stream(context.Background(), Request{Model: "gpt-4o-mini"})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	text, _, _, finished := collect(ch)
+	if text != "via proxy" || !finished {
+		t.Fatalf("text=%q finished=%v", text, finished)
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Errorf("path = %q", gotPath)
 	}
 }

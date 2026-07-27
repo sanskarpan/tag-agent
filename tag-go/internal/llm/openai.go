@@ -31,16 +31,26 @@ func (p OpenAIProvider) key() string {
 	return os.Getenv("OPENAI_API_KEY")
 }
 
+// base resolves the API root: the struct field, then OPENAI_BASE_URL (the
+// convention shared by the OpenAI SDKs and every OpenAI-compatible gateway —
+// LiteLLM, Helicone, Azure), then the public API. The env override is also what
+// makes this adapter exercisable offline against a local mock.
+func (p OpenAIProvider) base() string {
+	if p.BaseURL != "" {
+		return p.BaseURL
+	}
+	if v := strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")); v != "" {
+		return v
+	}
+	return "https://api.openai.com/v1"
+}
+
 // Stream sends the request and decodes the SSE response into provider-neutral events.
 func (p OpenAIProvider) Stream(ctx context.Context, req Request) (<-chan Event, error) {
 	if p.key() == "" {
 		return nil, fmt.Errorf("OPENAI_API_KEY is not set")
 	}
-	base := p.BaseURL
-	if base == "" {
-		base = "https://api.openai.com/v1"
-	}
-	return streamOpenAICompatible(ctx, req, base, p.key(), "openai", p.HTTPClient)
+	return streamOpenAICompatible(ctx, req, p.base(), p.key(), "openai", p.HTTPClient)
 }
 
 // streamOpenAICompatible POSTs an OpenAI-shaped chat-completions request to

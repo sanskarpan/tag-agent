@@ -34,15 +34,28 @@ func (p AnthropicProvider) key() string {
 	return os.Getenv("ANTHROPIC_API_KEY")
 }
 
+// base resolves the API root: the struct field, then ANTHROPIC_BASE_URL (the
+// override the Anthropic SDKs honour, and what every proxy/gateway expects),
+// then the public API. The env override is also what makes this adapter
+// exercisable offline against a local mock. Note the root does NOT include
+// /v1 — Stream appends /v1/messages.
+func (p AnthropicProvider) base() string {
+	b := p.BaseURL
+	if b == "" {
+		b = strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL"))
+	}
+	if b == "" {
+		return "https://api.anthropic.com"
+	}
+	return strings.TrimRight(b, "/")
+}
+
 // Stream sends the request and decodes the SSE response into provider-neutral events.
 func (p AnthropicProvider) Stream(ctx context.Context, req Request) (<-chan Event, error) {
 	if p.key() == "" {
 		return nil, fmt.Errorf("ANTHROPIC_API_KEY is not set")
 	}
-	base := p.BaseURL
-	if base == "" {
-		base = "https://api.anthropic.com"
-	}
+	base := p.base()
 	version := p.Version
 	if version == "" {
 		version = "2023-06-01"
