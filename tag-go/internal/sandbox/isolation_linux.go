@@ -3,6 +3,7 @@ package sandbox
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -46,6 +47,11 @@ func rlimitPrologue(timeout time.Duration) string {
 
 // landlockAllowList is the filesystem allow-list. Anything not listed is denied
 // -- notably /etc/passwd, /etc/shadow, /root and the invoking user's $HOME.
+//
+// The run dir is the ONLY writable tree, which is exactly why validateRunDir
+// must have vetted it first: a run dir of `/` would grant write over the whole
+// filesystem and `--dir $HOME` over the user's entire home, silently undoing
+// every denial this list encodes.
 func landlockAllowList(runDir string) []llRule {
 	rules := []llRule{
 		// The run directory is the only writable tree.
@@ -75,6 +81,26 @@ func landlockAllowList(runDir string) []llRule {
 // buildIsolation assembles the strongest plan this kernel supports, with a
 // weaker Alt used only if the kernel refuses to start the strong one.
 func buildIsolation(runDir string, timeout time.Duration) (*isolationPlan, *Result, error) {
+	// A run dir at or above a sensitive boundary is refused before any layer is
+	// assembled, exactly as on macOS: the Landlock allow-list would otherwise
+	// make that entire tree the sandbox's writable area. The check is
+	// unconditional (not gated on Landlock being available) so the same command
+	// behaves the same way on every kernel.
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		// Match confineDir's resolution so a symlinked home compares equal.
+		if real, err := filepath.EvalSymlinks(home); err == nil {
+			home = real
+		}
+	}
+	if err := validateRunDir(runDir, home); err != nil {
+		return nil, &Result{
+			Exit:      127,
+			Stderr:    err.Error(),
+			Isolation: runDirTooBroadIsolation,
+		}, nil
+	}
+
 	prologue := rlimitPrologue(timeout)
 	abi := landlockABI()
 

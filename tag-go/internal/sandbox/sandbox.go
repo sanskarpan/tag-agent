@@ -22,6 +22,9 @@
 //     Landlock (ABI v1+, no CGO) confines the filesystem to an allow-list that
 //     excludes /etc/passwd and the user's home, and network egress is blocked
 //     via Landlock ABI v4 TCP scoping and/or an unprivileged network namespace.
+//     The run dir is the ONLY writable tree, so -- exactly as on macOS -- a run
+//     directory at or above a boundary (`/`, `/home`, `/root`, `/etc`, `$HOME`,
+//     ...) is refused with exit 127 instead of granting write over that tree.
 //     Layers that the running kernel cannot provide are DEGRADED, never faked --
 //     the reduced guarantee is spelled out in Result.Isolation.
 //   - everything else: FAILS CLOSED, pointing at `--backend docker`.
