@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 )
 
 // AnthropicProvider calls the Anthropic Messages API (streaming SSE) directly
@@ -61,7 +60,9 @@ func (p AnthropicProvider) Stream(ctx context.Context, req Request) (<-chan Even
 	httpReq.Header.Set("anthropic-version", version)
 	client := p.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Minute}
+		// Shared bounded client: a stalled server fails at
+		// ResponseHeaderTimeout instead of hanging for the full request timeout.
+		client = DefaultHTTPClient()
 	}
 	resp, err := client.Do(httpReq)
 	if err != nil {

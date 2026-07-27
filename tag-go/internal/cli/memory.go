@@ -13,6 +13,17 @@ import (
 	"github.com/tag-agent/tag/internal/memory"
 )
 
+// checkMemLimit rejects a negative --limit with the SAME message and JSON shape
+// `queue list` uses. `queue list --limit -1 --json` already emitted
+// {"error": ...} while the mem commands printed bare prose under --json, so a
+// consumer had to special-case each command to learn it had passed bad input.
+func checkMemLimit(limit int) error {
+	if limit >= 0 {
+		return nil
+	}
+	return jsonErrorMaybe(fmt.Errorf("--limit must be >= 0, got %d.", limit))
+}
+
 func (a *App) profile(flag string) string {
 	if flag != "" {
 		return flag
@@ -130,38 +141,51 @@ func registerMemory(root *cobra.Command, app *App) {
 			}
 			id, err := memory.Add(db.DB, app.profile(profile), args[0], memType, confidence)
 			if err != nil {
-				return err
+				return jsonErrorMaybe(err)
 			}
-			outJSON(map[string]any{"id": id}, "Memory saved: "+id)
+			// Python: json.dumps({"id": mem_id, "profile": profile}) — the profile
+			// disambiguates the id, which is only unique within one.
+			outJSON(map[string]any{"id": id, "profile": app.profile(profile)}, "Memory saved: "+id)
 			return nil
 		}}
 	memAdd.Flags().StringVar(&memType, "type", "fact", "memory type")
 	memAdd.Flags().Float64Var(&confidence, "confidence", 1.0, "confidence (0,1]")
 
+	var searchType string
 	memSearch := &cobra.Command{Use: "search QUERY", Short: "Search memories (FTS/BM25)", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := checkMemLimit(limit); err != nil {
+				return err
+			}
 			db, err := app.OpenDB()
 			if err != nil {
 				return err
 			}
-			res, err := memory.Search(db.DB, app.profile(profile), args[0], limit, "")
+			// memory.Search has always accepted a memory_type filter (as Python's
+			// search_memories does); the CLI just never exposed it, so
+			// `mem search q --type fact` died with "unknown flag: --type", exit 2.
+			res, err := memory.Search(db.DB, app.profile(profile), args[0], limit, searchType)
 			if err != nil {
-				return err
+				return jsonErrorMaybe(err)
 			}
 			printMems(res, args[0])
 			return nil
 		}}
 	memSearch.Flags().IntVar(&limit, "limit", 10, "max results")
+	memSearch.Flags().StringVar(&searchType, "type", "", "filter type")
 
 	memList := &cobra.Command{Use: "list", Short: "List memories",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := checkMemLimit(limit); err != nil {
+				return err
+			}
 			db, err := app.OpenDB()
 			if err != nil {
 				return err
 			}
 			res, err := memory.List(db.DB, app.profile(profile), memType, limit)
 			if err != nil {
-				return err
+				return jsonErrorMaybe(err)
 			}
 			printMems(res, "")
 			return nil
@@ -177,12 +201,17 @@ func registerMemory(root *cobra.Command, app *App) {
 			}
 			ok, err := memory.Forget(db.DB, app.profile(profile), args[0])
 			if err != nil {
-				return err
+				return jsonErrorMaybe(err)
 			}
-			outJSON(map[string]any{"deleted": ok}, ternary(ok, "forgotten", "not found"))
 			if !ok {
-				return fmt.Errorf("memory not found: %s", args[0])
+				// A miss is a failure, so it must NOT print the success-shaped
+				// {"deleted": false} on stdout: a --json consumer reading stdout and
+				// ignoring the exit code would treat it as a completed delete.
+				// Message matches Python cmd_memory_semantic's forget branch.
+				return jsonErrorMaybe(fmt.Errorf("Memory '%s' not found for profile '%s'", args[0], app.profile(profile)))
 			}
+			outJSON(map[string]any{"deleted": true, "id": args[0], "profile": app.profile(profile)},
+				"forgotten: "+args[0])
 			return nil
 		}}
 	memStats := &cobra.Command{Use: "stats", Short: "Memory stats",

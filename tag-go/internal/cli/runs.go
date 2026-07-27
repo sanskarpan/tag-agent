@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/tag-agent/tag/internal/sqlutil"
 )
 
 // registerRuns wires `tag runs list` and `tag runs show <id>`.
@@ -103,7 +104,7 @@ func registerRuns(root *cobra.Command, app *App) {
 			err = db.QueryRow(`SELECT id, created_at, kind, task_type, execution, master_profile, board, prompt, status,
 				model_id, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens,
 				estimated_cost_usd, duration_ms, completed_at, metadata_json
-				FROM runs WHERE id LIKE ?||'%' ORDER BY created_at DESC LIMIT 1`, prefix).Scan(
+				FROM runs WHERE id LIKE ?||'%' ESCAPE '\' ORDER BY created_at DESC LIMIT 1`, sqlutil.EscapeLike(prefix)).Scan(
 				&id, &createdAt, &kind, &taskType, &execution, &masterProfile, &board, &prompt, &status,
 				&modelID, &promptTok, &compTok, &cacheRead, &cacheCreate, &cost, &dur, &completedAt, &metadata)
 			if err == sql.ErrNoRows {

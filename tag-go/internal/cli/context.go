@@ -12,6 +12,7 @@ import (
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/contextwin"
 	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/sqlutil"
 	"github.com/tag-agent/tag/internal/store"
 )
 
@@ -135,7 +136,7 @@ func contextEnsureSchema(db *store.DB) error {
 // persistent context so compression sees the durable facts too.
 func assembleSession(db *store.DB, profile, session string) (runID string, items []contextwin.Item, err error) {
 	var prompt string
-	err = db.QueryRow(`SELECT id, prompt FROM runs WHERE id LIKE ?||'%' ORDER BY created_at DESC LIMIT 1`, session).
+	err = db.QueryRow(`SELECT id, prompt FROM runs WHERE id LIKE ?||'%' ESCAPE '\' ORDER BY created_at DESC LIMIT 1`, sqlutil.EscapeLike(session)).
 		Scan(&runID, &prompt)
 	if err == sql.ErrNoRows {
 		return "", nil, fmt.Errorf("session not found: %q (no matching run)", session)

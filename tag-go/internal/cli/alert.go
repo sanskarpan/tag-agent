@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
+	"github.com/tag-agent/tag/internal/sqlutil"
 	"github.com/tag-agent/tag/internal/store"
 )
 
@@ -222,7 +223,7 @@ type alertFiring struct {
 // resolveAlertRuleID resolves a full rule id from an unambiguous prefix (matches
 // the truncated 8-char id shown by `alert list`).
 func resolveAlertRuleID(db *store.DB, prefix string) (string, error) {
-	rows, err := db.Query(`SELECT id FROM alert_rules WHERE id LIKE ? || '%'`, prefix)
+	rows, err := db.Query(`SELECT id FROM alert_rules WHERE id LIKE ? || '%' ESCAPE '\'`, sqlutil.EscapeLike(prefix))
 	if err != nil {
 		return "", err
 	}

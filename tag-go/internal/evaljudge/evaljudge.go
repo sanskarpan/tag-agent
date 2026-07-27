@@ -25,6 +25,7 @@ import (
 
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/sqlutil"
 )
 
 // DefaultThreshold is the minimum score (0.0–1.0) counted as a pass, mirroring
@@ -224,7 +225,7 @@ func Show(db *sql.DB, idPrefix string) (*Judgment, error) {
 	}
 	rows, err := db.Query(
 		`SELECT id,created_at,provider,COALESCE(model,''),question,answer,COALESCE(reference,''),score,passed,COALESCE(reasoning,''),threshold
-		 FROM eval_judgments WHERE id LIKE ? || '%' ORDER BY id`, idPrefix)
+		 FROM eval_judgments WHERE id LIKE ? || '%' ESCAPE '\' ORDER BY id`, sqlutil.EscapeLike(idPrefix))
 	if err != nil {
 		return nil, err
 	}

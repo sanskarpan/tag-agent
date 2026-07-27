@@ -93,6 +93,18 @@ CREATE TABLE IF NOT EXISTS entities (
 );
 CREATE INDEX IF NOT EXISTS idx_ent_profile ON entities(profile, entity_type);
 CREATE INDEX IF NOT EXISTS idx_ent_name ON entities(profile, name COLLATE NOCASE);
+-- (profile, name) is the logical identity of an entity, and graph.addEntity now
+-- upserts on it (INSERT ... ON CONFLICT DO UPDATE) so concurrent `graph build`
+-- runs cannot lose a mention_count increment. That requires a real UNIQUE index.
+-- DBs written before the upsert can hold duplicate (profile, name) rows, so fold
+-- their counts into the surviving row and drop the rest first; both statements
+-- are no-ops once the unique index exists.
+UPDATE entities SET mention_count = (
+  SELECT SUM(e2.mention_count) FROM entities e2
+  WHERE e2.profile = entities.profile AND e2.name = entities.name COLLATE NOCASE)
+WHERE rowid IN (SELECT MIN(rowid) FROM entities GROUP BY profile, name COLLATE NOCASE);
+DELETE FROM entities WHERE rowid NOT IN (SELECT MIN(rowid) FROM entities GROUP BY profile, name COLLATE NOCASE);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ent_name_unique ON entities(profile, name COLLATE NOCASE);
 CREATE TABLE IF NOT EXISTS relations (
   id TEXT PRIMARY KEY, source_entity_id TEXT NOT NULL, target_entity_id TEXT NOT NULL,
   relation_type TEXT NOT NULL DEFAULT 'related_to', confidence REAL NOT NULL DEFAULT 1.0,

@@ -294,7 +294,9 @@ func RunGCAllProfiles(db *sql.DB, cfg GCConfig) ([]GCResult, error) {
 		return nil, err
 	}
 	rows.Close()
-	var results []GCResult
+	// Non-nil so an empty DB marshals to [] rather than null — the same
+	// empty-result contract as the #559-568 batch.
+	results := []GCResult{}
 	for _, p := range profiles {
 		r, err := RunGC(db, p, cfg)
 		if err != nil {

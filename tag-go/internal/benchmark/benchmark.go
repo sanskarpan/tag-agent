@@ -24,6 +24,7 @@ import (
 
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/sqlutil"
 )
 
 //go:embed suite.yaml
@@ -208,7 +209,7 @@ func Show(db *sql.DB, idPrefix string) (*RunResult, error) {
 	}
 	rows, err := db.Query(
 		`SELECT id,created_at,provider,COALESCE(model,''),suite,total,passed,failed,results_json
-		 FROM benchmark_runs WHERE id LIKE ? || '%' ORDER BY id`, idPrefix)
+		 FROM benchmark_runs WHERE id LIKE ? || '%' ESCAPE '\' ORDER BY id`, sqlutil.EscapeLike(idPrefix))
 	if err != nil {
 		return nil, err
 	}

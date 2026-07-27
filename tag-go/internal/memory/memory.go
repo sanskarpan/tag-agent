@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tag-agent/tag/internal/sqlutil"
 )
 
 // Mem is one semantic memory row.
@@ -106,7 +107,17 @@ func List(db *sql.DB, profile, memType string, limit int) ([]Mem, error) {
 	return scan(db, q, args...)
 }
 
-// Search runs FTS5 MATCH ranked by BM25 (SQLite built-in), decay applied.
+// Search runs FTS5 MATCH ranked by BM25 (SQLite built-in), decay applied, and
+// ALWAYS supplements the FTS hits with a case-insensitive substring scan.
+//
+// Port of the semantic_memory.search_memories fix for issue #567. FTS5's
+// tokenizer only matches whole (stemmed) tokens, so it silently drops
+// partial-word queries ("deploy" inside "deployment") and non-tokenizable
+// scripts such as CJK. The previous Go code only fell back to LIKE when the FTS
+// query ERRORED — a zero-row FTS result was accepted as "no matches", so the
+// fallback never fired and recall was lost with exit 0. The LIKE pass is now
+// unconditional and only ADDS rows FTS would have dropped; FTS still drives
+// ranking for normal queries.
 func Search(db *sql.DB, profile, query string, limit int, memType string) ([]Mem, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -128,12 +139,35 @@ func Search(db *sql.DB, profile, query string, limit int, memType string) ([]Mem
 	args = append(args, limit)
 	res, err := scan(db, q, args...)
 	if err != nil {
-		// FTS may fail on odd queries; degrade to LIKE
+		// FTS5 unavailable, or the query tripped its grammar — the LIKE pass below
+		// is the only source of recall in that case. Mirrors the Python except:.
+		res = nil
+	}
+	if len(res) < limit {
+		seen := make(map[string]bool, len(res))
+		for _, m := range res {
+			seen[m.ID] = true
+		}
 		like := `SELECT id,profile,content,memory_type,confidence,created_at,accessed_at,access_count,source
-			FROM semantic_memories WHERE profile=? AND content LIKE ? ORDER BY created_at DESC LIMIT ?`
-		res, err = scan(db, like, profile, "%"+query+"%", limit)
-		if err != nil {
-			return nil, err
+			FROM semantic_memories WHERE profile=? AND content LIKE ? ESCAPE '\'`
+		largs := []any{profile, "%" + sqlutil.EscapeLike(query) + "%"}
+		if memType != "" {
+			like += ` AND memory_type=?`
+			largs = append(largs, memType)
+		}
+		like += ` ORDER BY created_at DESC LIMIT 200`
+		extra, lerr := scan(db, like, largs...)
+		if lerr != nil {
+			return nil, lerr
+		}
+		for _, m := range extra {
+			if len(res) >= limit {
+				break
+			}
+			if !seen[m.ID] {
+				seen[m.ID] = true
+				res = append(res, m)
+			}
 		}
 	}
 	// Bump access bookkeeping on each hit (mirrors the Python semantic_memory,
