@@ -305,3 +305,45 @@ class TestWebhookConcurrency:
         assert srv is not None
         assert issubclass(ws._ThreadingWebhookServer, http.server.ThreadingHTTPServer)
         assert ws._TimeoutWebhookHandler.timeout is not None
+
+
+class TestDevUIConcurrency:
+    """#4 (devui half) — the DevUI was single-threaded with no read timeout."""
+
+    def _start(self, tmp_path):
+        from tag.devui import DevUIServer
+
+        db_path = tmp_path / "devui.sqlite3"
+        sqlite3.connect(db_path).close()
+        port = _free_port()
+        srv = DevUIServer(db_path=str(db_path), host="127.0.0.1", port=port)
+        srv.start_background()
+        for _ in range(100):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        return srv, port
+
+    def test_stalled_client_does_not_block_devui(self, tmp_path):
+        """Pre-fix: a single stalled client wedged the dashboard entirely."""
+        srv, port = self._start(tmp_path)
+        stalled = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            time.sleep(0.3)  # connected, never sends a request line
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                c.request("GET", "/")
+                assert c.getresponse().status == 200, "stalled client wedged the DevUI"
+            finally:
+                c.close()
+        finally:
+            stalled.close()
+            srv._server.shutdown()
+            srv._server.server_close()
+
+    def test_devui_server_is_threaded(self, tmp_path):
+        from tag.devui import _ThreadingDevUIServer
+
+        assert issubclass(_ThreadingDevUIServer, http.server.ThreadingHTTPServer)
