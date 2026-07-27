@@ -309,10 +309,21 @@ func extractJSONObject(s string) string {
 	return ""
 }
 
+// Placeholder literals from the example spec embedded in architectPrompt.
+// Named so parseSpec can recognise its own prompt coming back at it; keep them
+// in sync with architectPrompt below.
+const (
+	placeholderEllipsis = "..."
+	placeholderFile     = "path"
+)
+
 // architectPrompt instructs the architect model to emit a JSON change spec. The
-// offline echo provider replays the last user message verbatim, so this prompt
-// itself embeds a valid example spec — parseSpec extracts it and the deterministic
-// fallback guarantees a usable plan even when a model returns prose.
+// prompt embeds an example spec so the required shape is unambiguous.
+//
+// NOTE: the offline echo provider replays the last user message verbatim, so
+// this example comes straight back as the "model output". parseSpec detects
+// that (isPlaceholderSpec) and falls through to the deterministic fallback
+// rather than persisting the example as though it were a real plan.
 func architectPrompt(task string) string {
 	return "Decompose the following software task into a JSON change specification.\n" +
 		"Respond with ONLY a JSON object of the form " +
@@ -320,14 +331,33 @@ func architectPrompt(task string) string {
 		"\n\nTask: " + task
 }
 
+// isPlaceholderSpec reports whether s is nothing but architectPrompt's example
+// echoed back — every item is the literal {"file": "path", "description": "..."}
+// template. Such a spec describes no real work, so accepting it would report
+// "status":"planned" over content no architect ever produced. A spec with even
+// one concrete item is kept as-is.
+func isPlaceholderSpec(s splitSpec) bool {
+	if len(s.Items) == 0 {
+		return true
+	}
+	for _, it := range s.Items {
+		if strings.TrimSpace(it.File) != placeholderFile ||
+			strings.TrimSpace(it.Description) != placeholderEllipsis {
+			return false
+		}
+	}
+	return true
+}
+
 // parseSpec extracts a splitSpec from model output. It tolerates surrounding
-// prose by grabbing the first {...} block. On any failure it returns a
-// single-item deterministic fallback so `split plan` always produces a usable,
-// persisted plan (offline-safe).
+// prose by grabbing the first {...} block. On any failure — including output
+// that is only the prompt's own placeholder example — it returns a single-item
+// deterministic fallback whose rationale says plainly that no structured spec
+// came back, so `split plan` never dresses up a non-result as a real plan.
 func parseSpec(task, output string) splitSpec {
 	if m := extractJSONObject(output); m != "" {
 		var s splitSpec
-		if err := json.Unmarshal([]byte(m), &s); err == nil && len(s.Items) > 0 {
+		if err := json.Unmarshal([]byte(m), &s); err == nil && len(s.Items) > 0 && !isPlaceholderSpec(s) {
 			return normalizeSpec(task, s)
 		}
 	}
@@ -437,6 +467,11 @@ func splitPlan(app *App, task, provider, architect, editor, profileFlag, specJSO
 	fmt.Printf("Task:      %s\n", task)
 	fmt.Printf("Architect: %s\n", architect)
 	fmt.Printf("Editor:    %s\n", editor)
+	// Print the rationale so the deterministic fallback's "architect returned no
+	// structured spec" is visible to a human, not only to a --json consumer.
+	if strings.TrimSpace(spec.Rationale) != "" {
+		fmt.Printf("Rationale: %s\n", spec.Rationale)
+	}
 	fmt.Printf("Items:     %d\n", len(spec.Items))
 	for _, it := range spec.Items {
 		fmt.Printf("  - [%-6s] %-40s  %s\n", it.Action, it.File, truncate(it.Description, 50))
