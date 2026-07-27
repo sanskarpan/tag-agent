@@ -10,8 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"github.com/tag-agent/tag/internal/store"
+	"github.com/tag-agent/tag/internal/sqlutil"
 )
 
 // Mem is one semantic memory row.
@@ -151,7 +150,7 @@ func Search(db *sql.DB, profile, query string, limit int, memType string) ([]Mem
 		}
 		like := `SELECT id,profile,content,memory_type,confidence,created_at,accessed_at,access_count,source
 			FROM semantic_memories WHERE profile=? AND content LIKE ? ESCAPE '\'`
-		largs := []any{profile, "%" + store.EscapeLike(query) + "%"}
+		largs := []any{profile, "%" + sqlutil.EscapeLike(query) + "%"}
 		if memType != "" {
 			like += ` AND memory_type=?`
 			largs = append(largs, memType)

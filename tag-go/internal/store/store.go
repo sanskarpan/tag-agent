@@ -92,19 +92,3 @@ func isBusy(err error) bool {
 		strings.Contains(msg, "sqlite_busy") ||
 		strings.Contains(msg, "(5)")
 }
-
-// EscapeLike makes s safe to embed in a SQL LIKE pattern, so that user input
-// containing %, _ or \ matches those characters LITERALLY instead of acting as
-// wildcards. The result must be used with an explicit `ESCAPE '\'` clause:
-//
-//	WHERE content LIKE ? ESCAPE '\'   -- bind "%"+EscapeLike(q)+"%"
-//	WHERE id LIKE ? || '%' ESCAPE '\' -- bind EscapeLike(prefix)
-//
-// Mirrors semantic_memory.py's escaping (issue #567). Without it, a query of
-// "%" matches every row and an id prefix of "_" resolves to an arbitrary
-// record — which let `context compress --session-id '%'` write against a
-// session the user never named.
-func EscapeLike(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return r.Replace(s)
-}

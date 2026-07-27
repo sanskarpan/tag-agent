@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tag-agent/tag/internal/sqlutil"
 )
 
 // DBTX is the query surface the graph package needs. Both *store.DB (which
@@ -316,8 +317,8 @@ func Query(db DBTX, profile, nameFilter string, limit int) ([]Entity, error) {
 	q := `SELECT id,name,entity_type,mention_count,confidence FROM entities WHERE profile=?`
 	args := []any{profile}
 	if nameFilter != "" {
-		q += ` AND name LIKE ? COLLATE NOCASE`
-		args = append(args, "%"+nameFilter+"%")
+		q += ` AND name LIKE ? ESCAPE '\' COLLATE NOCASE`
+		args = append(args, "%"+sqlutil.EscapeLike(nameFilter)+"%")
 	}
 	q += ` ORDER BY mention_count DESC LIMIT ?`
 	args = append(args, limit)

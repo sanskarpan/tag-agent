@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
+	"github.com/tag-agent/tag/internal/sqlutil"
 	"github.com/tag-agent/tag/internal/store"
 )
 
@@ -225,7 +226,7 @@ func listHooks(db *store.DB, profile string) ([]map[string]any, error) {
 // resolveHookID resolves a full hook id from an unambiguous prefix (matches the
 // truncated 8-char id shown by `notify list`). Errors if no or multiple matches.
 func resolveHookID(db *store.DB, prefix string) (string, error) {
-	rows, err := db.Query(`SELECT id FROM notification_hooks WHERE id LIKE ? || '%'`, prefix)
+	rows, err := db.Query(`SELECT id FROM notification_hooks WHERE id LIKE ? || '%' ESCAPE '\'`, sqlutil.EscapeLike(prefix))
 	if err != nil {
 		return "", err
 	}

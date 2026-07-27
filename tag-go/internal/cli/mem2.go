@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/tag-agent/tag/internal/memory"
+	"github.com/tag-agent/tag/internal/sqlutil"
 )
 
 // registerMem2 wires advanced memory operations: mem2 gc / mem2 tier.
@@ -255,7 +256,7 @@ func registerMem2(root *cobra.Command, app *App) {
 			// run. runs.prompt is NOT NULL, so a real run always yields text; any
 			// recorded step outputs are appended when present.
 			var runID, prompt string
-			err = db.QueryRow(`SELECT id, prompt FROM runs WHERE id LIKE ?||'%' ORDER BY created_at DESC LIMIT 1`, args[0]).
+			err = db.QueryRow(`SELECT id, prompt FROM runs WHERE id LIKE ?||'%' ESCAPE '\' ORDER BY created_at DESC LIMIT 1`, sqlutil.EscapeLike(args[0])).
 				Scan(&runID, &prompt)
 			if err == sql.ErrNoRows {
 				return fmt.Errorf("Run not found: %q", args[0])

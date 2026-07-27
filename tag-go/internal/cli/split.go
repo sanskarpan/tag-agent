@@ -13,6 +13,7 @@ import (
 
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/sqlutil"
 	"github.com/tag-agent/tag/internal/store"
 )
 
@@ -144,7 +145,7 @@ func registerSplit(root *cobra.Command, app *App) {
 			// consistent with `runs show`.
 			err = db.QueryRow(`SELECT id, task, architect_model, editor_model, profile, spec_json,
 				status, items_total, items_done, items_rejected, created_at, updated_at
-				FROM split_runs WHERE id LIKE ?||'%' ORDER BY created_at DESC LIMIT 1`, prefix).Scan(
+				FROM split_runs WHERE id LIKE ?||'%' ESCAPE '\' ORDER BY created_at DESC LIMIT 1`, sqlutil.EscapeLike(prefix)).Scan(
 				&id, &task, &architect, &editor, &profile, &specJSON,
 				&status, &itemsTotal, &itemsDone, &itemsRejected, &createdAt, &updatedAt)
 			if err == sql.ErrNoRows {
