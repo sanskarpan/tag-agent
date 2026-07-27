@@ -17,7 +17,10 @@ const entropyWindow = 32
 const entropyThreshold = 4.5
 
 var skipExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".pdf": true, ".zip": true, ".tar": true, ".gz": true, ".pyc": true, ".so": true, ".dylib": true, ".dll": true, ".exe": true, ".woff": true, ".ttf": true, ".mp4": true, ".sqlite3": true, ".db": true}
-var skipDirs = map[string]bool{".git": true, "node_modules": true, "vendor": true, "__pycache__": true, ".venv": true}
+
+// skipDirs is kept in sync with security.py's _SKIP_DIRS: dist/build/venv (and
+// the tool cache dirs) are generated trees that produced duplicate findings.
+var skipDirs = map[string]bool{".git": true, "node_modules": true, "vendor": true, "__pycache__": true, ".venv": true, ".qa-venv312": true, "venv": true, ".mypy_cache": true, ".pytest_cache": true, "dist": true, "build": true}
 
 var patterns = []struct {
 	name string
@@ -26,8 +29,11 @@ var patterns = []struct {
 	// --- existing patterns (kept) ---
 	{"aws_access_key", regexp.MustCompile(`AKIA[0-9A-Z]{16}`)},
 	{"github_token", regexp.MustCompile(`ghp_[0-9A-Za-z]{36}`)},
-	{"openai_key", regexp.MustCompile(`sk-(?:proj-)?[A-Za-z0-9_\-]{20,}`)},
+	// anthropic_key MUST stay ahead of openai_key: `sk-ant-...` also matches the
+	// broader `sk-` OpenAI pattern, and the match loop stops at the first hit,
+	// so the more specific prefix has to be tried first.
 	{"anthropic_key", regexp.MustCompile(`sk-ant-[A-Za-z0-9\-_]{20,}`)},
+	{"openai_key", regexp.MustCompile(`sk-(?:proj-)?[A-Za-z0-9_\-]{20,}`)},
 	{"private_key", regexp.MustCompile(`-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY`)},
 	{"generic_secret", regexp.MustCompile(`(?i)(secret|token|password|api_key)\s*[=:]\s*["']?[A-Za-z0-9/+_\-]{16,}`)},
 	// --- ported from security.py ---
