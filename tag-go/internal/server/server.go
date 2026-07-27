@@ -23,35 +23,61 @@ type Snapshot struct {
 }
 
 // ReadSnapshot gathers current TAG state (pure SQLite, no runtime).
+//
+// Query/scan errors are propagated instead of swallowed: a DB with missing or
+// corrupt tables must be distinguishable from a healthy-but-empty one (the
+// latter still returns a snapshot with empty slices and no error).
 func ReadSnapshot(db *store.DB) (*Snapshot, error) {
 	snap := &Snapshot{Runs: []map[string]any{}, Queue: []map[string]any{}}
 	rows, err := db.Query(`SELECT id, kind, task_type, master_profile, status, created_at FROM runs ORDER BY created_at DESC LIMIT 20`)
-	if err == nil {
-		for rows.Next() {
-			var id, kind, tt, mp, status, created string
-			if rows.Scan(&id, &kind, &tt, &mp, &status, &created) == nil {
-				snap.Runs = append(snap.Runs, map[string]any{
-					"run_id": id, "kind": kind, "task_type": tt,
-					"master_profile": mp, "status": status, "created_at": created,
-				})
-			}
+	if err != nil {
+		return nil, fmt.Errorf("read runs: %w", err)
+	}
+	for rows.Next() {
+		var id, kind, tt, mp, status, created string
+		if err := rows.Scan(&id, &kind, &tt, &mp, &status, &created); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan runs: %w", err)
 		}
-		rows.Close()
+		snap.Runs = append(snap.Runs, map[string]any{
+			"run_id": id, "kind": kind, "task_type": tt,
+			"master_profile": mp, "status": status, "created_at": created,
+		})
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read runs: %w", err)
 	}
 	qrows, err := db.Query(`SELECT id, task, status, profile, created_at FROM queue_jobs ORDER BY created_at DESC LIMIT 50`)
-	if err == nil {
-		for qrows.Next() {
-			var id, task, status, profile, created string
-			if qrows.Scan(&id, &task, &status, &profile, &created) == nil {
-				snap.Queue = append(snap.Queue, map[string]any{
-					"id": id, "task": task, "status": status, "profile": profile, "created_at": created,
-				})
-			}
-		}
-		qrows.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read queue: %w", err)
 	}
-	db.QueryRow(`SELECT COUNT(*) FROM memory_journal`).Scan(&snap.JournalCount)
+	for qrows.Next() {
+		var id, task, status, profile, created string
+		if err := qrows.Scan(&id, &task, &status, &profile, &created); err != nil {
+			qrows.Close()
+			return nil, fmt.Errorf("scan queue: %w", err)
+		}
+		snap.Queue = append(snap.Queue, map[string]any{
+			"id": id, "task": task, "status": status, "profile": profile, "created_at": created,
+		})
+	}
+	err = qrows.Err()
+	qrows.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read queue: %w", err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM memory_journal`).Scan(&snap.JournalCount); err != nil {
+		return nil, fmt.Errorf("read journal: %w", err)
+	}
 	return snap, nil
+}
+
+// sseJSONError renders an error as a one-line JSON object for an SSE payload.
+func sseJSONError(err error) string {
+	b, _ := json.Marshal(map[string]string{"error": err.Error()})
+	return string(b)
 }
 
 // Handler builds the HTTP mux for the dashboard/API/SSE endpoints.
@@ -78,7 +104,16 @@ func Handler(db *store.DB, profile string) http.Handler {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		flusher, ok := w.(http.Flusher)
-		snap, _ := ReadSnapshot(db)
+		// A snapshot failure is reported as an SSE `error` event rather than
+		// streaming `data: null`, which clients cannot distinguish from state.
+		snap, err := ReadSnapshot(db)
+		if err != nil {
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", sseJSONError(err))
+			if ok {
+				flusher.Flush()
+			}
+			return
+		}
 		b, _ := json.Marshal(snap)
 		fmt.Fprintf(w, "data: %s\n\n", b)
 		if ok {
@@ -95,7 +130,14 @@ func Handler(db *store.DB, profile string) http.Handler {
 			case <-r.Context().Done():
 				return
 			case <-ticker.C:
-				snap, _ := ReadSnapshot(db)
+				snap, err := ReadSnapshot(db)
+				if err != nil {
+					fmt.Fprintf(w, "event: error\ndata: %s\n\n", sseJSONError(err))
+					if ok {
+						flusher.Flush()
+					}
+					return
+				}
 				b, _ := json.Marshal(snap)
 				if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
 					return
