@@ -7,12 +7,17 @@
 // user can tell exactly what they got:
 //
 //   - darwin: the command is wrapped in `sandbox-exec` with an SBPL profile that
-//     denies all network access, denies read/write of /etc, /private/etc,
-//     /var/db, /private/var/db and master.passwd, denies reads of the invoking
-//     user's home tree (with credential dirs such as ~/.ssh and ~/.aws denied for
-//     write too), re-allows read/write under the resolved run directory, and
-//     makes /usr, /bin, /sbin, /System and /Library read-only. If sandbox-exec is
-//     missing the run FAILS CLOSED with exit 127 (matching Python).
+//     denies all network access, allows read/write under the resolved run
+//     directory, and then -- because SBPL is last-match-wins, the denials come
+//     last so the run-dir allowance can never cancel them -- denies read/write of
+//     /etc, /private/etc, /var/db, /private/var/db and master.passwd, denies
+//     reads of the invoking user's home tree (with credential dirs such as ~/.ssh
+//     and ~/.aws denied for write too), and makes /usr, /bin, /sbin, /System and
+//     /Library read-only. A run directory that sits AT or ABOVE any of those
+//     boundaries (`/`, `/Users`, `$HOME`, ...) is refused outright, because
+//     re-allowing it would hand back the very trees the profile exists to deny.
+//     If sandbox-exec is missing, or the run dir is too broad, the run FAILS
+//     CLOSED with exit 127 (matching Python).
 //   - linux: RLIMIT_CPU and RLIMIT_AS are applied via a shell `ulimit` prologue,
 //     Landlock (ABI v1+, no CGO) confines the filesystem to an allow-list that
 //     excludes /etc/passwd and the user's home, and network egress is blocked
@@ -156,6 +161,11 @@ func Exec(ctx context.Context, opts Options) (*Result, error) {
 	}
 }
 
+// waitDelay bounds how long Wait may block on I/O after the process itself has
+// gone. A command that backgrounds a grandchild leaves the stdout/stderr pipe
+// open; without this, Wait blocks forever and `tag` never returns.
+const waitDelay = 2 * time.Second
+
 // runPlan launches one isolationPlan. A non-nil error means the process could
 // not be started at all (the caller may then try plan.Alt).
 func runPlan(cctx context.Context, plan *isolationPlan, runDir, command string) (*Result, error) {
@@ -169,7 +179,14 @@ func runPlan(cctx context.Context, plan *isolationPlan, runDir, command string) 
 		"PATH=/usr/bin:/bin:/usr/local/bin:/usr/sbin:/sbin",
 		"HOME=" + runDir,
 	}, plan.ExtraEnv...)
-	cmd.SysProcAttr = plan.SysProcAttr
+	// Own process group + group-wide SIGKILL on cancellation: CommandContext's
+	// default only kills the direct child (`sandbox-exec`), so anything the
+	// command backgrounded survives the timeout, keeps the pipe open and hangs
+	// Wait indefinitely.
+	setProcGroup(cmd, plan.SysProcAttr)
+	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	cmd.WaitDelay = waitDelay
+
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -178,6 +195,10 @@ func runPlan(cctx context.Context, plan *isolationPlan, runDir, command string) 
 		return nil, err
 	}
 	runErr := cmd.Wait()
+	// Reap anything the command left behind even on the happy path: a
+	// backgrounded grandchild that outlives its parent would otherwise be
+	// re-parented to init and keep running unconfined-looking on the host.
+	_ = killProcessGroup(cmd)
 	res := &Result{Stdout: stdout.String(), Stderr: stderr.String(), Isolation: plan.Isolation}
 
 	if cctx.Err() == context.DeadlineExceeded {
@@ -189,6 +210,15 @@ func runPlan(cctx context.Context, plan *isolationPlan, runDir, command string) 
 		var ee *exec.ExitError
 		if errors.As(runErr, &ee) {
 			res.Exit = ee.ExitCode()
+			return res, nil
+		}
+		// ErrWaitDelay means the process exited fine but a lingering grandchild
+		// held the output pipe past waitDelay. That is a completed run, not a
+		// start failure: report the real exit status.
+		if errors.Is(runErr, exec.ErrWaitDelay) {
+			if cmd.ProcessState != nil {
+				res.Exit = cmd.ProcessState.ExitCode()
+			}
 			return res, nil
 		}
 		return nil, runErr
