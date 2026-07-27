@@ -23,10 +23,10 @@ func registerCron(root *cobra.Command, app *App) {
 	add := &cobra.Command{Use: "add TASK", Short: "Add a scheduled job", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if name == "" || schedule == "" {
-				return fmt.Errorf("--name and --schedule required")
+				return jsonErrorMaybe(fmt.Errorf("--name and --schedule required"))
 			}
 			if err := cron.Validate(schedule); err != nil {
-				return err
+				return jsonErrorMaybe(err)
 			}
 			db, err := app.OpenDB()
 			if err != nil {
@@ -52,7 +52,11 @@ func registerCron(root *cobra.Command, app *App) {
 			if n, _ := res.RowsAffected(); n == 0 {
 				return jsonErrorMaybe(fmt.Errorf("A cron job named '%s' already exists (names must be unique)", name))
 			}
-			outJSON(map[string]any{"id": id, "name": name}, fmt.Sprintf("cron job added: %s  %q  [%s]", id, name, schedule))
+			// Python: json.dumps({"id": job_id, "name": name, "schedule": schedule}).
+			// Without the schedule a --json caller has to re-query to learn what it
+			// just created.
+			outJSON(map[string]any{"id": id, "name": name, "schedule": schedule},
+				fmt.Sprintf("cron job added: %s  %q  [%s]", id, name, schedule))
 			return nil
 		}}
 	add.Flags().StringVar(&name, "name", "", "job name")
@@ -65,20 +69,30 @@ func registerCron(root *cobra.Command, app *App) {
 			if err != nil {
 				return err
 			}
-			rows, err := db.Query(`SELECT id,name,schedule,enabled,run_count FROM cron_jobs ORDER BY created_at`)
+			// Python selects id, name, schedule, profile, enabled, last_run_at,
+			// run_count and dumps the rows verbatim. Go dropped profile (so a
+			// --json caller could not tell WHICH profile a job runs under) and the
+			// last-run timestamp (so it could not tell whether a job had ever
+			// fired). The Go column is `last_run`; the JSON key follows Python's
+			// `last_run_at`, since the wire contract is what consumers read.
+			rows, err := db.Query(`SELECT id,name,schedule,profile,enabled,COALESCE(last_run,''),run_count FROM cron_jobs ORDER BY created_at`)
 			if err != nil {
 				return err
 			}
 			defer rows.Close()
 			items := []map[string]any{}
 			for rows.Next() {
-				var id, nm, sc string
+				var id, nm, sc, pr, lastRun string
 				var en, rc int
-				if err := rows.Scan(&id, &nm, &sc, &en, &rc); err != nil {
+				if err := rows.Scan(&id, &nm, &sc, &pr, &en, &lastRun, &rc); err != nil {
 					return err
 				}
+				var lastRunVal any
+				if lastRun != "" {
+					lastRunVal = lastRun
+				}
 				items = append(items, map[string]any{"id": id, "name": nm, "schedule": sc,
-					"enabled": en != 0, "run_count": rc})
+					"profile": pr, "enabled": en != 0, "last_run_at": lastRunVal, "run_count": rc})
 			}
 			if err := rows.Err(); err != nil {
 				return err
@@ -97,7 +111,12 @@ func registerCron(root *cobra.Command, app *App) {
 				if it["enabled"] == false {
 					st = "✗"
 				}
-				fmt.Printf("%s %s  %-24s [%s]  runs=%d\n", st, it["id"], it["name"], it["schedule"], it["run_count"])
+				last := "never"
+				if s, ok := it["last_run_at"].(string); ok && s != "" {
+					last = s
+				}
+				fmt.Printf("%s %s  %-24s [%s]  %-14s runs=%d  last=%s\n",
+					st, it["id"], it["name"], it["schedule"], it["profile"], it["run_count"], last)
 			}
 			return nil
 		}}
@@ -113,24 +132,32 @@ func registerCron(root *cobra.Command, app *App) {
 			}
 			n, _ := r.RowsAffected()
 			if n == 0 {
-				return fmt.Errorf("cron job not found: %s", args[0])
+				// Python's wording for every cron ID miss.
+				return jsonErrorMaybe(fmt.Errorf("Job '%s' not found", args[0]))
 			}
-			fmt.Println("removed")
+			// Python: print(f"removed: {job_id}"). A bare "removed" leaves a script
+			// (and a human scrolling back) unable to tell WHICH job went away.
+			outJSON(map[string]any{"removed": args[0]}, "removed: "+args[0])
 			return nil
 		}}
 	next := &cobra.Command{Use: "next EXPR", Short: "Validate an expr and show next 3 fire times", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := cron.Validate(args[0]); err != nil {
-				return err
+				return jsonErrorMaybe(err)
 			}
 			t := time.Now().Truncate(time.Minute)
-			found := 0
-			for i := 0; i < 366*24*60 && found < 3; i++ {
+			fires := []string{}
+			for i := 0; i < 366*24*60 && len(fires) < 3; i++ {
 				t = t.Add(time.Minute)
 				if cron.Matches(args[0], t) {
-					fmt.Println(t.Format("2006-01-02 15:04"))
-					found++
+					fires = append(fires, t.Format("2006-01-02 15:04"))
 				}
+			}
+			if flagJSON {
+				return emitJSON(map[string]any{"schedule": args[0], "next": fires})
+			}
+			for _, f := range fires {
+				fmt.Println(f)
 			}
 			return nil
 		}}
@@ -145,9 +172,9 @@ func registerCron(root *cobra.Command, app *App) {
 		}
 		n, _ := r.RowsAffected()
 		if n == 0 {
-			return fmt.Errorf("Job '%s' not found", id)
+			return jsonErrorMaybe(fmt.Errorf("Job '%s' not found", id))
 		}
-		fmt.Printf("%s: %s\n", verb, id)
+		outJSON(map[string]any{"id": id, "enabled": enabled != 0}, fmt.Sprintf("%s: %s", verb, id))
 		return nil
 	}
 	enable := &cobra.Command{Use: "enable ID", Short: "Enable a cron job", Args: cobra.ExactArgs(1),
@@ -166,7 +193,7 @@ func registerCron(root *cobra.Command, app *App) {
 			var profileVal, task string
 			if err := db.QueryRow(`SELECT profile, task FROM cron_jobs WHERE id=?`, args[0]).Scan(&profileVal, &task); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
-					return fmt.Errorf("Job '%s' not found", args[0])
+					return jsonErrorMaybe(fmt.Errorf("Job '%s' not found", args[0]))
 				}
 				return err
 			}
@@ -195,12 +222,15 @@ func registerCron(root *cobra.Command, app *App) {
 				if err != nil {
 					return err
 				}
-				fmt.Printf("triggered: cron job %s → queue job %s (executed: %d done, %d failed)\n",
-					args[0], qID, sum.Done, sum.Failed)
+				outJSON(map[string]any{"cron_job_id": args[0], "queue_job_id": qID,
+					"status": "executed", "done": sum.Done, "failed": sum.Failed},
+					fmt.Sprintf("triggered: cron job %s → queue job %s (executed: %d done, %d failed)",
+						args[0], qID, sum.Done, sum.Failed))
 				return nil
 			}
 			// Default: enqueue-only (no worker launched).
-			fmt.Printf("triggered: cron job %s → queue job %s (queued)\n", args[0], qID)
+			outJSON(map[string]any{"cron_job_id": args[0], "queue_job_id": qID, "status": "queued"},
+				fmt.Sprintf("triggered: cron job %s → queue job %s (queued)", args[0], qID))
 			return nil
 		}}
 	run.Flags().BoolVar(&cronExecute, "execute", false, "run the enqueued job through the agent loop after triggering")

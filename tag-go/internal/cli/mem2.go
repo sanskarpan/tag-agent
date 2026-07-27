@@ -29,6 +29,18 @@ func registerMem2(root *cobra.Command, app *App) {
 			cfg := memory.DefaultGCConfig()
 			if dryRun {
 				// GC has no non-mutating mode, so a dry run reports intent only.
+				// Under --json the preview must still be JSON, and must NOT be
+				// shaped like a completed GCResult: `dry_run: true` and the absence
+				// of evicted/merged/promoted counts are what tell a consumer that
+				// nothing happened.
+				if flagJSON {
+					return emitJSON(map[string]any{
+						"profile":                  app.profile(profile),
+						"dry_run":                  true,
+						"max_memories_per_profile": cfg.MaxMemoriesPerProfile,
+						"min_confidence_to_keep":   cfg.MinConfidenceToKeep,
+					})
+				}
 				fmt.Printf("dry-run: GC preview for '%s' — no changes made. Re-run without --dry-run to evict/merge/promote (cap=%d, min_confidence=%g).\n",
 					app.profile(profile), cfg.MaxMemoriesPerProfile, cfg.MinConfidenceToKeep)
 				return nil
@@ -128,21 +140,25 @@ func registerMem2(root *cobra.Command, app *App) {
 			case "start":
 				id, err := memory.StartEpisode(db.DB, p, strOr(summary, "CLI session"))
 				if err != nil {
-					return err
+					return jsonErrorMaybe(err)
 				}
-				fmt.Printf("Episode started: %s\n", id)
+				// `episode list`/`get` already key on episode_id (as Python's
+				// list_episodes does), so start must hand back the same field name
+				// rather than only a prose line a --json caller has to scrape.
+				outJSON(map[string]any{"episode_id": id, "profile": p},
+					fmt.Sprintf("Episode started: %s", id))
 			case "end":
 				if epID == "" {
-					return fmt.Errorf("--id required")
+					return jsonErrorMaybe(fmt.Errorf("--id required"))
 				}
 				ended, err := memory.EndEpisode(db.DB, epID, summary)
 				if err != nil {
-					return err
+					return jsonErrorMaybe(err)
 				}
 				if !ended {
-					return fmt.Errorf("episode not found: %q", epID)
+					return jsonErrorMaybe(fmt.Errorf("episode not found: %q", epID))
 				}
-				fmt.Println("Episode ended")
+				outJSON(map[string]any{"episode_id": epID, "status": "ended"}, "Episode ended")
 			case "list":
 				eps, err := memory.ListEpisodes(db.DB, p, 20)
 				if err != nil {
@@ -168,7 +184,7 @@ func registerMem2(root *cobra.Command, app *App) {
 					}
 				}
 				if found == nil {
-					return fmt.Errorf("episode not found: %q", epID)
+					return jsonErrorMaybe(fmt.Errorf("episode not found: %q", epID))
 				}
 				mems, err := memory.EpisodeMemories(db.DB, epID)
 				if err != nil {
@@ -176,7 +192,7 @@ func registerMem2(root *cobra.Command, app *App) {
 				}
 				return emitJSON(map[string]any{"episode": found, "memories": mems})
 			default:
-				return fmt.Errorf("action must be start|end|list|get, got %q", args[0])
+				return jsonErrorMaybe(fmt.Errorf("action must be start|end|list|get, got %q", args[0]))
 			}
 			return nil
 		}}
@@ -195,19 +211,23 @@ func registerMem2(root *cobra.Command, app *App) {
 			switch args[0] {
 			case "update":
 				if factID == "" {
-					return fmt.Errorf("--id required for fact update")
+					return jsonErrorMaybe(fmt.Errorf("--id required for fact update"))
 				}
 				if !cmd.Flags().Changed("content") {
-					return fmt.Errorf("--content required for fact update")
+					return jsonErrorMaybe(fmt.Errorf("--content required for fact update"))
 				}
 				if strings.TrimSpace(factContent) == "" {
-					return fmt.Errorf("--content must not be empty")
+					return jsonErrorMaybe(fmt.Errorf("--content must not be empty"))
 				}
 				newID, err := memory.UpdateFact(db.DB, factID, factContent, p, "")
 				if err != nil {
-					return err
+					return jsonErrorMaybe(err)
 				}
-				fmt.Printf("Updated fact, new id=%s\n", newID)
+				// A fact update supersedes one memory with a new one, so a --json
+				// caller needs BOTH ids: the new row to follow, and the superseded
+				// one it can no longer resolve.
+				outJSON(map[string]any{"id": newID, "previous_id": factID, "profile": p},
+					fmt.Sprintf("Updated fact, new id=%s", newID))
 			case "history":
 				if factID == "" {
 					return fmt.Errorf("--id required")
