@@ -93,6 +93,33 @@ func traceSnapshotSpans(snap map[string]any) []map[string]any {
 	return out
 }
 
+// traceDiffKey identifies a span within a snapshot for diffing: its name plus
+// the 0-based ordinal of that occurrence among same-named spans.
+type traceDiffKey struct {
+	name    string
+	ordinal int
+}
+
+// traceDiffIndex keys snapshot spans by (name, ordinal) so repeated span names
+// are all retained instead of collapsing onto one another.
+func traceDiffIndex(spans []map[string]any) map[traceDiffKey]map[string]any {
+	out := map[traceDiffKey]map[string]any{}
+	seen := map[string]int{}
+	for _, s := range spans {
+		n := str(s["name"])
+		out[traceDiffKey{name: n, ordinal: seen[n]}] = s
+		seen[n]++
+	}
+	return out
+}
+
+func traceDiffDelta(d int) string {
+	if d > 0 {
+		return fmt.Sprintf("+%d", d)
+	}
+	return fmt.Sprintf("%d", d)
+}
+
 func traceSpanTokens(m map[string]any) int {
 	pt, _ := m["prompt_tokens"].(float64)
 	ct, _ := m["completion_tokens"].(float64)
@@ -164,8 +191,8 @@ func registerObservability(root *cobra.Command, app *App) {
 				return err
 			}
 			costUSD := storedCost
-			rows, err := db.Query(`SELECT COALESCE(model,''), COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0)
-				FROM spans WHERE cost_usd IS NULL AND model IS NOT NULL AND model <> ''`)
+			rows, err := db.Query(`SELECT COALESCE(model_id,''), COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0)
+				FROM spans WHERE cost_usd IS NULL AND model_id IS NOT NULL AND model_id <> ''`)
 			if err != nil {
 				return err
 			}
@@ -356,11 +383,9 @@ func registerObservability(root *cobra.Command, app *App) {
 				if err := rows.Scan(&id, &tid, &pid, &name, &prof, &model, &start, &fin, &dur, &status, &pt, &ct); err != nil {
 					return err
 				}
-				spans = append(spans, map[string]any{"traceId": tid, "spanId": id, "parentSpanId": pid,
-					"name": name, "startTimeUnixNano": otelISOToNanos(start), "endTimeUnixNano": otelISOToNanos(fin),
-					"status": map[string]any{"code": status},
-					"attributes": []map[string]any{otelAttr("gen_ai.request.model", model), otelAttr("tag.profile", prof),
-						otelAttrInt("gen_ai.usage.input_tokens", pt), otelAttrInt("gen_ai.usage.output_tokens", ct)}})
+				attrs := []map[string]any{otelAttr("gen_ai.request.model", model), otelAttr("tag.profile", prof),
+					otelAttrInt("gen_ai.usage.input_tokens", pt), otelAttrInt("gen_ai.usage.output_tokens", ct)}
+				spans = append(spans, otelSpanJSON(id, tid, pid, name, start, fin, status, attrs))
 			}
 			if err := rows.Err(); err != nil {
 				return err
@@ -371,11 +396,7 @@ func registerObservability(root *cobra.Command, app *App) {
 			if exportEndpoint != "" {
 				fmt.Fprintf(cmd.ErrOrStderr(), "note: offline build does not POST to a collector; emitting OTLP/JSON for %d spans (endpoint %q ignored)\n", len(spans), exportEndpoint)
 			}
-			payload := map[string]any{"resourceSpans": []map[string]any{{
-				"resource":   map[string]any{"attributes": []map[string]any{otelAttr("service.name", "tag")}},
-				"scopeSpans": []map[string]any{{"spans": spans}},
-			}}, "_exported_spans": len(spans)}
-			b, _ := json.MarshalIndent(payload, "", "  ")
+			b, _ := json.MarshalIndent(otelPayload(spans), "", "  ")
 			fmt.Println(string(b))
 			return nil
 		}}
@@ -488,46 +509,66 @@ func registerObservability(root *cobra.Command, app *App) {
 			if snapB == nil {
 				return fmt.Errorf("No snapshot for trace %s", args[1])
 			}
-			spansA := map[string]map[string]any{}
-			for _, s := range traceSnapshotSpans(snapA) {
-				spansA[str(s["name"])] = s
+			// A trace normally contains several spans with the same name (e.g.
+			// one `llm.call` per turn), so spans are keyed by (name, ordinal
+			// within that name) rather than by name alone — keying by name made
+			// every repeat overwrite the previous one, dropping its tokens and
+			// reporting a bogus delta. Each occurrence is compared positionally
+			// against the same occurrence in the other trace, which keeps
+			// per-span granularity (and therefore correct totals).
+			spansA := traceDiffIndex(traceSnapshotSpans(snapA))
+			spansB := traceDiffIndex(traceSnapshotSpans(snapB))
+			keySet := map[traceDiffKey]bool{}
+			for k := range spansA {
+				keySet[k] = true
 			}
-			spansB := map[string]map[string]any{}
-			for _, s := range traceSnapshotSpans(snapB) {
-				spansB[str(s["name"])] = s
+			for k := range spansB {
+				keySet[k] = true
 			}
-			nameSet := map[string]bool{}
-			for n := range spansA {
-				nameSet[n] = true
+			keys := make([]traceDiffKey, 0, len(keySet))
+			for k := range keySet {
+				keys = append(keys, k)
 			}
-			for n := range spansB {
-				nameSet[n] = true
+			sort.Slice(keys, func(i, j int) bool {
+				if keys[i].name != keys[j].name {
+					return keys[i].name < keys[j].name
+				}
+				return keys[i].ordinal < keys[j].ordinal
+			})
+			// Occurrence counts decide whether a label needs a #N suffix.
+			occurrences := map[string]int{}
+			for _, k := range keys {
+				if k.ordinal+1 > occurrences[k.name] {
+					occurrences[k.name] = k.ordinal + 1
+				}
 			}
-			names := make([]string, 0, len(nameSet))
-			for n := range nameSet {
-				names = append(names, n)
+			label := func(k traceDiffKey) string {
+				if occurrences[k.name] > 1 {
+					return fmt.Sprintf("%s#%d", k.name, k.ordinal+1)
+				}
+				return k.name
 			}
-			sort.Strings(names)
 			if flagJSON {
 				diff := []map[string]any{}
-				for _, n := range names {
+				for _, k := range keys {
 					var a, b any
-					if v, ok := spansA[n]; ok {
+					if v, ok := spansA[k]; ok {
 						a = v
 					}
-					if v, ok := spansB[n]; ok {
+					if v, ok := spansB[k]; ok {
 						b = v
 					}
-					diff = append(diff, map[string]any{"name": n, "a": a, "b": b})
+					diff = append(diff, map[string]any{"name": k.name, "occurrence": k.ordinal + 1, "a": a, "b": b})
 				}
 				out, _ := json.MarshalIndent(diff, "", "  ")
 				fmt.Println(string(out))
 				return nil
 			}
 			fmt.Printf("Trace diff: %s  vs  %s\n", truncate(args[0], 12), truncate(args[1], 12))
-			for _, n := range names {
-				sa, okA := spansA[n]
-				sb, okB := spansB[n]
+			totalA, totalB := 0, 0
+			for _, k := range keys {
+				sa, okA := spansA[k]
+				sb, okB := spansB[k]
 				ta, tb := 0, 0
 				staStr, stbStr := "—", "—"
 				if okA {
@@ -538,19 +579,17 @@ func registerObservability(root *cobra.Command, app *App) {
 					tb = traceSpanTokens(sb)
 					stbStr = strOr(str(sb["status"]), "—")
 				}
-				delta := tb - ta
-				deltaStr := fmt.Sprintf("%d", delta)
-				if delta > 0 {
-					deltaStr = "+" + deltaStr
-				}
+				totalA += ta
+				totalB += tb
 				prefix := " "
 				if !okA {
 					prefix = "+"
 				} else if !okB {
 					prefix = "-"
 				}
-				fmt.Printf("%s %-38s %10d %10d %10s %-10s %s\n", prefix, n, ta, tb, deltaStr, staStr, stbStr)
+				fmt.Printf("%s %-38s %10d %10d %10s %-10s %s\n", prefix, label(k), ta, tb, traceDiffDelta(tb-ta), staStr, stbStr)
 			}
+			fmt.Printf("%s %-38s %10d %10d %10s\n", " ", "TOTAL", totalA, totalB, traceDiffDelta(totalB-totalA))
 			return nil
 		}}
 
