@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 )
 
 // OpenAIProvider calls the OpenAI Chat Completions API (streaming SSE) directly
@@ -63,7 +62,9 @@ func streamOpenAICompatible(ctx context.Context, req Request, baseURL, apiKey, e
 		httpReq.Header.Set("authorization", "Bearer "+apiKey)
 	}
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Minute}
+		// Shared bounded client: a stalled server fails at
+		// ResponseHeaderTimeout instead of hanging for the full request timeout.
+		client = DefaultHTTPClient()
 	}
 	resp, err := client.Do(httpReq)
 	if err != nil {

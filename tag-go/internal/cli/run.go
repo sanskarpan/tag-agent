@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -22,6 +23,7 @@ import (
 func registerRun(root *cobra.Command, app *App) {
 	var provider, system, profile string
 	var maxSteps int
+	var timeoutSecs int
 	var withTools bool
 	var useFallback bool
 	var enableWeb bool
@@ -74,12 +76,28 @@ func registerRun(root *cobra.Command, app *App) {
 				tool.Register(reg, topts)
 				loop.Tools = reg
 			}
+			// Bound the whole agent loop. This used context.Background(), so a
+			// provider that accepted the connection and never answered kept
+			// `tag run` silent for the HTTP client's 10-minute timeout — TAG must
+			// never hang silently. Deriving from cmd.Context() also lets an
+			// interrupt propagate into the in-flight request.
+			ctx := cmd.Context()
+			if timeoutSecs > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
+				defer cancel()
+			}
 			started := time.Now().UTC()
-			res, err := loop.Run(context.Background(), args[0], agent.Options{
+			res, err := loop.Run(ctx, args[0], agent.Options{
 				Model:  app.Cfg.String("profiles."+app.profile(profile)+".config.model.default", ""),
 				System: system, MaxSteps: maxSteps,
 			})
 			if err != nil {
+				// Report a deadline as a deadline, not as an opaque transport error.
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					return fmt.Errorf("run timed out after %ds waiting on provider %q (raise --timeout, or use 0 to disable): %w",
+						timeoutSecs, provider, err)
+				}
 				return err
 			}
 			// record the run with usage (best-effort; runtime tables exist from bootstrap)
@@ -122,6 +140,7 @@ func registerRun(root *cobra.Command, app *App) {
 	c.Flags().StringVar(&system, "system", "", "system prompt")
 	c.Flags().StringVar(&profile, "profile", "", "profile")
 	c.Flags().IntVar(&maxSteps, "max-steps", 8, "max agent-loop steps")
+	c.Flags().IntVar(&timeoutSecs, "timeout", 300, "abort the run after N seconds (0 = no limit)")
 	c.Flags().BoolVar(&withTools, "tools", false, "enable built-in tools (bash/read_file/write_file/list_dir)")
 	c.Flags().BoolVar(&enableWeb, "web", false, "add the Exa web_search tool (requires --tools and EXA_API_KEY)")
 	c.Flags().StringSliceVar(&disableTools, "disable-tools", nil, "tool-budget: comma-list of tool names to omit (e.g. bash,write_file)")
