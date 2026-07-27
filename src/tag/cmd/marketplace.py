@@ -15,7 +15,7 @@ from typing import Any
 from tag.core.config import load_config, config_path
 from tag.core.paths import runtime_db_path, hermes_root, tag_home, runtime_home, profile_home, ensure_runtime_dirs
 from tag.core.db import open_db
-from tag.core.utils import nonnegative_int, utc_now
+from tag.core.utils import check_loopback_bind, is_loopback_host, nonnegative_int, utc_now
 
 try:
     from tag.tui_output import print_error, print_success, print_warning
@@ -768,7 +768,16 @@ def cmd_web(args: argparse.Namespace) -> int:
     port = getattr(args, "port", 8787) or 8787
     no_browser = getattr(args, "no_browser", False)
 
-    if host != "127.0.0.1":
+    # The dashboard serves spans, costs, memories and alerts with no auth, so a
+    # warning is not enough: refuse a non-loopback bind unless explicitly opted in.
+    bind_err = check_loopback_bind(
+        host, service="the web dashboard",
+        allow_remote=getattr(args, "allow_remote", False),
+    )
+    if bind_err:
+        print(f"error: {bind_err}", file=sys.stderr)
+        return 1
+    if not is_loopback_host(host):
         print(f"⚠ WARNING: Binding to {host} — dashboard will be accessible on your network.", file=sys.stderr)
 
     server = DashboardServer(db_path=db_path, host=host, port=port)
@@ -868,4 +877,6 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     web_cmd.add_argument("--port", type=int, default=8787)
     web_cmd.add_argument("--host", default="127.0.0.1")
     web_cmd.add_argument("--no-browser", action="store_true")
+    web_cmd.add_argument("--allow-remote", action="store_true", dest="allow_remote",
+                         help="permit a non-loopback --host (INSECURE: serves unauthenticated data)")
     web_cmd.set_defaults(func=cmd_web)

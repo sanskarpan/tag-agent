@@ -11,7 +11,7 @@ from typing import Any
 
 from tag.core.config import load_config, config_path
 from tag.core.paths import runtime_db_path, ensure_runtime_dirs
-from tag.core.utils import nonnegative_int, utc_now
+from tag.core.utils import check_loopback_bind, nonnegative_int, utc_now
 
 try:
     from tag.tui_output import print_error, print_success, print_warning
@@ -402,6 +402,14 @@ def cmd_devui(args: argparse.Namespace) -> int:
     db_path = _db_for_profile(profile, cfg)
     port = getattr(args, "port", 7777)
     host = getattr(args, "host", "127.0.0.1")
+    # The DevUI serves spans, costs, memories and alerts with no auth, so a
+    # non-loopback bind must be an explicit, deliberate choice.
+    bind_err = check_loopback_bind(
+        host, service="devui", allow_remote=getattr(args, "allow_remote", False)
+    )
+    if bind_err:
+        print_error(bind_err)
+        return 1
     server = DevUIServer(db_path=str(db_path), host=host, port=port)
     if getattr(args, "open_browser", False):
         import webbrowser
@@ -463,6 +471,13 @@ def cmd_webhook_server(args: argparse.Namespace) -> int:
             host = getattr(args, "host", "127.0.0.1")
             secret = getattr(args, "secret", None) or os.environ.get("TAG_WEBHOOK_SECRET") or None
             allow_unsigned = bool(getattr(args, "allow_unsigned", False))
+            bind_err = check_loopback_bind(
+                host, service="the webhook receiver",
+                allow_remote=getattr(args, "allow_remote", False),
+            )
+            if bind_err:
+                print_error(bind_err)
+                return 1
             if secret is None and not allow_unsigned:
                 # Without a secret every anonymous POST could enqueue agent work,
                 # so refuse to start unless the operator explicitly opts in.
@@ -966,6 +981,8 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     devui_p = sub.add_parser("devui", help="Local browser DevUI dashboard")
     devui_p.add_argument("--port", type=int, default=7777)
     devui_p.add_argument("--host", default="127.0.0.1")
+    devui_p.add_argument("--allow-remote", action="store_true", dest="allow_remote",
+                         help="permit a non-loopback --host (INSECURE: serves unauthenticated data)")
     devui_p.add_argument("--open", action="store_true", dest="open_browser")
     devui_p.add_argument("--profile", default=None)
     devui_p.set_defaults(func=cmd_devui)
@@ -991,6 +1008,8 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
                            help="HMAC secret to verify signatures (or set TAG_WEBHOOK_SECRET)")
     wh_listen.add_argument("--allow-unsigned", action="store_true", dest="allow_unsigned",
                            help="accept unauthenticated events when no secret is set (INSECURE)")
+    wh_listen.add_argument("--allow-remote", action="store_true", dest="allow_remote",
+                           help="permit a non-loopback --host (INSECURE)")
     wh_rule_add = wh_sub.add_parser("rule-add", help="Add a trigger rule")
     wh_rule_add.add_argument("--platform", required=True, choices=["github", "linear", "slack"])
     wh_rule_add.add_argument("--event", required=True)

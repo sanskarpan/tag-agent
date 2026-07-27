@@ -347,3 +347,61 @@ class TestDevUIConcurrency:
         from tag.devui import _ThreadingDevUIServer
 
         assert issubclass(_ThreadingDevUIServer, http.server.ThreadingHTTPServer)
+
+
+# ---------------------------------------------------------------------------
+# #12 — local servers must not silently bind non-loopback interfaces
+# ---------------------------------------------------------------------------
+
+class TestLoopbackBindGuard:
+    """Pre-fix: `--host 0.0.0.0` bound all interfaces, serving spans/costs/
+    memories/alerts to the whole network with no auth and (for devui/webhook)
+    no warning at all."""
+
+    def test_is_loopback_host_classification(self):
+        from tag.core.utils import is_loopback_host
+
+        for good in ("127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.2", ""):
+            assert is_loopback_host(good) is True, good
+        for bad in ("0.0.0.0", "192.168.1.10", "10.0.0.1", "::", "example.com"):
+            assert is_loopback_host(bad) is False, bad
+
+    @pytest.mark.parametrize(
+        "handler_mod,handler_name,kwargs",
+        [
+            ("tag.cmd.prd_clusters", "cmd_devui", {"port": 7999}),
+            ("tag.cmd.marketplace", "cmd_web", {"port": 8999, "no_browser": True}),
+        ],
+    )
+    def test_non_loopback_bind_refused(
+        self, handler_mod, handler_name, kwargs, tmp_path, monkeypatch, capsys
+    ):
+        import argparse
+        import importlib
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        mod = importlib.import_module(handler_mod)
+        args = argparse.Namespace(
+            host="0.0.0.0", profile=None, config=None, allow_remote=False,
+            open_browser=False, **kwargs
+        )
+        rc = getattr(mod, handler_name)(args)
+        assert rc == 1, "a non-loopback bind must be refused"
+        out = capsys.readouterr()
+        assert "non-loopback" in (out.out + out.err)
+
+    def test_webhook_listen_refuses_non_loopback(self, tmp_path, monkeypatch, capsys):
+        import argparse
+
+        from tag.cmd import prd_clusters
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        args = argparse.Namespace(
+            hooks_subcommand="listen", port=_free_port(), host="0.0.0.0",
+            secret=SECRET, allow_unsigned=False, allow_remote=False,
+            profile=None, config=None,
+        )
+        rc = prd_clusters.cmd_webhook_server(args)
+        assert rc == 1
+        out = capsys.readouterr()
+        assert "non-loopback" in (out.out + out.err)
