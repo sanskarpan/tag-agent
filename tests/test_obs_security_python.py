@@ -701,3 +701,225 @@ class TestSandboxShellMetacharacters:
         assert rc == 2, f"malformed COMMAND is a usage error (2), got {rc}"
         assert "metacharacter" in capsys.readouterr().err
         assert not Path("/tmp/tag_sbx_probe2.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# #7 — `trace diff` silently dropped same-named spans
+# ---------------------------------------------------------------------------
+
+def _seed_span(conn, span_id, trace_id, name, prompt, completion, duration):
+    conn.execute(
+        "INSERT INTO spans(id,trace_id,parent_id,name,profile,model_id,started_at,"
+        "finished_at,duration_ms,status,prompt_tokens,completion_tokens,kind) "
+        "VALUES(?,?,NULL,?,'default','m',?,?,?, 'ok',?,?,'llm')",
+        (span_id, trace_id, name, f"2026-01-01T00:00:0{duration % 10}Z",
+         "2026-01-01T00:01:00Z", duration, prompt, completion),
+    )
+
+
+class TestTraceDiffDuplicateSpanNames:
+    """Pre-fix both engines keyed spans by name alone, so two `llm.call` spans
+    collapsed to one: a trace totalling 1300 tokens reported 900, and the
+    printed delta was computed from a single span."""
+
+    @pytest.fixture()
+    def diff_args(self, tmp_path, monkeypatch):
+        import argparse
+
+        from tag.core.db import open_db
+
+        home = tmp_path / "home"
+        monkeypatch.setenv("TAG_HOME", str(home))
+        from tag.core.config import config_path, load_config
+
+        cfg = load_config(config_path(None))
+        conn = open_db(cfg)
+        _seed_span(conn, "a1", "tr-a", "llm.call", 300, 100, 1500)
+        _seed_span(conn, "a2", "tr-a", "llm.call", 700, 200, 2700)
+        _seed_span(conn, "b1", "tr-b", "llm.call", 30, 10, 900)
+        conn.commit()
+        conn.close()
+        return argparse.Namespace(
+            trace_subcommand="diff", trace_a="tr-a", trace_b="tr-b",
+            config=None, profile=None, json=False,
+        )
+
+    def test_both_same_named_spans_are_reported(self, diff_args, capsys):
+        from tag.cmd.observability import cmd_trace
+
+        assert cmd_trace(diff_args) == 0
+        out = capsys.readouterr().out
+        # Two llm.call rows must survive, not one.
+        assert out.count("llm.call") == 2, f"a span was dropped:\n{out}"
+        # And the A-side total must be the real 1300, not just the last span.
+        assert "1300" in out, f"A-side total wrong (span collapsed):\n{out}"
+
+    def test_json_keeps_every_occurrence(self, diff_args, capsys):
+        from tag.cmd.observability import cmd_trace
+
+        diff_args.json = True
+        assert cmd_trace(diff_args) == 0
+        entries = json.loads(capsys.readouterr().out)
+        llm = [e for e in entries if e["name"] == "llm.call"]
+        assert len(llm) == 2, f"expected 2 llm.call entries, got {len(llm)}"
+        assert {e["occurrence"] for e in llm} == {1, 2}
+        a_tokens = sum((e["a"] or {}).get("prompt_tokens", 0) for e in llm)
+        assert a_tokens == 1000, f"A prompt tokens = {a_tokens}, want 1000"
+
+
+# ---------------------------------------------------------------------------
+# #13 — --json gaps and the global --json flag
+# ---------------------------------------------------------------------------
+
+class TestJSONFlagCoverage:
+    """Pre-fix these all exited 2 (`unrecognized arguments: --json`) where Go
+    returns valid JSON, and the global `tag --json <cmd>` form did not exist."""
+
+    JSON_COMMANDS = [
+        ["runs", "list"],
+        ["webhook", "events"],
+        ["webhook", "rule-list"],
+        ["annotate", "stats"],
+        ["logs"],
+    ]
+
+    @pytest.mark.parametrize("cmd", JSON_COMMANDS, ids=lambda c: "-".join(c))
+    def test_trailing_json_flag(self, cmd, tmp_path, monkeypatch, capsys):
+        from tag.controller import main
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        rc = main([*cmd, "--json"])
+        assert rc == 0, f"`tag {' '.join(cmd)} --json` exited {rc}"
+        json.loads(capsys.readouterr().out)  # must be parseable JSON
+
+    @pytest.mark.parametrize("cmd", JSON_COMMANDS, ids=lambda c: "-".join(c))
+    def test_global_json_flag(self, cmd, tmp_path, monkeypatch, capsys):
+        from tag.controller import main
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        rc = main(["--json", *cmd])
+        assert rc == 0, f"`tag --json {' '.join(cmd)}` exited {rc}"
+        json.loads(capsys.readouterr().out)
+
+    def test_agentops_status_schema_matches_go(self, tmp_path, monkeypatch, capsys):
+        """The two engines reported completely disjoint field sets."""
+        from tag.controller import main
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        assert main(["agentops", "status", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        # Union of both engines' fields (see tag-go/internal/cli/agentops.go).
+        for field in (
+            "sdk_installed", "api_key_configured", "api_key_masked",
+            "total_runs", "prompt_tokens", "completion_tokens", "total_tokens",
+            "estimated_cost_usd", "statuses", "profiles",
+        ):
+            assert field in payload, f"agentops status --json missing {field!r}"
+        assert isinstance(payload["profiles"], list)
+
+
+# ---------------------------------------------------------------------------
+# #5 (follow-up) — `gpt-5.4`, TAG's own master-profile default, was unpriced
+# ---------------------------------------------------------------------------
+
+class TestShippedDefaultModelsArePriced:
+    """The pricing pass corrected the Anthropic rates and added the deepseek/qwen
+    profile defaults, but missed `gpt-5.4` — the model
+    src/tag/config/default.yaml ships as the master/orchestrator default. Pre-fix
+    `tag pricing get gpt-5.4` exited 1 with `Model not found: 'gpt-5.4'`, so the
+    default profile silently costed at $0."""
+
+    def test_gpt_5_4_is_priced(self):
+        from tag.cost_table import compute_cost, reload_pricing_table
+
+        reload_pricing_table()
+        cost = compute_cost("gpt-5.4", 1_000_000, 1_000_000)
+        assert cost is not None, "gpt-5.4 missing from src/tag/assets/pricing.yaml"
+        assert abs(cost - 11.25) < 1e-9, f"gpt-5.4 1M/1M = {cost}, want 11.25"
+
+    def test_every_shipped_profile_default_is_priced(self):
+        """Whatever default.yaml ships must resolve — this is what regressed."""
+        import yaml
+
+        from tag.cost_table import compute_cost, reload_pricing_table
+
+        reload_pricing_table()
+        default_yaml = Path(__file__).resolve().parents[1] / "src/tag/config/default.yaml"
+        cfg = yaml.safe_load(default_yaml.read_text())
+
+        models: set[str] = set()
+
+        def walk(node):
+            if isinstance(node, dict):
+                # A model block is {"default": "<id>", ...} under a "model" key.
+                if isinstance(node.get("model"), dict) and node["model"].get("default"):
+                    models.add(str(node["model"]["default"]))
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+
+        walk(cfg)
+        assert models, "no profile model defaults found in default.yaml"
+        unpriced = sorted(m for m in models if compute_cost(m, 1000, 1000) is None)
+        assert not unpriced, f"shipped profile defaults missing from pricing.yaml: {unpriced}"
+
+    def test_unknown_model_still_reports_not_found(self):
+        """The fix must add a real entry, not make every lookup succeed."""
+        from tag.cost_table import compute_cost, reload_pricing_table
+
+        reload_pricing_table()
+        assert compute_cost("definitely-not-a-real-model-xyz", 10, 10) is None
+
+
+# ---------------------------------------------------------------------------
+# #13 (follow-up) — `costs --json` broke its own JSON contract
+# ---------------------------------------------------------------------------
+
+class TestCostsJSONContract:
+    """`cmd_costs` emits `{"runs": [], "totals": {}}` when the DB is absent, but
+    when the DB exists with a pre-cost `runs` schema it printed the human
+    sentence "No cost data recorded yet (run some tasks first)." even under
+    --json, so a caller parsing stdout got a JSONDecodeError."""
+
+    def test_json_stays_json_on_legacy_runs_schema(self, tmp_path, monkeypatch, capsys):
+        import argparse
+
+        from tag.cmd.observability import cmd_costs
+        from tag.controller import config_path, load_config, runtime_db_path
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        cfg = load_config(config_path(None))
+        db_path = runtime_db_path(cfg)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        # `runs` without the total_tokens column — the pre-cost schema.
+        conn.execute("CREATE TABLE runs(id TEXT PRIMARY KEY, master_profile TEXT)")
+        conn.commit()
+        conn.close()
+
+        args = argparse.Namespace(config=None, json=True, limit=20, profile=None)
+        assert cmd_costs(args) == 0
+        out = capsys.readouterr().out
+        payload = json.loads(out)  # pre-fix: JSONDecodeError on the prose line
+        assert payload == {"runs": [], "totals": {}}
+
+    def test_human_output_unchanged_without_json(self, tmp_path, monkeypatch, capsys):
+        import argparse
+
+        from tag.cmd.observability import cmd_costs
+        from tag.controller import config_path, load_config, runtime_db_path
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        cfg = load_config(config_path(None))
+        db_path = runtime_db_path(cfg)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE runs(id TEXT PRIMARY KEY, master_profile TEXT)")
+        conn.commit()
+        conn.close()
+
+        args = argparse.Namespace(config=None, json=False, limit=20, profile=None)
+        assert cmd_costs(args) == 0
+        assert "No cost data recorded yet" in capsys.readouterr().out

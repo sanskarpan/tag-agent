@@ -156,7 +156,14 @@ def cmd_costs(args: argparse.Namespace) -> int:
     try:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
         if "total_tokens" not in cols:
-            print("No cost data recorded yet (run some tasks first).")
+            # Honour --json here too: this path printed a human sentence even
+            # under --json, so a caller parsing stdout hit a JSONDecodeError
+            # instead of the documented empty result that the missing-database
+            # branch above already emits.
+            if getattr(args, "json", False):
+                print(json.dumps({"runs": [], "totals": {}}))
+            else:
+                print("No cost data recorded yet (run some tasks first).")
             conn.close()
             return 0
         limit = getattr(args, "limit", 20)
@@ -413,33 +420,66 @@ def cmd_trace_extended(args: argparse.Namespace) -> int:
                 print_error(f"No snapshot for trace {trace_b}")
                 return 1
 
-            spans_a = {s["name"]: s for s in snap_a.get("spans", [])}
-            spans_b = {s["name"]: s for s in snap_b.get("spans", [])}
-            all_names = sorted(set(spans_a) | set(spans_b))
+            # Key by (name, occurrence) rather than name alone. Multiple spans
+            # sharing a name (several `llm.call`s in one trace) is the normal
+            # case, and keying by name let the last one silently overwrite the
+            # rest — so a trace with llm.call=400 and llm.call=900 reported only
+            # 900 and printed a delta computed from a single span.
+            def _index(spans):
+                out, counts = {}, {}
+                for s in spans:
+                    name = s["name"]
+                    counts[name] = counts.get(name, 0) + 1
+                    out[(name, counts[name])] = s
+                return out, counts
+
+            spans_a, counts_a = _index(snap_a.get("spans", []))
+            spans_b, counts_b = _index(snap_b.get("spans", []))
+            all_keys = sorted(set(spans_a) | set(spans_b))
+
+            def _tokens(s):
+                return ((s or {}).get("prompt_tokens", 0) or 0) + ((s or {}).get("completion_tokens", 0) or 0)
+
+            def _label(key):
+                name, occurrence = key
+                # Only disambiguate when the name actually repeats, so the
+                # common single-span case keeps its original label.
+                if max(counts_a.get(name, 0), counts_b.get(name, 0)) > 1:
+                    return f"{name}#{occurrence}"
+                return name
 
             if getattr(args, "json", False):
                 diff = []
-                for name in all_names:
-                    sa = spans_a.get(name)
-                    sb = spans_b.get(name)
-                    diff.append({"name": name, "a": sa, "b": sb})
+                for key in all_keys:
+                    diff.append({
+                        "name": key[0],
+                        "occurrence": key[1],
+                        "a": spans_a.get(key),
+                        "b": spans_b.get(key),
+                    })
                 print(json.dumps(diff, indent=2))
                 return 0
 
             print(f"Trace diff: {trace_a[:12]}  vs  {trace_b[:12]}")
             print(f"{'Span':<40} {'A tokens':>10} {'B tokens':>10} {'Δ tokens':>10} {'A status':<10} {'B status'}")
             print("-" * 100)
-            for name in all_names:
-                sa = spans_a.get(name)
-                sb = spans_b.get(name)
-                ta = ((sa or {}).get("prompt_tokens", 0) or 0) + ((sa or {}).get("completion_tokens", 0) or 0)
-                tb = ((sb or {}).get("prompt_tokens", 0) or 0) + ((sb or {}).get("completion_tokens", 0) or 0)
+            total_a = total_b = 0
+            for key in all_keys:
+                sa = spans_a.get(key)
+                sb = spans_b.get(key)
+                ta = _tokens(sa)
+                tb = _tokens(sb)
+                total_a += ta
+                total_b += tb
                 delta = tb - ta
                 delta_str = f"+{delta}" if delta > 0 else str(delta)
                 sta = (sa or {}).get("status", "—")
                 stb = (sb or {}).get("status", "—")
                 prefix = "+" if sa is None else ("-" if sb is None else " ")
-                print(f"{prefix} {name:<38} {ta:>10} {tb:>10} {delta_str:>10} {sta:<10} {stb}")
+                print(f"{prefix} {_label(key):<38} {ta:>10} {tb:>10} {delta_str:>10} {sta:<10} {stb}")
+            total_delta = total_b - total_a
+            total_delta_str = f"+{total_delta}" if total_delta > 0 else str(total_delta)
+            print(f"  {'TOTAL':<38} {total_a:>10} {total_b:>10} {total_delta_str:>10}")
             return 0
 
         if sub == "checkpoint":
@@ -885,16 +925,24 @@ def cmd_agentops(args: argparse.Namespace) -> int:
     if sub == "status":
         sdk_ok = is_available()
         cfg_ok = is_configured(cfg)
-        db.close()
         if getattr(args, "json", False):
             import os
             key = cfg.get("agentops", {}).get("api_key", "") or os.environ.get("AGENTOPS_API_KEY", "")
-            print(json.dumps({
+            # Emit the union of both engines' fields. Python previously reported
+            # only the SDK/credential block and Go only the run aggregates, so
+            # `agentops status --json` had a completely disjoint schema between
+            # them and no consumer could read both.
+            agg = _agentops_run_aggregates(db)
+            db.close()
+            payload = {
                 "sdk_installed": sdk_ok,
                 "api_key_configured": cfg_ok,
                 "api_key_masked": mask_key(key) if cfg_ok else None,
-            }, indent=2))
+            }
+            payload.update(agg)
+            print(json.dumps(payload, indent=2))
             return 0
+        db.close()
         print(f"AgentOps SDK installed: {'✓' if sdk_ok else '✗'}")
         print(f"API key configured:     {'✓' if cfg_ok else '✗ (run: tag config set agentops.api_key <key>)'}")
         if cfg_ok:
@@ -1035,3 +1083,51 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     ao_show.add_argument("--json", action="store_true")
     for ap in [ao_cmd, ao_status, ao_sessions, ao_show]:
         ap.set_defaults(func=cmd_agentops)
+
+
+def _agentops_run_aggregates(db) -> dict:
+    """Run-level aggregates matching tag-go/internal/cli/agentops.go's schema."""
+    row = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), "
+        "COALESCE(SUM(estimated_cost_usd),0) FROM runs"
+    ).fetchone()
+    total_runs, pt, ct, cost = int(row[0]), int(row[1]), int(row[2]), float(row[3])
+    statuses = {
+        str(r[0]): int(r[1])
+        for r in db.execute("SELECT status, COUNT(*) FROM runs GROUP BY status").fetchall()
+    }
+    # List-of-objects, matching Go's aopProfileStat so the `profiles` value has
+    # the same shape in both engines, not just the same key name.
+    profiles = []
+    prows = db.execute(
+        "SELECT master_profile, COUNT(*), COALESCE(SUM(prompt_tokens),0), "
+        "COALESCE(SUM(completion_tokens),0), COALESCE(SUM(estimated_cost_usd),0) "
+        "FROM runs GROUP BY master_profile ORDER BY master_profile"
+    ).fetchall()
+    for pr in prows:
+        pname = str(pr[0])
+        pstatuses = {
+            str(r[0]): int(r[1])
+            for r in db.execute(
+                "SELECT status, COUNT(*) FROM runs WHERE master_profile=? GROUP BY status",
+                (pname,),
+            ).fetchall()
+        }
+        profiles.append({
+            "profile": pname,
+            "runs": int(pr[1]),
+            "prompt_tokens": int(pr[2]),
+            "completion_tokens": int(pr[3]),
+            "total_tokens": int(pr[2]) + int(pr[3]),
+            "estimated_cost_usd": float(pr[4]),
+            "statuses": pstatuses,
+        })
+    return {
+        "total_runs": total_runs,
+        "prompt_tokens": pt,
+        "completion_tokens": ct,
+        "total_tokens": pt + ct,
+        "estimated_cost_usd": cost,
+        "statuses": statuses,
+        "profiles": profiles,
+    }

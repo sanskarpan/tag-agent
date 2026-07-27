@@ -832,6 +832,13 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     runs.add_argument("--limit", type=positive_int, default=20)
     runs.add_argument("--json", action="store_true")
     runs.set_defaults(func=cmd_runs)
+    # `runs list` is the spelling the Go CLI uses; accept it as an alias so the
+    # two engines agree, while bare `tag runs` keeps working.
+    runs_sub = runs.add_subparsers(dest="runs_subcommand")
+    runs_list = runs_sub.add_parser("list", help="List recent runs")
+    runs_list.add_argument("--limit", type=positive_int, default=20)
+    runs_list.add_argument("--json", action="store_true")
+    runs_list.set_defaults(func=cmd_runs)
 
     # openrouter-models
     openrouter_models = sub.add_parser(

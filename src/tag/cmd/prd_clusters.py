@@ -505,11 +505,28 @@ def cmd_webhook_server(args: argparse.Namespace) -> int:
             return 0
         if sub == "rule-list":
             rules = wh_list_rules(conn)
+            if getattr(args, "json", False):
+                print(json.dumps([
+                    {"id": r.id, "platform": r.platform, "event": r.event,
+                     "profile": r.profile, "action": r.action,
+                     "filter_labels": r.filter_labels, "enabled": r.enabled,
+                     "created_at": r.created_at}
+                    for r in rules
+                ], indent=2))
+                return 0
             for r in rules:
                 print(f"{r.id[:8]}  {r.platform:<10} {r.event:<30} {r.action}")
             return 0
         if sub == "events":
             events = list_events(conn, limit=getattr(args, "limit", 20))
+            if getattr(args, "json", False):
+                print(json.dumps([
+                    {"id": e.id, "platform": e.platform, "event_type": e.event_type,
+                     "received_at": e.received_at, "signature_valid": e.signature_valid,
+                     "matched_rules": e.matched_rules, "status": e.status}
+                    for e in events
+                ], indent=2))
+                return 0
             for e in events:
                 print(e)
             return 0
@@ -952,6 +969,8 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     annot_label.add_argument("label", metavar="LABEL")
     annot_label.add_argument("--notes", default=None)
     annot_stats = annot_sub.add_parser("stats", help="Show annotation queue statistics")
+    # Output is already JSON; accept the flag so `--json` is not a usage error.
+    annot_stats.add_argument("--json", action="store_true")
     annot_export = annot_sub.add_parser("export", help="Export labeled tasks")
     annot_export.add_argument("--format", default="jsonl", choices=["jsonl", "csv"])
     annot_export.add_argument("--out", default=None)
@@ -1016,8 +1035,10 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     wh_rule_add.add_argument("--profile", required=True)
     wh_rule_add.add_argument("--action", default="run")
     wh_rule_list = wh_sub.add_parser("rule-list", help="List trigger rules")
+    wh_rule_list.add_argument("--json", action="store_true")
     wh_events = wh_sub.add_parser("events", help="List recent webhook events")
     wh_events.add_argument("--limit", type=int, default=20)
+    wh_events.add_argument("--json", action="store_true")
     for ap in [wh_cmd, wh_listen, wh_rule_add, wh_rule_list, wh_events]:
         ap.set_defaults(func=cmd_webhook_server)
 

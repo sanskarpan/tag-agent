@@ -309,7 +309,58 @@ def cmd_mcp(args: argparse.Namespace) -> int:
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
+    if getattr(args, "json", False):
+        return _logs_json(args)
     return _cmd_hermes_command(args, "logs")
+
+
+def _logs_json(args: argparse.Namespace) -> int:
+    """Machine-readable tail of recent activity (runs + spans), newest first.
+
+    The default `tag logs` shells out to hermes, which cannot produce a stable
+    JSON contract. Under --json we read the same state store the Go build reads
+    (tag-go/internal/cli/logs.go) and emit the identical event schema, so the
+    two engines agree instead of Python exiting 2 on an unsupported flag.
+    """
+    import json as _json
+    import sqlite3 as _sqlite3
+
+    cfg = load_config(config_path(args.config))
+    limit = getattr(args, "limit", 20) or 20
+    conn = open_db(cfg)
+    events: list[dict] = []
+    try:
+        rows = conn.execute(
+            "SELECT id, prompt, status, master_profile, COALESCE(model_id,''), created_at "
+            "FROM runs ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        for r in rows:
+            name = " ".join(str(r[1] or "").split())
+            events.append({
+                "source": "run", "id": r[0], "name": name, "status": r[2],
+                "profile": r[3], "model_id": r[4], "timestamp": r[5],
+            })
+        try:
+            srows = conn.execute(
+                "SELECT id, name, status, COALESCE(profile,''), COALESCE(model_id,''), "
+                "COALESCE(finished_at, started_at) FROM spans ORDER BY started_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except _sqlite3.OperationalError:
+            srows = []  # spans table absent — tolerate, as Go does
+        for r in srows:
+            events.append({
+                "source": "span", "id": r[0], "name": r[1], "status": r[2],
+                "profile": r[3], "model_id": r[4], "timestamp": r[5] or "",
+            })
+    finally:
+        conn.close()
+
+    # ISO timestamps sort lexicographically; stable sort keeps source order on ties.
+    events.sort(key=lambda e: e["timestamp"] or "", reverse=True)
+    print(_json.dumps(events[:limit], indent=2))
+    return 0
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
@@ -567,6 +618,9 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     # logs
     logs = sub.add_parser("logs", help="Run logs inside a TAG profile")
     logs.add_argument("--profile", default="orchestrator", help="TAG profile to use")
+    logs.add_argument("--json", action="store_true",
+                      help="Emit recent runs+spans as JSON (reads TAG state, not hermes)")
+    logs.add_argument("--limit", type=int, default=20, help="Max events for --json")
     logs.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     logs.set_defaults(func=cmd_logs)
 
