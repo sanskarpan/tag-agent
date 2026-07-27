@@ -10,6 +10,31 @@ runtime:
 skins:
   tag-control:
     source: assets/skins/tag-control.yaml
+# Tool-execution permissions (the consent gate). Uncomment to configure; with no
+# block here the secure built-in defaults apply:
+#   read_file / list_dir -> allow, write_file / bash -> ask, unknown tools -> ask,
+#   and credential-shaped paths (.env, .env.*, ~/.ssh/**, ~/.aws/**, *.pem, *.key,
+#   id_rsa, .netrc, ...) -> deny, with *.env.example / *.env.sample allowed.
+# An `ask` is prompted on a terminal and DENIED (never auto-approved, never
+# blocking) when there is no TTY -- queue worker, cron, dag run --execute, CI.
+# Per-run overrides: --allow-tool / --deny-tool / --ask-tool / --auto-approve.
+# Inspect what is in force with: tag permissions show
+#
+# permissions:
+#   default: ask                 # catch-all; cannot unprotect credential paths
+#   auto_approve: false          # same as --auto-approve (loud automation opt-in)
+#   tools:                       # per-tool verdicts (no pattern)
+#     read_file: allow
+#     bash: deny
+#   rules:                       # ordered; the FIRST match wins
+#     - tool: bash
+#       pattern: "git *"         # command-prefix match
+#       action: allow
+#     - tool: write_file
+#       pattern: "*.env"         # path glob (* = one segment, ** = any)
+#       action: deny
+# The same block is also honoured at profiles.<name>.config.permissions, which
+# takes precedence over this top-level one.
 defaults:
   master_profile: orchestrator
   board: default

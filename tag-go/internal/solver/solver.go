@@ -30,6 +30,7 @@ import (
 
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/permission"
 	"github.com/tag-agent/tag/internal/store"
 	"github.com/tag-agent/tag/internal/tool"
 )
@@ -74,6 +75,10 @@ type Options struct {
 	CheckCmd string
 	// CmdTimeout bounds RunTests / CheckCmd execution (default 2m).
 	CmdTimeout time.Duration
+	// Guard is the tool consent gate. Nil means tool.Register falls back to the
+	// secure default policy with no prompter, i.e. bash and write_file are DENIED
+	// -- registering a tool never by itself grants permission to execute it.
+	Guard *permission.Guard
 }
 
 // CmdOutcome is the result of running a shell command (tests or a CI check).
@@ -142,10 +147,11 @@ func Solve(ctx context.Context, db *store.DB, prov llm.Provider, model string, o
 		topts := tool.DefaultOptions()
 		topts.Root = opts.RepoPath
 		topts.DisableBash = !opts.EnableBash
+		topts.Guard = opts.Guard
 		tool.Register(reg, topts)
 		loop.Tools = reg
 		if opts.EnableBash {
-			notes = append(notes, "bash tool enabled: it runs UNRESTRICTED host commands (not confined to --repo); the working dir is --repo only.")
+			notes = append(notes, "bash tool REGISTERED: it runs UNRESTRICTED host commands (not confined to --repo); the working dir is --repo only. Execution is still gated by the permission model -- use --allow-tool bash / --auto-approve, or approve at the prompt.")
 		}
 	}
 

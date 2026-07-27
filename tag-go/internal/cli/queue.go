@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/permission"
 	"github.com/tag-agent/tag/internal/worker"
 )
 
@@ -304,13 +305,14 @@ func registerQueue(root *cobra.Command, app *App) {
 	var wProvider string
 	var wMax int
 	var wWatch, wTools bool
+	var wPerms permFlags
 	workerCmd := &cobra.Command{Use: "worker", Short: "Execute queued/ready jobs through the agent loop", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			db, err := app.OpenDB()
 			if err != nil {
 				return err
 			}
-			opts, err := buildWorkerOptions(app, wProvider, wMax, wWatch, wTools)
+			opts, err := buildWorkerOptions(app, wProvider, wMax, wWatch, wTools, &wPerms)
 			if err != nil {
 				return err
 			}
@@ -331,6 +333,7 @@ func registerQueue(root *cobra.Command, app *App) {
 	workerCmd.Flags().IntVar(&wMax, "max", 0, "max jobs to run (0 = unlimited)")
 	workerCmd.Flags().BoolVar(&wWatch, "watch", false, "keep polling for new jobs")
 	workerCmd.Flags().BoolVar(&wTools, "tools", false, "enable built-in tools (bash/read_file/write_file/list_dir)")
+	wPerms.bind(workerCmd)
 
 	q.AddCommand(add, list, cancel, result, clear, workerCmd)
 
@@ -510,6 +513,7 @@ func registerQueue(root *cobra.Command, app *App) {
 
 	var runBoard, dagProvider string
 	var dagExecute, dagTools bool
+	var dagPerms permFlags
 	dagRun := &cobra.Command{Use: "run NAME", Short: "Submit a named DAG", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			db, err := app.OpenDB()
@@ -624,7 +628,7 @@ func registerQueue(root *cobra.Command, app *App) {
 			// enqueue-only (offline parity) unless --execute is given.
 			var execSummary *worker.Summary
 			if dagExecute {
-				opts, err := buildWorkerOptions(app, dagProvider, 0, false, dagTools)
+				opts, err := buildWorkerOptions(app, dagProvider, 0, false, dagTools, &dagPerms)
 				if err != nil {
 					return err
 				}
@@ -672,6 +676,7 @@ func registerQueue(root *cobra.Command, app *App) {
 	dagRun.Flags().BoolVar(&dagExecute, "execute", false, "run enqueued jobs through the agent loop after submitting")
 	dagRun.Flags().StringVar(&dagProvider, "provider", "echo", "llm provider for --execute (echo = offline)")
 	dagRun.Flags().BoolVar(&dagTools, "tools", false, "enable built-in tools for --execute")
+	dagPerms.bind(dagRun)
 
 	dag.AddCommand(save, dagList, dagShow, dagRun)
 	root.AddCommand(q, dag)
@@ -680,12 +685,33 @@ func registerQueue(root *cobra.Command, app *App) {
 // buildWorkerOptions resolves a worker.Options from CLI flags. The provider is
 // looked up in the llm registry (echo = offline default); the per-job model is
 // resolved from profiles.<profile>.config.model.default.
-func buildWorkerOptions(app *App, provider string, max int, watch, tools bool) (worker.Options, error) {
+//
+// The permission guard built here is ALWAYS non-interactive (noPrompt), even if
+// the operator happens to have a terminal: `queue worker`, `dag run --execute`
+// and `cron run --execute` drain jobs in the background, and stopping a drain to
+// wait on a human is exactly the silent hang this project forbids. An `ask`
+// therefore resolves to a recorded deny; grant with --allow-tool/--auto-approve
+// or a permissions block in config.yaml.
+func buildWorkerOptions(app *App, provider string, max int, watch, tools bool, perms *permFlags) (worker.Options, error) {
 	prov, ok := llm.Registry[provider]
 	if !ok {
 		return worker.Options{}, fmt.Errorf("unknown provider %q (available: %v)", provider, providerNames())
 	}
+	var guard *permission.Guard
+	if tools {
+		pf := permFlags{}
+		if perms != nil {
+			pf = *perms
+		}
+		pf.noPrompt = true
+		g, err := pf.guard(app, "", "", os.Stderr)
+		if err != nil {
+			return worker.Options{}, err
+		}
+		guard = g
+	}
 	return worker.Options{
+		Guard:    guard,
 		Provider: prov,
 		ModelForProfile: func(p string) string {
 			return app.Cfg.String("profiles."+p+".config.model.default", "")

@@ -108,6 +108,7 @@ func NewRoot() *cobra.Command {
 	registerMem2(root, app)
 	registerDiffContext(root, app)
 	registerHooks(root, app)
+	registerPermissions(root, app)
 	registerMCPRegistry(root, app)
 	registerTemplate(root, app)
 	registerCompare(root, app)

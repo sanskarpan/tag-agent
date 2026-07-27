@@ -28,6 +28,7 @@ func registerRun(root *cobra.Command, app *App) {
 	var useFallback bool
 	var enableWeb bool
 	var disableTools []string
+	var perms permFlags
 
 	c := &cobra.Command{
 		Use:     "run <prompt>",
@@ -61,10 +62,20 @@ func registerRun(root *cobra.Command, app *App) {
 					fmt.Fprintln(os.Stderr, "  warning: --web set but EXA_API_KEY is empty; web_search not registered")
 				}
 			}
+			runID := uuid.NewString()[:16]
 			if withTools {
 				reg := agent.NewRegistry()
 				topts := tool.DefaultOptions()
 				topts.EnableExa = enableWeb // Exa web_search (needs EXA_API_KEY)
+				// Consent gate: resolved from --allow-tool/--deny-tool/--auto-approve
+				// and the profile's permissions block. Without it tool.Register would
+				// fall back to the secure default policy (bash/write_file denied when
+				// headless) — this just makes it configurable.
+				g, gerr := perms.guard(app, profile, runID, os.Stderr)
+				if gerr != nil {
+					return gerr
+				}
+				topts.Guard = g
 				if len(disableTools) > 0 {
 					topts.Disabled = map[string]bool{}
 					for _, name := range disableTools {
@@ -101,7 +112,6 @@ func registerRun(root *cobra.Command, app *App) {
 				return err
 			}
 			// record the run with usage (best-effort; runtime tables exist from bootstrap)
-			runID := uuid.NewString()[:16]
 			modelID := app.Cfg.String("profiles."+app.profile(profile)+".config.model.default", "")
 			durMs := time.Since(started).Milliseconds()
 			if db, derr := app.OpenDB(); derr == nil {
@@ -145,6 +155,7 @@ func registerRun(root *cobra.Command, app *App) {
 	c.Flags().BoolVar(&enableWeb, "web", false, "add the Exa web_search tool (requires --tools and EXA_API_KEY)")
 	c.Flags().StringSliceVar(&disableTools, "disable-tools", nil, "tool-budget: comma-list of tool names to omit (e.g. bash,write_file)")
 	c.Flags().BoolVar(&useFallback, "fallback", false, "on a retryable provider error, walk the profile's route-fallback chain")
+	perms.bind(c)
 	root.AddCommand(c)
 }
 
