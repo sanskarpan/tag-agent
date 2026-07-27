@@ -1,10 +1,13 @@
 package sandbox
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -13,36 +16,63 @@ import (
 // kernels differ. Whatever is NOT achieved is stated in Result.Isolation rather
 // than glossed over:
 //
-//  1. rlimits (always): RLIMIT_CPU = timeout+5 soft / timeout+10 hard and
-//     RLIMIT_AS = 512MB, matching src/tag/sandbox.py's preexec_fn. Go's
+//  1. rlimits (always attempted): RLIMIT_CPU = timeout+5 soft / timeout+10 hard
+//     and RLIMIT_AS = 512MB, matching src/tag/sandbox.py's preexec_fn. Go's
 //     os/exec has no preexec_fn and syscall.SysProcAttr exposes no Rlimits
 //     field, so we set them with a `ulimit` prologue in the same `sh -c` we
 //     already spawn -- POSIX sh applies them to itself and they are inherited
-//     by everything it runs. Downside vs. Python: a shell that lacks `ulimit`
-//     silently skips them, so the prologue also records nothing; see
-//     rlimitPrologue.
+//     by everything it runs. Downside vs. Python: a shell that lacks `ulimit
+//     -t`/`-v` silently skips them, so we PROBE the shell (rlimitSupport) and
+//     report only the limits it was observed to honour.
 //  2. Landlock (kernel >= 5.13): allow-list filesystem confinement. Without it
-//     there is NO filesystem confinement and we say so.
+//     there is NO filesystem confinement and we say so. /proc stays readable
+//     even with it, which is disclosed rather than hidden (procReadDisclosure).
 //  3. Network: a) Landlock ABI >= 4 (kernel >= 6.7) denies TCP connect/bind;
 //     b) an unprivileged user+network namespace denies everything including
 //     UDP/ICMP/unix-to-network. (b) requires unprivileged user namespaces to be
 //     enabled (kernel.unprivileged_userns_clone=1 and no seccomp/AppArmor
 //     block); when the kernel refuses, we fall back and downgrade the reported
 //     guarantee. We do NOT claim network isolation we did not get.
+//
+// The prologue, the claim strings and the fail-closed wording all live in
+// isolation_claims.go so they can be pinned by tests from a non-Linux host.
 
-// rlimitBytes is the RLIMIT_AS cap (512 MB), matching the Python backend.
-const rlimitBytes = 512 * 1024 * 1024
+// rlimitProbeTimeout is the (arbitrary, fixed) timeout the capability probe
+// pretends to run with. Only whether the shell honours ulimit is being measured,
+// and that does not vary with the value.
+const rlimitProbeTimeout = 30 * time.Second
 
-// rlimitPrologue emits the `ulimit` calls that stand in for Python's
-// preexec_fn setrlimit. Hard limits are lowered before soft ones because a
-// lowered hard limit can never be raised again.
-func rlimitPrologue(timeout time.Duration) string {
-	secs := int(timeout / time.Second)
-	if secs < 1 {
-		secs = 1
-	}
-	return fmt.Sprintf("ulimit -H -t %d 2>/dev/null; ulimit -S -t %d 2>/dev/null; "+
-		"ulimit -v %d 2>/dev/null; ", secs+10, secs+5, rlimitBytes/1024)
+var (
+	rlimitProbeOnce sync.Once
+	rlimitProbeCPU  bool
+	rlimitProbeAS   bool
+)
+
+// rlimitSupport reports whether this host's /bin/sh actually applies the CPU and
+// address-space limits rlimitPrologue asks for.
+//
+// It answers by running the real prologue in a throwaway `sh` and reading the
+// limits back out of that shell. Doing the read-back in a SEPARATE probe process
+// (rather than inside the sandboxed run, via an extra fd or a stderr sentinel)
+// is deliberate: the probe cannot corrupt the command's stdout/stderr, cannot
+// deadlock the run on a pipe, and cannot change the command's own exit status.
+// The shell binary does not change under us, so one probe per process is enough.
+//
+// Any failure -- no `sh`, a timeout, unparseable output -- yields false, i.e. the
+// weaker claim. Guessing "applied" on a failed probe would be exactly the
+// overclaim this function exists to remove.
+func rlimitSupport() (cpuOK, asOK bool) {
+	rlimitProbeOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "sh", "-c",
+			rlimitPrologue(rlimitProbeTimeout)+rlimitReadback).Output()
+		if err != nil {
+			return
+		}
+		rlimitProbeCPU, rlimitProbeAS = parseRlimitReadback(string(out), rlimitProbeTimeout)
+	})
+	return rlimitProbeCPU, rlimitProbeAS
 }
 
 // landlockAllowList is the filesystem allow-list. Anything not listed is denied
@@ -54,8 +84,10 @@ func rlimitPrologue(timeout time.Duration) string {
 // every denial this list encodes.
 func landlockAllowList(runDir string) []llRule {
 	rules := []llRule{
-		// The run directory is the only writable tree.
-		{path: runDir, access: llHandledFS(6)},
+		// The run directory is the only writable tree, and it is REQUIRED: a
+		// sandbox that cannot grant its own working directory is broken, not
+		// merely tightened, so failing to open it is fatal (see llPolicy.apply).
+		{path: runDir, access: llHandledFS(6), required: true},
 	}
 	// Read+execute for the system so the dynamic loader and the shell work.
 	for _, p := range []string{"/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32", "/opt", "/nix/store"} {
@@ -73,9 +105,36 @@ func landlockAllowList(runDir string) []llRule {
 	for _, p := range []string{"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/tty"} {
 		rules = append(rules, llRule{path: p, access: llFSReadWriteFile})
 	}
-	// /proc is needed by nearly everything (including the Go runtime and libc).
+	// /proc is needed by nearly everything (including the Go runtime and libc)
+	// and CANNOT be narrowed safely here:
+	//
+	//   - Landlock rules are resolved to a path at policy-install time. A rule on
+	//     "/proc/self" is opened by the helper, so it pins the HELPER's pid dir.
+	//     That happens to survive the helper's execve (exec keeps the pid), but
+	//     every process the command then spawns has a different pid and would be
+	//     denied its own /proc/self -- breaking libc, the Go runtime and most
+	//     language runtimes inside the sandbox. Landlock has no pid wildcard, and
+	//     hiding other pids would need a PID+mount namespace with a private
+	//     hidepid proc, which is a different (and much larger) design.
+	//
+	// So the read grant stays whole-/proc, and the consequence -- another
+	// same-uid process's environ/cmdline is readable from inside the sandbox --
+	// is DISCLOSED in Result.Isolation via procReadDisclosure. Any change here
+	// must keep that disclosure in sync with what is actually granted.
 	rules = append(rules, llRule{path: "/proc", access: llFSRead})
 	return rules
+}
+
+// grantsProcRead reports whether an allow-list still contains the whole-/proc
+// read grant, i.e. whether procReadDisclosure must appear in the claim. It keeps
+// the disclosure tied to the rules instead of to a comment someone can forget.
+func grantsProcRead(rules []llRule) bool {
+	for _, r := range rules {
+		if r.path == "/proc" && r.access&llFSRead != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // buildIsolation assembles the strongest plan this kernel supports, with a
@@ -108,13 +167,19 @@ func buildIsolation(runDir string, timeout time.Duration) (*isolationPlan, *Resu
 	var extraEnv []string
 	fsClaim := "filesystem NOT confined (Landlock unavailable: kernel < 5.13 or LSM disabled)"
 	netClaimLandlock := ""
+	// Set only when a helper is in the argv: only then can the run fail closed
+	// AFTER Start() succeeded, and only then is the fail-closed string right.
+	failExit := 0
+	failMarker := ""
+	failIsolation := ""
 
 	if abi >= 1 {
 		self, err := os.Executable()
 		if err != nil {
 			return nil, nil, fmt.Errorf("sandbox: cannot locate own executable for the Landlock helper: %w", err)
 		}
-		policy := llPolicy{abi: abi, rules: landlockAllowList(runDir), blockNet: abi >= 4}
+		rules := landlockAllowList(runDir)
+		policy := llPolicy{abi: abi, rules: rules, blockNet: abi >= 4}
 		spec, err := policy.encode()
 		if err != nil {
 			return nil, nil, err
@@ -123,13 +188,19 @@ func buildIsolation(runDir string, timeout time.Duration) (*isolationPlan, *Resu
 		extraEnv = []string{helperEnv + "=" + spec}
 		fsClaim = fmt.Sprintf("Landlock ABI v%d: writes confined to the run dir; reads limited to "+
 			"system dirs (/etc account databases, $HOME and /root denied)", abi)
+		if grantsProcRead(rules) {
+			fsClaim += "; " + procReadDisclosure
+		}
 		if abi >= 4 {
 			netClaimLandlock = "Landlock denies TCP connect/bind (UDP and raw sockets NOT blocked)"
 		}
+		failExit, failMarker, failIsolation = helperExitPolicy, helperFailMarker, landlockFailClosedIsolation
 	}
 
-	rl := fmt.Sprintf("rlimits via ulimit (CPU %ds soft / %ds hard, AS %dMB)",
-		int(timeout/time.Second)+5, int(timeout/time.Second)+10, rlimitBytes/1024/1024)
+	// The rlimit claim is whatever this shell was OBSERVED to honour, not what
+	// the prologue asked for.
+	cpuOK, asOK := rlimitSupport()
+	rl := rlimitClaim(timeout, cpuOK, asOK)
 
 	// Weak plan: no network namespace.
 	netWeak := "network NOT blocked"
@@ -137,10 +208,13 @@ func buildIsolation(runDir string, timeout time.Duration) (*isolationPlan, *Resu
 		netWeak = netClaimLandlock
 	}
 	weak := &isolationPlan{
-		Prefix:    prefix,
-		Prologue:  prologue,
-		ExtraEnv:  extraEnv,
-		Isolation: strings.Join([]string{rl, fsClaim, netWeak}, "; "),
+		Prefix:              prefix,
+		Prologue:            prologue,
+		ExtraEnv:            extraEnv,
+		Isolation:           strings.Join([]string{rl, fsClaim, netWeak}, "; "),
+		FailClosedExit:      failExit,
+		FailClosedMarker:    failMarker,
+		FailClosedIsolation: failIsolation,
 	}
 
 	// Strong plan: unprivileged user+network namespace => no network at all.
@@ -155,7 +229,10 @@ func buildIsolation(runDir string, timeout time.Duration) (*isolationPlan, *Resu
 		},
 		Isolation: strings.Join([]string{rl, fsClaim,
 			"network namespace: all egress denied (loopback only)"}, "; "),
-		Alt: weak,
+		Alt:                 weak,
+		FailClosedExit:      failExit,
+		FailClosedMarker:    failMarker,
+		FailClosedIsolation: failIsolation,
 	}
 	return strong, nil, nil
 }

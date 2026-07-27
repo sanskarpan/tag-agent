@@ -18,15 +18,22 @@
 //     re-allowing it would hand back the very trees the profile exists to deny.
 //     If sandbox-exec is missing, or the run dir is too broad, the run FAILS
 //     CLOSED with exit 127 (matching Python).
-//   - linux: RLIMIT_CPU and RLIMIT_AS are applied via a shell `ulimit` prologue,
-//     Landlock (ABI v1+, no CGO) confines the filesystem to an allow-list that
-//     excludes /etc/passwd and the user's home, and network egress is blocked
-//     via Landlock ABI v4 TCP scoping and/or an unprivileged network namespace.
-//     The run dir is the ONLY writable tree, so -- exactly as on macOS -- a run
-//     directory at or above a boundary (`/`, `/home`, `/root`, `/etc`, `$HOME`,
-//     ...) is refused with exit 127 instead of granting write over that tree.
-//     Layers that the running kernel cannot provide are DEGRADED, never faked --
-//     the reduced guarantee is spelled out in Result.Isolation.
+//   - linux: RLIMIT_CPU and RLIMIT_AS are requested via a shell `ulimit`
+//     prologue (and the shell is probed to confirm it honoured them -- a shell
+//     that ignores `ulimit -t`/`-v` yields a "REQUESTED but NOT applied" claim,
+//     not a silent one), Landlock (ABI v1+, no CGO) confines the filesystem to
+//     an allow-list that excludes /etc/passwd and the user's home, and network
+//     egress is blocked via Landlock ABI v4 TCP scoping and/or an unprivileged
+//     network namespace. /proc stays readable -- Landlock cannot scope it
+//     per-pid -- so Result.Isolation discloses that another same-uid process's
+//     environ/cmdline is visible from inside the sandbox. The run dir is the
+//     ONLY writable tree, so -- exactly as on macOS -- a run directory at or
+//     above a boundary (`/`, `/home`, `/root`, `/etc`, `$HOME`, ...) is refused
+//     with exit 127 instead of granting write over that tree. Layers that the
+//     running kernel cannot provide are DEGRADED, never faked -- the reduced
+//     guarantee is spelled out in Result.Isolation, and a Landlock policy that
+//     fails to install (including a run dir that cannot be opened) fails closed
+//     with exit 126 and an Isolation string that claims nothing.
 //   - everything else: FAILS CLOSED, pointing at `--backend docker`.
 //
 // The path-confinement idea (EvalSymlinks guard) is reused from internal/tool so
@@ -85,6 +92,16 @@ type isolationPlan struct {
 	// Alt is a weaker fallback plan used only when the process cannot be
 	// started with this plan (e.g. unprivileged netns denied by the kernel).
 	Alt *isolationPlan
+	// FailClosedExit / FailClosedMarker / FailClosedIsolation describe the one
+	// way this plan can fail AFTER the process has started: a confinement layer
+	// installed by a helper inside the child (Linux's Landlock re-exec) can
+	// refuse, at which point Start() has already succeeded, Alt is never tried,
+	// and Isolation would otherwise describe a policy that does not exist. When
+	// the child exits with FailClosedExit AND prints FailClosedMarker on stderr,
+	// FailClosedIsolation is reported instead. See resolveIsolation.
+	FailClosedExit      int
+	FailClosedMarker    string
+	FailClosedIsolation string
 }
 
 // confineDir resolves dir to a real absolute path, following symlinks so the
@@ -203,6 +220,11 @@ func runPlan(cctx context.Context, plan *isolationPlan, runDir, command string) 
 	// re-parented to init and keep running unconfined-looking on the host.
 	_ = killProcessGroup(cmd)
 	res := &Result{Stdout: stdout.String(), Stderr: stderr.String(), Isolation: plan.Isolation}
+	// Isolation can only be settled once the exit status is known: a helper that
+	// failed to install its policy reports that via the status + a stderr marker.
+	// res is a pointer, so fixing it up in a defer reaches the returned value on
+	// every path below without repeating the call at each return.
+	defer func() { res.Isolation = resolveIsolation(plan, res.Exit, res.Stderr) }()
 
 	if cctx.Err() == context.DeadlineExceeded {
 		res.TimedOut = true

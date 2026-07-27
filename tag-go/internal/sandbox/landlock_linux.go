@@ -103,6 +103,11 @@ func llHandledFS(abi int) uint64 {
 type llRule struct {
 	path   string
 	access uint64
+	// required marks a rule whose absence breaks the sandbox rather than merely
+	// tightening it -- in practice the run dir, the only writable tree. Optional
+	// rules for paths that do not exist on this system are skipped silently;
+	// a required one that cannot be opened is a hard, fail-closed error.
+	required bool
 }
 
 // llPolicy is the serialisable policy handed to the re-exec helper.
@@ -115,18 +120,23 @@ type llPolicy struct {
 
 // encode renders the policy into a single env-var value:
 //
-//	abi;net;<access>:<path>|<access>:<path>|...
+//	abi;net;<access>:<required>:<path>|<access>:<required>:<path>|...
 //
 // Paths may contain any byte except '|' and newline; we reject those rather
 // than invent an escaping scheme (the run dir is the only caller-controlled
-// path and such names are vanishingly rare).
+// path and such names are vanishingly rare). A ':' in a path is fine because
+// decodePolicy splits off only the two leading fields.
 func (p llPolicy) encode() (string, error) {
 	var parts []string
 	for _, r := range p.rules {
 		if strings.ContainsAny(r.path, "|\n") {
 			return "", fmt.Errorf("sandbox: refusing to build a Landlock policy for path %q (contains '|' or newline)", r.path)
 		}
-		parts = append(parts, fmt.Sprintf("%d:%s", r.access, r.path))
+		req := 0
+		if r.required {
+			req = 1
+		}
+		parts = append(parts, fmt.Sprintf("%d:%d:%s", r.access, req, r.path))
 	}
 	net := 0
 	if p.blockNet {
@@ -149,21 +159,48 @@ func decodePolicy(s string) (llPolicy, error) {
 		return p, nil
 	}
 	for _, item := range strings.Split(head[2], "|") {
-		i := strings.Index(item, ":")
-		if i < 0 {
+		f := strings.SplitN(item, ":", 3)
+		if len(f) != 3 {
 			return p, fmt.Errorf("malformed landlock rule %q", item)
 		}
 		var acc uint64
-		if _, err := fmt.Sscanf(item[:i], "%d", &acc); err != nil {
+		if _, err := fmt.Sscanf(f[0], "%d", &acc); err != nil {
 			return p, fmt.Errorf("malformed landlock rule %q: %w", item, err)
 		}
-		p.rules = append(p.rules, llRule{path: item[i+1:], access: acc})
+		p.rules = append(p.rules, llRule{path: f[2], access: acc, required: f[1] == "1"})
 	}
 	return p, nil
 }
 
+// checkRequiredPaths verifies that every rule marked required can be opened
+// before any ruleset is created.
+//
+// Optional rules for missing paths are skipped in apply(), which is a tightening
+// and therefore always safe. The run dir is different: skipping it leaves the
+// sandbox with NO writable tree, and the loss is invisible -- the command just
+// starts failing to write its own working directory while Result.Isolation still
+// claims "writes confined to the run dir". Refusing up front turns that into a
+// fail-closed 126 with a message that names the directory.
+func (p llPolicy) checkRequiredPaths() error {
+	for _, r := range p.rules {
+		if !r.required {
+			continue
+		}
+		fd, err := unix.Open(r.path, unix.O_PATH|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return fmt.Errorf("cannot open the run directory %s, so it could not be granted as the "+
+				"sandbox's writable tree: %w", r.path, err)
+		}
+		unix.Close(fd)
+	}
+	return nil
+}
+
 // apply installs the policy on the calling thread/process. It is irreversible.
 func (p llPolicy) apply() error {
+	if err := p.checkRequiredPaths(); err != nil {
+		return err
+	}
 	handled := llHandledFS(p.abi)
 	attr := llRulesetAttr{accessFS: handled}
 	size := uintptr(8)
@@ -186,6 +223,13 @@ func (p llPolicy) apply() error {
 	for _, r := range p.rules {
 		pfd, err := unix.Open(r.path, unix.O_PATH|unix.O_CLOEXEC, 0)
 		if err != nil {
+			if r.required {
+				// Re-checked here as well as in checkRequiredPaths: the run dir
+				// could have been removed in between, and losing it silently is
+				// exactly the failure this guard exists to prevent.
+				return fmt.Errorf("cannot open the run directory %s, so it could not be granted as the "+
+					"sandbox's writable tree: %w", r.path, err)
+			}
 			// A path that does not exist on this system simply contributes no
 			// rule; that is a tightening, never a loosening.
 			continue
@@ -219,18 +263,24 @@ func init() {
 	// process to install a policy. A missing/empty policy env var therefore means
 	// the policy was lost in transit -- falling through to normal CLI flow would
 	// run the command with NO Landlock at all, so fail closed instead.
+	//
+	// Every refusal below is prefixed with helperFailMarker: that marker plus the
+	// helperExitPolicy status is how the parent knows the policy was never
+	// installed and must report landlockFailClosedIsolation instead of the
+	// ruleset it intended to build. The exec failure further down is NOT marked --
+	// there the policy IS installed, so the plan's real guarantee still holds.
 	spec := os.Getenv(helperEnv)
 	if spec == "" {
-		fmt.Fprintln(os.Stderr, "sandbox: Landlock helper invoked without a policy; refusing to run unconfined")
+		fmt.Fprintln(os.Stderr, helperFailMarker, "helper invoked without a policy; refusing to run unconfined")
 		os.Exit(helperExitPolicy)
 	}
 	policy, err := decodePolicy(spec)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "sandbox:", err)
+		fmt.Fprintln(os.Stderr, helperFailMarker, err)
 		os.Exit(helperExitPolicy)
 	}
 	if err := policy.apply(); err != nil {
-		fmt.Fprintln(os.Stderr, "sandbox: failed to install Landlock policy:", err)
+		fmt.Fprintln(os.Stderr, helperFailMarker, err)
 		os.Exit(helperExitPolicy)
 	}
 	_ = os.Unsetenv(helperEnv)
