@@ -1,18 +1,34 @@
 # TAG — Complete Feature List
 
 > Consolidated, status-verified feature inventory for the TAG agent-orchestration platform.
-> Cross-checked against the live CLI surface (**103 commands**) and the PRD catalog (**PRD-001–127**,
+> Cross-checked against the live CLI surface and the PRD catalog (**PRD-001–127**,
 > clusters A–K). Sources: `docs/prd/INDEX.md`, `docs/FEATURES_ROADMAP.md`, and `src/tag/`.
 
 **Legend:** ✅ implemented & shipping (working command) · 📋 planned/proposed (PRD written, not yet built)
 
-**At a glance:** ~72 features implemented across 103 commands (PRD-001–072) · ~55 planned (PRD-073–127).
+> **Which edition these counts describe.** This page covers *both* the Python edition and
+> the native Go harness, and they do **not** have the same command surface. Counts
+> re-measured 2026-07-28:
+>
+> | Edition | Top-level commands | Total nodes | How counted |
+> |---|---|---|---|
+> | **Python** (`pip install tag-agent`) | **103** | 270 parser nodes | recursive walk of `tag.controller.build_parser()` |
+> | **Go** (`tag-go`, single binary) | **86** | 240 help nodes | recursive `--help` sweep of the built binary (Cobra reports 88; `help` and `completion` are Cobra built-ins) |
+>
+> Unless a bullet says otherwise, the **103** figure on this page is the **Python** number.
+> The Go node count slightly undercounts its real verb surface: `mem2 fact`, `mem2 episode`
+> and `mem2 store` take a positional verb rather than Cobra subcommands, hiding 9 verbs
+> from any `--help` sweep. Go-specific gaps (no `swarm run`/`abort`, `agentic-ci` is 1
+> command vs Python's 7 subcommands, `lsp` is hover-only) are tracked in
+> [`tag-go/MIGRATION_STATUS.md`](../tag-go/MIGRATION_STATUS.md).
+
+**At a glance:** ~72 features implemented across the Python edition's 103 commands (PRD-001–072) · ~55 planned (PRD-073–127).
 
 ---
 
 ## 0. Core platform (foundation)
 
-- ✅ **Control-plane CLI** wrapping the Hermes agent runtime — the `tag` binary, 103 subcommands
+- ✅ **Control-plane CLI** wrapping the Hermes agent runtime — the `tag` binary, 103 top-level subcommands (Python edition; 86 in the Go harness)
 - ✅ **Multi-profile orchestration** — 5 built-in profiles (orchestrator, researcher, coder, reviewer, codex-runtime-master)
 - ✅ **Task routing engine** — 4 routes (research / implementation / review / mixed); master/worker/verifier roles; Kanban vs direct execution
 - ✅ **Managed runtime provisioning** — `setup`, bundled 52 MB Hermes tarball, branding-patch application (pre-patched-bundle aware), TUI build, per-profile isolated HOMEs
@@ -201,7 +217,8 @@ self-review/self-improve for swarm (PRD-023).
 | | Count |
 |---|---|
 | ✅ Implemented features (PRD-001–072) | ~72 |
-| ✅ Live CLI commands | 103 |
+| ✅ Live CLI commands — **Python** edition | 103 top-level (270 parser nodes) |
+| ✅ Live CLI commands — **Go** harness | 86 top-level (240 help nodes) |
 | 📋 Planned features (PRD-073–127, clusters D–K) | ~55 |
 | **Total PRDs cataloged** | **127** |
 

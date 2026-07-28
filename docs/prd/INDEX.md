@@ -48,20 +48,42 @@ These PRDs address capabilities where Sakana leads and where TAG can close the g
 
 ## Priority Matrix (PRD-001 to PRD-044)
 
+> **Status accuracy — read this before trusting the Status column.**
+>
+> "Proposed" in this table means *"nobody has revisited this row since the PRD was
+> written"*, **not** "unbuilt". Several of these features shipped long ago and the index
+> was never updated.
+>
+> - **PRD-001 to PRD-012 — verified 2026-07-28 and updated to "Shipped".** Verification
+>   was by *running* the Python CLI (`--help` on `memory-journal`, `swarm`,
+>   `import-nous-portal`, `desktop`, `queue`, `doctor`, `dashboard`, `plugin`, `costs`,
+>   `mem`) and by locating the backing implementations (`_apply_memory_config` in
+>   `src/tag/core/profile.py` for 001, `src/tag/tui_output.py` for 003). All twelve were
+>   present and working.
+> - **PRD-013 to PRD-127 — NOT verified in this pass.** Those rows are left exactly as
+>   they were. Some have certainly shipped too (`trace`, `mcp-registry`, `eval`,
+>   `persona`, `marketplace` and others are live commands today), but they were not
+>   checked one by one here and are not being guessed at. Treat any "Proposed" status in
+>   that range as **unknown**, not as **unbuilt**.
+>
+> For a measured inventory of what exists right now, use the CLI surface itself
+> (`tag --help`), [`../FEATURES.md`](../FEATURES.md), and
+> [`../../tag-go/MIGRATION_STATUS.md`](../../tag-go/MIGRATION_STATUS.md).
+
 | PRD | Feature | Priority | Effort | Status |
 |-----|---------|----------|--------|--------|
-| [001](PRD-001-structured-memory-configuration.md) | Structured Memory Configuration Per Profile | P0 | M | Proposed |
-| [002](PRD-002-cross-session-memory-journal.md) | Cross-Session Memory Journal (`tag memory-journal`) | P0 | S | Proposed |
-| [003](PRD-003-rich-streaming-tui.md) | Rich Streaming TUI Output (spinners, progress, status bar) | P0 | M | Proposed |
-| [004](PRD-004-kanban-swarm-helpers.md) | Kanban Swarm Topology Helpers (`tag swarm`) | P1 | M | Proposed |
-| [005](PRD-005-execution-backend-selection.md) | Execution Backend Selection Per Profile (Docker, SSH, Modal) | P1 | S–M | Proposed |
-| [006](PRD-006-tool-gateway-opt-in.md) | Tool Gateway Opt-in (`tag import-nous-portal`) | P1 | XS | Proposed |
-| [007](PRD-007-tag-desktop.md) | Desktop Electron App Launcher (`tag desktop`) | P2 | M | Proposed |
-| [008](PRD-008-background-task-queue.md) | Background Task Queue with Notifications (`tag queue`) | P1 | M | Proposed |
-| [009](PRD-009-enhanced-doctor-diagnostics.md) | Enhanced `tag doctor` Diagnostics (pass/warn/fail per component) | P1 | S | Proposed |
-| [010](PRD-010-dashboard-admin-panel.md) | Dashboard Admin Panel Integration (`tag dashboard` upgrade) | P2 | XS | Proposed |
-| [011](PRD-011-plugin-management.md) | Plugin Management System (`tag plugin install/list/enable`) | P1 | M | Proposed |
-| [012](PRD-012-cost-tracking-budget.md) | Cost Tracking & Budget Management (`tag costs`) | P1 | M | Proposed |
+| [001](PRD-001-structured-memory-configuration.md) | Structured Memory Configuration Per Profile | P0 | M | **Shipped** |
+| [002](PRD-002-cross-session-memory-journal.md) | Cross-Session Memory Journal (`tag memory-journal`) | P0 | S | **Shipped** |
+| [003](PRD-003-rich-streaming-tui.md) | Rich Streaming TUI Output (spinners, progress, status bar) | P0 | M | **Shipped** |
+| [004](PRD-004-kanban-swarm-helpers.md) | Kanban Swarm Topology Helpers (`tag swarm`) | P1 | M | **Shipped** |
+| [005](PRD-005-execution-backend-selection.md) | Execution Backend Selection Per Profile (Docker, SSH, Modal) | P1 | S–M | **Shipped** |
+| [006](PRD-006-tool-gateway-opt-in.md) | Tool Gateway Opt-in (`tag import-nous-portal`) | P1 | XS | **Shipped** |
+| [007](PRD-007-tag-desktop.md) | Desktop Electron App Launcher (`tag desktop`) | P2 | M | **Shipped** |
+| [008](PRD-008-background-task-queue.md) | Background Task Queue with Notifications (`tag queue`) | P1 | M | **Shipped** |
+| [009](PRD-009-enhanced-doctor-diagnostics.md) | Enhanced `tag doctor` Diagnostics (pass/warn/fail per component) | P1 | S | **Shipped** |
+| [010](PRD-010-dashboard-admin-panel.md) | Dashboard Admin Panel Integration (`tag dashboard` upgrade) | P2 | XS | **Shipped** |
+| [011](PRD-011-plugin-management.md) | Plugin Management System (`tag plugin install/list/enable`) | P1 | M | **Shipped** |
+| [012](PRD-012-cost-tracking-budget.md) | Cost Tracking & Budget Management (`tag costs`) | P1 | M | **Shipped** |
 | [013](PRD-013-agent-tracing-observability.md) | Distributed Agent Tracing & Observability (`tag trace`) | P1 | L | Proposed |
 | [014](PRD-014-mcp-server-registry.md) | MCP Server Registry & Discovery (`tag mcp registry`) | P1 | M | Proposed |
 | [015](PRD-015-profile-templates-sharing.md) | Profile Templates & Sharing (`tag template export/import/pull`) | P2 | M | Proposed |

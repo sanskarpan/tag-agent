@@ -18,8 +18,8 @@ cd /Users/sanskar/dev/test/tag/tag-go && CGO_ENABLED=0 go build -o /tmp/tag-benc
 
 | Headline metric | Go | Python | Advantage |
 |---|---|---|---|
-| **Startup latency** (`--help`) median | **9.6 ms** | 112.8 ms | **Go ~11.8× faster** |
-| Startup (`mem list`) median | **13.4 ms** | 138.8 ms | Go ~10.4× faster |
+| **Startup latency** (`--help`) median | **~8–10 ms** | ~113–139 ms | **Go ~12–18× faster** |
+| Startup (`mem list`) median | **~10–13 ms** | ~139–145 ms | Go ~10–15× faster |
 | Startup (`--version`) median | 27.7 ms | 131.5 ms | Go ~4.7× faster |
 | **Throughput** 100 sequential `mem add` | **2.08 s** | 14.47 s | Go ~7.0× faster |
 | Throughput 100 parallel (`xargs -P8`) | **0.37 s** | 3.30 s | Go ~8.9× faster |
@@ -30,7 +30,12 @@ cd /Users/sanskar/dev/test/tag/tag-go && CGO_ENABLED=0 go build -o /tmp/tag-benc
 | Install time | 9.4 s (clean build) / 0.63 s (incr.) | 21.6 s (pip, warm cache) | Go faster |
 | Live single-shot model run | **native `run`** works | no clean path (managed runtime only) | **Go only** |
 
-**Bottom line:** the Go port is dramatically faster to start (≈10× for typical commands, ≈30× cold), ≈7–9× higher throughput, ≈9× smaller to ship, and ≈2× leaner in RAM — and it exposes a self-contained `run` agent loop the Python edition simply doesn't have offline. The two are **strongly differentiated on performance and packaging**, and largely **behaviorally faithful** on the shared Track-A command surface, with a catalog of small but real output/JSON/exit-code divergences (Section 3) plus a few genuine bugs (Section 6).
+Startup figures are ranges, not point values: they are machine-, environment- and (on
+macOS) code-signing-dependent. See §2.1a for the method, the re-measurement, and the
+Gatekeeper caveat for downloaded binaries. The ~10×+ relative advantage is robust; a
+single millisecond headline is not.
+
+**Bottom line:** the Go port is dramatically faster to start (≈10–18× for typical commands, ≈30× cold), ≈7–9× higher throughput, ≈9× smaller to ship, and ≈2× leaner in RAM — and it exposes a self-contained `run` agent loop the Python edition simply doesn't have offline. The two are **strongly differentiated on performance and packaging**, and largely **behaviorally faithful** on the shared Track-A command surface, with a catalog of small but real output/JSON/exit-code divergences (Section 3) plus a few genuine bugs (Section 6).
 
 ---
 
@@ -46,6 +51,44 @@ All timings from wall-clock of the child process (Python `time.perf_counter` aro
 | `mem list` | 13.4 | 138.8 | 10.4× |
 
 Note: Go `--version` (27.7 ms) is oddly slower than `--help`/`mem list` (~10–13 ms) — see Bug G7.
+
+#### 2.1a Re-measurement, 2026-07-28 (20 warm runs) — and the caveat that matters
+
+The table above was contested by an independent audit that measured Go `--help` at
+**56–68 ms** and `mem list` at **55 ms**, i.e. ~5× worse than published. We re-ran the
+measurement to settle it.
+
+**Method.** Binary built locally with `go build -o /tmp/tagdoc ./cmd/tag`. Isolated
+`TAG_HOME`; provider API keys unset. Python driver: 3 discarded warm-up runs, then **20
+timed runs** of `subprocess.run(...)` wrapped in `time.perf_counter()`. Both a normal
+inherited environment and a stripped `env -i`-equivalent environment were measured.
+**Machine: Apple M3 Pro, macOS 26.5.2, arm64.**
+
+| Scenario | Go median | Go (stripped env) | Python median | Py/Go |
+|---|---|---|---|---|
+| `--help` | **7.6 ms** (7.1–8.6) | 8.9 ms | 139.2 ms | ~18× |
+| `mem list` | **9.5 ms** (9.0–12.3) | 10.5 ms | 145.3 ms | ~15× |
+
+**Findings.**
+
+1. The published 9.6 ms / 13.4 ms figures **reproduce** on this machine — in fact they
+   are slightly conservative. The audit's 56–68 ms did **not** reproduce.
+2. The likely cause of the discrepancy is **macOS code-signing / Gatekeeper**, not the
+   binary. A locally built Go binary is *ad-hoc (linker-)signed*
+   (`codesign -dv` reports `flags=0x20002(adhoc,linker-signed)`) and pays no Gatekeeper
+   penalty. A **downloaded** release binary carries the `com.apple.quarantine`
+   attribute and is subject to a first-run notarization/`syspolicyd` check, which can add
+   **tens of milliseconds per exec** until the assessment is cached — and considerably
+   more on the very first run.
+3. Consequently, **treat ~8–14 ms as the figure for a locally built or
+   already-assessed binary, and expect meaningfully higher numbers for a freshly
+   downloaded, unsigned/unnotarized binary on macOS** (clearable with
+   `xattr -d com.apple.quarantine <binary>`). This is a distribution artifact, not a
+   property of the Go code.
+4. The **relative advantage over Python is real and robust** across every environment we
+   measured — roughly **15–18× on startup**, never below ~10×. The order of magnitude is
+   the honest claim; any specific millisecond headline is machine-, signing-, and
+   filesystem-dependent and should be read as such.
 
 Commands:
 ```
@@ -240,7 +283,14 @@ cd /Users/sanskar/dev/test/tag/tag-go && CGO_ENABLED=0 go build -o /tmp/tag-benc
 
 Since the original benchmark, a swarm pass closed the Go↔Python parity gap and hardened correctness:
 
-- **Command surface:** Go grew from **65 → 87 top-level commands**. New: `runs`, `logs`, `prompt-size`, `benchmark`, `sandbox`, `context`, `split`, `eval-judge`, `swe-solve`, `issue-solve`, `agentic-ci`, `review-pr`, 9 credential importers, and command aliases (`memory`/`plugins`/`model`).
+- **Command surface:** Go grew from **65 → 86 top-level TAG commands** (re-counted
+  2026-07-28 by a recursive `--help` sweep of the built binary: Cobra lists 88, of which
+  `help` and `completion` are Cobra built-ins, leaving **86** TAG commands across **240**
+  help nodes). For reference the Python edition has **103** top-level commands / **270**
+  parser nodes, walked from `tag.controller.build_parser()`. The Go node count is a
+  slight *undercount* of the real verb surface, because `mem2 fact`, `mem2 episode` and
+  `mem2 store` take a positional verb rather than Cobra subcommands (9 verbs invisible to
+  a `--help` sweep). New in Go: `runs`, `logs`, `prompt-size`, `benchmark`, `sandbox`, `context`, `split`, `eval-judge`, `swe-solve`, `issue-solve`, `agentic-ci`, `review-pr`, 9 credential importers, and command aliases (`memory`/`plugins`/`model`).
 - **Execution runtime (#532):** the queue is no longer inert — a new `internal/worker` executes queued jobs and full DAG dependency chains through the native agent loop (`queue worker`, `dag/cron run --execute`). Verified **live** against OpenAI (job add → worker → `queue result` shows model output). This closes the single biggest behavioral gap the benchmark identified.
 - **Contract parity:** the `--json` contract was audited across all commands (empty→`[]`, error paths emit `{"error":...}`, Python field names for `cache stats`/`mem stats`); usage errors now exit **2** like Python argparse; unknown subcommands error instead of silently exiting 0.
 - **26 bugs** found by two audit passes (code review + fresh-install QA) were fixed, verified on the binary, and closed (issues #520–#546). No critical issues, no data races (`go test -race ./...` green), no injection/SSRF/sandbox escapes, no leaks.
