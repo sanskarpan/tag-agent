@@ -34,14 +34,34 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("heroku_api_key",         re.compile(r'[hH]eroku.{0,20}[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')),
     ("generic_private_key",    re.compile(r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY')),
     ("jwt_token",              re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')),
+    # Catch-all for hardcoded credentials that match no vendor-specific format
+    # and sit below the entropy threshold (e.g. `PASSWORD = "hunter2..."`,
+    # `DB_PASSWORD=somevalue`). Ported from the Go implementation
+    # (tag-go/internal/security/scan.go, pattern "generic_secret"); Python was
+    # missing it entirely and reported such files as clean. Kept LAST so the
+    # vendor-specific patterns above still win the pattern-name race for lines
+    # like `api_key = "sk-ant-..."`.
+    # The (?!...) guard is a deliberate refinement over the Go regex: it drops
+    # obvious documentation placeholders (`OPENROUTER_API_KEY: your-openrouter-
+    # api-key` in TAG's own shipped tag.yaml, `changeme`, `<redacted>`,
+    # `${VAR}`), which are not credentials and would otherwise make every fresh
+    # install scan dirty.
+    ("generic_secret",         re.compile(
+        r'(?i)(?:secret|token|password|api_key)\s*[=:]\s*'
+        r'["\']?(?!your[-_]|xxxx|changeme|example[-_]|redacted|<|\$\{|\$\()'
+        r'[A-Za-z0-9/+_\-]{16,}')),
 ]
 
-# Files/dirs that are always skipped
-_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", ".qa-venv312",
-              "venv", ".mypy_cache", ".pytest_cache", "dist", "build"}
+# Files/dirs that are always skipped. Kept in sync with the Go implementation
+# (tag-go/internal/security/scan.go skipDirs/skipExts) so both scanners cover
+# the same tree.
+_SKIP_DIRS = {".git", "node_modules", "vendor", "__pycache__", ".venv",
+              ".qa-venv312", "venv", ".mypy_cache", ".pytest_cache",
+              "dist", "build"}
 _SKIP_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff",
               ".ttf", ".eot", ".mp4", ".mov", ".zip", ".tar", ".gz",
-              ".pyc", ".pyo", ".so", ".dylib", ".dll", ".exe"}
+              ".pdf", ".pyc", ".pyo", ".so", ".dylib", ".dll", ".exe",
+              ".db", ".sqlite3"}
 _MAX_FILE_BYTES = 10_000_000  # 10 MB — covers realistic source/config/env/log
                               # files; the old 1 MB cap silently reported larger
                               # secret-bearing files as clean.

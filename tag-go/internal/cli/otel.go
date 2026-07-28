@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -8,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/tag-agent/tag/internal/version"
 )
 
 // registerOtelExport wires `otel-export` — export spans as OTLP/JSON with OTel
@@ -54,24 +57,12 @@ func registerOtelExport(root *cobra.Command, app *App) {
 					otelAttrInt("gen_ai.usage.input_tokens", pt),
 					otelAttrInt("gen_ai.usage.output_tokens", ct),
 				}
-				spans = append(spans, map[string]any{
-					"traceId": tid, "spanId": id, "parentSpanId": pid, "name": name,
-					"startTimeUnixNano": otelISOToNanos(start), "endTimeUnixNano": otelISOToNanos(fin),
-					"status":     map[string]any{"code": status},
-					"attributes": attrs,
-				})
+				spans = append(spans, otelSpanJSON(id, tid, pid, name, start, fin, status, attrs))
 			}
 			if err := rows.Err(); err != nil {
 				return err
 			}
-			payload := map[string]any{
-				"resourceSpans": []map[string]any{{
-					"resource":   map[string]any{"attributes": []map[string]any{otelAttr("service.name", "tag")}},
-					"scopeSpans": []map[string]any{{"spans": spans}},
-				}},
-				"_semconv_version": "1.27.0",
-				"_exported_spans":  len(spans),
-			}
+			payload := otelPayload(spans)
 			b, _ := json.MarshalIndent(payload, "", "  ")
 			fmt.Println(string(b))
 			return nil
@@ -79,6 +70,101 @@ func registerOtelExport(root *cobra.Command, app *App) {
 	}
 	c.Flags().StringVar(&traceID, "trace-id", "", "export only this trace")
 	root.AddCommand(c)
+}
+
+// otelSemconvVersion is the pinned OTel GenAI semconv version (mirrors
+// otel_semconv.SEMCONV_VERSION). It is reported as a scope attribute — never as
+// a top-level key, which strict OTLP collectors reject.
+const otelSemconvVersion = "1.28.0"
+
+// otelSpanJSON builds one OTLP/JSON span. Ids are normalized to OTLP's required
+// widths and status is the numeric StatusCode enum (port of
+// otel_semconv.spans_to_otlp_json).
+func otelSpanJSON(id, traceID, parentID, name, start, fin, status string, attrs []map[string]any) map[string]any {
+	span := map[string]any{
+		"traceId":           otelHexID(traceID, 32),
+		"spanId":            otelHexID(id, 16),
+		"name":              name,
+		"kind":              3, // CLIENT
+		"startTimeUnixNano": otelISOToNanos(start),
+		"endTimeUnixNano":   otelISOToNanos(fin),
+		"attributes":        attrs,
+		"status":            map[string]any{"code": otelStatusCode(status)},
+	}
+	// An empty parentSpanId is invalid OTLP; the field is simply omitted for
+	// root spans (same as the Python exporter).
+	if p := strings.ReplaceAll(parentID, "-", ""); p != "" {
+		span["parentSpanId"] = otelHexID(parentID, 16)
+	}
+	return span
+}
+
+// otelPayload wraps spans in the OTLP resourceSpans envelope. No underscore
+// -prefixed bookkeeping keys are emitted: unknown top-level fields are rejected
+// by strict collectors.
+func otelPayload(spans []map[string]any) map[string]any {
+	if spans == nil {
+		spans = []map[string]any{}
+	}
+	return map[string]any{
+		"resourceSpans": []map[string]any{{
+			"resource": map[string]any{"attributes": []map[string]any{otelAttr("service.name", "tag-agent")}},
+			"scopeSpans": []map[string]any{{
+				"scope": map[string]any{
+					"name":    "tag-agent",
+					"version": version.Version,
+					"attributes": []map[string]any{
+						otelAttr("otel.semconv.version", otelSemconvVersion),
+						otelAttr("otel.semconv.stability", "Development"),
+					},
+				},
+				"spans": spans,
+			}},
+		}},
+	}
+}
+
+// otelStatusCode maps a TAG span status to an OTLP StatusCode enum value
+// (UNSET=0, OK=1, ERROR=2). Port of otel_semconv._otlp_status_code: a missing
+// status maps to UNSET, not ERROR, so status-less spans do not inflate backend
+// error rates.
+func otelStatusCode(status string) int {
+	switch status {
+	case "ok":
+		return 1
+	case "", "unset":
+		return 0
+	default:
+		return 2
+	}
+}
+
+// otelHexID normalizes a TAG id into an OTLP-valid lowercase-hex id of exactly
+// n chars. TAG ids are uuid hex, so the dash-strip / truncate / left-zero-pad
+// path is byte-identical to otel_semconv's
+// `(id or uuid4().hex).replace("-", "")[:n].zfill(n)`. Ids that are not hex
+// (synthetic or legacy ids) would make the document invalid, so they are folded
+// deterministically through SHA-256 instead of being emitted verbatim.
+func otelHexID(id string, n int) string {
+	s := strings.ToLower(strings.ReplaceAll(id, "-", ""))
+	if len(s) > n {
+		s = s[:n]
+	}
+	if s != "" && otelIsHex(s) {
+		return strings.Repeat("0", n-len(s)) + s
+	}
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:])[:n]
+}
+
+func otelIsHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func otelAttr(k, v string) map[string]any {

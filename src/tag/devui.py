@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -520,6 +520,13 @@ class _Handler(BaseHTTPRequestHandler):
 # DevUIServer
 # ---------------------------------------------------------------------------
 
+class _ThreadingDevUIServer(ThreadingHTTPServer):
+    """Threaded DevUI server so one slow client cannot stall the dashboard."""
+
+    daemon_threads = True
+    timeout = 30
+
+
 class DevUIServer:
     """Minimal HTTP server exposing the TAG DevUI dashboard."""
 
@@ -539,10 +546,16 @@ class DevUIServer:
         db_path = self.db_path
 
         class BoundHandler(_Handler):
-            pass
+            # socketserver.StreamRequestHandler.setup() applies this timeout to
+            # the accepted connection, so a client that opens a socket and never
+            # sends a request line is dropped instead of holding its thread.
+            timeout = 30
 
         BoundHandler.db_path = db_path
-        server = HTTPServer((self.host, self.port), BoundHandler)
+        # ThreadingHTTPServer (not the single-threaded HTTPServer): on a plain
+        # HTTPServer a single stalled client wedges the whole dashboard, so even
+        # /health stopped answering.
+        server = _ThreadingDevUIServer((self.host, self.port), BoundHandler)
         return server
 
     @property

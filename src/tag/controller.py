@@ -1750,6 +1750,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--config", metavar="PATH", help="Path to tag.yaml")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    # Global --json, so `tag --json <cmd>` works as well as `tag <cmd> --json`
+    # (Go accepts both). A separate dest is required: argparse applies a
+    # subparser's own defaults over the parent namespace, so a plain `--json`
+    # here would be reset to False by any subcommand that also defines --json.
+    p.add_argument(
+        "--json", action="store_true", dest="global_json",
+        help="JSON output where supported (may also be given after the subcommand)",
+    )
     sub = p.add_subparsers(dest="command", metavar="COMMAND")
     for mod in COMMAND_MODULES:
         try:
@@ -1764,6 +1772,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Fold the global form into the per-command flag every handler already reads.
+    if getattr(args, "global_json", False):
+        args.json = True
     if not hasattr(args, "func"):
         parser.print_help()
         return 1

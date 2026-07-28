@@ -480,3 +480,45 @@ def _apply_memory_config(
 
     elif provider == "local":
         pass  # hermes-local-memory plugin picks up {"provider": "local"}
+
+
+# ---------------------------------------------------------------------------
+# Network bind safety
+# ---------------------------------------------------------------------------
+
+#: Hosts that keep a local server reachable only from this machine.
+LOOPBACK_HOSTS = frozenset({
+    "127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.0/8",
+})
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return True when binding `host` exposes the server to this machine only."""
+    h = (host or "").strip().strip("[]").lower()
+    if not h:
+        return True
+    if h in {"localhost", "::1"}:
+        return True
+    try:
+        import ipaddress  # noqa: PLC0415
+
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def check_loopback_bind(host: str, *, service: str, allow_remote: bool) -> str | None:
+    """Validate a --host value for an unauthenticated local server.
+
+    TAG's local servers (devui, web dashboard, webhook receiver) expose spans,
+    costs, memories and alerts with no authentication, so binding them to
+    0.0.0.0 silently publishes that data to the whole network. Returns an error
+    message when the bind must be refused, or None when it is allowed.
+    """
+    if allow_remote or is_loopback_host(host):
+        return None
+    return (
+        f"refusing to bind {service} to non-loopback host {host!r}: it serves "
+        f"unauthenticated data. Use --host 127.0.0.1, or pass --allow-remote to "
+        f"expose it deliberately (INSECURE)."
+    )

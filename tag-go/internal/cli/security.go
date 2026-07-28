@@ -41,6 +41,12 @@ func registerSecurity(root *cobra.Command, app *App) {
 					uuid.NewString()[:12], abs, len(findings), ternary(len(findings) > 0, "findings", "ok"), time.Now().UTC().Format(time.RFC3339))
 			}
 			if flagJSON {
+				// A nil slice marshals to `null`, which breaks `| jq '.[]'`
+				// consumers; a clean scan must emit an empty array (parity
+				// with the Python CLI).
+				if findings == nil {
+					findings = []security.Finding{}
+				}
 				b, _ := json.MarshalIndent(findings, "", "  ")
 				fmt.Println(string(b))
 			} else if len(findings) == 0 {
@@ -69,13 +75,28 @@ func registerSecurity(root *cobra.Command, app *App) {
 				return err
 			}
 			defer rows.Close()
+			// Always a non-nil slice so --json emits `[]` rather than nothing.
+			items := []map[string]any{}
 			for rows.Next() {
 				var p, st, ts string
 				var fc int
 				if err := rows.Scan(&p, &fc, &st, &ts); err != nil {
 					return err
 				}
-				fmt.Printf("%s  %d findings  [%s]  %s\n", p, fc, st, ts)
+				items = append(items, map[string]any{
+					"scanned_path": p, "finding_count": fc, "status": st, "created_at": ts,
+				})
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			if flagJSON {
+				b, _ := json.MarshalIndent(items, "", "  ")
+				fmt.Println(string(b))
+				return nil
+			}
+			for _, it := range items {
+				fmt.Printf("%s  %d findings  [%s]  %s\n", it["scanned_path"], it["finding_count"], it["status"], it["created_at"])
 			}
 			return nil
 		}}

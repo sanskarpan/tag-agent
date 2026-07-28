@@ -15,7 +15,7 @@ from typing import Any
 from tag.core.config import load_config, config_path
 from tag.core.paths import runtime_db_path, hermes_root, tag_home, runtime_home, profile_home, ensure_runtime_dirs
 from tag.core.db import open_db
-from tag.core.utils import nonnegative_int, utc_now
+from tag.core.utils import check_loopback_bind, is_loopback_host, nonnegative_int, utc_now
 
 try:
     from tag.tui_output import print_error, print_success, print_warning
@@ -556,7 +556,10 @@ def cmd_sandbox(args: argparse.Namespace) -> int:
     sub = getattr(args, "sandbox_subcommand", "list")
 
     try:
-        from tag.sandbox import run_in_sandbox, list_sandbox_runs, get_sandbox_run
+        from tag.sandbox import (
+            ShellMetacharacterError, run_in_sandbox, list_sandbox_runs,
+            get_sandbox_run,
+        )
     except ImportError as exc:
         db.close()
         print_error(f"tag.sandbox not available: {exc}")
@@ -574,6 +577,12 @@ def cmd_sandbox(args: argparse.Namespace) -> int:
 
         try:
             result = run_in_sandbox(db, command, backend=backend, image=image, timeout=timeout)
+        except ShellMetacharacterError as exc:
+            # Malformed COMMAND argument — a usage error, so exit 2 per the
+            # project's exit-code contract (2 = usage, 1 = runtime failure).
+            db.close()
+            print_error(str(exc))
+            return 2
         except ValueError as exc:
             db.close()
             print_error(str(exc))
@@ -768,7 +777,16 @@ def cmd_web(args: argparse.Namespace) -> int:
     port = getattr(args, "port", 8787) or 8787
     no_browser = getattr(args, "no_browser", False)
 
-    if host != "127.0.0.1":
+    # The dashboard serves spans, costs, memories and alerts with no auth, so a
+    # warning is not enough: refuse a non-loopback bind unless explicitly opted in.
+    bind_err = check_loopback_bind(
+        host, service="the web dashboard",
+        allow_remote=getattr(args, "allow_remote", False),
+    )
+    if bind_err:
+        print(f"error: {bind_err}", file=sys.stderr)
+        return 1
+    if not is_loopback_host(host):
         print(f"⚠ WARNING: Binding to {host} — dashboard will be accessible on your network.", file=sys.stderr)
 
     server = DashboardServer(db_path=db_path, host=host, port=port)
@@ -826,8 +844,19 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     sb_cmd = sub.add_parser("sandbox", help="Isolated code execution (restricted subprocess or Docker)")
     sb_sub = sb_cmd.add_subparsers(dest="sandbox_subcommand")
 
-    sb_run = sb_sub.add_parser("run", help="Run a command in the sandbox")
-    sb_run.add_argument("command", metavar="COMMAND", help="Shell command to run")
+    sb_run = sb_sub.add_parser(
+        "run", help="Run a command in the sandbox",
+        description="Run a single program in the sandbox. The command is split "
+                    "into arguments with shell-style quoting, but it is executed "
+                    "directly WITHOUT a shell: pipes, redirections, globs, "
+                    "command substitution and ';'/'&&' chains are rejected "
+                    "rather than silently passed as literal arguments. To use "
+                    "shell syntax, invoke a shell explicitly (it stays inside "
+                    "the same sandbox), e.g. \"sh -c 'echo hi > out.txt'\".",
+    )
+    sb_run.add_argument("command", metavar="COMMAND",
+                        help="Program and arguments to run (no shell; quote shell "
+                             "metacharacters or use \"sh -c '...'\")")
     sb_run.add_argument("--backend", choices=["restricted", "docker"], default="restricted")
     sb_run.add_argument("--image", default="python:3.12-slim", help="Docker image (for --backend docker)")
     sb_run.add_argument("--timeout", type=int, default=60, metavar="SECONDS")
@@ -868,4 +897,6 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     web_cmd.add_argument("--port", type=int, default=8787)
     web_cmd.add_argument("--host", default="127.0.0.1")
     web_cmd.add_argument("--no-browser", action="store_true")
+    web_cmd.add_argument("--allow-remote", action="store_true", dest="allow_remote",
+                         help="permit a non-loopback --host (INSECURE: serves unauthenticated data)")
     web_cmd.set_defaults(func=cmd_web)

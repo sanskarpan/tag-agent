@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -117,5 +118,51 @@ func TestNotFound(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != 404 {
 		t.Errorf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+// TestSnapshotAPIMissingTablesReturns500 covers finding #11: ReadSnapshot used
+// to swallow every query/scan error, so a DB with dropped tables was reported
+// as a healthy-but-empty one with HTTP 200.
+func TestSnapshotAPIMissingTablesReturns500(t *testing.T) {
+	db := testDB(t)
+	for _, tbl := range []string{"runs", "queue_jobs", "memory_journal"} {
+		if _, err := db.Exec("DROP TABLE " + tbl); err != nil {
+			t.Fatalf("drop %s: %v", tbl, err)
+		}
+	}
+	if _, err := ReadSnapshot(db); err == nil {
+		t.Error("ReadSnapshot returned nil error for a DB with missing tables")
+	}
+
+	srv := httptest.NewServer(Handler(db, "orchestrator"))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 500 {
+		t.Errorf("status = %d, want 500 for a broken DB", resp.StatusCode)
+	}
+}
+
+// TestSnapshotAPIHealthyEmptyDBReturns200 pins the other side of finding #11:
+// an empty-but-valid DB must still be 200 with empty arrays.
+func TestSnapshotAPIHealthyEmptyDBReturns200(t *testing.T) {
+	db := testDB(t)
+	srv := httptest.NewServer(Handler(db, "orchestrator"))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 for a healthy empty DB", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"runs":[]`) || !strings.Contains(string(body), `"queue":[]`) {
+		t.Errorf("healthy empty snapshot body = %s", body)
 	}
 }

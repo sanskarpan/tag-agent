@@ -124,3 +124,35 @@ func TestScanDirSurfacesWalkErrors(t *testing.T) {
 		t.Error("permission-denied subtree must surface a walk_error finding")
 	}
 }
+
+// TestScanLabelsAnthropicKeyCorrectly covers finding #8: an Anthropic key must
+// be reported as anthropic_key. The broader `sk-` OpenAI pattern also matches
+// `sk-ant-...`, and the match loop breaks on the first hit, so pattern order
+// decides the label.
+func TestScanLabelsAnthropicKeyCorrectly(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "keys.env")
+	// Obviously fake key — not a real credential.
+	os.WriteFile(f, []byte("ANTHROPIC_API_KEY=sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE\n"), 0o644)
+	found := ScanFile(f)
+	if len(found) == 0 {
+		t.Fatal("expected the anthropic key to be detected")
+	}
+	if found[0].Pattern != "anthropic_key" {
+		t.Errorf("pattern = %q, want anthropic_key", found[0].Pattern)
+	}
+}
+
+// TestScanStillLabelsOpenAIKey guards the ordering fix from over-reaching.
+func TestScanStillLabelsOpenAIKey(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "openai.env")
+	os.WriteFile(f, []byte("OPENAI_API_KEY=sk-proj-FAKEFAKEFAKEFAKEFAKEFAKEFAKE\n"), 0o644)
+	found := ScanFile(f)
+	if len(found) == 0 {
+		t.Fatal("expected the openai key to be detected")
+	}
+	if found[0].Pattern != "openai_key" {
+		t.Errorf("pattern = %q, want openai_key", found[0].Pattern)
+	}
+}

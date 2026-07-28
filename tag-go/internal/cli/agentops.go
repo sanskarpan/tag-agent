@@ -3,6 +3,7 @@ package cli
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"sort"
 
 	"github.com/spf13/cobra"
@@ -29,12 +30,19 @@ type aopSummary struct {
 	EstimatedCostUSD float64          `json:"estimated_cost_usd"`
 	Statuses         map[string]int   `json:"statuses"`
 	Profiles         []aopProfileStat `json:"profiles"`
+
+	// SDK/credential block, reported by the Python engine. Included here so
+	// `agentops status --json` has one schema across both engines instead of
+	// two disjoint ones (Python: SDK only, Go: aggregates only).
+	SDKInstalled     bool    `json:"sdk_installed"`
+	APIKeyConfigured bool    `json:"api_key_configured"`
+	APIKeyMasked     *string `json:"api_key_masked"`
 }
 
 // aopSummarize reads the existing `runs` table and rolls up per-profile run
 // counts, token totals, and statuses.
 func aopSummarize(db *store.DB) (aopSummary, error) {
-	sum := aopSummary{Statuses: map[string]int{}}
+	sum := aopSummary{Statuses: map[string]int{}, Profiles: []aopProfileStat{}}
 	rows, err := db.Query(`SELECT master_profile, status,
 		COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0),
 		COALESCE(estimated_cost_usd,0) FROM runs`)
@@ -99,6 +107,14 @@ func registerAgentops(root *cobra.Command, app *App) {
 			if err != nil && err != sql.ErrNoRows {
 				return err
 			}
+			// The Go build has no AgentOps SDK binding, so sdk_installed is
+			// always false; the API key is still reported so the field set
+			// matches the Python engine.
+			if key := os.Getenv("AGENTOPS_API_KEY"); key != "" {
+				masked := aopMaskKey(key)
+				summary.APIKeyConfigured = true
+				summary.APIKeyMasked = &masked
+			}
 			if flagJSON {
 				return emitJSON(summary)
 			}
@@ -150,4 +166,13 @@ func repeatDash(n int) string {
 		b[i] = '-'
 	}
 	return string(b)
+}
+
+// aopMaskKey renders a credential as a short prefix plus a suffix, matching
+// src/tag/cmd/observability.py's mask_key so neither engine leaks the secret.
+func aopMaskKey(key string) string {
+	if len(key) <= 8 {
+		return "****"
+	}
+	return key[:4] + "..." + key[len(key)-4:]
 }

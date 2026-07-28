@@ -11,7 +11,7 @@ from typing import Any
 
 from tag.core.config import load_config, config_path
 from tag.core.paths import runtime_db_path, ensure_runtime_dirs
-from tag.core.utils import nonnegative_int, utc_now
+from tag.core.utils import check_loopback_bind, nonnegative_int, utc_now
 
 try:
     from tag.tui_output import print_error, print_success, print_warning
@@ -402,6 +402,14 @@ def cmd_devui(args: argparse.Namespace) -> int:
     db_path = _db_for_profile(profile, cfg)
     port = getattr(args, "port", 7777)
     host = getattr(args, "host", "127.0.0.1")
+    # The DevUI serves spans, costs, memories and alerts with no auth, so a
+    # non-loopback bind must be an explicit, deliberate choice.
+    bind_err = check_loopback_bind(
+        host, service="devui", allow_remote=getattr(args, "allow_remote", False)
+    )
+    if bind_err:
+        print_error(bind_err)
+        return 1
     server = DevUIServer(db_path=str(db_path), host=host, port=port)
     if getattr(args, "open_browser", False):
         import webbrowser
@@ -462,12 +470,30 @@ def cmd_webhook_server(args: argparse.Namespace) -> int:
             port = getattr(args, "port", 8765)
             host = getattr(args, "host", "127.0.0.1")
             secret = getattr(args, "secret", None) or os.environ.get("TAG_WEBHOOK_SECRET") or None
+            allow_unsigned = bool(getattr(args, "allow_unsigned", False))
+            bind_err = check_loopback_bind(
+                host, service="the webhook receiver",
+                allow_remote=getattr(args, "allow_remote", False),
+            )
+            if bind_err:
+                print_error(bind_err)
+                return 1
+            if secret is None and not allow_unsigned:
+                # Without a secret every anonymous POST could enqueue agent work,
+                # so refuse to start unless the operator explicitly opts in.
+                print_error(
+                    "refusing to start without an HMAC secret: set --secret or "
+                    "TAG_WEBHOOK_SECRET, or pass --allow-unsigned to accept "
+                    "unauthenticated events"
+                )
+                return 1
             conn.close()  # WebhookServer opens its own connection from db_path
-            server = WebhookServer(db_path=str(db_path), cfg=cfg, host=host, port=port, secret=secret)
+            server = WebhookServer(db_path=str(db_path), cfg=cfg, host=host, port=port,
+                                   secret=secret, allow_unsigned=allow_unsigned)
             if secret is None:
                 print_warning(
-                    "No TAG_WEBHOOK_SECRET set — unsigned webhooks will be accepted. "
-                    "Bind is localhost-only; set a secret before exposing the port."
+                    "running with --allow-unsigned and no secret — events are "
+                    "UNAUTHENTICATED and can enqueue jobs."
                 )
             print(f"Webhook server listening on {host}:{port} — Ctrl+C to stop")
             server.start()
@@ -479,11 +505,28 @@ def cmd_webhook_server(args: argparse.Namespace) -> int:
             return 0
         if sub == "rule-list":
             rules = wh_list_rules(conn)
+            if getattr(args, "json", False):
+                print(json.dumps([
+                    {"id": r.id, "platform": r.platform, "event": r.event,
+                     "profile": r.profile, "action": r.action,
+                     "filter_labels": r.filter_labels, "enabled": r.enabled,
+                     "created_at": r.created_at}
+                    for r in rules
+                ], indent=2))
+                return 0
             for r in rules:
                 print(f"{r.id[:8]}  {r.platform:<10} {r.event:<30} {r.action}")
             return 0
         if sub == "events":
             events = list_events(conn, limit=getattr(args, "limit", 20))
+            if getattr(args, "json", False):
+                print(json.dumps([
+                    {"id": e.id, "platform": e.platform, "event_type": e.event_type,
+                     "received_at": e.received_at, "signature_valid": e.signature_valid,
+                     "matched_rules": e.matched_rules, "status": e.status}
+                    for e in events
+                ], indent=2))
+                return 0
             for e in events:
                 print(e)
             return 0
@@ -926,6 +969,8 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     annot_label.add_argument("label", metavar="LABEL")
     annot_label.add_argument("--notes", default=None)
     annot_stats = annot_sub.add_parser("stats", help="Show annotation queue statistics")
+    # Output is already JSON; accept the flag so `--json` is not a usage error.
+    annot_stats.add_argument("--json", action="store_true")
     annot_export = annot_sub.add_parser("export", help="Export labeled tasks")
     annot_export.add_argument("--format", default="jsonl", choices=["jsonl", "csv"])
     annot_export.add_argument("--out", default=None)
@@ -955,6 +1000,8 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     devui_p = sub.add_parser("devui", help="Local browser DevUI dashboard")
     devui_p.add_argument("--port", type=int, default=7777)
     devui_p.add_argument("--host", default="127.0.0.1")
+    devui_p.add_argument("--allow-remote", action="store_true", dest="allow_remote",
+                         help="permit a non-loopback --host (INSECURE: serves unauthenticated data)")
     devui_p.add_argument("--open", action="store_true", dest="open_browser")
     devui_p.add_argument("--profile", default=None)
     devui_p.set_defaults(func=cmd_devui)
@@ -978,14 +1025,20 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     wh_listen.add_argument("--profile", default=None)
     wh_listen.add_argument("--secret", default=None,
                            help="HMAC secret to verify signatures (or set TAG_WEBHOOK_SECRET)")
+    wh_listen.add_argument("--allow-unsigned", action="store_true", dest="allow_unsigned",
+                           help="accept unauthenticated events when no secret is set (INSECURE)")
+    wh_listen.add_argument("--allow-remote", action="store_true", dest="allow_remote",
+                           help="permit a non-loopback --host (INSECURE)")
     wh_rule_add = wh_sub.add_parser("rule-add", help="Add a trigger rule")
     wh_rule_add.add_argument("--platform", required=True, choices=["github", "linear", "slack"])
     wh_rule_add.add_argument("--event", required=True)
     wh_rule_add.add_argument("--profile", required=True)
     wh_rule_add.add_argument("--action", default="run")
     wh_rule_list = wh_sub.add_parser("rule-list", help="List trigger rules")
+    wh_rule_list.add_argument("--json", action="store_true")
     wh_events = wh_sub.add_parser("events", help="List recent webhook events")
     wh_events.add_argument("--limit", type=int, default=20)
+    wh_events.add_argument("--json", action="store_true")
     for ap in [wh_cmd, wh_listen, wh_rule_add, wh_rule_list, wh_events]:
         ap.set_defaults(func=cmd_webhook_server)
 

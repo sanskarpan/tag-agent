@@ -40,6 +40,40 @@ except Exception:
 # Database open / schema
 # ---------------------------------------------------------------------------
 
+QUEUE_JOBS_SCHEMA: str = """
+        CREATE TABLE IF NOT EXISTS queue_jobs (
+          id          TEXT PRIMARY KEY,
+          profile     TEXT NOT NULL,
+          task        TEXT NOT NULL,
+          task_type   TEXT NOT NULL DEFAULT 'mixed',
+          status      TEXT NOT NULL DEFAULT 'queued',
+          priority    INTEGER NOT NULL DEFAULT 5,
+          created_at  TEXT NOT NULL,
+          started_at  TEXT,
+          finished_at TEXT,
+          pid         INTEGER,
+          result_path TEXT,
+          exit_code   INTEGER,
+          error       TEXT,
+          notify      INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_qj_status ON queue_jobs(status, priority, created_at);
+"""
+
+
+def ensure_queue_schema(conn: sqlite3.Connection) -> None:
+    """Create the queue_jobs table/index if absent (idempotent).
+
+    Exposed separately from `open_db` so components that connect straight to a
+    runtime DB path (e.g. the webhook receiver, which serves requests on its own
+    connection) can guarantee the queue schema exists before inserting a job.
+    Without this, `queue_insert_job` raised `no such table: queue_jobs` on a
+    fresh install and the request died with an unhandled traceback.
+    """
+    conn.executescript(QUEUE_JOBS_SCHEMA)
+    conn.commit()
+
+
 def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
     ensure_runtime_dirs(cfg)
     db_path = runtime_db_path(cfg)
@@ -116,24 +150,6 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS idx_mj_profile ON memory_journal(profile);
 
-        CREATE TABLE IF NOT EXISTS queue_jobs (
-          id          TEXT PRIMARY KEY,
-          profile     TEXT NOT NULL,
-          task        TEXT NOT NULL,
-          task_type   TEXT NOT NULL DEFAULT 'mixed',
-          status      TEXT NOT NULL DEFAULT 'queued',
-          priority    INTEGER NOT NULL DEFAULT 5,
-          created_at  TEXT NOT NULL,
-          started_at  TEXT,
-          finished_at TEXT,
-          pid         INTEGER,
-          result_path TEXT,
-          exit_code   INTEGER,
-          error       TEXT,
-          notify      INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE INDEX IF NOT EXISTS idx_qj_status ON queue_jobs(status, priority, created_at);
-
         CREATE TABLE IF NOT EXISTS spans (
           id                TEXT PRIMARY KEY,
           trace_id          TEXT NOT NULL,
@@ -206,6 +222,7 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_br_comparison ON benchmark_results(comparison_id, model_id);
         """
     )
+    ensure_queue_schema(conn)
     _migrate_runs_cost_columns(conn)
     _migrate_spans_schema(conn)
     _migrate_prd_021_032_tables(conn)
