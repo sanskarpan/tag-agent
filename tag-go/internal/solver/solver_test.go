@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/permission"
 )
 
 // echo is the offline provider; Solve must run fully without a DB or network.
@@ -179,6 +180,10 @@ func TestSolve_SWE_ToolsEditFile(t *testing.T) {
 		Task:        "add fix.txt",
 		RepoPath:    repo,
 		EnableTools: true,
+		// This test is about the tool actually writing; open the consent gate so
+		// it is not short-circuited. TestSolve_SWE_WriteDeniedByDefault covers the
+		// gate itself.
+		Guard: permission.UnsafeAllowAllGuard(),
 	})
 	if err != nil {
 		t.Fatalf("Solve: %v", err)
@@ -213,6 +218,9 @@ func TestSolve_SWE_ToolsConfined(t *testing.T) {
 	}
 	if _, err := Solve(context.Background(), nil, prov, "", Options{
 		Kind: KindSWE, Task: "escape", RepoPath: repo, EnableTools: true,
+		// Gate open: this asserts the ROOT-CONFINEMENT guard specifically, so a
+		// permission deny must not be what stops the escape.
+		Guard: permission.UnsafeAllowAllGuard(),
 	}); err != nil {
 		t.Fatalf("Solve: %v", err)
 	}

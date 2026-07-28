@@ -7,18 +7,23 @@ import (
 	"testing"
 
 	"github.com/tag-agent/tag/internal/agent"
+	"github.com/tag-agent/tag/internal/permission"
 )
 
+// newReg builds a registry with the consent gate opened, so these tests keep
+// exercising what they were written for (path confinement, symlink escapes,
+// bash exec) rather than short-circuiting on a permission deny. The gate itself
+// is covered by permission_test.go.
 func newReg(t *testing.T) (*agent.Registry, string) {
 	root := t.TempDir()
 	reg := agent.NewRegistry()
-	Register(reg, Options{Root: root})
+	Register(reg, Options{Root: root, Guard: permission.UnsafeAllowAllGuard()})
 	return reg, root
 }
 
 func TestRegisterDisableBashOmitsBash(t *testing.T) {
 	reg := agent.NewRegistry()
-	Register(reg, Options{DisableBash: true})
+	Register(reg, Options{DisableBash: true, Guard: permission.UnsafeAllowAllGuard()})
 	for _, d := range reg.Defs() {
 		if d.Name == "bash" {
 			t.Error("bash must be omitted when DisableBash is set")

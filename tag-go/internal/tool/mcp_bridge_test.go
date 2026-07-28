@@ -11,6 +11,7 @@ import (
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/llm"
 	"github.com/tag-agent/tag/internal/mcp"
+	"github.com/tag-agent/tag/internal/permission"
 )
 
 // minimal in-process MCP server exposing an "echo_upper" tool
@@ -77,7 +78,9 @@ func TestAgentLoopUsesMCPTool(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg := agent.NewRegistry()
-	if err := RegisterMCP(reg, client, "demo"); err != nil {
+	// allow-all guard: this test is about the MCP bridge, not the consent gate
+	// (a dedicated test below covers gating of MCP tools).
+	if err := RegisterMCP(reg, client, "demo", Options{Guard: permission.UnsafeAllowAllGuard()}); err != nil {
 		t.Fatal(err)
 	}
 	// the MCP tool should be registered under the namespaced name

@@ -18,6 +18,7 @@ import (
 
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/permission"
 	"github.com/tag-agent/tag/internal/sandbox"
 )
 
@@ -45,6 +46,20 @@ type Options struct {
 	ExaAPIKey  string
 	ExaBaseURL string
 	ExaClient  *http.Client
+	// Guard is the consent gate every registered tool is routed through. A nil
+	// Guard does NOT mean "ungated": Register substitutes permission's secure
+	// default policy with no prompter, which denies bash and write_file. Callers
+	// that want interaction or config-driven rules must pass a real Guard.
+	Guard *permission.Guard
+}
+
+// guard returns the effective consent gate: the caller's, or a fail-safe
+// default (secure built-in policy, no prompter => `ask` resolves to deny).
+func (o Options) guard() *permission.Guard {
+	if o.Guard != nil {
+		return o.Guard
+	}
+	return permission.NewGuard(permission.DefaultPolicy(), nil, nil)
 }
 
 func (o Options) exaKey() string {
@@ -67,21 +82,53 @@ func Register(reg *agent.Registry, opts Options) {
 	if opts.MaxReadBytes == 0 {
 		opts.MaxReadBytes = 256 * 1024
 	}
-	// add applies the tool-budget gate (Options.Disabled) uniformly.
-	add := func(t agent.Tool) {
+	g := opts.guard()
+	// add applies the tool-budget gate (Options.Disabled) AND the permission gate
+	// uniformly. Every built-in tool goes through here, so there is no path that
+	// registers an ungated tool.
+	add := func(t agent.Tool, subject permission.SubjectFunc) {
 		if opts.Disabled[t.Def.Name] {
 			return
 		}
-		reg.Add(t)
+		reg.Add(permission.Wrap(g, t, subject))
 	}
 	if !opts.DisableBash {
-		add(bashTool(opts))
+		add(bashTool(opts), commandSubject)
 	}
-	add(readFileTool(opts))
-	add(writeFileTool(opts))
-	add(listDirTool(opts))
+	add(readFileTool(opts), pathSubject(opts, "path"))
+	add(writeFileTool(opts), pathSubject(opts, "path"))
+	add(listDirTool(opts), pathSubject(opts, "path"))
 	if opts.EnableExa && opts.exaKey() != "" {
-		add(exaSearchTool(opts))
+		add(exaSearchTool(opts), permission.NoSubject)
+	}
+}
+
+// commandSubject exposes the bash command line to the permission gate.
+func commandSubject(in map[string]any) (permission.Kind, string) {
+	return permission.KindCommand, strArg(in, "command")
+}
+
+// pathSubject exposes a file tool's target as an ABSOLUTE, lexically cleaned
+// path. It deliberately does NOT use resolvePath: that fails on a traversal
+// escape, and a rule must still be able to see (and deny) the path the model
+// asked for. Cleaning first is what makes "../../.ssh/id_rsa" match the
+// ~/.ssh/** deny rule instead of sliding past a basename check.
+func pathSubject(opts Options, key string) permission.SubjectFunc {
+	return func(in map[string]any) (permission.Kind, string) {
+		rel := strArg(in, key)
+		if rel == "" {
+			rel = "."
+		}
+		root := opts.Root
+		if root == "" {
+			root, _ = os.Getwd()
+		}
+		root, _ = filepath.Abs(root)
+		p := rel
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(root, rel)
+		}
+		return permission.KindPath, filepath.Clean(p)
 	}
 }
 

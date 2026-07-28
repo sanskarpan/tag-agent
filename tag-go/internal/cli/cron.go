@@ -183,6 +183,7 @@ func registerCron(root *cobra.Command, app *App) {
 		RunE: func(cmd *cobra.Command, args []string) error { return setEnabled(args[0], 0, "disabled") }}
 
 	var cronExecute, cronTools bool
+	var cronPerms permFlags
 	var cronProvider string
 	run := &cobra.Command{Use: "run ID", Short: "Trigger a cron job immediately (ignore schedule)", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -207,7 +208,7 @@ func registerCron(root *cobra.Command, app *App) {
 				return err
 			}
 			if cronExecute {
-				opts, err := buildWorkerOptions(app, cronProvider, 0, false, cronTools)
+				opts, err := buildWorkerOptions(app, cronProvider, 0, false, cronTools, &cronPerms)
 				if err != nil {
 					return err
 				}
@@ -236,6 +237,7 @@ func registerCron(root *cobra.Command, app *App) {
 	run.Flags().BoolVar(&cronExecute, "execute", false, "run the enqueued job through the agent loop after triggering")
 	run.Flags().StringVar(&cronProvider, "provider", "echo", "llm provider for --execute (echo = offline)")
 	run.Flags().BoolVar(&cronTools, "tools", false, "enable built-in tools for --execute")
+	cronPerms.bind(run)
 
 	daemon := &cobra.Command{Use: "daemon", Short: "Run the cron daemon in-process (blocking)", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {

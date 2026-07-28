@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -20,6 +21,7 @@ func registerSWESolve(root *cobra.Command, app *App) {
 	var provider, repo, runTests string
 	var maxSteps int
 	var withTools, allowBash bool
+	var perms permFlags
 	c := &cobra.Command{
 		Use:     "swe-solve <task>",
 		Short:   "Solve a software-engineering task with the agent loop",
@@ -38,6 +40,15 @@ func registerSWESolve(root *cobra.Command, app *App) {
 			}
 			db, _ := app.OpenDB() // best-effort; solver records when non-nil
 			model := app.Cfg.String("profiles."+app.profile("")+".config.model.default", "")
+			// Consent gate for the registered tools. --tools/--allow-bash control
+			// REGISTRATION (what the model can see); this controls EXECUTION.
+			guard, gerr := perms.guard(app, "", "", os.Stderr)
+			if gerr != nil {
+				return gerr
+			}
+			if allowBash && !guard.Interactive() && !guard.Policy.AutoApprove && !guard.Policy.DangerouslyAllowAll {
+				fmt.Fprintln(os.Stderr, "  note: --allow-bash registers the bash tool, but execution still needs approval; with no TTY add --allow-tool bash or --auto-approve.")
+			}
 			res, err := solver.Solve(context.Background(), db, prov, model, solver.Options{
 				Kind:        solver.KindSWE,
 				Task:        args[0],
@@ -45,6 +56,7 @@ func registerSWESolve(root *cobra.Command, app *App) {
 				MaxSteps:    maxSteps,
 				EnableTools: withTools,
 				EnableBash:  allowBash,
+				Guard:       guard,
 				RunTests:    runTests,
 			})
 			if err != nil {
@@ -57,8 +69,9 @@ func registerSWESolve(root *cobra.Command, app *App) {
 	c.Flags().StringVar(&repo, "repo", "", "repository working directory for context")
 	c.Flags().IntVar(&maxSteps, "max-steps", 8, "max agent-loop steps")
 	c.Flags().BoolVar(&withTools, "tools", false, "enable root-confined file tools so the agent reads/edits files under --repo")
-	c.Flags().BoolVar(&allowBash, "allow-bash", false, "also enable the bash tool (unrestricted host exec; requires --tools)")
+	c.Flags().BoolVar(&allowBash, "allow-bash", false, "REGISTER the bash tool (unrestricted host exec; requires --tools). Execution is still gated: use --allow-tool bash or --auto-approve headless")
 	c.Flags().StringVar(&runTests, "run-tests", "", "shell command to run after the loop (working dir = --repo); reports pass/fail")
+	perms.bind(c)
 	root.AddCommand(c)
 }
 

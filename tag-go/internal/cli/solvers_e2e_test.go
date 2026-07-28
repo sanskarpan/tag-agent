@@ -143,7 +143,10 @@ func TestE2ESweSolveEditsFile(t *testing.T) {
 	srv := startWriteFileServer(t, "fix.txt", "patched by agent")
 	env := []string{"TAG_LOCAL_BASE_URL=" + srv.URL + "/v1", "TAG_LOCAL_API_KEY=x"}
 
-	out, code := runEnv(t, h, env, "swe-solve", "add fix.txt", "--repo", repo, "--provider", "local", "--tools")
+	// --allow-tool write_file: registration alone no longer grants execution
+	// (write_file defaults to `ask`, and there is no TTY in a test).
+	out, code := runEnv(t, h, env, "swe-solve", "add fix.txt", "--repo", repo, "--provider", "local", "--tools",
+		"--allow-tool", "write_file")
 	if code != 0 {
 		t.Fatalf("swe-solve exit %d: %q", code, out)
 	}

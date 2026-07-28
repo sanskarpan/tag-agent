@@ -26,6 +26,7 @@ import (
 
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/permission"
 	"github.com/tag-agent/tag/internal/tool"
 )
 
@@ -70,6 +71,11 @@ type Options struct {
 	MaxSteps int
 	// WithTools enables the built-in tools (bash/read_file/write_file/list_dir).
 	WithTools bool
+	// Guard is the tool consent gate. A worker is ALWAYS headless, so its guard
+	// must never carry a prompter: an `ask` here resolves to an immediate deny
+	// with a reason rather than blocking a queue drain forever. Nil falls back to
+	// the secure default policy (also headless).
+	Guard *permission.Guard
 	// MaxJobs caps how many jobs are claimed in this Drain (0 = unlimited).
 	MaxJobs int
 	// OnlyJobs, when non-empty, restricts this Drain to the given job ids;
@@ -342,7 +348,9 @@ func runJob(ctx context.Context, opts Options, j jobRow) (string, error) {
 	loop := &agent.Loop{Provider: opts.Provider}
 	if opts.WithTools {
 		reg := agent.NewRegistry()
-		tool.Register(reg, tool.DefaultOptions())
+		topts := tool.DefaultOptions()
+		topts.Guard = opts.Guard
+		tool.Register(reg, topts)
 		loop.Tools = reg
 	}
 	res, err := loop.Run(ctx, j.task, agent.Options{

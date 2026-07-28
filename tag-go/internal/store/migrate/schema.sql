@@ -231,3 +231,11 @@ CREATE TABLE IF NOT EXISTS benchmark_results (
   output TEXT, passed INTEGER, quality_score REAL, latency_ms INTEGER, prompt_tokens INTEGER,
   completion_tokens INTEGER, cost_usd REAL, error TEXT, created_at TEXT NOT NULL
 );
+-- Permission gate audit trail: one row per adjudicated tool call (allow or deny).
+CREATE TABLE IF NOT EXISTS permission_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, tool TEXT NOT NULL,
+  subject TEXT NOT NULL DEFAULT '', args_summary TEXT NOT NULL DEFAULT '{}',
+  verdict TEXT NOT NULL, via TEXT NOT NULL DEFAULT '', rule TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '', run_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_permdec_created ON permission_decisions(created_at);
