@@ -4,9 +4,22 @@ Native Go port of the Python TAG control plane, per `../docs/GO_MIGRATION_PLAN.m
 Single static binary (`CGO_ENABLED=0`, ~18 MB), owns its own SQLite runtime
 (`modernc.org/sqlite`, FTS5, WAL, single-writer). Module: `github.com/tag-agent/tag`.
 
-**Status: feature-complete + adversarially audited.** 88 top-level commands · 29 packages ·
-289 test funcs · `gofmt`/`go vet` clean · `go test ./... -race` green · 364-invocation
-recursive `--help` sweep passes (0 failures).
+**Status: Track A (control plane) and Track B (native runtime) are both ported and
+adversarially audited — with one named gap: `swarm` execution (`swarm run` / `swarm
+abort`) is NOT implemented in Go.** See "Known gaps" below before relying on the word
+"complete" anywhere in this file.
+
+**Measured surface (recursive `--help` sweep of the built binary, 2026-07-28):**
+**88 top-level commands** as Cobra reports them — of which 2 (`help`, `completion`)
+are Cobra built-ins, so **86 are TAG commands**. 240 total help nodes.
+This node count *undercounts* the real verb surface: `mem2 fact`, `mem2 episode`,
+and `mem2 store` take a **positional verb** rather than Cobra subcommands
+(`tag mem2 fact <update|history|list-at>`, `tag mem2 episode <start|end|list|get>`,
+`tag mem2 store <store|search|rebuild>`), so 9 further verbs exist that no `--help`
+sweep can enumerate. For the Python edition's separately-measured count, see
+`../docs/FEATURES.md`.
+
+29 packages · 289 test funcs · `gofmt`/`go vet` clean · `go test ./... -race` green.
 A 5-agent adversarial audit (read + RUN) found ~30 real bugs behind the green suite; all
 critical/high are fixed and regression-tested — see the "Audit fixes" section below. Two
 later passes (code review + fresh-install QA) found and closed 26 more (#520–#546).
@@ -56,10 +69,10 @@ preserved intentionally (e.g. substring keyword matching in the entity graph;
 | **compare** | **list, show** | benchmark_comparisons / benchmark_results (run path is Track-B) |
 | **plugin** | **list, install, enable, disable** | embedded plugin catalog; TAG_PLUGIN_*_ENABLED in profile .env; native `install` = record (self-ensured `plugins_installed`) + enable (no pip; refuses when `requires_env` secrets absent) |
 | **eval** | **list, show** | eval_runs / eval_cases (run path is Track-B) |
-| **swarm** | **list, status, results** | swarm_runs / swarm_tasks (run/abort are Track-B) |
+| **swarm** | **list, status, results** — read-only; **`run`/`abort` are NOT implemented in Go** | swarm_runs / swarm_tasks. There is no `internal/swarm` package; nothing in the Go binary writes these tables, so `list`/`status`/`results` only ever report on rows produced by the Python edition (or an empty DB). See "Known gaps". |
 
 | **run** | (native agent loop) | `internal/agent` + `internal/tool`; drives a provider through tool turns, records usage to `runs`; `--fallback` wraps the provider in `llm.FallbackProvider` to walk the profile's `route_fallbacks` chain on a retryable error |
-| **serve** | (HTTP dashboard) | `internal/server`; loopback dashboard + `/api/snapshot` + `/events` SSE |
+| **serve** | (HTTP dashboard) | `internal/server`; loopback dashboard + `/api/snapshot` + `/events` SSE. **Only 3 routes** — see the route matrix under "HTTP dashboards". |
 | **gateway** | (OpenAI-compatible chat API) | `internal/gateway`; serves the agent loop as `POST /v1/chat/completions` (stream + non-stream), `GET /v1/models`, `GET /health` behind optional bearer auth; resolves `provider/model` (or `--provider` default) and wraps in the `route_fallbacks` chain with `--fallback` |
 | **tool-index** | **index, search, status** | keyword retrieval over the embedded MCP registry |
 | **cache** | **stats** | prompt-cache hit rate + token totals per profile/model (from `runs`) |
@@ -107,18 +120,70 @@ on `alert delete` (Go enforces FKs; Python's sqlite3 defaults them off).
 | `internal/agent` | **agent loop done.** `Loop.Run` drives a `Provider` through tool-calling turns (execute → feed results → repeat) with a tool `Registry`, usage accumulation, unknown-tool handling, and a step cap. Fully tested offline via scripted/echo providers (4 tests); runs live through the real Anthropic/OpenAI providers. |
 | `internal/mcp` | **client + server + subprocess done.** JSON-RPC 2.0 over stdio: client (`Initialize`/`ListTools`/`CallTool`), server (`Register`/`Serve`), and `NewProcessClient` which spawns an external MCP server as a child process and speaks to it over its stdio. `tag mcp-serve` exposes TAG tools; `tag mcp-connect <cmd…>` consumes a third-party server; `tool.RegisterMCP` bridges external tools into `agent.Registry` (`mcp__<server>__<tool>`). Interop tested offline (in-process pipes + a real subprocess round-trip against our own `mcp-serve`) + agent-loop-over-MCP. |
 | `internal/tool` | **built-in tools done.** `bash` (timeout), `read_file`, `write_file`, `list_dir` — all confined to a tool root with a path-traversal guard — plus an opt-in Exa `web_search` (gap #5 from the hermes-octo parity review, which uses Exa as its web backend): POSTs to the Exa `/search` API (`x-api-key` auth) with content extraction and returns formatted title/URL/extract results. It is OFF by default (needs an API key and adds to the tool budget) and is enabled via `Options.EnableExa` + `EXA_API_KEY` (or `Options.ExaAPIKey`); `ExaBaseURL`/`ExaClient` are overridable so it is offline-testable. **Tool-budget discipline:** `Options.Disabled` is a name-keyed gate applied uniformly in `Register`, so any tool can be trimmed to keep the model's tool list lean. Wired into `tag run` via `--web` (adds `web_search`) and `--disable-tools` (comma-list of tool names to omit). Plug into `agent.Registry`; tested end-to-end *through* the agent loop via a one-shot provider, plus Exa unit tests against a mock server (result formatting, `x-api-key` sent, empty-query/missing-key/upstream-429 errors), tool-budget gating tests, and an E2E driving the real agent loop against the mock Exa endpoint — no live Exa calls in tests. |
-| `internal/server` | **HTTP `serve` + `devui` + `web` done.** Loopback dashboards + `/api/snapshot`, `/api/spans`, `/api/runs`, `/api/queue`, `/api/costs`, `/health` + SSE streams; no wildcard CORS. Pure `*store.DB` handlers, `httptest`-tested + smoke-tested live. `tag serve/devui/web`. |
+| `internal/server` | **HTTP `serve` + `devui` + `web` done — but they are three *different, partial* dashboards, not one API.** No single server exposes the full route set; only `/` and `/api/snapshot` are common to all three. Loopback-bound, no wildcard CORS. Pure `*store.DB` handlers, `httptest`-tested + smoke-tested live. See the measured route matrix below. |
 | `internal/gateway` | **OpenAI-compatible gateway done.** Serves the agent loop's provider turn as `POST /v1/chat/completions` (streaming `chat.completion.chunk` SSE ending in `[DONE]` + non-stream `chat.completion` with usage), `GET /v1/models`, `GET /health`, behind optional bearer auth (constant-time compare). Decoupled from cli/store via a `Resolve(model) → (provider, bareModel)` func, so it is fully `httptest`-able offline with a mock; body-capped and request-id-unique. Wired as `tag gateway`, which resolves `provider/`-prefixed models (else `--provider` default) and, with `--fallback`, wraps the provider in the `route_fallbacks` chain. A non-loopback bind without a key is refused unless `--allow-unauthenticated`. Verified with httptest units, a real-subprocess E2E round-trip, and live against OpenAI. Tool-calling multi-turn is a deliberate future extension. **Packaged for one-push cloud hosting** (gap #7 from the hermes-octo parity review) under `deploy/`: a multi-stage `Dockerfile` (CGO-free static binary + non-root Alpine runtime + `/health` HEALTHCHECK), a repo-root `render.yaml` Blueprint (auto-generated `TAG_GATEWAY_KEY`, provider keys as `sync:false` secrets), and an entrypoint that bootstraps managed state then serves on `0.0.0.0:$PORT` but refuses a keyless public bind unless `TAG_ALLOW_UNAUTHENTICATED=1`; see `deploy/README.md` for Docker/Render/Hugging Face Spaces/keep-warm recipes. |
-| `internal/lsp` | **LSP server done.** JSON-RPC 2.0 with `Content-Length` header framing (correct split-read + back-to-back handling); initialize/initialized/shutdown/exit/textDocument-hover; `-32601` on unknown method. Wired as `tag lsp`; framing tested offline (9 tests) + smoke-tested live. |
+| `internal/lsp` | **Minimal LSP server — hover only.** Not a general "IDE bridge". JSON-RPC 2.0 with `Content-Length` header framing (correct split-read + back-to-back handling) is solid and well-tested. The **complete** handler set is: `initialize`, `initialized`, `shutdown`, `exit`, `$/setTrace`, `$/cancelRequest`, and exactly **one** language feature — `textDocument/hover`. Everything else (completion, diagnostics, definition, code actions, formatting, rename, document sync) returns `-32601 method not found`. Wired as `tag lsp`; framing tested offline (9 tests) + smoke-tested live. |
 | `internal/tui` | **Charm TUI done.** bubbletea + lipgloss dashboard over the same snapshot (runs/queue/journal), refresh/quit keys, live ticker. `Model.Update`/`View` are pure and unit-tested offline (3 tests); `Run()` needs a TTY. Wired as `tag tui`. |
 | `internal/worker` | **execution worker done (#532).** Dep-aware atomic job claim; executes queued jobs and full DAG dependency chains through the native agent loop (`queue worker`, `dag run --execute`, `cron run --execute`). Offline via `echo` by default; verified live against OpenAI. |
 | `internal/webhook` | **listener done.** HMAC verify (GitHub/Slack/Linear), rule match, enqueue into the queue the worker drains. |
-| `internal/solver` | **solver harness done.** Backs `swe-solve` / `issue-solve` / `review-pr` / `agentic-ci`; drives the agent loop. Real depth is opt-in: `swe-solve --tools` enables the root-confined file tools (edits under `--repo`) plus `--run-tests`; `issue-solve` fetches a GitHub reference via `gh issue view`; `review-pr --pr` fetches the diff via `gh pr diff` and `--post` comments via `gh pr comment`; `agentic-ci --check` runs a real check→fix→re-check loop. Where a step genuinely cannot run offline (e.g. a live fetch when the `gh` CLI is absent) the solver stays honest and records a note rather than faking it. |
+| `internal/solver` | **solver harness done.** Backs `swe-solve` / `issue-solve` / `review-pr` / `agentic-ci`; drives the agent loop. Real depth is opt-in: `swe-solve --tools` enables the root-confined file tools (edits under `--repo`) plus `--run-tests`; `issue-solve` fetches a GitHub reference via `gh issue view`; `review-pr --pr` fetches the diff via `gh pr diff` and `--post` comments via `gh pr comment`; `agentic-ci --check` runs a real check→fix→re-check loop. Where a step genuinely cannot run offline (e.g. a live fetch when the `gh` CLI is absent) the solver stays honest and records a note rather than faking it. **Scope note — `agentic-ci` is narrower in Go than in Python:** Go's `agentic-ci` is a *single* command (`tag agentic-ci <task> [--check ...]`) implementing the check→fix loop only. Python's `tag agentic-ci` is a command *group* with 7 subcommands — `test-gen`, `install-action`, `fix-vuln`, `ci-diagnose`, `review`, `gen-pipeline`, `flaky-fix`. Six of those seven have no Go equivalent (Go's `review-pr` partially covers `review`). |
 | `internal/benchmark` / `internal/sandbox` / `internal/evaljudge` / `internal/contextwin` | **wave-1/2 backends done.** Benchmark suite runner, sandboxed code execution, LLM-as-judge scoring (verified live), context-window budget accounting plus session assembly + token/keep-last helpers backing native `context compress`/`trim` (summarize-or-trim pass through the agent loop, persisted to `context_compressions`). |
+
+## Known gaps (not "deliberately out of scope" — genuinely missing)
+
+These are distinct from the intentional non-ports listed under "Remaining". They are
+things the Go binary does not do that a reader of this file could reasonably assume it
+does.
+
+- **`swarm run` / `swarm abort` are not implemented.** There is no `internal/swarm`
+  package in the Go tree at all. `swarm list`, `swarm status` and `swarm results` exist
+  and work, but they are pure readers of the `swarm_runs` / `swarm_tasks` tables, and
+  **no Go code path ever writes those tables** — so against a Go-only `TAG_HOME` they
+  will always report nothing. Swarm *execution* remains Python-only.
+- **`agentic-ci` covers 1 of Python's 7 subcommands** — see the `internal/solver` row.
+- **`tag lsp` implements hover and nothing else** — see the `internal/lsp` row.
+- **There is no single dashboard API.** `serve`, `web` and `devui` are three partial,
+  non-overlapping dashboards — see the route matrix below.
+
+## HTTP dashboards — measured route matrix
+
+Measured on 2026-07-28 by starting each server on a loopback port against an isolated
+`TAG_HOME` and `curl`-ing every known route (status codes below are what the running
+binary actually returned, not what the handler table suggests):
+
+| Route | `serve` (:7880) | `web` (:8787) | `devui` (:7777) |
+|---|---|---|---|
+| `/` | 200 | 200 | 200 |
+| `/health` | **404** | 200 | 200 |
+| `/events` (SSE) | 200 | 404 | 404 |
+| `/api/stream` (SSE) | 404 | 200 | 404 |
+| `/api/snapshot` | 200 | 200 | 200 |
+| `/api/spans` | 404 | 404 | 200 |
+| `/api/runs` | 404 | 200 | 404 |
+| `/api/queue` | 404 | 200 | 404 |
+| `/api/costs` | 404 | 200 | 404 |
+| `/api/stats` | 404 | 404 | 200 |
+| `/api/eval_runs` | 404 | 404 | 200 |
+| `/api/judge_runs` | 404 | 404 | 200 |
+| `/api/memories` | 404 | 404 | 200 |
+| `/api/alerts` | 404 | 404 | 200 |
+
+Reading of the matrix:
+
+- Only `/` and `/api/snapshot` are served by all three.
+- `serve` is the smallest surface: dashboard + snapshot + an `/events` SSE stream. It has
+  **no** `/health`.
+- `web` is the operations dashboard: `/health`, snapshot, runs, queue, costs, and an
+  SSE stream at `/api/stream` (**not** `/events`).
+- `devui` is the developer/observability dashboard: `/health`, snapshot, spans, stats,
+  eval runs, judge runs, memories, alerts — and **no SSE stream at all**.
+- The two SSE endpoints have different paths (`/events` vs `/api/stream`) and are not
+  interchangeable. Any client must be written against one specific server.
 
 ## Remaining
 
-The feature surface is ported. What is *deliberately* out of scope:
+The feature surface is ported apart from the "Known gaps" above. What is *deliberately*
+out of scope:
 - **Managed-Hermes runtime passthrough** (`chat`, `kanban`, `runtime`, `sessions`,
   `status`, `dashboard`, `config`, `profile`, `submit`, `update`, `skills`, `tools`) and
   **`desktop`** (OS packaging): the Go binary owns its own runtime instead of shipping the
