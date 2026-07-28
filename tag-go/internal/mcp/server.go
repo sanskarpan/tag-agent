@@ -13,6 +13,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+
+	"github.com/tag-agent/tag/internal/version"
 )
 
 // JSON-RPC error codes used by the server.
@@ -173,7 +175,7 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *rpcError
 		return map[string]any{
 			"protocolVersion": ProtocolVersion,
 			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": s.name, "version": "0.9.0-go"},
+			"serverInfo":      map[string]any{"name": s.name, "version": version.Version},
 		}, nil
 	case "tools/list":
 		tools := make([]ToolDef, 0, len(s.order))
