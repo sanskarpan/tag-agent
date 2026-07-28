@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tag-agent/tag/internal/version"
 )
 
 var tagBin string
@@ -49,8 +51,10 @@ func newHome(t *testing.T) string {
 
 func TestE2EVersionAndDoctor(t *testing.T) {
 	h := newHome(t)
-	if out, code := run(t, h, "--version"); code != 0 || !strings.Contains(out, "0.9.0-go") {
-		t.Errorf("version: %q code=%d", out, code)
+	// Assert against the version constant, not a copy of the string: a literal
+	// here silently fails the suite on every release bump.
+	if out, code := run(t, h, "--version"); code != 0 || !strings.Contains(out, version.Version) {
+		t.Errorf("version: %q code=%d want substring %q", out, code, version.Version)
 	}
 	if out, code := run(t, h, "doctor"); code != 0 || !strings.Contains(out, "tag_home") {
 		t.Errorf("doctor: %q code=%d", out, code)

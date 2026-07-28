@@ -12,6 +12,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"github.com/tag-agent/tag/internal/version"
 )
 
 // ProtocolVersion is the MCP revision this client advertises.
@@ -191,7 +193,7 @@ func (c *Client) Initialize(clientName string) error {
 	params := map[string]any{
 		"protocolVersion": ProtocolVersion,
 		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": clientName, "version": "0.9.0-go"},
+		"clientInfo":      map[string]any{"name": clientName, "version": version.Version},
 	}
 	if err := c.call("initialize", params, nil); err != nil {
 		return err
