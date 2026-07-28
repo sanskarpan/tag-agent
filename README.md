@@ -31,7 +31,9 @@
 
 ---
 
-TAG is a production-grade AI agent orchestration CLI. It routes tasks across 10+ AI providers, manages autonomous loops and cron schedules, tracks spend with hard budget limits, scans for credential leaks, and ships with 44 built-in capabilities — from background job queues to architect/editor agent splits — all backed by a crash-safe WAL-mode SQLite store.
+TAG is a production-grade AI agent orchestration CLI. It manages autonomous loops and cron schedules, tracks spend with hard budget limits, scans for credential leaks, and ships **103 top-level commands** in the Python edition (**86** in the native Go harness) — from background job queues to architect/editor agent splits — all backed by a crash-safe WAL-mode SQLite store.
+
+On providers, precisely: the native Go harness ships **4 provider adapters** — `anthropic`, `openai`, an offline `echo` provider, and `local`, which speaks to **any OpenAI-compatible endpoint** (llama.cpp, Ollama, vLLM, LM Studio, or a hosted gateway) — plus **18 credential importers** that pull existing keys out of tools you already use (Claude Code, Codex, Cursor, Zed, Gemini CLI, Aider, Continue, opencode, AWS Bedrock, Mistral, and more). The importers configure credentials; they are not separate runtime adapters.
 
 ---
 
@@ -426,7 +428,7 @@ tag tool-index search "send a Slack message"
 tag tool-index status --json
 ```
 
-High-cardinality MCP server catalogs are indexed and searched semantically so only the relevant subset enters the context window.
+High-cardinality MCP server catalogs are indexed and searched by **keyword** — case-insensitive substring matching over tool names and descriptions, not embeddings or semantic similarity — so only the relevant subset enters the context window. Semantic (vector) retrieval is not implemented for tools; it exists separately for memories via `tag mem2 store search`.
 
 ---
 
@@ -749,7 +751,7 @@ Per-subsystem status and audit history: [`tag-go/MIGRATION_STATUS.md`](tag-go/MI
 | Feature | TAG | Claude Code | Aider | AutoGen | CrewAI |
 |---|---|---|---|---|---|
 | **CLI-first** | ✓ | ✓ | ✓ | — | — |
-| **Any provider** | ✓ (15+ imports) | Anthropic only | ✓ | ✓ | ✓ |
+| **Provider support** | Anthropic, OpenAI, `local` (any OpenAI-compatible endpoint), offline `echo` — 4 adapters + 18 credential importers | Anthropic only | ✓ | ✓ | ✓ |
 | **Background queue** | ✓ priority + DAG | — | — | — | — |
 | **Cron scheduling** | ✓ | — | — | — | — |
 | **Autonomous loop** | ✓ | via subagents | — | ✓ | ✓ |
