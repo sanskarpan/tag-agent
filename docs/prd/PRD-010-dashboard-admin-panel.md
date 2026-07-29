@@ -1,6 +1,6 @@
 # PRD-010: Dashboard & Admin Panel Integration
 
-**Status:** Proposed  
+**Status:** Shipped (Python only) — Deliberate non-port in Go (managed-runtime passthrough; `serve`/`web`/`devui` replace it)  
 **Priority:** P2  
 **Estimated Effort:** XS (2 days)  
 **Affects:** `controller.py` (`cmd_dashboard`, `cmd_setup`)

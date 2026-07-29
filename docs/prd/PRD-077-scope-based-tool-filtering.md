@@ -2,12 +2,12 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — no `mcp filter` command in either CLI
 **Priority:** P3
 **Estimated Effort:** M (1-2 weeks)
 **Category:** MCP Ecosystem & Tool Connectivity
 **Affects:** `internal/tool`, `internal/cli`
-**Depends on:** PRD-014 (MCP Server Registry), PRD-026 (Vector-Based Tool Retrieval), PRD-027 (Eval Framework), PRD-028 (Sandbox Code Execution), PRD-013 (Agent Tracing & Observability), PRD-034 (Security / Secret Scanning), PRD-001 (Structured Memory Configuration)
+**Depends on:** PRD-014 (MCP Server Registry), PRD-043 (Vector-Based Tool Retrieval), PRD-027 (Eval Framework), PRD-028 (Sandbox Code Execution), PRD-013 (Agent Tracing & Observability), PRD-034 (Security / Secret Scanning), PRD-001 (Structured Memory Configuration)
 **Inspired by:** Composio scope-based filtering, Toolhouse schema processors
 **GitHub Issue:** #346
 

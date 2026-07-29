@@ -1,6 +1,6 @@
 # PRD-033: Dependency-Aware Task Queue (`tag queue`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — Go covers this via `dag` only; Python adds `queue-dep add/promote/list`
 **Priority:** P1 High
 **Estimated Effort:** M (1 sprint, ~2 weeks)
 **Category:** Core

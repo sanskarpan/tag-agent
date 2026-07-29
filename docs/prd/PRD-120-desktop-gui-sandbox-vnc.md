@@ -1,7 +1,7 @@
 # PRD-120: Desktop GUI Sandbox VNC (`tag sandbox --vnc`)
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — duplicate scope of PRD-092; no VNC sandbox in either CLI
 **Priority:** P2
 **Estimated Effort:** L (8-13 days)
 **Category:** Computer Use

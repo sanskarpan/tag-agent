@@ -1,6 +1,6 @@
-# PRD-037: OTel GenAI Span Cost Attribution
+# PRD-041: OTel GenAI Span Cost Attribution
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — `tag otel-export` emits OTLP/JSON with OTel GenAI semconv 1.28.0
 **Priority:** P1
 **Estimated Effort:** S (1–2 days)
 **Affects:** `src/tag/tracing.py` (`export_spans_otlp`), `src/tag/config/otel_semconv_version.txt` (new), `src/tag/controller.py` (`cmd_trace` export subcommand, `cmd_config`)

@@ -1,6 +1,6 @@
-# PRD-021: Multi-Agent Swarm with Context-Centric Routing
+# PRD-023: Multi-Agent Swarm with Context-Centric Routing
 
-**Status:** Proposed  
+**Status:** Shipped (Python only) — Go `swarm` is read-only; no `swarm run`  
 **Priority:** P1  
 **Estimated Effort:** L (2 sprints, ~4 weeks)  
 **Affects:** `controller.py` (new `cmd_swarm_run`, `cmd_swarm_list`, `cmd_swarm_status`, `cmd_swarm_abort`, `cmd_swarm_results`), new `src/tag/swarm.py`, `tag.sqlite3` schema (3 new tables)

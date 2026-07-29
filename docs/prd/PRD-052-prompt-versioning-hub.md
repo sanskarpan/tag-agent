@@ -1,6 +1,6 @@
 # PRD-052: Prompt Versioning Hub with Terminal Playground (`tag prompt`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — Python lacks `prompt versions`
 **Priority:** P2
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Evaluation & Observability

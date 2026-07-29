@@ -1,6 +1,6 @@
 # PRD-034: Secret Scanning (`tag security scan`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **PRD Number:** 034
 **Category:** Security
 **Priority:** P0 Critical

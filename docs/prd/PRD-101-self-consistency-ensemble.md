@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — `tag submit` has no `--samples`/`--vote` flags
 **Priority:** P2
 **Estimated Effort:** S (3-5 days)
 **Category:** Advanced Reasoning & Planning

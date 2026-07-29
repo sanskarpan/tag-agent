@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — `mcp-registry` serves an embedded catalog; neither CLI has a registry `update`/sync verb
 **Priority:** P1
 **Estimated Effort:** S (3-5 days)
 **Category:** MCP Ecosystem & Tool Connectivity

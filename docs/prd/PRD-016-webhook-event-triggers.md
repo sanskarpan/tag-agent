@@ -1,6 +1,6 @@
 # PRD-016: Webhook Event Triggers & Automation
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P2  
 **Estimated Effort:** L (3–4 weeks)  
 **Affects:** `controller.py` (new `cmd_hooks`), new `tag/events.py`, `tag.sqlite3`

@@ -1,6 +1,6 @@
 # PRD-051: Human Annotation and Labeling Queue (`tag annotate`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — Python lacks `annotate add`/`skip`
 **Priority:** P2
 **Estimated Effort:** M (5-8 days)
 **Category:** Evaluation & Observability

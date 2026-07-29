@@ -1,6 +1,6 @@
 # PRD-032: Agent Replay / Time-Travel Debugging (`tag trace replay`)
 
-**Status:** Proposed
+**Status:** Partial — `trace replay/diff/checkpoint/snapshot` ship in both, but replay has nothing to replay until span emission is fixed (see PRD-013)
 **Priority:** P2 Medium
 **Estimated Effort:** L (2 sprints, ~4 weeks)
 **Category:** Observability

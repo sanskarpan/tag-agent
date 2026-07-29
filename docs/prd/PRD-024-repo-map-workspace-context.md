@@ -1,6 +1,6 @@
-# PRD-021: Repo-Map / Workspace Context
+# PRD-024: Repo-Map / Workspace Context
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P1
 **Estimated Effort:** L (2 sprints, ~4 weeks)
 **Affects:** new `src/tag/workspace.py`, `src/tag/controller.py` (new `cmd_workspace_*` commands, `hermes_env()` injection), `src/tag/config/default.yaml` (new `workspace:` config block)

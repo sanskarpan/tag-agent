@@ -1,6 +1,6 @@
 # PRD-065: Automatic Post-Run Memory Extraction (`tag memory config set auto_extract`)
 
-**Status:** Proposed
+**Status:** Partial — `mem2 extract <run-id>` ships in both, but extraction is manual; there is no automatic post-run trigger or `auto_extract` config toggle
 **Priority:** P1
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Memory & Knowledge

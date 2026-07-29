@@ -1,6 +1,6 @@
 # PRD-012: Cost Tracking & Budget Management
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P1  
 **Estimated Effort:** M (2 weeks)  
 **Affects:** `controller.py` (new `cmd_costs`), `tag.sqlite3` schema, `run_chat_step`, `cmd_submit`

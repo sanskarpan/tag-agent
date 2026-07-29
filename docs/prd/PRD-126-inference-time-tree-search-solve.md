@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — no `solve` command in either CLI (`swe-solve`/`issue-solve` are unrelated single-model solvers)
 **Priority:** P1
 **Estimated Effort:** L (2–3 sprints, ~5 weeks)
 **Category:** Advanced Reasoning & Planning (Cluster G extension)

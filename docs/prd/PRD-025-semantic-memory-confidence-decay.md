@@ -1,6 +1,6 @@
-# PRD-021: Semantic Memory with Confidence Decay (`tag memory`)
+# PRD-025: Semantic Memory with Confidence Decay (`tag memory`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P1 (High Impact)
 **Estimated Effort:** L (2 sprints, ~4 weeks)
 **Affects:** `controller.py`, `open_db()` schema, `hermes_env()`, `profile_exec_env()`

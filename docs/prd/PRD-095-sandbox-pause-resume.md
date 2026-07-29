@@ -1,7 +1,7 @@
 # PRD-095: Sandbox Pause/Resume with Billing Pause (`tag sandbox pause / tag sandbox resume`)
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — no `sandbox pause`/`resume` verbs in either CLI
 **Priority:** P3
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Sandbox & Execution Environment
@@ -64,7 +64,7 @@ TAG's `queue_worker.py` dispatches multi-phase jobs where phase N must complete 
 | NG1 | **Live migration:** Moving a paused sandbox from one host or region to another is not supported in v1. Checkpoint files are tied to the provider's storage layer. |
 | NG2 | **Windows CRIU support:** CRIU does not support Windows. Docker `pause` (SIGSTOP) is the Windows fallback; full checkpoint-to-disk is Linux-only. |
 | NG3 | **Incremental / differential checkpoints:** All checkpoints in v1 are full snapshots. Incremental dirty-page tracking (as used in live migration) is deferred. |
-| NG4 | **Automatic idle-pause:** Automatically pausing sandboxes after N minutes of inactivity is a policy feature deferred to PRD-096 (Sandbox Auto-Suspend Policy). This PRD covers only the explicit pause/resume API. |
+| NG4 | **Automatic idle-pause:** Automatically pausing sandboxes after N minutes of inactivity is a policy feature deferred to PRD-100 (Sandbox Lifecycle Policies). This PRD covers only the explicit pause/resume API. |
 | NG5 | **Multi-sandbox coordinated pause:** Pausing a linked sandbox group (parent + children) atomically is deferred. Each sandbox is paused individually. |
 | NG6 | **Checkpoint encryption at rest:** Checkpoint files stored on local disk are not encrypted by TAG in v1. Users relying on disk encryption at the OS level (FileVault, LUKS) should ensure it is enabled. |
 | NG7 | **Billing guarantee enforcement:** TAG reports provider-stated billing state but cannot enforce or audit provider billing. Billing pause is a provider contract, not a TAG guarantee. |

@@ -1,6 +1,6 @@
-# PRD-021: Sandbox Code Execution (`tag sandbox`)
+# PRD-028: Sandbox Code Execution (`tag sandbox`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — Go has `sandbox run` only (no `list`/`result`)
 **Priority:** P0 Critical
 **Estimated Effort:** L (2 sprints / ~4 weeks)
 **Affects:** new `src/tag/sandbox.py`, `src/tag/queue_worker.py` (sandbox routing), `src/tag/controller.py` (new `cmd_sandbox_*` commands, `tag sandbox` subcommand group), `pyproject.toml` (optional extras: `docker`, `e2b`), `docs/prd/INDEX.md`

@@ -1,6 +1,6 @@
 # PRD-005: Execution Backend Selection Per Profile
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P1  
 **Estimated Effort:** S–M (1–2 weeks)  
 **Affects:** `controller.py` (`render_profiles`, `hermes_env`, `profile_exec_env`), `default.yaml`

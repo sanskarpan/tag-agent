@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Partial — `dag save/run/show/list` ships a DAG workflow engine in both, but without conditional edges or state reducers
 **Priority:** P1
 **Estimated Effort:** L (8-13 days)
 **Category:** Workflow State

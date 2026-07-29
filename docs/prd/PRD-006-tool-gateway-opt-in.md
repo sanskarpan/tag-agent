@@ -1,6 +1,6 @@
 # PRD-006: Tool Gateway Opt-in Wiring
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P1  
 **Estimated Effort:** XS (2–3 days)  
 **Affects:** `controller.py` (`render_profiles`, new `cmd_import_nous_portal`), `default.yaml`

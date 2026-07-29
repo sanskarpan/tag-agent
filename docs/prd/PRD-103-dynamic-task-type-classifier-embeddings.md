@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — `tag route` has no `classify` verb
 **Priority:** P2
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Advanced Reasoning & Planning

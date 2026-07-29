@@ -1,6 +1,6 @@
 # PRD-068: Background Sleep-Time Memory Consolidation Agent (`tag memory gc`)
 
-**Status:** Proposed
+**Status:** Partial — `mem2 gc` ships the consolidation/eviction/promotion logic, but it runs on demand only; there is no background sleep-time agent
 **Priority:** P3
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Memory & Knowledge

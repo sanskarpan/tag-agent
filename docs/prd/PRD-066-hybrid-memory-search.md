@@ -1,6 +1,6 @@
 # PRD-066: Hybrid Memory Search (`tag mem search --mode hybrid`)
 
-**Status:** Proposed
+**Status:** Partial — `mem search` is FTS/BM25 only (no `--mode hybrid`); vector search exists separately as `mem2 store search`; no RRF fusion of the two
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Memory

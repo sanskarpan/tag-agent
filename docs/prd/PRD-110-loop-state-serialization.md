@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — no `workflow checkpoint` command (`trace checkpoint` is unrelated)
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Workflow State

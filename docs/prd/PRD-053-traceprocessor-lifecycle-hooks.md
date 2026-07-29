@@ -1,6 +1,6 @@
 # PRD-053: TraceProcessor Lifecycle Hooks Protocol (`tag hooks trace`)
 
-**Status:** Proposed
+**Status:** Proposed — `hooks` exposes only `list`/`log`/`test`; there is no trace-lifecycle processor registration (`hooks test trace_end` matched no hooks)
 **Priority:** P3
 **Estimated Effort:** S (3-5 days)
 **Category:** Evaluation & Observability

@@ -1,6 +1,6 @@
-# PRD-037: Notification Hooks (`tag hooks notify`)
+# PRD-040: Notification Hooks (`tag hooks notify`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — ships as `tag notify`, not `tag hooks notify`
 **Priority:** P1
 **Estimated Effort:** M (1 sprint, ~1 week)
 **Affects:** `src/tag/notifications.py` (new), `src/tag/controller.py` (extend `_fire_hooks`, `cmd_hooks`, `cmd_hooks_notify` subcommand tree), `tag.sqlite3` (new `notification_log` table)

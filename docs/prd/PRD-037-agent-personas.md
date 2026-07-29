@@ -1,13 +1,13 @@
-# PRD-036: Agent Personas (tag persona)
+# PRD-037: Agent Personas (tag persona)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P1
 **Estimated Effort:** M (1 sprint, ~2 weeks)
 **Affects:** `controller.py` (new `cmd_persona_*` handlers), new `src/tag/persona.py`,
 new `src/tag/config/personas/` (built-in persona files)
 **Security Classification:** MEDIUM — personas are system prompt injections; same threat
 model as profiles; marketplace personas gated behind PRD-034 (Secret Scanning)
-**Depends on:** PRD-035 (Profile Marketplace infrastructure for `persona pull/push`)
+**Depends on:** PRD-026 (Profile Marketplace infrastructure for `persona pull/push`)
 
 ---
 

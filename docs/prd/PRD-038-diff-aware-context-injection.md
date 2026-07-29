@@ -1,6 +1,6 @@
-# PRD-022: Diff-Aware Context Injection
+# PRD-038: Diff-Aware Context Injection
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P1
 **Estimated Effort:** S (2–3 days)
 **Affects:** `src/tag/context.py` (new `git_diff_filter`, `inject_diff` functions), `src/tag/controller.py` (extend `cmd_context` with `inject` subcommand and new flags), `src/tag/ci.py` (reuse `fetch_pr_diff` for `--pr` flag)

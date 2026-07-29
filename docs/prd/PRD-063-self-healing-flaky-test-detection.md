@@ -1,6 +1,6 @@
 # PRD-063: Self-Healing Flaky Test Detection (`tag ci flaky-fix`)
 
-**Status:** Proposed
+**Status:** Shipped (Python only) — `tag agentic-ci flaky-fix <log>`; no Go equivalent
 **Priority:** P3
 **Estimated Effort:** L (2-4 weeks)
 **Category:** CI/CD & Agentic Dev Workflows

@@ -1,6 +1,6 @@
 # PRD-013: Distributed Agent Tracing & Observability
 
-**Status:** Proposed  
+**Status:** Partial — the `trace` command surface (`list/show/export/replay/diff/checkpoint/snapshot`) and `otel-export` ship in both, but the Go native agent loop emits no spans (`tag run` then `tag trace list` reports "No spans recorded")  
 **Priority:** P1  
 **Estimated Effort:** L (3–4 weeks)  
 **Affects:** `controller.py` (`run_chat_step`, `cmd_submit`, `insert_step`), new `tag/tracing.py`, `tag.sqlite3`

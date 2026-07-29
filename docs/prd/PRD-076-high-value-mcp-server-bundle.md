@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Partial — `mcp-registry list/install` ships a curated embedded catalog, but there is no `add-curated` bundle verb
 **Priority:** P2
 **Estimated Effort:** XS (1-2 days)
 **Category:** MCP Ecosystem & Tool Connectivity

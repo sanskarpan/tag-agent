@@ -1,6 +1,6 @@
 # PRD-017: Multi-Model Benchmarking & Comparison
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python) — Go `compare` is `list`/`show`; the run path is `benchmark run`  
 **Priority:** P2  
 **Estimated Effort:** M (2 weeks)  
 **Affects:** `controller.py` (`cmd_benchmark`, new `cmd_compare`), `benchmark-suite.yaml`

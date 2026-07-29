@@ -1,6 +1,6 @@
 # PRD-018: Context Window & Long-Context Management
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P1  
 **Estimated Effort:** M (2–3 weeks)  
 **Affects:** `controller.py` (`cmd_chat`, `run_chat_step`, `hermes_env`), new `tag/context.py`

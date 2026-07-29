@@ -1,6 +1,6 @@
 # PRD-056: Inbound Webhook Trigger Server with HMAC Verification (`tag hooks listen`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P1
 **Estimated Effort:** M (1-2 weeks)
 **Category:** CI/CD & Agentic Dev Workflows

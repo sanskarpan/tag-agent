@@ -1,6 +1,6 @@
 # PRD-067: Hierarchical Memory Tiers: Core / Recall / Archival (`tag mem tier`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — `mem2 tier`
 **Priority:** P2
 **Estimated Effort:** L (2-4 weeks)
 **Category:** Memory & Knowledge

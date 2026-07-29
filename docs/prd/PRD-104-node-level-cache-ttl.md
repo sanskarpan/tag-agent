@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — `tag cache` is analytics only (`stats`/`tips`/`trend`); there is no node-level LLM response cache
 **Priority:** P2
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Advanced Reasoning & Planning

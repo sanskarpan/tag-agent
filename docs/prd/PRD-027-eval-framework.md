@@ -1,6 +1,6 @@
-# PRD-021: Eval Framework (tag eval)
+# PRD-027: Eval Framework (tag eval)
 
-**Status:** Proposed  
+**Status:** Shipped (Python only) — Go `eval` is `list`/`show`; `eval run` is not implemented in Go  
 **Priority:** P1  
 **Estimated Effort:** M (1 sprint, ~2 weeks)  
 **Affects:** `controller.py` (new `cmd_eval`), new `src/tag/eval.py`, new `evals/` directory convention, `tag.sqlite3` (new `eval_results` table)

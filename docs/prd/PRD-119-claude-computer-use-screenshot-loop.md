@@ -1,7 +1,7 @@
 # PRD-119: Claude Computer-Use Screenshot Loop (`tag cu-loop`)
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — no `cu-loop` command in either CLI
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Computer Use

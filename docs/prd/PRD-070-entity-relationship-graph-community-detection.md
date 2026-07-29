@@ -1,6 +1,6 @@
 # PRD-070: Entity-Relationship Graph with Community Detection (`tag mem graph`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — ships as `tag graph show/query/build`, not `tag mem graph`
 **Priority:** P3
 **Estimated Effort:** L (2-4 weeks)
 **Category:** Memory & Knowledge

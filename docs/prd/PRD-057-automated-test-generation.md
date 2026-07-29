@@ -1,6 +1,6 @@
 # PRD-057: Automated Test Generation on PR/Commit (`tag ci test-gen`)
 
-**Status:** Proposed
+**Status:** Shipped (Python only) — `tag agentic-ci test-gen`; Go `agentic-ci` is a single check→fix command (workflow scaffold only, via `eval-ci scaffold --type test-gen`)
 **Priority:** P2
 **Estimated Effort:** M (1-2 weeks)
 **Category:** CI/CD & Agentic Dev Workflows

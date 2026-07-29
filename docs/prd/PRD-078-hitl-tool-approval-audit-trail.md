@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Partial — Go `permissions show/log` provides allow/deny/ask tool rules plus a decision log; there is no pause/resume approval flow and no Python equivalent
 **Priority:** P3
 **Estimated Effort:** L (2-4 weeks)
 **Category:** MCP Ecosystem & Tool Connectivity

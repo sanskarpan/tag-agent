@@ -1,6 +1,6 @@
 # PRD-019: Natural Language Shell Mode (`tag shell`)
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P2  
 **Estimated Effort:** M (2 weeks)  
 **Affects:** `controller.py` (new `cmd_shell`), new `tag/shell_mode.py`

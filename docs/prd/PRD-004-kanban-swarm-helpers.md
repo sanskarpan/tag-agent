@@ -1,6 +1,6 @@
 # PRD-004: Kanban Swarm Topology Helpers
 
-**Status:** Proposed  
+**Status:** Shipped (Python only) — Go `swarm` is read-only (`list`/`status`/`results`); `swarm run`/`abort` are not implemented in Go  
 **Priority:** P1  
 **Estimated Effort:** M (2 weeks)  
 **Affects:** `controller.py` (`cmd_submit`, new `cmd_swarm`), `default.yaml` routing config

@@ -1,6 +1,6 @@
 # PRD-062: GitLab CI/CD Pipeline Auto-Generation (`tag ci gen-pipeline --platform gitlab`)
 
-**Status:** Proposed
+**Status:** Shipped (Python only) — `tag agentic-ci gen-pipeline`; no Go equivalent
 **Priority:** P3
 **Estimated Effort:** M (1-2 weeks)
 **Category:** CI/CD & Agentic Dev Workflows
