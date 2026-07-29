@@ -8,6 +8,11 @@
 #                            (optional; default 0.1, i.e. 10 % of input price)
 #   batch_multiplier       — fraction of standard price charged for batch API
 #                            (optional; default 0.5, i.e. 50 % of standard price)
+#   source                 — provenance for the rate: where the numbers came
+#                            from, e.g. "models.dev" (optional; default unset)
+#   estimated              — true when the rate is NOT an authoritative
+#                            published rate (unverified/conflicting/guessed).
+#                            (optional; default false)
 #
 # Prices are USD and reflect publicly listed rates as of 2026-06.
 # Update this file whenever a provider revises its pricing.
@@ -76,13 +81,15 @@ models:
   # ── OpenAI GPT ──────────────────────────────────────────────────────────────
 
   # GPT-5.4 — the model TAG ships as the `orchestrator`/master profile default
-  # (src/tag/config/default.yaml). It was absent from this table, so `tag pricing
-  # get gpt-5.4` and every cost rollup for the default profile reported
-  # "Model not found" / $0.
+  # (src/tag/config/default.yaml). The previously recorded 1.25 / 10.00 was
+  # unsourced and incorrect: it was GPT-5's rate copied onto gpt-5.4. The
+  # corroborated rate (models.dev, cross-checked against multiple independent
+  # public pricing aggregators, 2026-07) is 2.50 input / 15.00 output.
   - model_id: gpt-5.4
-    input_usd_per_1m: 1.25
-    output_usd_per_1m: 10.00
+    input_usd_per_1m: 2.50
+    output_usd_per_1m: 15.00
     cache_read_multiplier: 0.1
+    source: "models.dev (corroborated by multiple public pricing aggregators, 2026-07)"
 
   # GPT-4o — latest multimodal flagship
   - model_id: gpt-4o
@@ -142,11 +149,18 @@ models:
   - model_id: gemini-2.5-pro
     input_usd_per_1m: 1.25
     output_usd_per_1m: 10.00
+    source: "models.dev"
 
-  # Gemini 2.5 Flash — fast, cost-efficient Gemini 2.5 variant
+  # Gemini 2.5 Flash — fast, cost-efficient Gemini 2.5 variant.
+  # No authoritative resolution: this table says 0.15/0.60, the Go embedded
+  # table previously said 0.075/0.30 and models.dev says 0.30/2.50. The two
+  # engines now both carry this table's 0.15/0.60 so they cannot disagree, but
+  # the rate is still unverified and is flagged as not authoritative.
   - model_id: gemini-2.5-flash
     input_usd_per_1m: 0.15
     output_usd_per_1m: 0.60
+    estimated: true
+    source: "unverified — pricing.yaml value; conflicts with models.dev (0.30/2.50)"
 
   # Gemini 1.5 Pro — long-context (up to 2 M tokens) flagship
   - model_id: gemini-1.5-pro
@@ -165,10 +179,14 @@ models:
     input_usd_per_1m: 0.14
     output_usd_per_1m: 0.28
 
-  # DeepSeek V4 Pro — full-capability DeepSeek V4
+  # DeepSeek V4 Pro — full-capability DeepSeek V4.
+  # models.dev lists 1.74 / 3.48 against this table's 0.27 / 1.10; the conflict
+  # is unresolved, so the existing numbers stand but are flagged.
   - model_id: deepseek/deepseek-v4-pro
     input_usd_per_1m: 0.27
     output_usd_per_1m: 1.10
+    estimated: true
+    source: "unverified — conflicts with models.dev"
 
   # DeepSeek R1 — open reasoning model
   - model_id: deepseek/deepseek-r1
@@ -194,15 +212,21 @@ models:
 
   # ── Qwen (Alibaba) ──────────────────────────────────────────────────────────
 
-  # Qwen3 Coder — code-specialised Qwen3 model
+  # Qwen3 Coder — code-specialised Qwen3 model.
+  # Absent from models.dev; no public rate could be corroborated.
   - model_id: qwen/qwen3-coder
     input_usd_per_1m: 0.50
     output_usd_per_1m: 2.00
+    estimated: true
+    source: "unverified — no public rate found"
 
-  # Qwen Plus — general-purpose Qwen commercial model
+  # Qwen Plus — general-purpose Qwen commercial model.
+  # Absent from models.dev; no public rate could be corroborated.
   - model_id: qwen/qwen-plus
     input_usd_per_1m: 0.40
     output_usd_per_1m: 1.20
+    estimated: true
+    source: "unverified — no public rate found"
 
   # ── Meta Llama ───────────────────────────────────────────────────────────────
 

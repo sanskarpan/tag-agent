@@ -117,6 +117,10 @@ class PricingEntry:
             tokens are served from the prompt cache (default 0.1 = 90% off).
         batch_multiplier: Multiplier applied to both rates when the request
             is submitted via the batch API (default 0.5 = 50% off).
+        source: Optional provenance string recording where the rate came from
+            (e.g. ``"models.dev"``). ``None`` when unannotated.
+        estimated: ``True`` when the rate is *not* an authoritative published
+            rate (unverified, conflicting or guessed). Defaults to ``False``.
     """
 
     model_id: str
@@ -124,6 +128,27 @@ class PricingEntry:
     output_usd_per_1m: float
     cache_read_multiplier: float = 0.1
     batch_multiplier: float = 0.5
+    source: Optional[str] = None
+    estimated: bool = False
+
+
+def _coerce_source(value: object) -> Optional[str]:
+    """Normalise a raw ``source`` YAML value into ``Optional[str]``."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _coerce_estimated(value: object) -> bool:
+    """Normalise a raw ``estimated`` YAML value into a bool (default False)."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"true", "yes", "1", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +213,8 @@ def _parse_pricing_dict(raw: dict) -> dict[str, PricingEntry]:
                         item.get("cache_read_multiplier", 0.1)
                     ),
                     batch_multiplier=float(item.get("batch_multiplier", 0.5)),
+                    source=_coerce_source(item.get("source")),
+                    estimated=_coerce_estimated(item.get("estimated")),
                 )
             except (KeyError, ValueError, TypeError):
                 continue
@@ -208,6 +235,8 @@ def _parse_pricing_dict(raw: dict) -> dict[str, PricingEntry]:
                     cfg.get("cache_read_multiplier", 0.1)
                 ),
                 batch_multiplier=float(cfg.get("batch_multiplier", 0.5)),
+                source=_coerce_source(cfg.get("source")),
+                estimated=_coerce_estimated(cfg.get("estimated")),
             )
         except (KeyError, ValueError, TypeError):
             # Skip malformed entries rather than crashing.
@@ -320,6 +349,23 @@ def _resolve_entry(model_id: str) -> Optional[PricingEntry]:
                 best_len = len(pattern)
 
     return best
+
+
+def resolve_pricing_entry(model_id: str) -> Optional[PricingEntry]:
+    """Public wrapper over :func:`_resolve_entry` exposing rate provenance.
+
+    Callers use this to read ``.estimated`` / ``.source`` for a model without
+    reaching into private helpers. Glob patterns are honoured exactly as in
+    :func:`compute_cost`, so the entry returned here is the one whose rates
+    that function used.
+
+    Args:
+        model_id: The concrete model identifier to look up.
+
+    Returns:
+        The matching :class:`PricingEntry`, or ``None`` if no entry matches.
+    """
+    return _resolve_entry(model_id)
 
 
 def compute_cost(
