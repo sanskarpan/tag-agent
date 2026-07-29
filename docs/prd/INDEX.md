@@ -144,7 +144,30 @@ These PRDs address capabilities where Sakana leads and where TAG can close the g
 
 ---
 
-## Status Matrix (PRD-045 to PRD-127)
+## Cluster L — Competitive Parity Gap PRDs (PRD-128 to PRD-132)
+
+Written 2026-07-29 from `docs/COMPETITIVE_PARITY_2026_07.md`, which surveyed ~25 peer
+harnesses (Pi, OpenCode, Hermes, Claude Code, Codex CLI, Crush, Goose, Cline, Kilo,
+Cursor, Devin and others). Each PRD below closes a capability shipped by multiple
+competitors that TAG lacks. **All five were de-duplicated against PRD-001 to PRD-127
+before being written** — see the notes column for the near-misses.
+
+| PRD | Feature | Shipped by | De-duplication note | Priority | Effort |
+|---|---|---|---|---|---|
+| [128](PRD-128-agent-skills-packages.md) | `tag skill` — portable `SKILL.md` capability packages | ~10 peers (Claude Code, Goose, Amp, Crush, Kilo, Cline, Cursor, Qwen, Hermes, Pi) | No existing PRD covers skill packages. Widest single gap. | P1 | M |
+| [129](PRD-129-plan-act-execution-mode.md) | `tag run --mode plan` — read-only planning phase before mutation | Cline, Kilo, OpenHands, Kiro, Aider, Jules, Devin, Claude Code, Goose | **Distinct from PRD-105** (`tag plan decompose`, TDAG task-graph decomposition). That is a task-graph feature; this is an execution *mode*. Registers no top-level command, so the `tag plan` namespace stays PRD-105's. | P1 | S–M |
+| [130](PRD-130-git-worktree-isolation.md) | `tag worktree` — git worktree isolation for parallel agents | Claude Code, Kilo, Cline, Emdash, Hermes | Only mentioned incidentally in PRD-055 (FR-18); this supersedes that flag in scope and makes `issue-solve` a consumer. | P2 | M |
+| [131](PRD-131-zed-agent-client-protocol-editor-bridge.md) | `tag editor serve` — Zed Agent **Client** Protocol editor bridge | Zed registry (~45 agents, 13 client editors), OpenCode, Goose, Claude Code, Codex, Gemini CLI, OpenHands | ⚠️ **Not PRD-087.** That is IBM's Agent *Communication* Protocol (cluster messaging, BeeAI/AGNTCY, owns `tag acp`). This is Zed's Agent *Client* Protocol — the editor↔agent standard. Same acronym, different protocol. | P2 | M |
+| [132](PRD-132-provider-adapter-breadth-catalog.md) | `tag providers` — one multi-provider adapter + a model catalog | Pi 30+, Goose 50+, Hermes 32, Crush 25, Factory 39 | **Distinct from PRD-031** (fallback chains) and **PRD-107** (confidence routing) — those *route between* providers; this *adds* them. | P2 | M |
+
+**Deliberately NOT given a PRD number:**
+
+- **Auto context compaction in-loop** — already owned by [PRD-018](PRD-018-context-window-management.md). It is Python-framed and still Proposed; the correct follow-up is a Go re-frame of 018, not a new number.
+- **Multi-surface (IDE / desktop / web)** — a documented deliberate non-port (`tag-go/MIGRATION_STATUS.md`). PRD-131 is the pragmatic substitute: editor reach via a protocol endpoint rather than an owned UI.
+
+---
+
+## Status Matrix (PRD-045 to PRD-132)
 
 Cluster A–K. Same audit pass and same label vocabulary as the table above.
 
@@ -233,6 +256,11 @@ Cluster A–K. Same audit pass and same label vocabulary as the table above.
 | [125](PRD-125-constitutional-ai-policy.md) | Constitutional AI Policy (`tag constitutional`) | P2 | M (5-8 days) | Proposed — no `constitutional` command in either CLI |
 | [126](PRD-126-inference-time-tree-search-solve.md) | Inference-Time Multi-Model Tree Search (`tag solve`) | P1 | L (2–3 sprints, ~5 weeks) | Proposed — no `solve` command in either CLI (`swe-solve`/`issue-solve` are unrelated single-model solvers) |
 | [127](PRD-127-evolutionary-profile-optimization.md) | Evolutionary Profile Configuration Optimization (`tag evolve`) | P2 | L (2–3 sprints, ~5 weeks) | Proposed — no `evolve` command in either CLI |
+| [128](PRD-128-agent-skills-packages.md) | Agent Skills — Portable `SKILL.md` Capability Packages (`tag skill`) | P1 | M | Proposed |
+| [129](PRD-129-plan-act-execution-mode.md) | Plan/Act Execution Mode — read-only planning before mutation (`tag run --mode plan`) | P1 | S–M | Proposed |
+| [130](PRD-130-git-worktree-isolation.md) | Git Worktree Isolation for Parallel Agents (`tag worktree`) | P2 | M | Proposed |
+| [131](PRD-131-zed-agent-client-protocol-editor-bridge.md) | Zed Agent **Client** Protocol — editor↔agent bridge (`tag editor serve`) | P2 | M | Proposed |
+| [132](PRD-132-provider-adapter-breadth-catalog.md) | Provider Adapter Breadth: multi-provider adapter + model catalog (`tag providers`) | P2 | M | Proposed |
 
 ---
 
