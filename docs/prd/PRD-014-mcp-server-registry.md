@@ -1,6 +1,6 @@
 # PRD-014: MCP Server Registry & Discovery
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P1  
 **Estimated Effort:** M (2 weeks)  
 **Affects:** `controller.py` (new `cmd_mcp_registry`), `default.yaml`, profile configs

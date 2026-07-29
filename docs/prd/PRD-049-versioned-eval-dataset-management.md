@@ -1,6 +1,6 @@
 # PRD-049: Versioned Eval Dataset Management (`tag eval dataset`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — Python lacks `eval-dataset add-case`
 **Priority:** P2
 **Estimated Effort:** S (3-5 days)
 **Category:** Evaluation & Observability

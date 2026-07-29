@@ -1,6 +1,6 @@
 # PRD-036: Web Dashboard (`tag serve`)
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P1  
 **Estimated Effort:** L (backend M, frontend L — 2–3 sprints)  
 **Affects:** new `src/tag/api.py`, `src/tag/controller.py` (`cmd_serve`), `web/src/`, `pyproject.toml`, `MANIFEST.in`

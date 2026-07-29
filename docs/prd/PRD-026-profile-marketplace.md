@@ -1,6 +1,6 @@
 # PRD-026: Profile Marketplace (tag profile pull/push)
 
-**Status:** Proposed — BLOCKED on PRD-034 (Secret Scanning)
+**Status:** Shipped (Go + Python) — ships as `tag marketplace pull/push/list`, not `tag profile pull/push`
 **Priority:** P1
 **Estimated Effort:** M (1 sprint, ~2 weeks)
 **Affects:** `controller.py` (new `cmd_profile_hub`), new `src/tag/profile_hub.py`

@@ -1,6 +1,6 @@
 # PRD-009: Enhanced `tag doctor` Diagnostics
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P1  
 **Estimated Effort:** S (3–5 days)  
 **Affects:** `controller.py` (`cmd_doctor`, `doctor_prerequisites`)

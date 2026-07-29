@@ -1,6 +1,6 @@
 # PRD-069: Temporal Fact Versioning with valid_at/invalid_at (`tag mem fact`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — `mem2 fact`
 **Priority:** P3
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Memory & Knowledge

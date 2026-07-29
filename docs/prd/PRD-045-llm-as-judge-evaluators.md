@@ -1,6 +1,6 @@
 # PRD-045: LLM-as-Judge Evaluators (`tag eval run --judge`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P1
 **Estimated Effort:** S (3-5 days)
 **Category:** Evaluation & Observability

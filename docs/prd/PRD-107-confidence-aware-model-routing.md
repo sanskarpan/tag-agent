@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — `tag route` has no `optimize` verb
 **Priority:** P3
 **Estimated Effort:** L (2-4 weeks)
 **Category:** Advanced Reasoning & Planning

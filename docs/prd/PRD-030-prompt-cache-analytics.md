@@ -1,6 +1,6 @@
 # PRD-030: Prompt Cache Analytics
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P1  
 **Estimated Effort:** S (2–3 days)  
 **Affects:** `controller.py` (schema migration, new `cmd_cache`, extend `cmd_costs`), `tag.sqlite3` schema (`runs` table)

@@ -1,6 +1,6 @@
 # PRD-007: `tag desktop` Subcommand
 
-**Status:** Proposed  
+**Status:** Shipped (Python only) — Deliberate non-port in Go (OS desktop packaging; see `tag-go/MIGRATION_STATUS.md`)  
 **Priority:** P2  
 **Estimated Effort:** M (2 weeks)  
 **Affects:** `controller.py` (new `cmd_desktop`), setup/install flow

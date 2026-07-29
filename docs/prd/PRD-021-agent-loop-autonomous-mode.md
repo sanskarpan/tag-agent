@@ -1,6 +1,6 @@
 # PRD-021: Agent Loop / Autonomous Mode
 
-**Status:** Proposed  
+**Status:** Shipped (Python only) — Go `loop` is a single-shot `--iterations` driver with no `start`/`status`/`abort`/`approve` lifecycle  
 **Priority:** P1  
 **Estimated Effort:** M (2–3 weeks)  
 **Affects:** `controller.py` (new `cmd_loop`), new `src/tag/loop.py`, `queue_worker.py`, `pyproject.toml`, `tag.sqlite3` schema

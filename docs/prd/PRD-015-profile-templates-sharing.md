@@ -1,6 +1,6 @@
 # PRD-015: Profile Templates & Sharing
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P2  
 **Estimated Effort:** M (2 weeks)  
 **Affects:** `controller.py` (new `cmd_template`), new `tag/templates.py`

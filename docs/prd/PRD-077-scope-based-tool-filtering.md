@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — no `mcp filter` command in either CLI
 **Priority:** P3
 **Estimated Effort:** M (1-2 weeks)
 **Category:** MCP Ecosystem & Tool Connectivity

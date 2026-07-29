@@ -1,6 +1,6 @@
 # PRD-020: CI/CD Integration & Automated Code Review
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P2  
 **Estimated Effort:** L (3–4 weeks)  
 **Affects:** `controller.py` (new `cmd_review_pr`, `cmd_ci`), new `tag/ci.py`, GitHub Actions YAML

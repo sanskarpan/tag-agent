@@ -1,6 +1,6 @@
 # PRD-001: Structured Memory Configuration Per Profile
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P0 (Highest Impact)  
 **Estimated Effort:** M (2–3 weeks)  
 **Affects:** `controller.py`, `default.yaml`, `cmd_setup`, `render_profiles`

@@ -1,6 +1,6 @@
 # PRD-060: CI Failure Root-Cause Analysis + Auto-Fix PR (`tag ci diagnose --auto-fix`)
 
-**Status:** Proposed
+**Status:** Shipped (Python only) — `tag agentic-ci ci-diagnose` and `tag ci diagnose`; no Go equivalent
 **Priority:** P2
 **Estimated Effort:** M (1-2 weeks)
 **Category:** CI/CD & Agentic Dev Workflows

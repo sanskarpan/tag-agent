@@ -1,6 +1,6 @@
 # PRD-071: Episodic Memory: Structured Session Episode Storage (`tag mem episode`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — `mem2 episode`
 **Priority:** P3
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Memory & Knowledge

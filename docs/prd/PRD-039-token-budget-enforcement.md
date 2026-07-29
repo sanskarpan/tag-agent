@@ -1,6 +1,6 @@
 # PRD-039: Token Budget Enforcement (`tag budget`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **PRD Number:** 039
 **Category:** Core
 **Priority:** P1 High

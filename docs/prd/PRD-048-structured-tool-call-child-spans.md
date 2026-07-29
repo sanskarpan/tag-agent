@@ -1,6 +1,6 @@
 # PRD-048: Structured Tool-Call Child Spans with TOOL Kind (`tag trace show --kind tool`)
 
-**Status:** Proposed
+**Status:** Proposed (unverified) — no `--kind` filter on `trace show` in either CLI, and no spans are emitted to inspect
 **Priority:** P2
 **Estimated Effort:** S (3-5 days)
 **Category:** Evaluation & Observability

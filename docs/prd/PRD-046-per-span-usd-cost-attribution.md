@@ -1,6 +1,6 @@
 # PRD-046: Per-Span USD Cost Attribution (`tag trace show --cost / tag stats --cost`)
 
-**Status:** Proposed
+**Status:** Partial — cost attribution ships via `costs`/`pricing`/`otel-export`; there is no `trace show --cost` flag and no `tag stats` command, and no spans are emitted to attribute against (see PRD-013)
 **Priority:** P1
 **Estimated Effort:** XS (1-2 days)
 **Category:** Evaluation & Observability

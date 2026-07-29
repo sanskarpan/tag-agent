@@ -1,6 +1,6 @@
 # PRD-047: Eval CI Gate with PR Comment Integration (`tag eval ci`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — Go `eval-ci run` is offline/dry-run
 **Priority:** P1
 **Estimated Effort:** S (3-5 days)
 **Category:** Evaluation & Observability

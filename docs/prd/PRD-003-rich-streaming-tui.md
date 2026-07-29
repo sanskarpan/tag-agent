@@ -1,6 +1,6 @@
 # PRD-003: Rich Streaming TUI Output
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P0 (Highest Visible Impact)  
 **Estimated Effort:** M (2 weeks)  
 **Affects:** `controller.py` (`cmd_chat`, `cmd_submit`, `run_chat_step`), new `tag/tui.py` module

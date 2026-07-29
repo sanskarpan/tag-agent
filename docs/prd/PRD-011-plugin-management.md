@@ -1,6 +1,6 @@
 # PRD-011: Plugin Management System (`tag plugins`)
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P1  
 **Estimated Effort:** M (2 weeks)  
 **Affects:** `controller.py` (new `cmd_plugin_manage`), `cmd_setup`, `tag doctor`

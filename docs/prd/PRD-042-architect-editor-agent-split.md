@@ -1,6 +1,6 @@
 # PRD-042: Architect/Editor Agent Split (`tag run --architect ... --editor ...`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P2 — Medium
 **Estimated Effort:** S–M (1 week)
 **Category:** AI-Native

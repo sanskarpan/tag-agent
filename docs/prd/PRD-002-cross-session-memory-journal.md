@@ -1,6 +1,6 @@
 # PRD-002: TAG-Native Cross-Session Memory Journal
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P0 (Highest Impact)  
 **Estimated Effort:** S (1 week)  
 **Affects:** `controller.py` (`open_db`, `hermes_env`), `tag.sqlite3` schema

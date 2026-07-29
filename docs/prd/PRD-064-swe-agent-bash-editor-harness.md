@@ -1,6 +1,6 @@
 # PRD-064: SWE-Agent-Style Structured Bash+Editor Harness (`tag solve --harness swe`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — ships as `tag swe-solve`, not `tag solve --harness swe`
 **Priority:** P2
 **Estimated Effort:** M (1-2 weeks)
 **Category:** CI/CD & Agentic Dev Workflows

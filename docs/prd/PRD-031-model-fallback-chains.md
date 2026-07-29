@@ -1,6 +1,6 @@
 # PRD-031: Model Fallback Chains
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P1  
 **Estimated Effort:** M (1 sprint, ~2 weeks)  
 **Affects:** `controller.py` (`cmd_route`, fallback pre-flight in hermes dispatch), `tag.sqlite3` schema migration

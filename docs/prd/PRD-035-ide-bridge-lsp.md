@@ -1,6 +1,6 @@
 # PRD-035: IDE Bridge — LSP Server & VS Code Extension
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python) — `tag lsp start/status` verified; the VS Code extension package was not verified  
 **Priority:** P2  
 **Estimated Effort:** XL (3–4 sprints, ~8–10 weeks)  
 **Affects:** `controller.py` (new `cmd_lsp`), new `src/tag/lsp_server.py`, new `vscode/` directory (extension package)

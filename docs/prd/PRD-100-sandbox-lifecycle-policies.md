@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — no `sandbox policy` verb in either CLI
 **Priority:** P3
 **Estimated Effort:** S (3-5 days)
 **Category:** Sandbox & Execution Environment

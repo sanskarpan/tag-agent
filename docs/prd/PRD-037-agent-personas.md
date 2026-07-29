@@ -1,6 +1,6 @@
 # PRD-037: Agent Personas (tag persona)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P1
 **Estimated Effort:** M (1 sprint, ~2 weeks)
 **Affects:** `controller.py` (new `cmd_persona_*` handlers), new `src/tag/persona.py`,

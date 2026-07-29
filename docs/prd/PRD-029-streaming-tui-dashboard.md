@@ -1,6 +1,6 @@
 # PRD-029: Streaming TUI Dashboard (`tag serve` / `tag dashboard`)
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P1 (High Impact, Differentiating)  
 **Estimated Effort:** L (TUI sub-feature: M ~1 sprint; Web bridge sub-feature: L ~2 sprints; total: 2–3 sprints)  
 **Affects:** New `src/tag/dashboard.py`, new `src/tag/api.py`, `controller.py` (new subcommands `serve` and `dashboard`), `web/` directory  

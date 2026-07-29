@@ -1,6 +1,6 @@
 # PRD-050: Alert Rules on Metric Thresholds (`tag alert`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P2
 **Estimated Effort:** M (5-8 days)
 **Category:** Evaluation & Observability

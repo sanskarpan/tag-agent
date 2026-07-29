@@ -1,6 +1,6 @@
 # PRD-072: Cross-Session Vector Store (`tag mem store`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — `mem2 store store|search|rebuild`
 **Priority:** P1
 **Estimated Effort:** L (8-13 days)
 **Category:** Memory

@@ -1,6 +1,6 @@
 # PRD-008: Background Task Queue (`tag queue`)
 
-**Status:** Proposed  
+**Status:** Shipped (Go + Python)  
 **Priority:** P1  
 **Estimated Effort:** M (2 weeks)  
 **Affects:** `controller.py` (new `cmd_queue`), `tag.sqlite3` schema, new `tag/queue_worker.py`

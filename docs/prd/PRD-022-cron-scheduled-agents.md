@@ -1,6 +1,6 @@
 # PRD-022: Cron / Scheduled Agents (`tag cron`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P1
 **Estimated Effort:** M (2 weeks)
 **Affects:** `controller.py` (new `cmd_cron`), new `src/tag/scheduler.py`, `queue_worker.py` (cron-sourced job handling), `tag.sqlite3` schema (new `cron_jobs` table), `pyproject.toml` (add `apscheduler>=3.10`)

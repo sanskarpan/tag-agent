@@ -1,6 +1,6 @@
 # PRD-055: Issue-to-PR Autonomous Loop (`tag issue-solve`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P1
 **Estimated Effort:** M (1-2 weeks)
 **Category:** CI/CD & Agentic Dev Workflows

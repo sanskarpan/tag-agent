@@ -1,6 +1,6 @@
 # PRD-059: SAST Vulnerability Auto-Remediation from SARIF (`tag ci fix-vuln`)
 
-**Status:** Proposed
+**Status:** Shipped (Python only) — `tag agentic-ci fix-vuln <sarif>`; no Go equivalent
 **Priority:** P2
 **Estimated Effort:** M (1-2 weeks)
 **Category:** CI/CD & Agentic Dev Workflows

@@ -1,6 +1,6 @@
 # PRD-054: Local Browser-Based Agent Execution Visualizer (`tag devui`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P3
 **Estimated Effort:** L (2-4 weeks)
 **Category:** Evaluation & Observability

@@ -1,6 +1,6 @@
 # PRD-044: AgentOps Session Observability (`tag config set agentops.api_key`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python)
 **Priority:** P3 — Nice-to-have
 **Estimated Effort:** S (2–3 days)
 **Category:** Observability

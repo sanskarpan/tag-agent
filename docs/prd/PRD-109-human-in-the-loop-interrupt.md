@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Partial — Python `loop start --approval human` plus `loop approve`/`deny` gives a HITL gate; there is no `workflow interrupt`/`Command(resume=)` primitive and no Go equivalent
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Workflow State

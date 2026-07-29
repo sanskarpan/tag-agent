@@ -1,6 +1,6 @@
 # PRD-043: Vector-Based Tool Retrieval (`tag mcp-registry index`)
 
-**Status:** Proposed
+**Status:** Partial — `tool-index index/search/status` ships in both, but retrieval is keyword-based, not vector/embedding-based
 **Priority:** P1
 **Estimated Effort:** M (1 sprint, ~2 weeks)
 **Affects:** `controller.py` (new `cmd_mcp_registry_index`, `cmd_mcp_registry_search`; patch `cmd_mcp_registry`, `cmd_shell`), new `src/tag/tool_retrieval.py`

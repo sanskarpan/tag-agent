@@ -1,6 +1,6 @@
 # PRD-058: GitHub Actions Workflow Scaffold (`tag ci install-action`)
 
-**Status:** Proposed
+**Status:** Shipped (Go + Python) — `agentic-ci install-action` (Python) / `eval-ci scaffold` (Go)
 **Priority:** P2
 **Estimated Effort:** XS (1-2 days)
 **Category:** CI/CD & Agentic Dev Workflows

@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed
+**Status:** Proposed — no `identity` command in either CLI
 **Priority:** P3
 **Estimated Effort:** XL (4-8 weeks)
 **Category:** Multi-Agent Interoperability Protocols
