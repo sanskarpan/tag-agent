@@ -21,13 +21,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/paths"
 	"github.com/tag-agent/tag/internal/permission"
 	"github.com/tag-agent/tag/internal/tool"
+	"github.com/tag-agent/tag/internal/trace"
 )
 
 // claimableStatuses are the pre-execution statuses a job can be drained from.
@@ -76,6 +80,11 @@ type Options struct {
 	// with a reason rather than blocking a queue drain forever. Nil falls back to
 	// the secure default policy (also headless).
 	Guard *permission.Guard
+	// WorkRoot is the parent directory under which each job gets its OWN working
+	// directory (<WorkRoot>/<job-id>), which becomes the tool root for that job.
+	// Empty defaults to <TAG_HOME>/work. Jobs never share a working directory —
+	// see jobWorkDir and #591.
+	WorkRoot string
 	// MaxJobs caps how many jobs are claimed in this Drain (0 = unlimited).
 	MaxJobs int
 	// OnlyJobs, when non-empty, restricts this Drain to the given job ids;
@@ -226,7 +235,7 @@ func drainPass(ctx context.Context, db *sql.DB, opts Options, sum *Summary) (int
 		sum.Claimed++
 		claimedThisPass++
 
-		text, runErr := runJob(ctx, opts, j)
+		text, runErr := runJob(ctx, db, opts, j)
 		if runErr != nil {
 			applied, err := finish(db, j.id, "failed", "", runErr.Error())
 			if err != nil {
@@ -338,18 +347,38 @@ func reclaimStale(ctx context.Context, db *sql.DB) error {
 }
 
 // runJob executes a job's task through the native agent loop.
-func runJob(ctx context.Context, opts Options, j jobRow) (string, error) {
+func runJob(ctx context.Context, db *sql.DB, opts Options, j jobRow) (string, error) {
 	model := opts.Model
 	if opts.ModelForProfile != nil {
 		if m := opts.ModelForProfile(j.profile); m != "" {
 			model = m
 		}
 	}
-	loop := &agent.Loop{Provider: opts.Provider}
+	// #590: worker-executed runs (queue worker / dag run --execute / cron run
+	// --execute) emitted no spans at all. The job id is the trace id, so
+	// `tag trace show <job-id>` resolves that job's spans.
+	rec := trace.NewRecorder(j.id, j.profile)
+	loop := &agent.Loop{Provider: opts.Provider, Tracer: rec}
+	// Telemetry is best-effort: a job's outcome must not depend on it. It runs on
+	// every exit path so a failed job is still traced.
+	defer func() { _ = rec.Save(db) }()
 	if opts.WithTools {
 		reg := agent.NewRegistry()
 		topts := tool.DefaultOptions()
 		topts.Guard = opts.Guard
+		// #591: this used to leave Root at "" — tool.Register then falls back to
+		// os.Getwd(), so EVERY job in a worker shared the worker process's cwd.
+		// The DAG dispatches independent nodes precisely because they are
+		// independent, and independent nodes are the ones most likely to write
+		// the same filename, so a shared root made them clobber each other.
+		// Each job now gets its own root; the traversal/symlink guards in
+		// tool.resolvePath are unchanged and simply apply relative to it.
+		dir, cleanup, derr := jobWorkDir(opts.WorkRoot, j.id)
+		if derr != nil {
+			return "", fmt.Errorf("preparing work dir for job %s: %w", j.id, derr)
+		}
+		defer cleanup()
+		topts.Root = dir
 		tool.Register(reg, topts)
 		loop.Tools = reg
 	}
@@ -362,6 +391,44 @@ func runJob(ctx context.Context, opts Options, j jobRow) (string, error) {
 		return "", err
 	}
 	return res.FinalText, nil
+}
+
+// DefaultWorkRootName is the directory under TAG_HOME that holds per-job working
+// directories when Options.WorkRoot is unset.
+const DefaultWorkRootName = "work"
+
+// jobWorkDir creates the private working directory for one job and returns it
+// with a cleanup func.
+//
+// Behaviour (#591), chosen to be the least surprising of the options:
+//   - the job starts in an EMPTY scratch dir, not a copy or checkout of the
+//     repo. Copying a tree would be surprisingly expensive and would silently
+//     diverge from disk; a checkout is git-worktree isolation, which is
+//     specified separately as PRD-130 and deliberately out of scope here.
+//   - the dir is <WorkRoot>/<job-id>, i.e. stable and derivable from the job id,
+//     so an operator can find a job's artifacts after the fact.
+//   - cleanup removes the dir ONLY if the job left it empty. A job that produced
+//     files keeps them; a job that produced nothing leaves no litter.
+func jobWorkDir(workRoot, jobID string) (string, func(), error) {
+	if workRoot == "" {
+		workRoot = filepath.Join(paths.Home(), DefaultWorkRootName)
+	}
+	// The job id comes from the DB and is normally a uuid, but it must never be
+	// able to steer the path outside WorkRoot.
+	safe := filepath.Base(filepath.Clean("/" + strings.ReplaceAll(jobID, string(os.PathSeparator), "_")))
+	if safe == "." || safe == string(os.PathSeparator) || safe == "" {
+		safe = "job"
+	}
+	dir := filepath.Join(workRoot, safe)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", func() {}, err
+	}
+	return dir, func() {
+		entries, err := os.ReadDir(dir)
+		if err == nil && len(entries) == 0 {
+			_ = os.Remove(dir)
+		}
+	}, nil
 }
 
 // ensureResultColumn self-heals the schema: it adds a `result TEXT` column to

@@ -14,6 +14,7 @@ import (
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/llm"
 	"github.com/tag-agent/tag/internal/tool"
+	"github.com/tag-agent/tag/internal/trace"
 )
 
 // registerRun wires `tag run` — the native agent loop (Track B). It drives a
@@ -63,6 +64,22 @@ func registerRun(root *cobra.Command, app *App) {
 				}
 			}
 			runID := uuid.NewString()[:16]
+			// #590: the loop emitted no spans at all, so `tag trace list`,
+			// `trace show`, `otel-export` and per-span cost were all permanently
+			// empty in Go. The trace id IS the run id, so `tag trace show <run>`
+			// resolves a run's spans directly.
+			rec := trace.NewRecorder(runID, app.profile(profile))
+			loop.Tracer = rec
+			// Persisting the trace is best-effort and must never fail the run, but
+			// it must happen on EVERY exit path (including a provider error) —
+			// an untraced failure is exactly the blind spot #590 describes.
+			defer func() {
+				if db, derr := app.OpenDB(); derr == nil {
+					if serr := rec.Save(db.DB); serr != nil {
+						fmt.Fprintf(os.Stderr, "  warning: recording trace spans: %v\n", serr)
+					}
+				}
+			}()
 			if withTools {
 				reg := agent.NewRegistry()
 				topts := tool.DefaultOptions()
