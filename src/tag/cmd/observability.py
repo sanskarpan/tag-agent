@@ -142,73 +142,289 @@ def _snapshot_trace(conn: sqlite3.Connection, trace_id: str) -> None:
 # cmd_costs — PRD-012
 # ---------------------------------------------------------------------------
 
+def _empty_source_summary(source: str) -> dict:
+    """A zeroed per-source breakdown section (used when a table is absent)."""
+    return {
+        "source": source,
+        "rows": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
+        "includes_estimated_rates": False,
+    }
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set:
+    """Return the column names of *table*, or an empty set if it is absent."""
+    try:
+        return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.Error:
+        return set()
+
+
+def _summarise_source(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    table: str,
+    cost_column: str,
+    profile_column: str,
+    profile_filter: str | None,
+) -> dict:
+    """Aggregate tokens + cost for one population (``runs`` or ``spans``).
+
+    Rows whose stored cost column is NULL *or* 0 but which carry a ``model_id``
+    and token counts are priced through :func:`tag.cost_table.compute_cost`; if
+    such a fallback resolves to an entry flagged ``estimated``, the section's
+    ``includes_estimated_rates`` is set. A missing table or missing columns
+    yields a zeroed, ``rows: 0`` section rather than raising.
+
+    A stored 0 must be treated as "no stored cost", not as a real $0.00: the
+    Go engine bootstraps ``runs.estimated_cost_usd`` as ``NOT NULL DEFAULT 0``
+    while the Python schema leaves it nullable, so the very same unpriced row
+    reads back as 0 on a Go-created database and NULL on a Python-created one.
+    Honouring only NULL here made Python report a confidently-wrong $0.00 for
+    priced traffic and diverge from Go. Do not "simplify" this back to an
+    ``is not None`` check.
+    """
+    summary = _empty_source_summary(source)
+    cols = _table_columns(conn, table)
+    if not cols:
+        return summary
+    if not {"prompt_tokens", "completion_tokens"} <= cols:
+        return summary
+
+    has_cost = cost_column in cols
+    has_model = "model_id" in cols
+    has_total = "total_tokens" in cols
+
+    select_cost = cost_column if has_cost else "NULL"
+    select_model = "model_id" if has_model else "NULL"
+    select_total = "total_tokens" if has_total else "NULL"
+    where = ""
+    params: tuple = ()
+    if profile_filter and profile_column in cols:
+        where = f"WHERE {profile_column} = ?"
+        params = (profile_filter,)
+
+    try:
+        rows = conn.execute(
+            f"SELECT prompt_tokens, completion_tokens, {select_total}, "
+            f"{select_cost}, {select_model} FROM {table} {where}",
+            params,
+        ).fetchall()
+    except sqlite3.Error:
+        return summary
+
+    try:
+        from tag.cost_table import compute_cost, resolve_pricing_entry
+    except Exception:  # noqa: BLE001 - pricing is optional
+        compute_cost = None  # type: ignore[assignment]
+        resolve_pricing_entry = None  # type: ignore[assignment]
+
+    for prompt_tokens, completion_tokens, total_tokens, cost, model_id in rows:
+        prompt_tokens = int(prompt_tokens or 0)
+        completion_tokens = int(completion_tokens or 0)
+        total = int(total_tokens) if total_tokens is not None else prompt_tokens + completion_tokens
+        summary["rows"] += 1
+        summary["prompt_tokens"] += prompt_tokens
+        summary["completion_tokens"] += completion_tokens
+        summary["total_tokens"] += total
+        try:
+            stored = float(cost) if cost is not None else None
+        except (TypeError, ValueError):
+            stored = None
+        if stored:  # non-None and non-zero
+            summary["cost_usd"] += stored
+            continue
+        # Fall back to the pricing table for rows with tokens but no stored cost
+        # (NULL on the Python schema, 0 on the Go NOT NULL DEFAULT 0 schema).
+        if not model_id or compute_cost is None:
+            continue
+        if prompt_tokens == 0 and completion_tokens == 0:
+            continue
+        derived = compute_cost(str(model_id), prompt_tokens, completion_tokens)
+        if derived is None:
+            continue
+        summary["cost_usd"] += float(derived)
+        entry = resolve_pricing_entry(str(model_id)) if resolve_pricing_entry else None
+        if entry is not None and getattr(entry, "estimated", False):
+            summary["includes_estimated_rates"] = True
+
+    return summary
+
+
+def _build_cost_breakdown(
+    conn: sqlite3.Connection | None, profile_filter: str | None
+) -> tuple[dict, dict]:
+    """Return ``(by_source, totals)`` for the runs + spans populations."""
+    if conn is None:
+        runs_summary = _empty_source_summary("runs")
+        spans_summary = _empty_source_summary("spans")
+    else:
+        runs_summary = _summarise_source(
+            conn, source="runs", table="runs", cost_column="estimated_cost_usd",
+            profile_column="master_profile", profile_filter=profile_filter,
+        )
+        spans_summary = _summarise_source(
+            conn, source="spans", table="spans", cost_column="cost_usd",
+            profile_column="profile", profile_filter=profile_filter,
+        )
+
+    by_source = {"runs": runs_summary, "spans": spans_summary}
+    populated = [s["source"] for s in (runs_summary, spans_summary) if s["rows"] > 0]
+    cost = runs_summary["cost_usd"] + spans_summary["cost_usd"]
+    totals = {
+        "prompt_tokens": runs_summary["prompt_tokens"] + spans_summary["prompt_tokens"],
+        "completion_tokens": runs_summary["completion_tokens"] + spans_summary["completion_tokens"],
+        "total_tokens": runs_summary["total_tokens"] + spans_summary["total_tokens"],
+        "cost_usd": cost,
+        # Back-compat alias for consumers predating the dual-source contract.
+        "estimated_cost_usd": cost,
+        "sources": populated,
+        "overlap_warning": len(populated) == 2,
+        "includes_estimated_rates": (
+            runs_summary["includes_estimated_rates"]
+            or spans_summary["includes_estimated_rates"]
+        ),
+    }
+    return by_source, totals
+
+
+def _fetch_run_details(
+    conn: sqlite3.Connection, profile_filter: str | None, limit: int
+) -> list[dict]:
+    """Return the per-run detail rows, tolerating partial ``runs`` schemas.
+
+    The Go-created ``runs`` table has no ``total_tokens`` column; rather than
+    bailing out of the detail listing (which produced an empty ``runs`` array
+    and a misleading "no cost data" sentence on a database that plainly had
+    rows), the total is derived as ``prompt_tokens + completion_tokens`` — the
+    same thing the Go engine reports. Any other missing column selects as NULL
+    so an alien schema degrades to partial rows instead of raising.
+    """
+    cols = _table_columns(conn, "runs")
+    if not cols or "id" not in cols:
+        return []
+
+    def col(name: str) -> str:
+        return name if name in cols else "NULL"
+
+    has_total = "total_tokens" in cols
+    select_total = "total_tokens" if has_total else "NULL"
+    where = ""
+    params: tuple = ()
+    if profile_filter and "master_profile" in cols:
+        where = "WHERE master_profile = ?"
+        params = (profile_filter,)
+    order = "ORDER BY created_at DESC " if "created_at" in cols else ""
+    try:
+        rows = conn.execute(
+            f"SELECT id, {col('master_profile')}, {col('model_id')}, "
+            f"{col('prompt_tokens')}, {col('completion_tokens')}, {select_total}, "
+            f"{col('estimated_cost_usd')}, {col('created_at')} FROM runs "
+            f"{where} {order}LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+
+    out: list[dict] = []
+    for r in rows:
+        prompt_tokens, completion_tokens = r[3], r[4]
+        total = r[5]
+        if total is None:
+            total = int(prompt_tokens or 0) + int(completion_tokens or 0)
+        out.append({
+            "id": r[0], "profile": r[1], "model_id": r[2],
+            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "total_tokens": total, "estimated_cost_usd": r[6], "created_at": r[7],
+        })
+    return out
+
+
+def _print_cost_breakdown(by_source: dict, totals: dict) -> None:
+    """Print the labelled per-source breakdown + TOTAL line."""
+    print()
+    print(f"{'Source':<10} {'Rows':>6} {'Prompt':>10} {'Completion':>12} {'Tokens':>10} {'Cost':>12}")
+    print("-" * 64)
+    for key in ("runs", "spans"):
+        s = by_source[key]
+        marker = "  (includes estimated rates)" if s["includes_estimated_rates"] else ""
+        print(
+            f"{s['source']:<10} {s['rows']:>6} {s['prompt_tokens']:>10} "
+            f"{s['completion_tokens']:>12} {s['total_tokens']:>10} "
+            f"${s['cost_usd']:>11.4f}{marker}"
+        )
+    print("-" * 64)
+    print(
+        f"{'TOTAL':<10} {'':>6} {totals['prompt_tokens']:>10} "
+        f"{totals['completion_tokens']:>12} {totals['total_tokens']:>10} "
+        f"${totals['cost_usd']:>11.4f}"
+    )
+    if totals["overlap_warning"]:
+        print("note: runs and spans are different populations (a run aggregates spans); "
+              "the TOTAL may double-count.")
+    if totals["includes_estimated_rates"]:
+        print("note: total includes estimated rates that are not authoritative "
+              "published prices.")
+
+
 def cmd_costs(args: argparse.Namespace) -> int:
     from tag.controller import load_config, config_path, runtime_db_path
     cfg = load_config(config_path(getattr(args, "config", None)))
     db_path = runtime_db_path(cfg)
+    profile_filter = getattr(args, "profile", None)
     if not db_path.exists():
+        # Emit the full contract shape (zeroed) so a --json consumer can tell
+        # "no data" from "different schema" instead of getting a stub.
+        by_source, totals = _build_cost_breakdown(None, profile_filter)
         if getattr(args, "json", False):
-            print(json.dumps({"runs": [], "totals": {}}))
+            print(json.dumps({"runs": [], "by_source": by_source, "totals": totals}, indent=2))
         else:
             print("No runs database found.")
+            _print_cost_breakdown(by_source, totals)
         return 0
     conn = sqlite3.connect(str(db_path))
     try:
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
-        if "total_tokens" not in cols:
-            # Honour --json here too: this path printed a human sentence even
-            # under --json, so a caller parsing stdout hit a JSONDecodeError
-            # instead of the documented empty result that the missing-database
-            # branch above already emits.
-            if getattr(args, "json", False):
-                print(json.dumps({"runs": [], "totals": {}}))
-            else:
-                print("No cost data recorded yet (run some tasks first).")
-            conn.close()
-            return 0
         limit = getattr(args, "limit", 20)
-        profile_filter = getattr(args, "profile", None)
-        where = "WHERE master_profile = ?" if profile_filter else ""
-        params = (profile_filter,) if profile_filter else ()
-        rows = conn.execute(
-            f"SELECT id, master_profile, model_id, prompt_tokens, completion_tokens, total_tokens, "
-            f"estimated_cost_usd, created_at FROM runs {where} ORDER BY created_at DESC LIMIT ?",
-            (*params, limit),
-        ).fetchall()
-        agg = conn.execute(
-            f"SELECT SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens), "
-            f"SUM(estimated_cost_usd) FROM runs {where}",
-            params,
-        ).fetchone()
+        # A partial `runs` schema (e.g. the Go-created table, which has no
+        # `total_tokens`) no longer short-circuits the detail listing: the rows
+        # exist and must be shown, with the total derived from the token
+        # columns. See _fetch_run_details.
+        run_rows = _fetch_run_details(conn, profile_filter, limit)
+        # `runs` and `spans` are written by different engines (Python fills
+        # spans, Go fills runs), so both populations are reported separately.
+        by_source, totals = _build_cost_breakdown(conn, profile_filter)
     finally:
         conn.close()
 
     if getattr(args, "json", False):
-        out = {
-            "runs": [
-                {"id": r[0], "profile": r[1], "model_id": r[2], "prompt_tokens": r[3],
-                 "completion_tokens": r[4], "total_tokens": r[5],
-                 "estimated_cost_usd": r[6], "created_at": r[7]}
-                for r in rows
-            ],
-            "totals": {
-                "prompt_tokens": agg[0] or 0,
-                "completion_tokens": agg[1] or 0,
-                "total_tokens": agg[2] or 0,
-                "estimated_cost_usd": agg[3] or 0.0,
-            },
-        }
-        print(json.dumps(out, indent=2))
+        print(json.dumps(
+            {"runs": run_rows, "by_source": by_source, "totals": totals}, indent=2
+        ))
+        return 0
+
+    # Only claim "no data" when both populations are genuinely empty — never
+    # above a breakdown that is about to print non-zero rows.
+    if not run_rows and not totals["sources"]:
+        print("No cost data recorded yet (run some tasks first).")
+        _print_cost_breakdown(by_source, totals)
         return 0
 
     print(f"{'Run ID':<24} {'Profile':<20} {'Model':<40} {'Tokens':>8} {'Cost':>10}")
     print("-" * 110)
-    for r in rows:
-        cost = f"${r[6]:.4f}" if r[6] is not None else "n/a"
-        print(f"{r[0]:<24} {(r[1] or ''):<20} {(r[2] or ''):<40} {(r[5] or 0):>8} {cost:>10}")
+    for r in run_rows:
+        # A stored 0 means "not priced" (see _summarise_source), so render it
+        # as n/a rather than printing $0.0000 directly above a breakdown that
+        # reports this same run's derived cost as non-zero.
+        stored = r["estimated_cost_usd"]
+        cost = f"${float(stored):.4f}" if stored else "n/a"
+        print(f"{str(r['id']):<24} {(r['profile'] or ''):<20} "
+              f"{(r['model_id'] or ''):<40} {(r['total_tokens'] or 0):>8} {cost:>10}")
     print("-" * 110)
-    total_cost = f"${agg[3]:.4f}" if agg[3] is not None else "n/a"
-    print(f"{'TOTAL':<85} {(agg[2] or 0):>8} {total_cost:>10}")
+    _print_cost_breakdown(by_source, totals)
     return 0
 
 
