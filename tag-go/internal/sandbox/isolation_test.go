@@ -54,9 +54,31 @@ func netConfined(iso string) bool {
 	return !strings.Contains(iso, "network NOT blocked")
 }
 
+// execRunnable runs Exec and, when the platform refuses purely because it cannot
+// confine the FILESYSTEM (a Linux kernel with no Landlock), retries with the
+// explicit AllowUnconfined opt-in.
+//
+// It exists for the behavioural tests below -- run dir usable, timeouts, process
+// groups -- which are about the runner, not about filesystem confinement, and
+// which would otherwise all collapse into the same fail-closed 127 on a
+// Landlock-less kernel and stop testing anything. The tests that assert
+// confinement itself deliberately do NOT use this; they call Exec directly and
+// check what the isolation string claims.
+func execRunnable(t *testing.T, opts Options) (*Result, error) {
+	t.Helper()
+	res, err := Exec(context.Background(), opts)
+	if err != nil || res.Exit != 127 || res.Isolation != landlockUnavailableIsolation {
+		return res, err
+	}
+	t.Logf("this kernel cannot confine the filesystem (%s); re-running with AllowUnconfined "+
+		"to exercise the runner", res.Stderr)
+	opts.AllowUnconfined = true
+	return Exec(context.Background(), opts)
+}
+
 // TestExecReportsIsolation pins the contract that every run says what it got.
 func TestExecReportsIsolation(t *testing.T) {
-	res, err := Exec(context.Background(), Options{Command: "echo hi", Dir: t.TempDir(), Timeout: 20 * time.Second})
+	res, err := execRunnable(t, Options{Command: "echo hi", Dir: t.TempDir(), Timeout: 20 * time.Second})
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
@@ -78,7 +100,7 @@ func TestExecDeniesNetworkEgress(t *testing.T) {
 	if !hostCanRun(t, probe) {
 		t.Skipf("host itself has no outbound network (probe %q failed unsandboxed); cannot prove denial", probe)
 	}
-	res, err := Exec(context.Background(), Options{Command: probe, Dir: t.TempDir(), Timeout: 25 * time.Second})
+	res, err := execRunnable(t, Options{Command: probe, Dir: t.TempDir(), Timeout: 25 * time.Second})
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
@@ -117,7 +139,7 @@ func TestExecDeniesEtcPasswd(t *testing.T) {
 // read and write files in its own run directory.
 func assertRunDirUsable(t *testing.T, dir string) {
 	t.Helper()
-	res, err := Exec(context.Background(), Options{
+	res, err := execRunnable(t, Options{
 		Command: `echo sentinel-value > out.txt && cat out.txt`,
 		Dir:     dir,
 		Timeout: 20 * time.Second,
@@ -175,7 +197,7 @@ func TestExecRunDirWithHostilePunctuation(t *testing.T) {
 			if err := os.Mkdir(dir, 0o755); err != nil {
 				t.Skipf("filesystem rejects %q: %v", name, err)
 			}
-			res, err := Exec(context.Background(), Options{
+			res, err := execRunnable(t, Options{
 				Command: `echo ok > f.txt && cat f.txt`,
 				Dir:     dir,
 				Timeout: 20 * time.Second,
@@ -189,7 +211,7 @@ func TestExecRunDirWithHostilePunctuation(t *testing.T) {
 				t.Fatalf("run dir %q unusable: exit=%d stdout=%q stderr=%q", name, res.Exit, res.Stdout, res.Stderr)
 			}
 			// The policy must still hold for a hostile path name.
-			probe, err2 := Exec(context.Background(), Options{Command: "cat /etc/passwd", Dir: dir, Timeout: 20 * time.Second})
+			probe, err2 := execRunnable(t, Options{Command: "cat /etc/passwd", Dir: dir, Timeout: 20 * time.Second})
 			if err2 != nil {
 				t.Fatalf("Exec: %v", err2)
 			}
@@ -233,7 +255,7 @@ func TestExecTimeoutKillsProcessGroup(t *testing.T) {
 
 	done := make(chan *Result, 1)
 	go func() {
-		res, err := Exec(context.Background(), Options{Command: script, Dir: dir, Timeout: 1 * time.Second})
+		res, err := execRunnable(t, Options{Command: script, Dir: dir, Timeout: 1 * time.Second})
 		if err != nil {
 			done <- nil
 			return
@@ -266,7 +288,7 @@ func TestExecReapsBackgroundedChildOnCleanExit(t *testing.T) {
 	if _, err := exec.LookPath("pgrep"); err != nil {
 		t.Skip("pgrep not available; cannot check for orphans")
 	}
-	res, err := Exec(context.Background(), Options{
+	res, err := execRunnable(t, Options{
 		Command: "sleep 93 >/dev/null 2>&1 </dev/null & echo started",
 		Dir:     t.TempDir(),
 		Timeout: 20 * time.Second,
@@ -288,7 +310,7 @@ func TestExecReapsBackgroundedChildOnCleanExit(t *testing.T) {
 // process-group change cannot regress it.
 func TestExecTimeoutSimpleCommand(t *testing.T) {
 	start := time.Now()
-	res, err := Exec(context.Background(), Options{Command: "sleep 5", Dir: t.TempDir(), Timeout: 1 * time.Second})
+	res, err := execRunnable(t, Options{Command: "sleep 5", Dir: t.TempDir(), Timeout: 1 * time.Second})
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}

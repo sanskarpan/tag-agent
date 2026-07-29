@@ -3,6 +3,7 @@ package sandbox
 import (
 	"fmt"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -103,6 +104,63 @@ func rlimitClaim(timeout time.Duration, cpuOK, asOK bool) string {
 const procReadDisclosure = "/proc IS readable: the environment (/proc/<pid>/environ) and command line of " +
 	"your other same-uid processes are NOT hidden, so secrets held by another process (e.g. API keys in " +
 	"another `tag` run) can be read from inside the sandbox"
+
+// landlockUnavailableReason renders WHY the Landlock ABI probe
+// (landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)) came back
+// empty-handed, from the errno the kernel actually returned.
+//
+// This matters for diagnosis, and the previous single hard-coded string ("kernel
+// < 5.13 or LSM disabled") got it wrong in the most common case: Docker
+// Desktop's 6.10 linuxkit kernel returns ENOSYS because Landlock is not compiled
+// in at all -- a 6.10 kernel is not "< 5.13", and no boot parameter will fix it.
+// The two errnos point at completely different remedies (rebuild/replace the
+// kernel vs. change `lsm=`), so they must not share a message. Anything else is
+// reported verbatim rather than guessed at.
+func landlockUnavailableReason(errno syscall.Errno) string {
+	switch errno {
+	case syscall.ENOSYS:
+		return "the landlock_create_ruleset syscall does not exist on this kernel (ENOSYS), " +
+			"i.e. Landlock is not compiled in (CONFIG_SECURITY_LANDLOCK) -- this can be true of ANY " +
+			"kernel version, however new, and is the case for Docker Desktop's linuxkit kernel; " +
+			"upgrading the kernel version alone will not fix it"
+	case syscall.EOPNOTSUPP:
+		return "Landlock is compiled into this kernel but disabled (EOPNOTSUPP): add `landlock` to " +
+			"CONFIG_LSM or to the kernel's `lsm=` boot parameter to enable it"
+	case 0:
+		return "the Landlock ABI probe reported no supported version"
+	default:
+		return fmt.Sprintf("the Landlock ABI probe failed with errno %d (%v)", int(errno), errno)
+	}
+}
+
+// landlockUnavailableMsg is the fail-closed error for a Linux kernel that cannot
+// give us filesystem confinement. It deliberately mirrors the structure of
+// darwin's sandboxExecMissingMsg -- what is missing, that the command was NOT
+// run, and `--backend docker` as the isolated alternative -- plus the loudly
+// named opt-in that has no macOS counterpart.
+func landlockUnavailableMsg(reason string) string {
+	return "sandbox: cannot confine the filesystem on this kernel: " + reason + ". " +
+		"Running would give you NO filesystem isolation, so the command was NOT run. " +
+		"Use --backend docker for isolated execution, or pass --allow-unconfined to run " +
+		"anyway with only rlimits and a network namespace (filesystem NOT confined)."
+}
+
+// landlockUnavailableIsolation is Result.Isolation for that refusal: no layer was
+// applied at all, in the same "none (failed closed: ...)" shape used for a
+// missing sandbox-exec and a too-broad run dir.
+const landlockUnavailableIsolation = "none (failed closed: Landlock unavailable, so the filesystem " +
+	"could not be confined and the command was NOT run)"
+
+// landlockUnconfinedClaim is the filesystem half of Result.Isolation for a run
+// the user explicitly opted into with --allow-unconfined. There is no
+// filesystem boundary at all, so it says exactly that, first, before naming the
+// reason -- a reader skimming the isolation line must not have to reach the
+// parenthetical to learn that nothing is confined.
+func landlockUnconfinedClaim(reason string) string {
+	return "filesystem NOT confined: every file this user can read or write on the HOST is readable " +
+		"and writable from inside the sandbox (" + reason + "; running anyway because --allow-unconfined " +
+		"was passed)"
+}
 
 // landlockFailClosedIsolation is Result.Isolation for a run whose Landlock
 // helper could not install the policy it was given (helperExitPolicy).

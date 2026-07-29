@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -24,24 +25,30 @@ func TestBuildIsolationRejectsBroadRunDirs(t *testing.T) {
 	if home != "" {
 		dirs = append(dirs, home)
 	}
-	for _, dir := range dirs {
-		plan, failClosed, err := buildIsolation(dir, 10*time.Second)
-		if err != nil {
-			t.Fatalf("buildIsolation(%q): unexpected error %v", dir, err)
-		}
-		if failClosed == nil || plan != nil {
-			t.Fatalf("buildIsolation(%q) produced a plan; a boundary run dir must fail closed", dir)
-		}
-		if failClosed.Exit != 127 {
-			t.Fatalf("buildIsolation(%q) exit = %d, want 127", dir, failClosed.Exit)
-		}
-		if !strings.Contains(failClosed.Stderr, "--backend docker") {
-			t.Fatalf("buildIsolation(%q) stderr should name the escape hatch, got %q", dir, failClosed.Stderr)
-		}
-		if !strings.Contains(failClosed.Isolation, "none (failed closed") ||
-			!strings.Contains(failClosed.Isolation, "run directory too broad") {
-			t.Fatalf("buildIsolation(%q) isolation = %q; it must admit that no layer was applied",
-				dir, failClosed.Isolation)
+	// Both opt-in states are checked: --allow-unconfined waives FILESYSTEM
+	// confinement only, and must never be mistakable for a waiver of the run-dir
+	// boundary check -- `--dir /` stays refused even with it.
+	for _, allowUnconfined := range []bool{false, true} {
+		for _, dir := range dirs {
+			plan, failClosed, err := buildIsolation(dir, 10*time.Second, allowUnconfined)
+			if err != nil {
+				t.Fatalf("buildIsolation(%q, allowUnconfined=%v): unexpected error %v", dir, allowUnconfined, err)
+			}
+			if failClosed == nil || plan != nil {
+				t.Fatalf("buildIsolation(%q, allowUnconfined=%v) produced a plan; a boundary run dir must fail closed",
+					dir, allowUnconfined)
+			}
+			if failClosed.Exit != 127 {
+				t.Fatalf("buildIsolation(%q) exit = %d, want 127", dir, failClosed.Exit)
+			}
+			if !strings.Contains(failClosed.Stderr, "--backend docker") {
+				t.Fatalf("buildIsolation(%q) stderr should name the escape hatch, got %q", dir, failClosed.Stderr)
+			}
+			if !strings.Contains(failClosed.Isolation, "none (failed closed") ||
+				!strings.Contains(failClosed.Isolation, "run directory too broad") {
+				t.Fatalf("buildIsolation(%q) isolation = %q; it must admit that no layer was applied",
+					dir, failClosed.Isolation)
+			}
 		}
 	}
 }
@@ -49,7 +56,7 @@ func TestBuildIsolationRejectsBroadRunDirs(t *testing.T) {
 // TestBuildIsolationAcceptsScratchDir: a normal scratch dir still produces a
 // real plan that reports what it got.
 func TestBuildIsolationAcceptsScratchDir(t *testing.T) {
-	plan, failClosed, err := buildIsolation(t.TempDir(), 10*time.Second)
+	plan, failClosed, err := buildIsolation(t.TempDir(), 10*time.Second, true)
 	if err != nil {
 		t.Fatalf("buildIsolation: %v", err)
 	}
@@ -145,7 +152,7 @@ func TestLandlockClaimDisclosesProcExposure(t *testing.T) {
 	if !grantsProcRead(rules) {
 		t.Skip("/proc is no longer granted; the disclosure requirement is moot")
 	}
-	plan, failClosed, err := buildIsolation(runDir, 10*time.Second)
+	plan, failClosed, err := buildIsolation(runDir, 10*time.Second, true)
 	if err != nil || failClosed != nil {
 		t.Fatalf("buildIsolation: err=%v failClosed=%+v", err, failClosed)
 	}
@@ -169,7 +176,7 @@ func TestLandlockClaimDisclosesProcExposure(t *testing.T) {
 // falls back to Alt and this is the only thing standing between the user and a
 // description of a ruleset that does not exist.
 func TestBuildIsolationCarriesTheFailClosedContract(t *testing.T) {
-	plan, failClosed, err := buildIsolation(t.TempDir(), 10*time.Second)
+	plan, failClosed, err := buildIsolation(t.TempDir(), 10*time.Second, true)
 	if err != nil || failClosed != nil {
 		t.Fatalf("buildIsolation: err=%v failClosed=%+v", err, failClosed)
 	}
@@ -271,7 +278,7 @@ func TestPolicyEncodeRoundTripsRequired(t *testing.T) {
 // observed to do, never the unconditional "applied" string.
 func TestRlimitClaimMatchesThisShell(t *testing.T) {
 	const timeout = 10 * time.Second
-	plan, failClosed, err := buildIsolation(t.TempDir(), timeout)
+	plan, failClosed, err := buildIsolation(t.TempDir(), timeout, true)
 	if err != nil || failClosed != nil {
 		t.Fatalf("buildIsolation: err=%v failClosed=%+v", err, failClosed)
 	}
@@ -334,5 +341,152 @@ func TestExecReportsAFailClosedIsolationWhenTheHelperCannotInstall(t *testing.T)
 	}
 	if res.Isolation != landlockFailClosedIsolation {
 		t.Fatalf("isolation = %q, want the fail-closed string %q", res.Isolation, landlockFailClosedIsolation)
+	}
+}
+
+// --- Landlock availability: fail closed, or actually confine -------------------
+//
+// The two tests below are deliberately written so that EVERY kernel asserts
+// something. A Landlock-less kernel (Docker Desktop's linuxkit, most container
+// runtimes) must refuse to run; a kernel with Landlock (GitHub's ubuntu-latest
+// runners) must genuinely deny /etc/shadow while keeping the run dir writable.
+// Skipping either branch would be exactly the vacuous pass that let `sandbox
+// run "cat /etc/shadow"` print the file for a whole release.
+
+// TestBuildIsolationFailsClosedWithoutLandlock is DEFECT 1 at the unit level: no
+// Landlock and no opt-in means no plan, exit 127, and a message that names both
+// the docker alternative and the opt-in flag. With the opt-in, a plan appears
+// and its claim must say the filesystem is NOT confined.
+func TestBuildIsolationFailsClosedWithoutLandlock(t *testing.T) {
+	abi, errno := landlockABI()
+	dir := t.TempDir()
+
+	plan, failClosed, err := buildIsolation(dir, 10*time.Second, false)
+	if err != nil {
+		t.Fatalf("buildIsolation: %v", err)
+	}
+	if abi >= 1 {
+		// Landlock IS available: the default must produce a real, confining plan.
+		if failClosed != nil || plan == nil {
+			t.Fatalf("Landlock ABI v%d is available but the default run failed closed: %+v", abi, failClosed)
+		}
+		if !strings.Contains(plan.Isolation, "Landlock ABI") {
+			t.Fatalf("plan does not claim the Landlock policy it installs: %q", plan.Isolation)
+		}
+		if strings.Contains(plan.Isolation, "filesystem NOT confined") {
+			t.Fatalf("plan claims no filesystem confinement on a Landlock ABI v%d kernel: %q", abi, plan.Isolation)
+		}
+		return
+	}
+
+	// No Landlock: fail closed by default.
+	if failClosed == nil || plan != nil {
+		t.Fatalf("no Landlock (errno %v) yet buildIsolation produced a plan: the command would run with "+
+			"NO filesystem confinement", errno)
+	}
+	if failClosed.Exit != 127 {
+		t.Fatalf("fail-closed exit = %d, want 127", failClosed.Exit)
+	}
+	for _, want := range []string{"Landlock", "--backend docker", "--allow-unconfined", "was NOT run"} {
+		if !strings.Contains(failClosed.Stderr, want) {
+			t.Fatalf("fail-closed message must mention %q, got %q", want, failClosed.Stderr)
+		}
+	}
+	if failClosed.Isolation != landlockUnavailableIsolation {
+		t.Fatalf("isolation = %q, want %q", failClosed.Isolation, landlockUnavailableIsolation)
+	}
+
+	// The opt-in runs, and says exactly what the user gave up.
+	plan, failClosed, err = buildIsolation(dir, 10*time.Second, true)
+	if err != nil || failClosed != nil {
+		t.Fatalf("--allow-unconfined still refused: err=%v failClosed=%+v", err, failClosed)
+	}
+	if !strings.Contains(plan.Isolation, "filesystem NOT confined") {
+		t.Fatalf("the opt-in plan must state that the filesystem is NOT confined: %q", plan.Isolation)
+	}
+	if strings.Contains(plan.Isolation, "Landlock ABI") {
+		t.Fatalf("the opt-in plan claims a Landlock policy it never installed: %q", plan.Isolation)
+	}
+	// The network layer genuinely works without Landlock and must survive.
+	if !strings.Contains(plan.Isolation, "network namespace") {
+		t.Fatalf("the opt-in plan dropped the network namespace layer: %q", plan.Isolation)
+	}
+	// DEFECT 2: the reason must reflect the real errno, not a canned kernel range.
+	if !strings.Contains(plan.Isolation, landlockUnavailableReason(errno)) {
+		t.Fatalf("the opt-in plan does not carry the probed reason %q: %q",
+			landlockUnavailableReason(errno), plan.Isolation)
+	}
+	if errno == syscall.ENOSYS && strings.Contains(plan.Isolation, "5.13") {
+		t.Fatalf("ENOSYS reported as a kernel-version problem; it is a not-compiled-in problem: %q", plan.Isolation)
+	}
+}
+
+// TestExecConfinesFilesystemOrFailsClosed is the end-to-end half, and the one
+// that would have caught the live bug: `sandbox run "cat /etc/shadow"` in a
+// perfectly ordinary scratch dir.
+//
+//   - Landlock available  -> the run dir is writable AND /etc/shadow is NOT
+//     readable (this is the allow-list path, exercised for real).
+//   - Landlock absent     -> the command does not run at all (exit 127), and the
+//     opt-in run does execute while reporting no filesystem confinement.
+func TestExecConfinesFilesystemOrFailsClosed(t *testing.T) {
+	abi, _ := landlockABI()
+	dir := t.TempDir()
+
+	res, err := Exec(context.Background(), Options{
+		Command: "cat /etc/shadow", Dir: dir, Timeout: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+
+	if abi >= 1 {
+		if res.Exit == 0 {
+			t.Fatalf("/etc/shadow was READ inside the sandbox on a Landlock ABI v%d kernel: stdout=%q isolation=%q",
+				abi, res.Stdout, res.Isolation)
+		}
+		if strings.Contains(res.Stdout, ":") && strings.Contains(res.Stdout, "root") {
+			t.Fatalf("/etc/shadow contents leaked: %q", res.Stdout)
+		}
+		if !strings.Contains(res.Isolation, "Landlock ABI") {
+			t.Fatalf("isolation does not report the Landlock policy: %q", res.Isolation)
+		}
+		// The confinement must not have cost us our own working directory.
+		w, err := Exec(context.Background(), Options{
+			Command: "echo confined > out.txt && cat out.txt", Dir: dir, Timeout: 20 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("Exec: %v", err)
+		}
+		if w.Exit != 0 || strings.TrimSpace(w.Stdout) != "confined" {
+			t.Fatalf("the run dir is not writable under Landlock ABI v%d: exit=%d stdout=%q stderr=%q",
+				abi, w.Exit, w.Stdout, w.Stderr)
+		}
+		return
+	}
+
+	// No Landlock: the command must not have run.
+	if res.Exit != 127 || res.Isolation != landlockUnavailableIsolation {
+		t.Fatalf("no Landlock, yet the run was not refused: exit=%d isolation=%q stdout=%q",
+			res.Exit, res.Isolation, res.Stdout)
+	}
+	if res.Stdout != "" {
+		t.Fatalf("a refused run produced stdout: %q", res.Stdout)
+	}
+
+	// The opt-in must actually run the command, and say the filesystem is open.
+	opt, err := Exec(context.Background(), Options{
+		Command: "echo unconfined > out.txt && cat out.txt", Dir: dir,
+		Timeout: 20 * time.Second, AllowUnconfined: true,
+	})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if opt.Exit != 0 || strings.TrimSpace(opt.Stdout) != "unconfined" {
+		t.Fatalf("--allow-unconfined did not run the command: exit=%d stdout=%q stderr=%q",
+			opt.Exit, opt.Stdout, opt.Stderr)
+	}
+	if !strings.Contains(opt.Isolation, "filesystem NOT confined") {
+		t.Fatalf("the opt-in run hides that the filesystem was open: %q", opt.Isolation)
 	}
 }

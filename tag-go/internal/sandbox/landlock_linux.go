@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -74,14 +75,21 @@ type llPathBeneath struct {
 	_             int32
 }
 
-// landlockABI returns the kernel's supported Landlock ABI version, or 0 when
-// Landlock is unavailable (kernel < 5.13, or the LSM is not enabled).
-func landlockABI() int {
+// landlockABI returns the kernel's supported Landlock ABI version, plus the
+// errno the probe failed with when that version is 0.
+//
+// The errno is returned rather than swallowed because it is the only thing that
+// distinguishes "Landlock is not in this kernel at all" (ENOSYS -- true of
+// Docker Desktop's 6.10 linuxkit kernel, and of any kernel built without
+// CONFIG_SECURITY_LANDLOCK) from "it is there but switched off" (EOPNOTSUPP --
+// fixable with the `lsm=` boot parameter). Reporting the wrong one sends a user
+// after the wrong remedy; see landlockUnavailableReason.
+func landlockABI() (int, syscall.Errno) {
 	r, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, 0, 0, unix.LANDLOCK_CREATE_RULESET_VERSION)
 	if errno != 0 {
-		return 0
+		return 0, errno
 	}
-	return int(r)
+	return int(r), 0
 }
 
 // llHandledFS is the set of access rights the ruleset governs for a given ABI.
