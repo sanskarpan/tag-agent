@@ -45,3 +45,144 @@ jobs:
       - name: Smoke-test npm launcher version
         run: node bin/tag.js --version
 
+  # The Linux sandbox had NEVER been executed by CI: internal/sandbox's
+  # linux-tagged tests only ever got compile-checked from a macOS dev box, and
+  # the consequence shipped -- `sandbox run "cat /etc/shadow"` printed the file
+  # on any kernel without Landlock. This job runs them for real, and asserts the
+  # end-to-end behaviour on whichever kind of kernel the runner has.
+  go-linux-sandbox:
+    name: Go sandbox (linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: tag-go/go.sum
+
+      - name: gofmt
+        working-directory: tag-go
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would rewrite:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        working-directory: tag-go
+        run: go vet ./...
+
+      # The whole package, race-enabled: this is the first time the //go:build
+      # linux tests (Landlock policy encoding, the re-exec helper, the run-dir
+      # boundary tables, the fail-closed contract) have ever actually run.
+      - name: go test ./internal/sandbox/ -race
+        working-directory: tag-go
+        run: go test ./internal/sandbox/ -race -count=1 -v
+
+      - name: Build the CLI
+        working-directory: tag-go
+        run: go build -o /tmp/tagl ./cmd/tag
+
+      # E2E 1: a run dir at or above a boundary must be refused outright. The
+      # run dir is the sandbox's only writable tree, so `--dir /` would hand back
+      # the whole filesystem. --allow-unconfined waives FILESYSTEM confinement
+      # only and must not waive this.
+      - name: E2E - a broad run dir is refused with exit 127
+        run: |
+          set +e
+          fail=0
+          for flags in "" "--allow-unconfined"; do
+            for d in / /root /etc; do
+              /tmp/tagl sandbox run $flags --dir "$d" "echo LEAKED" >/tmp/out 2>/tmp/err
+              rc=$?
+              echo "--- dir=$d flags='$flags' exit=$rc"
+              if [ "$rc" -ne 127 ]; then
+                echo "FAIL: --dir $d exited $rc, want 127"; cat /tmp/out /tmp/err; fail=1
+              fi
+              if grep -q LEAKED /tmp/out; then
+                echo "FAIL: the command RAN with --dir $d"; fail=1
+              fi
+              if ! grep -q -- "--backend docker" /tmp/err; then
+                echo "FAIL: the refusal does not name --backend docker"; cat /tmp/err; fail=1
+              fi
+            done
+          done
+          exit $fail
+
+      # E2E 2: the defect this job exists for. Whether or not the runner's kernel
+      # has Landlock, ONE of the two branches below must hold -- there is no
+      # "skip" path, because a vacuous pass is how the original bug survived.
+      # GitHub's ubuntu-latest images normally do have Landlock, so this is
+      # expected to exercise the real allow-list.
+      - name: E2E - filesystem is confined, or the run fails closed
+        run: |
+          set +e
+          mkdir -p /tmp/sbx
+          fail=0
+
+          /tmp/tagl sandbox run --dir /tmp/sbx "cat /etc/shadow" >/tmp/out 2>/tmp/err
+          rc=$?
+          echo "exit=$rc"; echo "--- stdout"; cat /tmp/out; echo "--- stderr"; cat /tmp/err
+
+          if grep -q "Landlock ABI" /tmp/out; then
+            echo "== branch: this kernel HAS Landlock; the allow-list must hold =="
+            if [ "$rc" -eq 0 ]; then
+              echo "FAIL: /etc/shadow was readable inside the sandbox"; fail=1
+            fi
+            if grep -qE '^[a-z_]+:[^ ]*:[0-9]+:' /tmp/out; then
+              echo "FAIL: /etc/shadow contents leaked to stdout"; fail=1
+            fi
+            # /etc/shadow is unreadable to a non-root user anyway, so it cannot
+            # prove the allow-list on its own. /etc/passwd CAN be read by this
+            # user on the host and is deliberately NOT in the allow-list, so it
+            # is the assertion that actually distinguishes Landlock from nothing.
+            cat /etc/passwd >/dev/null 2>&1 || { echo "host cannot read /etc/passwd"; fail=1; }
+            /tmp/tagl sandbox run --dir /tmp/sbx "cat /etc/passwd" >/tmp/outp 2>/tmp/errp
+            rcp=$?
+            echo "sandboxed /etc/passwd exit=$rcp"; cat /tmp/outp
+            if [ "$rcp" -eq 0 ] || grep -q "^root:" /tmp/outp; then
+              echo "FAIL: /etc/passwd is readable inside the sandbox despite a Landlock policy"; fail=1
+            fi
+            # Confinement must not have cost the run its own working directory.
+            /tmp/tagl sandbox run --dir /tmp/sbx "echo sentinel > out.txt && cat out.txt" >/tmp/out2 2>/tmp/err2
+            rc2=$?
+            echo "run-dir write exit=$rc2"; cat /tmp/out2 /tmp/err2
+            if [ "$rc2" -ne 0 ]; then
+              echo "FAIL: the run dir is not usable under Landlock"; fail=1
+            fi
+            if ! grep -q sentinel /tmp/out2 || [ ! -s /tmp/sbx/out.txt ]; then
+              echo "FAIL: the file written inside the sandbox is missing on the host"; fail=1
+            fi
+          elif grep -q "Landlock unavailable" /tmp/out; then
+            echo "== branch: this kernel has NO Landlock; the run must fail closed =="
+            if [ "$rc" -ne 127 ]; then
+              echo "FAIL: exit $rc, want 127"; fail=1
+            fi
+            if [ -s /tmp/sbx/out.txt ] || grep -qE '^[a-z_]+:[^ ]*:[0-9]+:' /tmp/out; then
+              echo "FAIL: the command ran despite the refusal"; fail=1
+            fi
+            grep -q -- "--backend docker" /tmp/err || {
+              echo "FAIL: the refusal does not name --backend docker"; fail=1; }
+            grep -q -- "--allow-unconfined" /tmp/err || {
+              echo "FAIL: the refusal does not name the --allow-unconfined opt-in"; fail=1; }
+            # The documented opt-in must work, and must admit what it gave up.
+            /tmp/tagl sandbox run --allow-unconfined --dir /tmp/sbx "echo sentinel > out.txt && cat out.txt" >/tmp/out2 2>&1
+            rc2=$?
+            echo "opt-in exit=$rc2"; cat /tmp/out2
+            if [ "$rc2" -ne 0 ] || ! grep -q sentinel /tmp/out2; then
+              echo "FAIL: --allow-unconfined did not run the command"; fail=1
+            fi
+            if ! grep -q "filesystem NOT confined" /tmp/out2; then
+              echo "FAIL: the opt-in run does not report that the filesystem was NOT confined"; fail=1
+            fi
+          else
+            echo "FAIL: the isolation line reported neither a Landlock policy nor its absence;"
+            echo "refusing to pass vacuously."
+            fail=1
+          fi
+          exit $fail
+

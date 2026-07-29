@@ -493,6 +493,14 @@ than executed unconfined.
   write; the run dir read/write; `/usr`, `/bin`, `/sbin`, `/System`, `/Library`
   read-only.
 - **Linux** — a Landlock filesystem allow-list plus rlimits (`RLIMIT_CPU`, `RLIMIT_AS`).
+  **A kernel with no Landlock fails closed** (exit 127, the command is *not* run) — that
+  includes Docker Desktop's linuxkit kernel and any kernel built without
+  `CONFIG_SECURITY_LANDLOCK`, regardless of version. The error names the real reason
+  (`ENOSYS` = not compiled in, `EOPNOTSUPP` = compiled but disabled via `lsm=`) so you
+  know whether to change kernels or change a boot parameter. Use `--backend docker`, or
+  accept the loss explicitly with `--allow-unconfined`, which runs with rlimits and a
+  network namespace but **no filesystem confinement at all** and says exactly that in the
+  reported isolation string.
   Honest caveat: **network is blocked only when the kernel permits it** (an unprivileged
   user namespace, or Landlock ABI ≥ 4). When it can't be blocked, that is *stated in the
   reported isolation string* rather than silently assumed.

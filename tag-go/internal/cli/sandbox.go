@@ -58,6 +58,7 @@ func registerSandbox(root *cobra.Command, app *App) {
 	var memory string
 	var cpus string
 	var network string
+	var allowUnconfined bool
 	run := &cobra.Command{Use: "run <command>", Short: "Execute a command in the sandbox (restricted or docker backend)", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			timeout := time.Duration(timeoutSec) * time.Second
@@ -66,9 +67,10 @@ func registerSandbox(root *cobra.Command, app *App) {
 			switch backend {
 			case "", "restricted":
 				res, err = sandbox.Exec(context.Background(), sandbox.Options{
-					Command: args[0],
-					Dir:     dir,
-					Timeout: timeout,
+					Command:         args[0],
+					Dir:             dir,
+					Timeout:         timeout,
+					AllowUnconfined: allowUnconfined,
 				})
 			case "docker":
 				res, err = sandbox.ExecDocker(context.Background(), sandbox.DockerOptions{
@@ -119,8 +121,14 @@ func registerSandbox(root *cobra.Command, app *App) {
 	run.Flags().StringVar(&backend, "backend", "restricted",
 		"sandbox backend: 'restricted' (macOS: sandbox-exec profile - no network, no /etc or $HOME reads, "+
 			"run dir writable; Linux: Landlock filesystem allow-list + rlimits, network blocked only when the "+
-			"kernel allows a user namespace or Landlock ABI>=4 - see the reported 'isolation' line; other OSes: "+
+			"kernel allows a user namespace or Landlock ABI>=4 - see the reported 'isolation' line; a kernel "+
+			"without Landlock fails closed unless --allow-unconfined; other OSes: "+
 			"unsupported, fails closed) or 'docker'")
+	run.Flags().BoolVar(&allowUnconfined, "allow-unconfined", false,
+		"DANGEROUS (Linux only): run even when the kernel cannot confine the filesystem (no Landlock). "+
+			"You get rlimits and a network namespace but NO filesystem isolation - every file you can read "+
+			"or write on the host is reachable from inside. Without this flag such a kernel fails closed "+
+			"with exit 127; prefer --backend docker")
 	run.Flags().StringVar(&image, "image", "", "container image (required for --backend docker)")
 	run.Flags().StringVar(&memory, "memory", sandbox.DefaultDockerMemory, "docker memory limit (docker backend)")
 	run.Flags().StringVar(&cpus, "cpus", sandbox.DefaultDockerCPUs, "docker CPU limit (docker backend)")

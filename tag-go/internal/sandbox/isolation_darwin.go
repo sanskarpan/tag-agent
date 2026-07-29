@@ -157,7 +157,13 @@ func sbplProfile(runDir, home string) (string, []string, error) {
 // buildIsolation wraps the command in sandbox-exec. If sandbox-exec is not on
 // PATH, or the run dir is too broad to confine, the run fails closed with exit
 // 127 rather than executing unconfined.
-func buildIsolation(runDir string, _ time.Duration) (*isolationPlan, *Result, error) {
+//
+// The allowUnconfined opt-in is ignored here on purpose. It exists for Linux
+// kernels that cannot provide Landlock; macOS either has sandbox-exec (in which
+// case the filesystem IS confined) or it does not (in which case there is no
+// partial confinement to opt into -- nothing at all would be applied), so
+// honouring the flag would only widen the fail-closed path for no benefit.
+func buildIsolation(runDir string, _ time.Duration, _ bool) (*isolationPlan, *Result, error) {
 	se, err := exec.LookPath("sandbox-exec")
 	if err != nil {
 		return nil, &Result{

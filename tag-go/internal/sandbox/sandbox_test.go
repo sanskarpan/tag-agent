@@ -8,7 +8,7 @@ import (
 )
 
 func TestExecEcho(t *testing.T) {
-	res, err := Exec(context.Background(), Options{Command: "echo hello-sandbox", Timeout: 5 * time.Second})
+	res, err := execRunnable(t, Options{Command: "echo hello-sandbox", Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
@@ -21,7 +21,7 @@ func TestExecEcho(t *testing.T) {
 }
 
 func TestExecNonzeroExit(t *testing.T) {
-	res, err := Exec(context.Background(), Options{Command: "exit 3", Timeout: 5 * time.Second})
+	res, err := execRunnable(t, Options{Command: "exit 3", Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
@@ -31,7 +31,7 @@ func TestExecNonzeroExit(t *testing.T) {
 }
 
 func TestExecTimeout(t *testing.T) {
-	res, err := Exec(context.Background(), Options{Command: "sleep 5", Timeout: 200 * time.Millisecond})
+	res, err := execRunnable(t, Options{Command: "sleep 5", Timeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestExecTimeout(t *testing.T) {
 }
 
 func TestExecStderrCapture(t *testing.T) {
-	res, err := Exec(context.Background(), Options{Command: "echo oops 1>&2", Timeout: 5 * time.Second})
+	res, err := execRunnable(t, Options{Command: "echo oops 1>&2", Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestExecStderrCapture(t *testing.T) {
 
 func TestExecConfinedDir(t *testing.T) {
 	dir := t.TempDir()
-	res, err := Exec(context.Background(), Options{Command: "pwd", Dir: dir, Timeout: 5 * time.Second})
+	res, err := execRunnable(t, Options{Command: "pwd", Dir: dir, Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}

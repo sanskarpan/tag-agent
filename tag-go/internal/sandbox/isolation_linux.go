@@ -139,7 +139,16 @@ func grantsProcRead(rules []llRule) bool {
 
 // buildIsolation assembles the strongest plan this kernel supports, with a
 // weaker Alt used only if the kernel refuses to start the strong one.
-func buildIsolation(runDir string, timeout time.Duration) (*isolationPlan, *Result, error) {
+//
+// allowUnconfined is the caller's explicit acceptance of a run with NO
+// filesystem confinement. Without it, a kernel that cannot give us Landlock
+// FAILS CLOSED (exit 127, command never runs), exactly as macOS does when
+// sandbox-exec is missing. This is a deliberate behaviour change: the previous
+// version degraded instead, so `sandbox run --dir /tmp/w "cat /etc/shadow"`
+// printed the shadow file with exit 0 on any Landlock-less kernel -- honestly
+// labelled, but a command named `sandbox` must not run with zero filesystem
+// isolation unless the user asked for that in so many words.
+func buildIsolation(runDir string, timeout time.Duration, allowUnconfined bool) (*isolationPlan, *Result, error) {
 	// A run dir at or above a sensitive boundary is refused before any layer is
 	// assembled, exactly as on macOS: the Landlock allow-list would otherwise
 	// make that entire tree the sandbox's writable area. The check is
@@ -161,17 +170,33 @@ func buildIsolation(runDir string, timeout time.Duration) (*isolationPlan, *Resu
 	}
 
 	prologue := rlimitPrologue(timeout)
-	abi := landlockABI()
+	abi, abiErrno := landlockABI()
 
 	var prefix []string
 	var extraEnv []string
-	fsClaim := "filesystem NOT confined (Landlock unavailable: kernel < 5.13 or LSM disabled)"
+	var fsClaim string
 	netClaimLandlock := ""
 	// Set only when a helper is in the argv: only then can the run fail closed
 	// AFTER Start() succeeded, and only then is the fail-closed string right.
 	failExit := 0
 	failMarker := ""
 	failIsolation := ""
+
+	if abi < 1 {
+		// No Landlock: there is no filesystem boundary to be had on this kernel.
+		// The rlimit and network-namespace layers still work, but they protect
+		// nothing about the filesystem, so this is a fail-closed refusal unless
+		// the user opted in.
+		reason := landlockUnavailableReason(abiErrno)
+		if !allowUnconfined {
+			return nil, &Result{
+				Exit:      127,
+				Stderr:    landlockUnavailableMsg(reason),
+				Isolation: landlockUnavailableIsolation,
+			}, nil
+		}
+		fsClaim = landlockUnconfinedClaim(reason)
+	}
 
 	if abi >= 1 {
 		self, err := os.Executable()

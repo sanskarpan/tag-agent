@@ -29,11 +29,18 @@
 //     environ/cmdline is visible from inside the sandbox. The run dir is the
 //     ONLY writable tree, so -- exactly as on macOS -- a run directory at or
 //     above a boundary (`/`, `/home`, `/root`, `/etc`, `$HOME`, ...) is refused
-//     with exit 127 instead of granting write over that tree. Layers that the
-//     running kernel cannot provide are DEGRADED, never faked -- the reduced
-//     guarantee is spelled out in Result.Isolation, and a Landlock policy that
-//     fails to install (including a run dir that cannot be opened) fails closed
-//     with exit 126 and an Isolation string that claims nothing.
+//     with exit 127 instead of granting write over that tree. A kernel with NO
+//     Landlock at all (not compiled in -- Docker Desktop's linuxkit kernel, for
+//     one -- or disabled via `lsm=`) FAILS CLOSED with exit 127 exactly like a
+//     missing sandbox-exec on macOS: rlimits and a network namespace do not
+//     confine the filesystem, so the command is not run unless the caller passes
+//     AllowUnconfined (`--allow-unconfined`), in which case Result.Isolation
+//     states plainly that the filesystem was NOT confined. The remaining layers
+//     that a kernel merely cannot provide (e.g. no user namespace, so no netns)
+//     are DEGRADED, never faked -- the reduced guarantee is spelled out in
+//     Result.Isolation -- and a Landlock policy that fails to install (including
+//     a run dir that cannot be opened) fails closed with exit 126 and an
+//     Isolation string that claims nothing.
 //   - everything else: FAILS CLOSED, pointing at `--backend docker`.
 //
 // The path-confinement idea (EvalSymlinks guard) is reused from internal/tool so
@@ -61,6 +68,12 @@ type Options struct {
 	Dir string
 	// Timeout caps runtime. Non-positive is rejected (mirrors Python).
 	Timeout time.Duration
+	// AllowUnconfined lets the run proceed on a Linux kernel that cannot provide
+	// Landlock, i.e. with rlimits and a network namespace but NO filesystem
+	// confinement at all. Default (false) fails closed with exit 127 instead of
+	// running. It has no effect on macOS or on unsupported platforms, where the
+	// alternative is not "weaker confinement" but "none whatsoever".
+	AllowUnconfined bool
 }
 
 // Result is the captured outcome of a sandboxed run.
@@ -152,7 +165,7 @@ func Exec(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 
-	plan, failClosed, err := buildIsolation(runDir, opts.Timeout)
+	plan, failClosed, err := buildIsolation(runDir, opts.Timeout, opts.AllowUnconfined)
 	if err != nil {
 		return nil, err
 	}

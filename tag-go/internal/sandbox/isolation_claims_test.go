@@ -3,6 +3,7 @@ package sandbox
 import (
 	"fmt"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -193,5 +194,86 @@ func TestResolveIsolationOnlyDowngradesOnAMarkedFailure(t *testing.T) {
 func TestHelperFailMarkerIsUnambiguous(t *testing.T) {
 	if !strings.HasPrefix(helperFailMarker, "sandbox: ") || len(helperFailMarker) < 20 {
 		t.Fatalf("helperFailMarker %q is too generic to identify our own helper", helperFailMarker)
+	}
+}
+
+// TestLandlockUnavailableReasonMatchesTheErrno is DEFECT 2: the reason a user
+// reads has to match the errno the kernel returned, because the two errnos have
+// completely different remedies. The old single string claimed "kernel < 5.13 or
+// LSM disabled" on a 6.10 kernel that simply has no Landlock compiled in, which
+// sends the reader after the wrong fix.
+func TestLandlockUnavailableReasonMatchesTheErrno(t *testing.T) {
+	enosys := landlockUnavailableReason(syscall.ENOSYS)
+	for _, want := range []string{"ENOSYS", "not compiled in", "ANY kernel version"} {
+		if !strings.Contains(enosys, want) {
+			t.Fatalf("ENOSYS reason must contain %q: %q", want, enosys)
+		}
+	}
+	// The specific inaccuracy that shipped: a version bound implying an upgrade.
+	for _, forbidden := range []string{"5.13", "LSM disabled"} {
+		if strings.Contains(enosys, forbidden) {
+			t.Fatalf("ENOSYS reason still blames %q, but the syscall is simply absent: %q", forbidden, enosys)
+		}
+	}
+
+	notsup := landlockUnavailableReason(syscall.EOPNOTSUPP)
+	for _, want := range []string{"EOPNOTSUPP", "disabled", "lsm="} {
+		if !strings.Contains(notsup, want) {
+			t.Fatalf("EOPNOTSUPP reason must contain %q: %q", want, notsup)
+		}
+	}
+	if strings.Contains(notsup, "not compiled in") {
+		t.Fatalf("EOPNOTSUPP means compiled-but-off; the reason says the opposite: %q", notsup)
+	}
+	if enosys == notsup {
+		t.Fatal("the two errnos have different remedies but share one message")
+	}
+
+	// Anything else is reported verbatim rather than guessed at.
+	other := landlockUnavailableReason(syscall.EPERM)
+	if !strings.Contains(other, "EPERM") && !strings.Contains(other, other) {
+		t.Fatalf("an unexpected errno must be reported verbatim: %q", other)
+	}
+	if !strings.Contains(other, fmt.Sprintf("%d", int(syscall.EPERM))) {
+		t.Fatalf("an unexpected errno must carry its numeric value: %q", other)
+	}
+}
+
+// TestLandlockUnavailableMsgMirrorsDarwin: the Linux fail-closed message must
+// read like the macOS one -- what is missing, that the command did NOT run, and
+// `--backend docker` -- plus the opt-in flag by name. A user who hits this on
+// one platform should recognise it on the other.
+func TestLandlockUnavailableMsgMirrorsDarwin(t *testing.T) {
+	msg := landlockUnavailableMsg(landlockUnavailableReason(syscall.ENOSYS))
+	for _, want := range []string{
+		"cannot confine the filesystem", "was NOT run", "--backend docker", "--allow-unconfined",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("fail-closed message must contain %q: %q", want, msg)
+		}
+	}
+	if !strings.Contains(landlockUnavailableIsolation, "none (failed closed") {
+		t.Fatalf("the isolation string must claim nothing: %q", landlockUnavailableIsolation)
+	}
+	if strings.Contains(landlockUnavailableIsolation, "Landlock ABI") {
+		t.Fatalf("the isolation string names a policy that was never installed: %q", landlockUnavailableIsolation)
+	}
+}
+
+// TestLandlockUnconfinedClaimLeadsWithTheBadNews: the opt-in claim must say the
+// filesystem is not confined BEFORE it explains why, so a reader skimming the
+// isolation line cannot miss it.
+func TestLandlockUnconfinedClaimLeadsWithTheBadNews(t *testing.T) {
+	claim := landlockUnconfinedClaim(landlockUnavailableReason(syscall.ENOSYS))
+	if !strings.HasPrefix(claim, "filesystem NOT confined") {
+		t.Fatalf("the opt-in claim must lead with the loss of confinement: %q", claim)
+	}
+	if !strings.Contains(claim, "--allow-unconfined") {
+		t.Fatalf("the opt-in claim must name the flag that caused it: %q", claim)
+	}
+	// isolation_test.go's fsConfined() keys off this exact substring; if the
+	// wording drifts, every filesystem assertion silently starts asserting.
+	if fsConfined(claim) {
+		t.Fatalf("fsConfined() no longer recognises the unconfined claim: %q", claim)
 	}
 }
