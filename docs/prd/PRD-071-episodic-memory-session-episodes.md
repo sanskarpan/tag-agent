@@ -1062,5 +1062,5 @@ These run only in CI with `pytest -m perf` marker. They require a populated data
 
 ---
 
-*This document covers PRD-071. For the community detection and topic clustering layer over the episode entity graph, see the forthcoming PRD-072 (Episode Community Detection). For automatic post-run episode creation via hooks, see PRD-016 (Webhook Event Triggers).*
+*This document covers PRD-071. For the community detection and topic clustering layer over the episode entity graph, see the PRD-070 (Entity-Relationship Graph with Community Detection). For automatic post-run episode creation via hooks, see PRD-016 (Webhook Event Triggers).*
 

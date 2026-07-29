@@ -1,4 +1,4 @@
-# PRD-021: Streaming TUI Dashboard (`tag serve` / `tag dashboard`)
+# PRD-029: Streaming TUI Dashboard (`tag serve` / `tag dashboard`)
 
 **Status:** Proposed  
 **Priority:** P1 (High Impact, Differentiating)  

@@ -1,4 +1,4 @@
-# PRD-021: Semantic Memory with Confidence Decay (`tag memory`)
+# PRD-025: Semantic Memory with Confidence Decay (`tag memory`)
 
 **Status:** Proposed
 **Priority:** P1 (High Impact)

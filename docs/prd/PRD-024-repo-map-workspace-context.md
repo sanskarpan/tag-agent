@@ -1,4 +1,4 @@
-# PRD-021: Repo-Map / Workspace Context
+# PRD-024: Repo-Map / Workspace Context
 
 **Status:** Proposed
 **Priority:** P1

@@ -1,4 +1,4 @@
-# PRD-022: IDE Bridge — LSP Server & VS Code Extension
+# PRD-035: IDE Bridge — LSP Server & VS Code Extension
 
 **Status:** Proposed  
 **Priority:** P2  

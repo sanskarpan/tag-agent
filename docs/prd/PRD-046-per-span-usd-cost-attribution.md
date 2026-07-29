@@ -5,7 +5,7 @@
 **Estimated Effort:** XS (1-2 days)
 **Category:** Evaluation & Observability
 **Affects:** `cost_table.py + otel_semconv.py`
-**Depends on:** PRD-013 (agent tracing/observability), PRD-012 (cost tracking & budget), PRD-037 (OTel GenAI span cost attribution), PRD-028 (sandbox code execution), PRD-034 (secret scanning)
+**Depends on:** PRD-013 (agent tracing/observability), PRD-012 (cost tracking & budget), PRD-041 (OTel GenAI span cost attribution), PRD-028 (sandbox code execution), PRD-034 (secret scanning)
 **Inspired by:** LangSmith, W&B Weave, Braintrust, E2B billing
 
 ---

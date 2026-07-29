@@ -1,4 +1,4 @@
-# PRD-021: Multi-Agent Swarm with Context-Centric Routing
+# PRD-023: Multi-Agent Swarm with Context-Centric Routing
 
 **Status:** Proposed  
 **Priority:** P1  

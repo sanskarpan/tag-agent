@@ -1,4 +1,4 @@
-# PRD-026: Vector-Based Tool Retrieval (`tag mcp-registry index`)
+# PRD-043: Vector-Based Tool Retrieval (`tag mcp-registry index`)
 
 **Status:** Proposed
 **Priority:** P1
@@ -316,7 +316,7 @@ Concretely, `tool_retrieval.py` will call `memory_store.get_embedding_model()` i
 | OQ-02 | **Tool description quality** — many MCP servers ship tools with one-line or empty descriptions (e.g., `"Execute a shell command."`). Poor descriptions degrade retrieval precision. Should TAG provide a `tag mcp-registry enrich` command that uses the model to auto-generate richer descriptions from the tool's JSON schema? Or should this PRD accept low-quality descriptions as a given and document the limitation? | If unenriched descriptions are accepted, users with poorly-documented MCP servers may see low retrieval accuracy and abandon the feature. | Product |
 | OQ-03 | **Re-ranking after initial retrieval** — bi-encoder retrieval (MiniLM) is fast but imprecise for short tool descriptions. A cross-encoder re-ranking pass over the top-20 candidates could improve precision before selecting K. Would the latency cost (~30–80ms additional) be acceptable given NFR-01 (50ms total budget)? | Retrieval accuracy vs. latency trade-off. May require a tighter NFR. | Engineering |
 | OQ-04 | **Per-profile retrieval configuration** — should `mcp.tool_retrieval` and `mcp.retrieval_top_k` be configurable per profile (overridable in `profiles/researcher.yaml`) or only globally? Per-profile K would allow the `coder` profile to use a wider window (K=15) while `reviewer` uses a narrow one (K=5). | Complexity of config resolution in `controller.py`. | Product |
-| OQ-05 | **Retrieval for structured multi-step tasks** — for a task like "analyze, fix, and push to GitHub", the optimal tool set changes across the three steps. Should TAG retrieve tools once (from the top-level prompt) or retrieve per-step? Per-step retrieval requires knowing step boundaries before they occur. | Requires integration with PRD-021 (multi-agent swarm) if per-step retrieval is desired. | Future PRD |
+| OQ-05 | **Retrieval for structured multi-step tasks** — for a task like "analyze, fix, and push to GitHub", the optimal tool set changes across the three steps. Should TAG retrieve tools once (from the top-level prompt) or retrieve per-step? Per-step retrieval requires knowing step boundaries before they occur. | Requires integration with PRD-023 (multi-agent swarm) if per-step retrieval is desired. | Future PRD |
 
 ---
 

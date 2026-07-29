@@ -1,4 +1,4 @@
-# PRD-037: Notification Hooks (`tag hooks notify`)
+# PRD-040: Notification Hooks (`tag hooks notify`)
 
 **Status:** Proposed
 **Priority:** P1

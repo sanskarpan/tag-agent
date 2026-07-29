@@ -1,4 +1,4 @@
-# PRD-022: Diff-Aware Context Injection
+# PRD-038: Diff-Aware Context Injection
 
 **Status:** Proposed
 **Priority:** P1

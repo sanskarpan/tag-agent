@@ -1,4 +1,4 @@
-# PRD-022: Prompt Cache Analytics
+# PRD-030: Prompt Cache Analytics
 
 **Status:** Proposed  
 **Priority:** P1  

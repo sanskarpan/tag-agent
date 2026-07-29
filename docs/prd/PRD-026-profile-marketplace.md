@@ -1,4 +1,4 @@
-# PRD-035: Profile Marketplace (tag profile pull/push)
+# PRD-026: Profile Marketplace (tag profile pull/push)
 
 **Status:** Proposed — BLOCKED on PRD-034 (Secret Scanning)
 **Priority:** P1

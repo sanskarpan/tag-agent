@@ -1,4 +1,4 @@
-# PRD-037: OTel GenAI Span Cost Attribution
+# PRD-041: OTel GenAI Span Cost Attribution
 
 **Status:** Proposed
 **Priority:** P1

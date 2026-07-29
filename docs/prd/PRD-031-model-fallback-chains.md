@@ -1,4 +1,4 @@
-# PRD-036: Model Fallback Chains
+# PRD-031: Model Fallback Chains
 
 **Status:** Proposed  
 **Priority:** P1  

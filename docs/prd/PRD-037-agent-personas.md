@@ -1,4 +1,4 @@
-# PRD-036: Agent Personas (tag persona)
+# PRD-037: Agent Personas (tag persona)
 
 **Status:** Proposed
 **Priority:** P1
@@ -7,7 +7,7 @@
 new `src/tag/config/personas/` (built-in persona files)
 **Security Classification:** MEDIUM — personas are system prompt injections; same threat
 model as profiles; marketplace personas gated behind PRD-034 (Secret Scanning)
-**Depends on:** PRD-035 (Profile Marketplace infrastructure for `persona pull/push`)
+**Depends on:** PRD-026 (Profile Marketplace infrastructure for `persona pull/push`)
 
 ---
 

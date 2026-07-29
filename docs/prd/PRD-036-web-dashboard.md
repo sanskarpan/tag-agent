@@ -1,4 +1,4 @@
-# PRD-022: Web Dashboard (`tag serve`)
+# PRD-036: Web Dashboard (`tag serve`)
 
 **Status:** Proposed  
 **Priority:** P1  

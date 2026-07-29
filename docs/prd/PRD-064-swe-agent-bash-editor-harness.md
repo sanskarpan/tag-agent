@@ -5,7 +5,7 @@
 **Estimated Effort:** M (1-2 weeks)
 **Category:** CI/CD & Agentic Dev Workflows
 **Affects:** `swe_harness.py` (new), `controller.py` (new `cmd_solve`, `cmd_benchmark` extensions)
-**Depends on:** PRD-027 (Eval Framework), PRD-028 (Sandbox Code Execution), PRD-013 (Agent Tracing / OTel), PRD-034 (Security / Secret Scanning), PRD-008 (Background Task Queue), PRD-019 (Token Budget Enforcement), PRD-021 (Agent Loop / Autonomous Mode), PRD-038 (Diff-Aware Context Injection), PRD-041 (OTel GenAI Span Cost Attribution), PRD-042 (Architect-Editor Agent Split), PRD-055 (Issue-to-PR Autonomous Loop)
+**Depends on:** PRD-027 (Eval Framework), PRD-028 (Sandbox Code Execution), PRD-013 (Agent Tracing / OTel), PRD-034 (Security / Secret Scanning), PRD-008 (Background Task Queue), PRD-039 (Token Budget Enforcement), PRD-021 (Agent Loop / Autonomous Mode), PRD-038 (Diff-Aware Context Injection), PRD-041 (OTel GenAI Span Cost Attribution), PRD-042 (Architect-Editor Agent Split), PRD-055 (Issue-to-PR Autonomous Loop)
 **Inspired by:** SWE-agent (Princeton NLP, arXiv:2405.15793, NeurIPS 2024), SWE-bench, Aider structured edits
 **GitHub Issue:** #344
 
