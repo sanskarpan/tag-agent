@@ -16,7 +16,7 @@ func costOf(t *testing.T, model string, in, out int64) float64 {
 	if !ok {
 		t.Fatalf("model not found: %q", model)
 	}
-	return float64(in)/1e6*p[0] + float64(out)/1e6*p[1]
+	return float64(in)/1e6*p.In + float64(out)/1e6*p.Out
 }
 
 func TestLookupPriceResolvesBareAliases(t *testing.T) {
@@ -86,8 +86,11 @@ func TestAnthropicPricesMatchPublishedRates(t *testing.T) {
 		if !ok {
 			t.Fatalf("model not found: %q", model)
 		}
-		if got != exp {
-			t.Errorf("%s: got %v, want %v", model, got, exp)
+		if got.In != exp[0] || got.Out != exp[1] {
+			t.Errorf("%s: got %v/%v, want %v", model, got.In, got.Out, exp)
+		}
+		if got.Estimated {
+			t.Errorf("%s: published Anthropic rate must not be flagged estimated", model)
 		}
 	}
 }
@@ -97,10 +100,12 @@ func TestAnthropicPricesMatchPublishedRates(t *testing.T) {
 // src/tag/config/default.yaml, yet `tag pricing get --model gpt-5.4` returned
 // `model not found: "gpt-5.4"` and every cost rollup for the default profile
 // silently priced it at $0.
+// The rate is 2.50/15.00 (models.dev, corroborated 2026-07); the earlier 11.25
+// expectation encoded an unsourced 1.25/10.00 copied from GPT-5.
 func TestPricingCoversGPT54(t *testing.T) {
 	got := costOf(t, "gpt-5.4", 1_000_000, 1_000_000)
-	if math.Abs(got-11.25) > 1e-9 {
-		t.Errorf("gpt-5.4: cost = %v, want 11.25", got)
+	if math.Abs(got-17.50) > 1e-9 {
+		t.Errorf("gpt-5.4: cost = %v, want 17.50", got)
 	}
 }
 
@@ -114,8 +119,8 @@ func TestLookupPriceResolvesUnknownVendorPrefix(t *testing.T) {
 		if !ok {
 			t.Fatalf("model not found: %q", m)
 		}
-		if p != [2]float64{1.25, 10.0} {
-			t.Errorf("%s: got %v, want [1.25 10]", m, p)
+		if p.In != 2.50 || p.Out != 15.00 {
+			t.Errorf("%s: got %v/%v, want 2.50/15.00", m, p.In, p.Out)
 		}
 	}
 	// The fallback must not turn genuinely unknown models into a price.

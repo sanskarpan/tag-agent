@@ -58,7 +58,12 @@ def _open_conn(db_path) -> sqlite3.Connection:
 def cmd_pricing(args: argparse.Namespace) -> int:
     sub = getattr(args, "pricing_subcommand", None)
     try:
-        from tag.cost_table import list_all_models, compute_cost, reload_pricing_table
+        from tag.cost_table import (
+            list_all_models,
+            compute_cost,
+            reload_pricing_table,
+            resolve_pricing_entry,
+        )
         reload_pricing_table()
     except ImportError as e:
         print_error(f"cost_table not available: {e}")
@@ -67,12 +72,16 @@ def cmd_pricing(args: argparse.Namespace) -> int:
         models = list_all_models()
         if getattr(args, "json", False):
             print(json.dumps([{"model_id": m.model_id, "input_usd_per_1m": m.input_usd_per_1m,
-                               "output_usd_per_1m": m.output_usd_per_1m} for m in models], indent=2))
+                               "output_usd_per_1m": m.output_usd_per_1m,
+                               "estimated": bool(getattr(m, "estimated", False)),
+                               "source": getattr(m, "source", None)} for m in models], indent=2))
         else:
-            print(f"{'Model':<45} {'Input $/1M':>12} {'Output $/1M':>12}")
-            print("-" * 72)
+            print(f"{'Model':<45} {'Input $/1M':>12} {'Output $/1M':>12}  {'Rate':<9}")
+            print("-" * 83)
             for m in models:
-                print(f"{m.model_id:<45} {m.input_usd_per_1m:>12.4f} {m.output_usd_per_1m:>12.4f}")
+                marker = "estimated" if getattr(m, "estimated", False) else ""
+                print(f"{m.model_id:<45} {m.input_usd_per_1m:>12.4f} "
+                      f"{m.output_usd_per_1m:>12.4f}  {marker:<9}")
         return 0
     if sub == "get":
         cost = compute_cost(args.model, args.input_tokens, args.output_tokens,
@@ -81,7 +90,23 @@ def cmd_pricing(args: argparse.Namespace) -> int:
         if cost is None:
             print_error(f"Model not found: {args.model!r}")
             return 1
-        print(f"${cost:.8f}")
+        entry = resolve_pricing_entry(args.model)
+        estimated = bool(getattr(entry, "estimated", False)) if entry else False
+        if getattr(args, "json", False):
+            # Cross-engine contract — the Go engine emits these exact keys.
+            print(json.dumps({
+                "model_id": args.model,
+                "input_tokens": args.input_tokens,
+                "output_tokens": args.output_tokens,
+                "input_usd_per_1m": entry.input_usd_per_1m if entry else None,
+                "output_usd_per_1m": entry.output_usd_per_1m if entry else None,
+                "cost_usd": cost,
+                "estimated": estimated,
+                "source": getattr(entry, "source", None) if entry else None,
+            }, indent=2))
+            return 0
+        suffix = "  (estimated — not an authoritative published rate)" if estimated else ""
+        print(f"${cost:.8f}{suffix}")
         return 0
     print_error(f"Unknown pricing subcommand: {sub!r}")
     return 1
@@ -886,6 +911,7 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     pr_get.add_argument("--output-tokens", type=int, default=500)
     pr_get.add_argument("--cache-read", action="store_true")
     pr_get.add_argument("--batch", action="store_true")
+    pr_get.add_argument("--json", action="store_true")
     for ap in [pricing_cmd, pr_list, pr_get]:
         ap.set_defaults(func=cmd_pricing)
 

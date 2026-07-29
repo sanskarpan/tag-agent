@@ -835,7 +835,9 @@ class TestShippedDefaultModelsArePriced:
         reload_pricing_table()
         cost = compute_cost("gpt-5.4", 1_000_000, 1_000_000)
         assert cost is not None, "gpt-5.4 missing from src/tag/assets/pricing.yaml"
-        assert abs(cost - 11.25) < 1e-9, f"gpt-5.4 1M/1M = {cost}, want 11.25"
+        # 2.50 in / 15.00 out (models.dev, corroborated 2026-07). The former
+        # 1.25/10.00 (=> $11.25) was GPT-5's rate copied over, and unsourced.
+        assert abs(cost - 17.50) < 1e-9, f"gpt-5.4 1M/1M = {cost}, want 17.50"
 
     def test_every_shipped_profile_default_is_priced(self):
         """Whatever default.yaml ships must resolve — this is what regressed."""
@@ -903,7 +905,18 @@ class TestCostsJSONContract:
         assert cmd_costs(args) == 0
         out = capsys.readouterr().out
         payload = json.loads(out)  # pre-fix: JSONDecodeError on the prose line
-        assert payload == {"runs": [], "totals": {}}
+        # The full dual-source contract is emitted regardless of schema shape,
+        # so a --json consumer can tell "no data" from "different schema".
+        # `runs` is empty here because the table genuinely holds no rows — not
+        # because a missing `total_tokens` column suppressed the listing.
+        assert payload["runs"] == []
+        assert payload["by_source"]["runs"]["rows"] == 0
+        assert payload["by_source"]["spans"]["rows"] == 0
+        assert payload["totals"]["total_tokens"] == 0
+        assert payload["totals"]["cost_usd"] == 0.0
+        assert payload["totals"]["estimated_cost_usd"] == 0.0  # back-compat alias
+        assert payload["totals"]["sources"] == []
+        assert payload["totals"]["overlap_warning"] is False
 
     def test_human_output_unchanged_without_json(self, tmp_path, monkeypatch, capsys):
         import argparse
@@ -922,4 +935,440 @@ class TestCostsJSONContract:
 
         args = argparse.Namespace(config=None, json=False, limit=20, profile=None)
         assert cmd_costs(args) == 0
+        # Both populations are genuinely empty here (the table has no rows), so
+        # the "no data" sentence is still the correct human output.
         assert "No cost data recorded yet" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# #32 — Python and Go disagreed on the same seeded database
+# ---------------------------------------------------------------------------
+
+class TestCostsCrossEngineParity:
+    """Run against a `runs` table shaped the way the **Go** engine bootstraps it
+    (`estimated_cost_usd NOT NULL DEFAULT 0`, and no `total_tokens` column at
+    all). Both defects below were invisible to the unit suite because every
+    existing fixture used the Python schema.
+
+    Pre-fix, on a database holding one priced run and one priced span:
+      * `by_source.runs.cost_usd` came back 0.00 against Go's 0.01, because a
+        stored 0 was read as a real "this cost nothing" rather than as the
+        NOT NULL default standing in for "no stored cost"; and
+      * the per-run listing was skipped entirely -- `"runs": []` plus the prose
+        "No cost data recorded yet (run some tasks first)." -- on a database
+        that plainly had a run in it.
+    """
+
+    GO_RUNS_DDL = (
+        "CREATE TABLE runs("
+        " id TEXT PRIMARY KEY, created_at TEXT, master_profile TEXT, model_id TEXT,"
+        " prompt_tokens INTEGER, completion_tokens INTEGER,"
+        " estimated_cost_usd REAL NOT NULL DEFAULT 0)"
+    )
+
+    def _seed(self, tmp_path, monkeypatch, *, with_span=True):
+        from tag.controller import config_path, load_config, runtime_db_path
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        cfg = load_config(config_path(None))
+        db_path = runtime_db_path(cfg)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(self.GO_RUNS_DDL)
+        conn.execute(
+            "INSERT INTO runs(id, created_at, master_profile, model_id,"
+            " prompt_tokens, completion_tokens, estimated_cost_usd)"
+            " VALUES('rA','2026-07-01T00:00:00Z','orchestrator','gpt-5.4',1000,500,0)"
+        )
+        if with_span:
+            conn.execute(
+                "CREATE TABLE spans(id TEXT PRIMARY KEY, profile TEXT, model_id TEXT,"
+                " prompt_tokens INTEGER, completion_tokens INTEGER, cost_usd REAL)"
+            )
+            conn.execute(
+                "INSERT INTO spans(id, profile, model_id, prompt_tokens,"
+                " completion_tokens, cost_usd)"
+                " VALUES('sA','orchestrator','gpt-5.4',2000,1000,NULL)"
+            )
+        conn.commit()
+        conn.close()
+
+    def test_stored_zero_cost_falls_back_to_pricing_table(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A stored 0 must be priced from the table, not reported as $0.00.
+
+        gpt-5.4 is 2.50/1M in + 15.00/1M out, so 1000/500 tokens = $0.01 --
+        the number the Go engine reports for this exact row. Pre-fix: 0.0.
+        """
+        from tag.controller import main
+
+        self._seed(tmp_path, monkeypatch)
+        assert main(["costs", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+
+        assert payload["by_source"]["runs"]["cost_usd"] == pytest.approx(0.01)
+        assert payload["by_source"]["spans"]["cost_usd"] == pytest.approx(0.02)
+        assert payload["totals"]["cost_usd"] == pytest.approx(0.03)
+        assert payload["totals"]["overlap_warning"] is True
+        # A derived rate from a verified entry must not flip the estimated flag.
+        assert payload["totals"]["includes_estimated_rates"] is False
+
+    def test_runs_without_total_tokens_column_still_listed(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The detail rows survive a `runs` table that has no total_tokens.
+
+        Total is derived as prompt + completion (what Go reports), and the
+        "no cost data" sentence must not appear above a populated breakdown.
+        """
+        from tag.controller import main
+
+        self._seed(tmp_path, monkeypatch)
+        assert main(["costs", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+
+        assert [r["id"] for r in payload["runs"]] == ["rA"]
+        row = payload["runs"][0]
+        assert row["total_tokens"] == 1500  # 1000 + 500, column absent
+        # Existing key names are part of the contract.
+        for key in ("id", "profile", "model_id", "prompt_tokens",
+                    "completion_tokens", "total_tokens", "estimated_cost_usd",
+                    "created_at"):
+            assert key in row, f"costs --json run row lost key {key!r}"
+
+        assert main(["costs"]) == 0
+        human = capsys.readouterr().out
+        assert "No cost data recorded yet" not in human
+        assert "rA" in human
+
+    def test_runs_missing_token_columns_degrades_without_raising(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """An alien `runs` table (no token columns at all) must not raise."""
+        from tag.controller import config_path, load_config, runtime_db_path
+        from tag.controller import main
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        cfg = load_config(config_path(None))
+        db_path = runtime_db_path(cfg)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE runs(id TEXT PRIMARY KEY, master_profile TEXT)")
+        conn.execute("INSERT INTO runs(id, master_profile) VALUES('rX','orchestrator')")
+        conn.commit()
+        conn.close()
+
+        assert main(["costs", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert [r["id"] for r in payload["runs"]] == ["rX"]
+        assert payload["runs"][0]["total_tokens"] == 0
+        assert payload["by_source"]["runs"]["rows"] == 0  # nothing priceable
+        assert payload["totals"]["cost_usd"] == 0.0
+
+        assert main(["costs"]) == 0
+        assert capsys.readouterr().out  # human path renders rather than raising
+
+
+# ---------------------------------------------------------------------------
+# #31 — pricing rates carried no provenance, and `pricing get` had no --json
+# ---------------------------------------------------------------------------
+
+class TestPricingProvenance:
+    """Pre-fix every rate in pricing.yaml looked equally authoritative even
+    though several (gemini-2.5-flash, deepseek-v4-pro, the qwen pair) were
+    unverified guesses, and gpt-5.4 carried GPT-5's rate by mistake. There was
+    also no way to read a rate as JSON: `pricing get` never declared --json, so
+    `tag pricing get gpt-5.4 --json` died with argparse "unrecognized
+    arguments: --json" (exit 2)."""
+
+    def test_estimated_entry_is_flagged_in_human_output(self, tmp_path, monkeypatch, capsys):
+        from tag.controller import main
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        assert main(["pricing", "get", "gemini-2.5-flash"]) == 0
+        out = capsys.readouterr().out
+        assert "(estimated — not an authoritative published rate)" in out
+
+    def test_estimated_entry_is_flagged_in_json(self, tmp_path, monkeypatch, capsys):
+        from tag.controller import main
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        assert main(["pricing", "get", "gemini-2.5-flash", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["estimated"] is True
+        assert payload["source"], "an estimated rate must record why it is unverified"
+
+    def test_verified_entry_is_not_flagged(self, tmp_path, monkeypatch, capsys):
+        """gpt-5.4 is corroborated post-fix, so it must not be marked estimated."""
+        from tag.controller import main
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        assert main(["pricing", "get", "gpt-5.4"]) == 0
+        assert "estimated" not in capsys.readouterr().out
+
+        assert main(["pricing", "get", "gpt-5.4", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["estimated"] is False
+        assert payload["source"] == (
+            "models.dev (corroborated by multiple public pricing aggregators, 2026-07)"
+        )
+        assert payload["input_usd_per_1m"] == 2.50
+        assert payload["output_usd_per_1m"] == 15.00
+
+    def test_pricing_get_json_is_parseable_and_exits_zero(self, tmp_path, monkeypatch, capsys):
+        """Pre-fix this raised SystemExit(2) from argparse, not a JSON document."""
+        from tag.controller import main
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        rc = main(["pricing", "get", "gpt-5.4", "--input-tokens", "1000000",
+                   "--output-tokens", "1000000", "--json"])
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["model_id"] == "gpt-5.4"
+        assert payload["input_tokens"] == 1_000_000
+        assert payload["output_tokens"] == 1_000_000
+        assert payload["cost_usd"] == pytest.approx(17.50)
+        for key in ("model_id", "input_tokens", "output_tokens", "input_usd_per_1m",
+                    "output_usd_per_1m", "cost_usd", "estimated", "source"):
+            assert key in payload, f"pricing get --json missing cross-engine key {key!r}"
+
+    def test_pricing_get_json_honours_cache_read_flag(self, tmp_path, monkeypatch, capsys):
+        """cost_usd must reflect the rate modifiers, not the list price."""
+        from tag.controller import main
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        assert main(["pricing", "get", "gpt-5.4", "--input-tokens", "1000000",
+                     "--output-tokens", "0", "--cache-read", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["cost_usd"] == pytest.approx(0.25)  # 2.50 * 0.1
+
+    def test_pricing_list_json_carries_provenance(self, tmp_path, monkeypatch, capsys):
+        from tag.controller import main
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        assert main(["pricing", "list", "--json"]) == 0
+        rows = {r["model_id"]: r for r in json.loads(capsys.readouterr().out)}
+        assert rows["gemini-2.5-flash"]["estimated"] is True
+        assert rows["gemini-2.5-pro"]["estimated"] is False
+        assert rows["gemini-2.5-pro"]["source"] == "models.dev"
+        assert rows["gpt-4o"]["source"] is None  # unannotated entries stay null
+
+    def test_pricing_list_human_marks_estimated_rows(self, tmp_path, monkeypatch, capsys):
+        from tag.controller import main
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        assert main(["pricing", "list"]) == 0
+        lines = {
+            line.split()[0]: line
+            for line in capsys.readouterr().out.splitlines()
+            if line and not line.startswith(("-", "Model"))
+        }
+        assert "estimated" in lines["gemini-2.5-flash"]
+        assert "estimated" not in lines["gemini-2.5-pro"]
+
+    def test_unverified_rates_keep_their_numbers(self):
+        """The fix annotates the disputed rates; it must not silently move them."""
+        from tag.cost_table import reload_pricing_table, resolve_pricing_entry
+
+        reload_pricing_table()
+        for model, want_in, want_out in [
+            ("gemini-2.5-flash", 0.15, 0.60),
+            ("deepseek/deepseek-v4-pro", 0.27, 1.10),
+            ("qwen/qwen3-coder", 0.50, 2.00),
+            ("qwen/qwen-plus", 0.40, 1.20),
+        ]:
+            entry = resolve_pricing_entry(model)
+            assert entry is not None, f"{model} vanished from the pricing table"
+            assert entry.input_usd_per_1m == want_in
+            assert entry.output_usd_per_1m == want_out
+            assert entry.estimated is True, f"{model} must be flagged estimated"
+            assert entry.source
+
+    def test_unannotated_entries_default_to_not_estimated(self):
+        from tag.cost_table import reload_pricing_table, resolve_pricing_entry
+
+        reload_pricing_table()
+        entry = resolve_pricing_entry("claude-sonnet-4-6")
+        assert entry is not None
+        assert entry.estimated is False
+        assert entry.source is None
+
+
+# ---------------------------------------------------------------------------
+# #32 — `costs` was blind to half its own data (runs vs spans)
+# ---------------------------------------------------------------------------
+
+def _seed_costs_db(tmp_path, monkeypatch, *, runs=(), spans=()):
+    """Create a runtime DB under a scratch TAG_HOME with runs + spans rows."""
+    from tag.controller import config_path, load_config, runtime_db_path
+
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+    cfg = load_config(config_path(None))
+    db_path = runtime_db_path(cfg)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE runs(id TEXT PRIMARY KEY, master_profile TEXT, model_id TEXT, "
+        "prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, "
+        "estimated_cost_usd REAL, created_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE spans(id TEXT PRIMARY KEY, trace_id TEXT, profile TEXT, "
+        "model_id TEXT, prompt_tokens INTEGER, completion_tokens INTEGER, "
+        "cost_usd REAL, started_at TEXT)"
+    )
+    for row in runs:
+        conn.execute("INSERT INTO runs VALUES(?,?,?,?,?,?,?,?)", row)
+    for row in spans:
+        conn.execute("INSERT INTO spans VALUES(?,?,?,?,?,?,?,?)", row)
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+class TestCostsDualSource:
+    """Pre-fix `cmd_costs` aggregated `runs` only. Python writes tokens/cost to
+    `spans` and never fills the runs cost columns, so Python's own token data
+    was invisible; the Go engine is the mirror image. Both engines now report
+    both populations with an explicit, labelled breakdown."""
+
+    def test_both_sources_are_reported_with_overlap_warning(self, tmp_path, monkeypatch, capsys):
+        from tag.controller import main
+
+        _seed_costs_db(
+            tmp_path, monkeypatch,
+            runs=[("r1", "default", "gpt-5.4", 1000, 500, 1500, None, "2026-07-01")],
+            spans=[("s1", "t1", "default", "gpt-5.4", 2000, 1000, None, "2026-07-01")],
+        )
+        assert main(["costs", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+
+        runs_section = payload["by_source"]["runs"]
+        spans_section = payload["by_source"]["spans"]
+        assert runs_section["source"] == "runs"
+        assert runs_section["rows"] == 1
+        assert runs_section["prompt_tokens"] == 1000
+        assert runs_section["completion_tokens"] == 500
+        assert runs_section["total_tokens"] == 1500
+        # 1000 * 2.50/1M + 500 * 15.00/1M
+        assert runs_section["cost_usd"] == pytest.approx(0.01)
+
+        assert spans_section["source"] == "spans"
+        assert spans_section["rows"] == 1
+        assert spans_section["prompt_tokens"] == 2000
+        assert spans_section["completion_tokens"] == 1000
+        assert spans_section["total_tokens"] == 3000
+        assert spans_section["cost_usd"] == pytest.approx(0.02)
+
+        totals = payload["totals"]
+        assert totals["prompt_tokens"] == 3000
+        assert totals["completion_tokens"] == 1500
+        assert totals["total_tokens"] == 4500
+        assert totals["cost_usd"] == pytest.approx(0.03)
+        assert totals["estimated_cost_usd"] == totals["cost_usd"]  # back-compat alias
+        assert sorted(totals["sources"]) == ["runs", "spans"]
+        assert totals["overlap_warning"] is True
+
+    def test_human_output_labels_both_sources(self, tmp_path, monkeypatch, capsys):
+        from tag.controller import main
+
+        _seed_costs_db(
+            tmp_path, monkeypatch,
+            runs=[("r1", "default", "gpt-5.4", 1000, 500, 1500, 0.01, "2026-07-01")],
+            spans=[("s1", "t1", "default", "gpt-5.4", 2000, 1000, 0.02, "2026-07-01")],
+        )
+        assert main(["costs"]) == 0
+        out = capsys.readouterr().out
+        assert "runs" in out and "spans" in out
+        assert "TOTAL" in out
+        assert "0.0300" in out
+        assert ("note: runs and spans are different populations (a run aggregates "
+                "spans); the TOTAL may double-count.") in out
+
+    def test_single_source_has_no_overlap_warning(self, tmp_path, monkeypatch, capsys):
+        from tag.controller import main
+
+        _seed_costs_db(
+            tmp_path, monkeypatch,
+            spans=[("s1", "t1", "default", "gpt-5.4", 2000, 1000, None, "2026-07-01")],
+        )
+        assert main(["costs", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["by_source"]["runs"]["rows"] == 0
+        assert payload["by_source"]["spans"]["rows"] == 1
+        assert payload["totals"]["sources"] == ["spans"]
+        assert payload["totals"]["overlap_warning"] is False
+
+    def test_estimated_rate_propagates_to_totals(self, tmp_path, monkeypatch, capsys):
+        from tag.controller import main
+
+        _seed_costs_db(
+            tmp_path, monkeypatch,
+            spans=[("s1", "t1", "default", "gemini-2.5-flash", 1000, 500, None, "2026-07-01")],
+        )
+        assert main(["costs", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["by_source"]["spans"]["includes_estimated_rates"] is True
+        assert payload["totals"]["includes_estimated_rates"] is True
+
+    def test_verified_rates_only_clears_the_flag(self, tmp_path, monkeypatch, capsys):
+        from tag.controller import main
+
+        _seed_costs_db(
+            tmp_path, monkeypatch,
+            runs=[("r1", "default", "gpt-5.4", 1000, 500, 1500, None, "2026-07-01")],
+        )
+        assert main(["costs", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["by_source"]["runs"]["includes_estimated_rates"] is False
+        assert payload["totals"]["includes_estimated_rates"] is False
+
+    def test_estimated_note_printed_in_human_output(self, tmp_path, monkeypatch, capsys):
+        from tag.controller import main
+
+        _seed_costs_db(
+            tmp_path, monkeypatch,
+            spans=[("s1", "t1", "default", "gemini-2.5-flash", 1000, 500, None, "2026-07-01")],
+        )
+        assert main(["costs"]) == 0
+        assert ("note: total includes estimated rates that are not authoritative "
+                "published prices.") in capsys.readouterr().out
+
+    def test_missing_db_emits_full_zeroed_contract(self, tmp_path, monkeypatch, capsys):
+        """The early return must be the same shape, not a {"runs":[],"totals":{}} stub."""
+        from tag.controller import main
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "empty"))
+        assert main(["costs", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["runs"] == []
+        for key in ("runs", "spans"):
+            section = payload["by_source"][key]
+            assert section == {
+                "source": key, "rows": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                "total_tokens": 0, "cost_usd": 0.0, "includes_estimated_rates": False,
+            }
+        assert payload["totals"]["sources"] == []
+        assert payload["totals"]["overlap_warning"] is False
+        assert payload["totals"]["cost_usd"] == 0.0
+
+    def test_missing_spans_table_is_not_an_error(self, tmp_path, monkeypatch, capsys):
+        from tag.controller import config_path, load_config, main, runtime_db_path
+
+        monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+        cfg = load_config(config_path(None))
+        db_path = runtime_db_path(cfg)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE runs(id TEXT PRIMARY KEY, master_profile TEXT, model_id TEXT, "
+            "prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, "
+            "estimated_cost_usd REAL, created_at TEXT)"
+        )
+        conn.commit()
+        conn.close()
+
+        assert main(["costs", "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["by_source"]["spans"]["rows"] == 0

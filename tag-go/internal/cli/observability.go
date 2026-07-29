@@ -130,25 +130,60 @@ func traceSpanTokens(m map[string]any) int {
 // Kept in sync with src/tag/assets/pricing.yaml — in particular it must cover the
 // models TAG ships in its own default config (src/tag/config/default.yaml), which
 // previously all reported "model not found".
-var pricingTable = map[string][2]float64{ // {input, output} $/1M
-	"openai/gpt-4o":      {2.5, 10.0},
-	"openai/gpt-4o-mini": {0.15, 0.6},
-	"gpt-4o":             {2.5, 10.0},
-	"gpt-4o-mini":        {0.15, 0.6},
+// modelPrice is one row of the embedded pricing table. Source/Estimated carry
+// provenance so a rate that TAG cannot corroborate against a published price is
+// never presented as authoritative.
+type modelPrice struct {
+	In, Out   float64 // $/1M tokens
+	Source    string  // provenance, e.g. "models.dev"; "" if unknown
+	Estimated bool    // true = NOT an authoritative published rate
+}
+
+const srcModelsDev = "models.dev"
+
+// srcPricingYAML marks rates that match src/tag/assets/pricing.yaml exactly and
+// are corroborated by models.dev.
+const srcPricingYAML = "models.dev (matches src/tag/assets/pricing.yaml)"
+
+var pricingTable = map[string]modelPrice{
+	"openai/gpt-4o":      {In: 2.5, Out: 10.0, Source: srcPricingYAML},
+	"openai/gpt-4o-mini": {In: 0.15, Out: 0.6, Source: srcPricingYAML},
+	"gpt-4o":             {In: 2.5, Out: 10.0, Source: srcPricingYAML},
+	"gpt-4o-mini":        {In: 0.15, Out: 0.6, Source: srcPricingYAML},
 	// TAG's own default master/orchestrator model. It was missing here and in
 	// src/tag/assets/pricing.yaml, so the shipped default profile priced at $0.
-	"openai/gpt-5.4":              {1.25, 10.0},
-	"anthropic/claude-opus-4-8":   {5.0, 25.0},
-	"anthropic/claude-sonnet-4-6": {3.0, 15.0},
-	"anthropic/claude-haiku-4-5":  {1.0, 5.0},
-	"google/gemini-2.5-pro":       {1.25, 5.0},
-	"google/gemini-2.5-flash":     {0.075, 0.3},
+	// The value first added here — 1.25/10.00 — was UNSOURCED: it was GPT-5's
+	// rate copied onto GPT-5.4. The corroborated GPT-5.4 rate (models.dev plus
+	// several independent public pricing aggregators, 2026-07) is 2.50/15.00.
+	"openai/gpt-5.4": {In: 2.50, Out: 15.00,
+		Source: "models.dev (corroborated by multiple public pricing aggregators, 2026-07)"},
+	"anthropic/claude-opus-4-8":   {In: 5.0, Out: 25.0, Source: srcPricingYAML},
+	"anthropic/claude-sonnet-4-6": {In: 3.0, Out: 15.0, Source: srcPricingYAML},
+	"anthropic/claude-haiku-4-5":  {In: 1.0, Out: 5.0, Source: srcPricingYAML},
+	// The two engines previously disagreed on Gemini 2.5 Pro output: this table
+	// said 5.00 while src/tag/assets/pricing.yaml said 10.00. models.dev confirms
+	// 10.00, so the Go side was the wrong one.
+	"google/gemini-2.5-pro": {In: 1.25, Out: 10.0, Source: srcModelsDev},
+	// No authoritative resolution: this table previously said 0.075/0.30,
+	// pricing.yaml says 0.15/0.60 and models.dev says 0.30/2.50. The rate stays
+	// unverified, but the two engines must not ship *different* numbers for the
+	// same model, so this mirrors the canonical pricing.yaml value and is
+	// flagged estimated rather than silently trusted.
+	"google/gemini-2.5-flash": {In: 0.15, Out: 0.6, Estimated: true,
+		Source: "unverified — pricing.yaml value; conflicts with models.dev (0.30/2.50)"},
 	// Models TAG ships as profile defaults.
-	"deepseek/deepseek-v4-flash": {0.14, 0.28},
-	"deepseek/deepseek-v4-pro":   {0.27, 1.10},
-	"deepseek/deepseek-r1":       {0.55, 2.19},
-	"qwen/qwen3-coder":           {0.50, 2.00},
-	"qwen/qwen-plus":             {0.40, 1.20},
+	"deepseek/deepseek-v4-flash": {In: 0.14, Out: 0.28, Source: srcPricingYAML},
+	// models.dev lists 1.74/3.48 for this model; the repo says 0.27/1.10. The
+	// repo value is kept (changing it would silently restate every past cost)
+	// but marked estimated.
+	"deepseek/deepseek-v4-pro": {In: 0.27, Out: 1.10, Estimated: true,
+		Source: "unverified — conflicts with models.dev"},
+	"deepseek/deepseek-r1": {In: 0.55, Out: 2.19, Source: srcPricingYAML},
+	// Not present in models.dev at all; no public rate could be found.
+	"qwen/qwen3-coder": {In: 0.50, Out: 2.00, Estimated: true,
+		Source: "unverified — no public rate found"},
+	"qwen/qwen-plus": {In: 0.40, Out: 1.20, Estimated: true,
+		Source: "unverified — no public rate found"},
 }
 
 // knownProviderPrefixes are the vendor namespaces used in pricingTable keys. A
@@ -157,9 +192,9 @@ var pricingTable = map[string][2]float64{ // {input, output} $/1M
 // prefix rather than reporting "model not found".
 var knownProviderPrefixes = []string{"anthropic/", "openai/", "google/", "deepseek/", "qwen/"}
 
-// lookupPrice resolves a model id to its {input, output} $/1M price, accepting
-// either the fully prefixed id or the bare alias.
-func lookupPrice(model string) ([2]float64, bool) {
+// lookupPrice resolves a model id to its price row (including provenance),
+// accepting either the fully prefixed id or the bare alias.
+func lookupPrice(model string) (modelPrice, bool) {
 	if p, ok := pricingTable[model]; ok {
 		return p, true
 	}
@@ -169,7 +204,7 @@ func lookupPrice(model string) ([2]float64, bool) {
 				return p, true
 			}
 		}
-		return [2]float64{}, false
+		return modelPrice{}, false
 	}
 	// A vendor namespace we do not carry in the table (TAG ships runtime-flavoured
 	// ids such as "openai-codex/gpt-5.4"): retry on the bare alias, then on that
@@ -183,7 +218,102 @@ func lookupPrice(model string) ([2]float64, bool) {
 			return p, true
 		}
 	}
-	return [2]float64{}, false
+	return modelPrice{}, false
+}
+
+// costSourceAgg is one population's contribution to `tag costs`. The Go engine
+// only ever writes the `runs` table while the Python engine only populates
+// tokens/cost on `spans`, so aggregating a single table silently reported zero
+// for the other engine's data. Both are reported, separately labelled.
+type costSourceAgg struct {
+	Source           string  `json:"source"`
+	Rows             int64   `json:"rows"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	CostUSD          float64 `json:"cost_usd"`
+	IncludesEstimate bool    `json:"includes_estimated_rates"`
+}
+
+// tableColumns returns the column set of a table (empty if the table is absent),
+// so an older DB missing the token/cost columns degrades to an empty section
+// instead of failing the whole command.
+func tableColumns(db *store.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		cols[n] = true
+	}
+	return cols, rows.Err()
+}
+
+// aggregateCosts rolls up one table into a labelled section. costCol may be "" —
+// then every priced row falls back to the pricing table. Rows whose cost is
+// derived from an Estimated rate set IncludesEstimate.
+func aggregateCosts(db *store.DB, label, table, costCol string) (costSourceAgg, error) {
+	agg := costSourceAgg{Source: label}
+	cols, err := tableColumns(db, table)
+	if err != nil {
+		return agg, err
+	}
+	if !cols["prompt_tokens"] || !cols["completion_tokens"] {
+		// Table missing or pre-dates token accounting: report an empty section.
+		return agg, nil
+	}
+	if err := db.QueryRow(fmt.Sprintf(
+		`SELECT COUNT(*),COALESCE(SUM(prompt_tokens),0),COALESCE(SUM(completion_tokens),0) FROM %s`, table),
+	).Scan(&agg.Rows, &agg.PromptTokens, &agg.CompletionTokens); err != nil {
+		return agg, err
+	}
+	agg.TotalTokens = agg.PromptTokens + agg.CompletionTokens
+	if !cols[costCol] {
+		costCol = ""
+	}
+	// A stored cost is authoritative for that row; only rows lacking one are
+	// priced from the embedded table.
+	unpriced := "1=1"
+	if costCol != "" {
+		if err := db.QueryRow(fmt.Sprintf(`SELECT COALESCE(SUM(%s),0) FROM %s`, costCol, table)).Scan(&agg.CostUSD); err != nil {
+			return agg, err
+		}
+		// `runs.estimated_cost_usd` is NOT NULL DEFAULT 0, so an unpopulated row
+		// reads as 0 rather than NULL; treat both as "no stored cost".
+		unpriced = fmt.Sprintf("(%s IS NULL OR %s = 0)", costCol, costCol)
+	}
+	if !cols["model_id"] {
+		return agg, nil
+	}
+	rows, err := db.Query(fmt.Sprintf(
+		`SELECT COALESCE(model_id,''), COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0)
+		 FROM %s WHERE %s AND model_id IS NOT NULL AND model_id <> ''`, table, unpriced))
+	if err != nil {
+		return agg, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var model string
+		var p, c int64
+		if err := rows.Scan(&model, &p, &c); err != nil {
+			return agg, err
+		}
+		price, ok := lookupPrice(model)
+		if !ok {
+			continue
+		}
+		agg.CostUSD += float64(p)/1e6*price.In + float64(c)/1e6*price.Out
+		if price.Estimated {
+			agg.IncludesEstimate = true
+		}
+	}
+	return agg, rows.Err()
 }
 
 func registerObservability(root *cobra.Command, app *App) {
@@ -194,47 +324,55 @@ func registerObservability(root *cobra.Command, app *App) {
 			if err != nil {
 				return err
 			}
-			var pt, ct int64
-			if err := db.QueryRow(`SELECT COALESCE(SUM(prompt_tokens),0),COALESCE(SUM(completion_tokens),0) FROM spans`).Scan(&pt, &ct); err != nil {
-				return err
-			}
-			// Dollar cost: prefer the persisted cost_usd column, and fall back to
-			// the embedded pricing table for spans that recorded a model + tokens
-			// but no cost. Previously `costs` printed tokens only, despite having
-			// both a pricing table and a cost_usd column available.
-			var storedCost float64
-			if err := db.QueryRow(`SELECT COALESCE(SUM(cost_usd),0) FROM spans`).Scan(&storedCost); err != nil {
-				return err
-			}
-			costUSD := storedCost
-			rows, err := db.Query(`SELECT COALESCE(model_id,''), COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0)
-				FROM spans WHERE cost_usd IS NULL AND model_id IS NOT NULL AND model_id <> ''`)
+			// `runs` and `spans` are written by different engines (Go writes
+			// runs; Python's tracing writes spans), so aggregating only one of
+			// them made `costs` blind to half the data. Report both, labelled.
+			runsAgg, err := aggregateCosts(db, "runs", "runs", "estimated_cost_usd")
 			if err != nil {
 				return err
 			}
-			defer rows.Close()
-			for rows.Next() {
-				var model string
-				var p, c int64
-				if err := rows.Scan(&model, &p, &c); err != nil {
-					return err
-				}
-				if price, ok := lookupPrice(model); ok {
-					costUSD += float64(p)/1e6*price[0] + float64(c)/1e6*price[1]
-				}
-			}
-			if err := rows.Err(); err != nil {
+			spansAgg, err := aggregateCosts(db, "spans", "spans", "cost_usd")
+			if err != nil {
 				return err
 			}
-			out := map[string]any{
-				"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct,
-				"cost_usd": costUSD,
+			sources := []string{}
+			if runsAgg.Rows > 0 {
+				sources = append(sources, "runs")
 			}
+			if spansAgg.Rows > 0 {
+				sources = append(sources, "spans")
+			}
+			// A run aggregates its spans, so when both populations exist the sum
+			// may double-count. That must never be reported silently.
+			overlap := runsAgg.Rows > 0 && spansAgg.Rows > 0
+			estimated := runsAgg.IncludesEstimate || spansAgg.IncludesEstimate
+			totPT := runsAgg.PromptTokens + spansAgg.PromptTokens
+			totCT := runsAgg.CompletionTokens + spansAgg.CompletionTokens
+			totCost := runsAgg.CostUSD + spansAgg.CostUSD
 			if flagJSON {
-				b, _ := json.Marshal(map[string]any{"totals": out})
+				b, _ := json.Marshal(map[string]any{
+					"by_source": map[string]any{"runs": runsAgg, "spans": spansAgg},
+					"totals": map[string]any{
+						"prompt_tokens": totPT, "completion_tokens": totCT,
+						"total_tokens": totPT + totCT, "cost_usd": totCost,
+						"sources": sources, "overlap_warning": overlap,
+						"includes_estimated_rates": estimated,
+					},
+				})
 				fmt.Println(string(b))
-			} else {
-				fmt.Printf("prompt=%d completion=%d total=%d tokens  cost=$%.6f\n", pt, ct, pt+ct, costUSD)
+				return nil
+			}
+			line := func(label string, p, c int64, cost float64) {
+				fmt.Printf("%-6s prompt=%d completion=%d total=%d tokens  cost=$%.6f\n", label, p, c, p+c, cost)
+			}
+			line("runs", runsAgg.PromptTokens, runsAgg.CompletionTokens, runsAgg.CostUSD)
+			line("spans", spansAgg.PromptTokens, spansAgg.CompletionTokens, spansAgg.CostUSD)
+			line("TOTAL", totPT, totCT, totCost)
+			if overlap {
+				fmt.Println("note: runs and spans are different populations (a run aggregates spans); the TOTAL may double-count.")
+			}
+			if estimated {
+				fmt.Println("note: total includes estimated rates that are not authoritative published prices.")
 			}
 			return nil
 		}}
@@ -244,14 +382,36 @@ func registerObservability(root *cobra.Command, app *App) {
 	pricing := &cobra.Command{Use: "pricing", Short: "LLM pricing table", GroupID: "obs"}
 	prList := &cobra.Command{Use: "list", Short: "List model prices",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Map iteration order is random, so the human table used to print in a
+			// different order on every invocation. Sort for determinism.
+			ids := make([]string, 0, len(pricingTable))
+			for m := range pricingTable {
+				ids = append(ids, m)
+			}
+			sort.Strings(ids)
 			if flagJSON {
-				b, _ := json.MarshalIndent(pricingTable, "", "  ")
+				out := map[string]any{}
+				for _, m := range ids {
+					p := pricingTable[m]
+					out[m] = map[string]any{
+						"input_usd_per_1m":  p.In,
+						"output_usd_per_1m": p.Out,
+						"estimated":         p.Estimated,
+						"source":            p.Source,
+					}
+				}
+				b, _ := json.MarshalIndent(out, "", "  ")
 				fmt.Println(string(b))
 				return nil
 			}
-			fmt.Printf("%-32s %12s %12s\n", "Model", "In $/1M", "Out $/1M")
-			for m, p := range pricingTable {
-				fmt.Printf("%-32s %12.4f %12.4f\n", m, p[0], p[1])
+			fmt.Printf("%-32s %12s %12s %12s\n", "Model", "In $/1M", "Out $/1M", "")
+			for _, m := range ids {
+				p := pricingTable[m]
+				marker := ""
+				if p.Estimated {
+					marker = "estimated"
+				}
+				fmt.Printf("%-32s %12.4f %12.4f %12s\n", m, p.In, p.Out, marker)
 			}
 			return nil
 		}}
@@ -264,7 +424,22 @@ func registerObservability(root *cobra.Command, app *App) {
 			if !ok {
 				return fmt.Errorf("model not found: %q", model)
 			}
-			cost := float64(inTok)/1e6*p[0] + float64(outTok)/1e6*p[1]
+			cost := float64(inTok)/1e6*p.In + float64(outTok)/1e6*p.Out
+			// `pricing get` used to ignore the global --json flag entirely and
+			// always print "$%.8f", which no caller could parse.
+			if flagJSON {
+				b, _ := json.Marshal(map[string]any{
+					"model_id": model, "input_tokens": inTok, "output_tokens": outTok,
+					"input_usd_per_1m": p.In, "output_usd_per_1m": p.Out,
+					"cost_usd": cost, "estimated": p.Estimated, "source": p.Source,
+				})
+				fmt.Println(string(b))
+				return nil
+			}
+			if p.Estimated {
+				fmt.Printf("$%.8f  (estimated — not an authoritative published rate)\n", cost)
+				return nil
+			}
 			fmt.Printf("$%.8f\n", cost)
 			return nil
 		}}
