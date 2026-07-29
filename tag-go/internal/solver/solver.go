@@ -33,6 +33,7 @@ import (
 	"github.com/tag-agent/tag/internal/permission"
 	"github.com/tag-agent/tag/internal/store"
 	"github.com/tag-agent/tag/internal/tool"
+	"github.com/tag-agent/tag/internal/trace"
 )
 
 // Kind identifies which agentic-solver command produced a result.
@@ -138,7 +139,19 @@ func Solve(ctx context.Context, db *store.DB, prov llm.Provider, model string, o
 		return nil, err
 	}
 
-	loop := &agent.Loop{Provider: prov}
+	// The run id is generated up-front so it can double as the trace id: #590
+	// left swe-solve/issue-solve/agentic-ci/review-pr emitting no spans at all,
+	// so `tag trace show <solve-id>` had nothing to show. Persisting spans is
+	// best-effort — a solve must not fail because its telemetry did not save.
+	id := uuid.NewString()[:16]
+	rec := trace.NewRecorder(id, "default")
+	defer func() {
+		if db != nil {
+			_ = rec.Save(db.DB)
+		}
+	}()
+
+	loop := &agent.Loop{Provider: prov, Tracer: rec}
 	// Enable the root-confined file tools for swe-solve when requested. The echo
 	// provider never requests tools, so this is inert offline; a real/scripted
 	// provider can now read_file/write_file/list_dir under RepoPath.
@@ -156,7 +169,6 @@ func Solve(ctx context.Context, db *store.DB, prov llm.Provider, model string, o
 	}
 
 	started := time.Now().UTC()
-	id := uuid.NewString()[:16]
 
 	// agentic-ci with a real --check command runs its own check→fix loop.
 	if opts.Kind == KindCI && strings.TrimSpace(opts.CheckCmd) != "" {
