@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Linux counterparts of the macOS run-dir tests. They only build and run on
@@ -138,6 +140,111 @@ func TestLandlockAllowListWritesOnlyRunDir(t *testing.T) {
 				t.Fatalf("allow-list contains %q; it must stay denied", denied)
 			}
 		}
+	}
+}
+
+// TestLandlockFileRulesUseFileOnlyRights is the regression test for the bug that
+// made the sandbox 100% unusable on every Landlock-capable kernel: the
+// allow-list handed directory-only rights (READ_DIR, MAKE_*, REMOVE_*) to
+// regular files such as /etc/ld.so.cache, and landlock_add_rule answered EINVAL
+// for the whole policy -- so every sandboxed run failed closed with exit 126.
+//
+// It runs on ANY kernel, Landlock or not: nothing here needs the LSM, only
+// stat(2). A future edit that adds a file entry with a directory mask, or that
+// removes the narrowing in apply(), fails here instead of only on a real kernel.
+func TestLandlockFileRulesUseFileOnlyRights(t *testing.T) {
+	for _, abi := range []int{1, 2, 3, 4, 5, 6} {
+		fileMask := llFileAccessMask(abi)
+		want := uint64(llFSFileV1)
+		if abi >= 3 {
+			want |= llFSTruncate
+		}
+		if abi >= 5 {
+			want |= llFSIoctlDev
+		}
+		if fileMask != want {
+			t.Fatalf("abi %d: file mask %#x, want %#x", abi, fileMask, want)
+		}
+		// A directory keeps everything; a non-directory keeps only the subset.
+		full := llHandledFS(abi)
+		if got := llAccessForType(full, true, abi); got != full {
+			t.Fatalf("abi %d: a directory lost rights: %#x -> %#x", abi, full, got)
+		}
+		if got := llAccessForType(full, false, abi); got != fileMask {
+			t.Fatalf("abi %d: a non-directory kept %#x, want the file mask %#x", abi, got, fileMask)
+		}
+		// The narrowing must actually drop something, or it is not doing its job.
+		if full&^fileMask == 0 {
+			t.Fatalf("abi %d: no directory-only rights exist in %#x; the mask is vacuous", abi, full)
+		}
+	}
+
+	// And the real allow-list, against the real filesystem of whatever host this
+	// runs on: every entry that exists and is NOT a directory must end up with a
+	// mask the kernel will accept, and must not be emptied out by the narrowing.
+	abi := 6
+	handled := llHandledFS(abi)
+	fileMask := llFileAccessMask(abi)
+	sawNonDir := false
+	for _, r := range landlockAllowList(t.TempDir()) {
+		fi, err := os.Stat(r.path) // follows symlinks, like the O_PATH fd apply() uses
+		if err != nil {
+			continue // not present on this distro; apply() skips it too
+		}
+		if fi.IsDir() {
+			continue
+		}
+		sawNonDir = true
+		// Go through the same open+fstat path apply() uses, so a regression that
+		// removes the narrowing there is caught here and not only on a kernel
+		// that actually has Landlock.
+		pfd, err := unix.Open(r.path, unix.O_PATH|unix.O_CLOEXEC, 0)
+		if err != nil {
+			continue
+		}
+		got, isDir, err := llAccessForFD(pfd, r.access&handled, abi)
+		unix.Close(pfd)
+		if err != nil {
+			t.Fatalf("llAccessForFD(%s): %v", r.path, err)
+		}
+		if isDir {
+			continue // raced with os.Stat; not this test's business
+		}
+		if got&^fileMask != 0 {
+			t.Fatalf("%s is not a directory (mode %v) yet would be sent %#x, which contains the "+
+				"directory-only rights %#x -- landlock_add_rule returns EINVAL and the whole policy fails",
+				r.path, fi.Mode(), got, got&^fileMask)
+		}
+		if got == 0 {
+			t.Fatalf("%s ends up with no access rights at all; it was granted %#x, none of which is a file right",
+				r.path, r.access)
+		}
+	}
+	if !sawNonDir {
+		t.Log("no non-directory allow-list entry exists on this host")
+	}
+
+	// The other half of the contract: a real directory (the run dir, the one rule
+	// that MUST keep its write rights) is not narrowed at all.
+	runDir := t.TempDir()
+	dfd, err := unix.Open(runDir, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", runDir, err)
+	}
+	defer unix.Close(dfd)
+	got, isDir, err := llAccessForFD(dfd, handled, abi)
+	if err != nil {
+		t.Fatalf("llAccessForFD(%s): %v", runDir, err)
+	}
+	if !isDir {
+		t.Fatalf("%s is not seen as a directory", runDir)
+	}
+	if got != handled {
+		t.Fatalf("the run dir lost rights: %#x -> %#x (dropped %#x); it is the sandbox's only writable tree",
+			handled, got, handled&^got)
+	}
+	if got&unix.LANDLOCK_ACCESS_FS_MAKE_REG == 0 || got&unix.LANDLOCK_ACCESS_FS_WRITE_FILE == 0 {
+		t.Fatalf("the run dir cannot create or write files: %#x", got)
 	}
 }
 

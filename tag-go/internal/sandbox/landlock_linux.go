@@ -54,7 +54,80 @@ const (
 	llFSExecute = unix.LANDLOCK_ACCESS_FS_EXECUTE
 	// llFSReadWriteFile is read+write on a single file (no directory rights).
 	llFSReadWriteFile = unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_WRITE_FILE
+
+	// llFSFileV1 is the ABI-1 subset of access rights the kernel accepts on a
+	// NON-directory. See llFileAccessMask.
+	llFSFileV1 = unix.LANDLOCK_ACCESS_FS_EXECUTE |
+		unix.LANDLOCK_ACCESS_FS_WRITE_FILE |
+		unix.LANDLOCK_ACCESS_FS_READ_FILE
 )
+
+// llFileAccessMask returns the access rights landlock_add_rule accepts when the
+// rule's target is not a directory, for a given ABI.
+//
+// The kernel (security/landlock/syscalls.c, add_rule_path_beneath) rejects the
+// whole call with EINVAL -- not silently ignoring the surplus bits -- when the
+// target is not a directory and allowed_access contains anything outside its
+// ACCESS_FILE set:
+//
+//	if (!d_is_dir(path.dentry) &&
+//	    (path_beneath_attr.allowed_access | ACCESS_FILE) != ACCESS_FILE)
+//	        return -EINVAL;
+//
+// ACCESS_FILE is EXECUTE|WRITE_FILE|READ_FILE, plus TRUNCATE from ABI 3 and
+// IOCTL_DEV from ABI 5. Everything else -- READ_DIR, REMOVE_*, MAKE_*, REFER --
+// is directory-only and must never be sent for a regular file, a symlink target
+// that is a regular file, or a character/block device.
+func llFileAccessMask(abi int) uint64 {
+	m := uint64(llFSFileV1)
+	if abi >= 3 {
+		m |= llFSTruncate
+	}
+	if abi >= 5 {
+		m |= llFSIoctlDev
+	}
+	return m
+}
+
+// llAccessForType narrows a rule's access rights to what the kernel will accept
+// for the type of the path it points at: directories keep the full mask, and
+// anything else (regular file, device node, fifo, socket) is reduced to the
+// file-only subset.
+//
+// Doing this generically rather than per-entry is the point: the allow-list
+// mixes directories (/usr, /proc, /etc/ssl/certs) with regular files
+// (/etc/ld.so.cache, /etc/localtime) and character devices (/dev/null, /dev/tty),
+// and a single directory-flavoured bit on any one of them used to abort the
+// entire policy install with EINVAL.
+func llAccessForType(access uint64, isDir bool, abi int) uint64 {
+	if isDir {
+		return access
+	}
+	return access & llFileAccessMask(abi)
+}
+
+// llAccessForFD is the exact computation apply() performs for one rule: it asks
+// the kernel what the path IS, using the very fd that is about to be handed to
+// landlock_add_rule, and narrows the rights accordingly.
+//
+// fstat(2) on an O_PATH fd is legal, and because the fd was opened WITHOUT
+// O_NOFOLLOW it names the same resolved dentry that landlock_add_rule inspects
+// with d_is_dir(). Deliberately NOT lstat(path): the kernel judges the symlink
+// TARGET, so stat-ing the link itself would disagree exactly where it matters --
+// /lib -> usr/lib on merged-usr distros would look like a non-directory and lose
+// its READ_DIR/EXECUTE grant, silently breaking the dynamic loader. Using the fd
+// also closes the TOCTOU window a second path lookup would open.
+//
+// It is a separate function so tests can pin the narrowing without needing a
+// Landlock-capable kernel.
+func llAccessForFD(fd int, access uint64, abi int) (uint64, bool, error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return 0, false, err
+	}
+	isDir := st.Mode&unix.S_IFMT == unix.S_IFDIR
+	return llAccessForType(access, isDir, abi), isDir, nil
+}
 
 // llRulesetAttr mirrors struct landlock_ruleset_attr. Only the first `size`
 // bytes we pass to the kernel are read, so older ABIs get an 8-byte view.
@@ -242,12 +315,37 @@ func (p llPolicy) apply() error {
 			// rule; that is a tightening, never a loosening.
 			continue
 		}
-		pb := llPathBeneath{allowedAccess: r.access & handled, parentFD: int32(pfd)}
+		access, isDir, ferr := llAccessForFD(pfd, r.access&handled, p.abi)
+		if ferr != nil {
+			unix.Close(pfd)
+			if r.required {
+				return fmt.Errorf("cannot stat the run directory %s, so it could not be granted as the "+
+					"sandbox's writable tree: %w", r.path, ferr)
+			}
+			continue
+		}
+		if access == 0 {
+			// Nothing left to grant (e.g. a directory-only rule that turned out
+			// to point at a file). An empty rule grants nothing, so skipping it
+			// is a tightening -- but never for the run dir, which must be
+			// writable or the sandbox is broken.
+			unix.Close(pfd)
+			if r.required {
+				return fmt.Errorf("no Landlock access rights remain for the run directory %s "+
+					"(is it a directory?), so it could not be granted as the sandbox's writable tree", r.path)
+			}
+			continue
+		}
+		pb := llPathBeneath{allowedAccess: access, parentFD: int32(pfd)}
 		_, _, errno := unix.Syscall6(unix.SYS_LANDLOCK_ADD_RULE, uintptr(rulesetFD),
 			unix.LANDLOCK_RULE_PATH_BENEATH, uintptr(unsafe.Pointer(&pb)), 0, 0, 0)
 		unix.Close(pfd)
 		if errno != 0 {
-			return fmt.Errorf("landlock_add_rule(%s): %w", r.path, errno)
+			// access/dir are in the message because the only realistic cause of
+			// EINVAL here is a rights/type mismatch, and knowing both halves is
+			// the difference between a one-line fix and a guess.
+			return fmt.Errorf("landlock_add_rule(%s, access=%#x, dir=%t, abi=%d): %w",
+				r.path, access, isDir, p.abi, errno)
 		}
 	}
 
