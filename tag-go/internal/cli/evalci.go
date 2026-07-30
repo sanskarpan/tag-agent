@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/tag-agent/tag/internal/ciauto"
+	"github.com/tag-agent/tag/internal/eval"
 )
 
 // registerEvalCI wires the `eval-ci` command (scaffold + offline run).
@@ -45,12 +46,16 @@ func registerEvalCI(root *cobra.Command, app *App) {
 	var cixRunDryRun bool
 	run := &cobra.Command{
 		Use:   "run <suite-path>",
-		Short: "Run an eval suite as a CI gate (dry-run offline: plans cases, no model calls)",
+		Short: "Plan an eval suite as a CI gate (always dry-run; use `tag eval run` to execute)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			suite, err := ciauto.LoadSuite(args[0])
+			// Shares eval.LoadSuite with `tag eval run` so both commands accept
+			// exactly one suite format and apply the same validation (invalid
+			// regex, unknown case keys, duplicate ids) rather than each having
+			// its own looser parser.
+			suite, err := eval.LoadSuite(args[0])
 			if err != nil {
-				return err
+				return jsonErrorMaybe(usageErr{err})
 			}
 			// No live provider is configured in this native build, so `run` is
 			// always a dry-run: we plan how many cases WOULD run and exit 0

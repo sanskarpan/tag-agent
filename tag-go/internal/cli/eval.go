@@ -5,14 +5,16 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/tag-agent/tag/internal/eval"
+
 	"github.com/spf13/cobra"
 )
 
-// registerEval wires eval suite results: eval list/show.
-// Port of src/tag/cmd/marketplace.py:cmd_eval (list/show read paths). The
-// `run` subcommand executes a suite through the runtime (Track B).
+// registerEval wires the eval suite runner: eval run/list/show.
+// Port of src/tag/cmd/marketplace.py:cmd_eval + src/tag/eval_framework.py.
 func registerEval(root *cobra.Command, app *App) {
-	e := &cobra.Command{Use: "eval", Short: "Eval suite runs (list/show results)", GroupID: "obs"}
+	e := &cobra.Command{Use: "eval", Short: "Run eval suites and read their results", GroupID: "obs"}
+	registerEvalRun(e, app)
 
 	list := &cobra.Command{Use: "list", Short: "List eval runs", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -20,24 +22,34 @@ func registerEval(root *cobra.Command, app *App) {
 			if err != nil {
 				return err
 			}
-			rows, err := db.Query(`SELECT id, suite_name, profile, status, pass_count, fail_count
+			if err := eval.EnsureSchema(db.DB); err != nil {
+				return err
+			}
+			rows, err := db.Query(`SELECT id, suite_path, profile, suite_name, status,
+				pass_count, fail_count, total_count, created_at
 				FROM eval_runs ORDER BY created_at DESC LIMIT 20`)
 			if err != nil {
 				return err
 			}
 			defer rows.Close()
+			// Field set/order matches eval_framework.list_eval_runs so `--json`
+			// output is byte-comparable with Python's.
 			type run struct {
-				ID        string `json:"id"`
-				SuiteName string `json:"suite_name"`
-				Profile   string `json:"profile"`
-				Status    string `json:"status"`
-				PassCount int    `json:"pass_count"`
-				FailCount int    `json:"fail_count"`
+				ID         string `json:"id"`
+				SuitePath  string `json:"suite_path"`
+				Profile    string `json:"profile"`
+				SuiteName  string `json:"suite_name"`
+				Status     string `json:"status"`
+				PassCount  int    `json:"pass_count"`
+				FailCount  int    `json:"fail_count"`
+				TotalCount int    `json:"total_count"`
+				CreatedAt  string `json:"created_at"`
 			}
 			var out []run
 			for rows.Next() {
 				var r run
-				if err := rows.Scan(&r.ID, &r.SuiteName, &r.Profile, &r.Status, &r.PassCount, &r.FailCount); err != nil {
+				if err := rows.Scan(&r.ID, &r.SuitePath, &r.Profile, &r.SuiteName, &r.Status,
+					&r.PassCount, &r.FailCount, &r.TotalCount, &r.CreatedAt); err != nil {
 					return err
 				}
 				out = append(out, r)
@@ -69,37 +81,57 @@ func registerEval(root *cobra.Command, app *App) {
 			if err != nil {
 				return err
 			}
+			if err := eval.EnsureSchema(db.DB); err != nil {
+				return err
+			}
 			var id, suitePath, profile, suiteName, status, createdAt string
 			var pass, fail, total int
 			var completed sql.NullString
 			err = db.QueryRow(`SELECT id, suite_path, profile, suite_name, status, pass_count, fail_count, total_count, created_at, completed_at
 				FROM eval_runs WHERE id=?`, args[0]).Scan(&id, &suitePath, &profile, &suiteName, &status, &pass, &fail, &total, &createdAt, &completed)
 			if err == sql.ErrNoRows {
-				return fmt.Errorf("eval run %q not found", args[0])
+				return jsonErrorMaybe(fmt.Errorf("eval run %q not found", args[0]))
 			}
 			if err != nil {
 				return err
 			}
-			crows, err := db.Query(`SELECT case_id, passed, score, COALESCE(failure_reason,''), created_at FROM eval_cases WHERE eval_run_id=?`, id)
+			crows, err := db.Query(`SELECT case_id, passed, score, failure_reason, created_at,
+				prompt_tokens, completion_tokens, cost_usd FROM eval_cases WHERE eval_run_id=? ORDER BY created_at, case_id`, id)
 			if err != nil {
 				return err
 			}
 			defer crows.Close()
+			// failure_reason is a *string so an unfailed case serializes as null,
+			// matching get_eval_run_detail (Python emits None, not "").
 			type ecase struct {
-				CaseID        string  `json:"case_id"`
-				Passed        bool    `json:"passed"`
-				Score         float64 `json:"score"`
-				FailureReason string  `json:"failure_reason"`
-				CreatedAt     string  `json:"created_at"`
+				CaseID           string   `json:"case_id"`
+				Passed           bool     `json:"passed"`
+				Score            float64  `json:"score"`
+				FailureReason    *string  `json:"failure_reason"`
+				CreatedAt        string   `json:"created_at"`
+				PromptTokens     int      `json:"prompt_tokens"`
+				CompletionTokens int      `json:"completion_tokens"`
+				CostUSD          *float64 `json:"cost_usd"`
 			}
-			var cases []ecase
+			cases := []ecase{}
 			for crows.Next() {
 				var c ecase
 				var p int
-				if err := crows.Scan(&c.CaseID, &p, &c.Score, &c.FailureReason, &c.CreatedAt); err != nil {
+				var reason sql.NullString
+				var cost sql.NullFloat64
+				if err := crows.Scan(&c.CaseID, &p, &c.Score, &reason, &c.CreatedAt,
+					&c.PromptTokens, &c.CompletionTokens, &cost); err != nil {
 					return err
 				}
 				c.Passed = p != 0
+				if reason.Valid {
+					v := reason.String
+					c.FailureReason = &v
+				}
+				if cost.Valid {
+					v := cost.Float64
+					c.CostUSD = &v
+				}
 				cases = append(cases, c)
 			}
 			if err := crows.Err(); err != nil {
@@ -121,8 +153,8 @@ func registerEval(root *cobra.Command, app *App) {
 					icon = "✗"
 				}
 				reason := ""
-				if c.FailureReason != "" {
-					reason = "  (" + c.FailureReason + ")"
+				if c.FailureReason != nil && *c.FailureReason != "" {
+					reason = "  (" + *c.FailureReason + ")"
 				}
 				fmt.Printf("  [%s] %s  score=%.2f%s\n", icon, c.CaseID, c.Score, reason)
 			}
