@@ -1,0 +1,282 @@
+package ciauto
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// stackRule maps a stack identifier to its marker files/dirs. Ordered exactly as
+// Python's _STACK_DETECTION_RULES so DetectStack returns the same sequence.
+type stackRule struct {
+	name    string
+	markers []string
+}
+
+var stackRules = []stackRule{
+	{"python", []string{"pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"}},
+	{"node", []string{"package.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb"}},
+	{"rust", []string{"Cargo.toml"}},
+	{"go", []string{"go.mod"}},
+	{"java", []string{"pom.xml", "build.gradle", "build.gradle.kts", "gradlew"}},
+	{"ruby", []string{"Gemfile", ".ruby-version"}},
+	{"docker", []string{"Dockerfile", "docker-compose.yml", "docker-compose.yaml"}},
+	{"k8s", []string{"k8s/", "kubernetes/", "helm/", "Chart.yaml"}},
+}
+
+// DetectStack returns the technology stacks present in root, in a stable order.
+func DetectStack(root string) []string {
+	if root == "" {
+		root = "."
+	}
+	out := []string{}
+	for _, r := range stackRules {
+		for _, m := range r.markers {
+			if strings.HasSuffix(m, "/") {
+				if st, err := os.Stat(filepath.Join(root, strings.TrimSuffix(m, "/"))); err == nil && st.IsDir() {
+					out = append(out, r.name)
+					break
+				}
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(root, m)); err == nil {
+				out = append(out, r.name)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// stackJobs holds the per-stack GitLab CI job snippets, ported verbatim from
+// Python's _STACK_JOB_SNIPPETS.
+var stackJobs = map[string]string{
+	"python": `python-lint:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pip install --upgrade pip
+    - pip install -e ".[dev]" || pip install -r requirements.txt || true
+    - python -m pytest --tb=short -q
+
+python-type-check:
+  stage: test
+  image: python:3.12-slim
+  allow_failure: true
+  script:
+    - pip install mypy
+    - mypy . --ignore-missing-imports
+`,
+	"node": `node-install:
+  stage: build
+  image: node:20-alpine
+  script:
+    - npm ci
+  cache:
+    paths:
+      - node_modules/
+
+node-test:
+  stage: test
+  image: node:20-alpine
+  script:
+    - npm test
+  needs: [node-install]
+`,
+	"rust": `rust-build:
+  stage: build
+  image: rust:latest
+  script:
+    - cargo build --release
+
+rust-test:
+  stage: test
+  image: rust:latest
+  script:
+    - cargo test
+  needs: [rust-build]
+`,
+	"go": `go-build:
+  stage: build
+  image: golang:1.22-alpine
+  script:
+    - go build ./...
+
+go-test:
+  stage: test
+  image: golang:1.22-alpine
+  script:
+    - go test ./...
+  needs: [go-build]
+`,
+	"java": `java-build:
+  stage: build
+  image: eclipse-temurin:21-jdk
+  script:
+    - ./mvnw package -DskipTests
+
+java-test:
+  stage: test
+  image: eclipse-temurin:21-jdk
+  script:
+    - ./mvnw test
+  needs: [java-build]
+`,
+	"ruby": `ruby-test:
+  stage: test
+  image: ruby:3.3-slim
+  script:
+    - bundle install
+    - bundle exec rspec
+`,
+	"docker": `docker-build:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+`,
+	"k8s": `k8s-lint:
+  stage: test
+  image: bitnami/kubectl:latest
+  script:
+    - kubectl apply --dry-run=client -f k8s/
+`,
+}
+
+const deploySnippet = `deploy-staging:
+  stage: deploy
+  environment:
+    name: staging
+    url: https://staging.example.com
+  script:
+    - echo "Deploy to staging - customise this step."
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+`
+
+// PipelineOptions configures GenerateGitLabPipeline.
+type PipelineOptions struct {
+	// Stages overrides the stage list (default build/test/deploy).
+	Stages []string
+	// IncludeDeploy appends a manual deploy-to-staging job.
+	IncludeDeploy bool
+}
+
+// GenerateGitLabPipeline renders a .gitlab-ci.yml for the detected stacks.
+//
+// Divergences from Python's generate_gitlab_pipeline, all deliberate:
+//   - Python built a broken `header` variable (a bogus chr(10+...) join) and then
+//     threw it away, rebuilding the stages block correctly below. The dead code
+//     is dropped here.
+//   - Every Python job script ended in `|| true`, so the generated pipeline was
+//     GREEN NO MATTER WHAT — a CI config that can never fail is worse than none.
+//     This port removes `|| true` from test/build jobs; the only tolerant job is
+//     the type check, which is marked `allow_failure: true` explicitly so the
+//     tolerance is visible in the GitLab UI instead of hidden in a shell operator.
+//   - `only:` (deprecated by GitLab) is replaced with `rules:`.
+func GenerateGitLabPipeline(stack []string, opts PipelineOptions) string {
+	stages := opts.Stages
+	if len(stages) == 0 {
+		stages = []string{"build", "test", "deploy"}
+	}
+	var b strings.Builder
+	b.WriteString("# Generated by tag-agent - customise as needed.\n")
+	b.WriteString("# https://docs.gitlab.com/ee/ci/yaml/\n\n")
+	b.WriteString("default:\n  retry:\n    max: 1\n    when:\n")
+	b.WriteString("      - runner_system_failure\n      - stuck_or_timeout_failure\n\n")
+	b.WriteString("stages:\n")
+	for _, s := range stages {
+		fmt.Fprintf(&b, "  - %s\n", s)
+	}
+	b.WriteString("\n")
+
+	emitted := 0
+	for _, id := range stack {
+		snip, ok := stackJobs[id]
+		if !ok {
+			continue
+		}
+		fmt.Fprintf(&b, "# --- %s ---\n%s\n", id, snip)
+		emitted++
+	}
+	if emitted == 0 {
+		b.WriteString("# No known stack detected - add your jobs below.\n")
+		b.WriteString("placeholder:\n  stage: test\n  script:\n    - echo \"Add your CI steps here.\"\n\n")
+	}
+	if opts.IncludeDeploy {
+		fmt.Fprintf(&b, "# --- deploy ---\n%s", deploySnippet)
+	}
+	return b.String()
+}
+
+// frameworkMarkers maps a test framework to its marker files, ordered so the
+// first hit wins (mirrors Python's _FRAMEWORK_MARKERS iteration order).
+var frameworkMarkers = []struct {
+	name    string
+	markers []string
+}{
+	{"pytest", []string{"pytest.ini", "conftest.py", "tox.ini", "pyproject.toml"}},
+	{"cargo", []string{"Cargo.toml"}},
+	{"go-test", []string{"go.mod"}},
+	{"rspec", []string{".rspec", "spec/spec_helper.rb"}},
+	{"jest", []string{"jest.config.js", "jest.config.ts", "jest.config.mjs"}},
+	{"mocha", []string{".mocharc.json", ".mocharc.yml", ".mocharc.js"}},
+}
+
+// DetectTestFramework identifies the test framework in root. Mirrors
+// detect_test_framework, including the pyproject.toml special case (only counts
+// as pytest when the file actually mentions pytest) and the package.json
+// fallback. Falls back to "pytest".
+func DetectTestFramework(root string) string {
+	if root == "" {
+		root = "."
+	}
+	for _, fw := range frameworkMarkers {
+		for _, m := range fw.markers {
+			p := filepath.Join(root, m)
+			if _, err := os.Stat(p); err != nil {
+				continue
+			}
+			if m == "pyproject.toml" {
+				b, rerr := os.ReadFile(p)
+				if rerr == nil && strings.Contains(string(b), "pytest") {
+					return "pytest"
+				}
+				continue
+			}
+			return fw.name
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(root, "package.json")); err == nil {
+		s := string(b)
+		if strings.Contains(s, "jest") {
+			return "jest"
+		}
+		if strings.Contains(s, "mocha") {
+			return "mocha"
+		}
+	}
+	return "pytest"
+}
+
+// TestGenSystemPrompt is the system message for test-gen.
+const TestGenSystemPrompt = "You are a test engineer. Write focused, deterministic unit tests for the " +
+	"changed code in the supplied diff. Cover happy paths, boundaries and error cases. " +
+	"Output ONLY test code - no prose, no markdown fences."
+
+// BuildTestGenPrompt renders the test-generation user message (8000-char diff
+// cap, matching Python's generate_tests).
+func BuildTestGenPrompt(framework, diff string) string {
+	if len(diff) > 8000 {
+		diff = diff[:8000] + "\n[... diff truncated at 8000 chars ...]"
+	}
+	return fmt.Sprintf("## Target Framework\n\n%s\n\n## Code Diff\n\n```diff\n%s\n```\n\nGenerate tests now.\n",
+		framework, diff)
+}
