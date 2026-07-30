@@ -40,6 +40,13 @@ func registerCI(root *cobra.Command, app *App) {
 	}
 	ci.Flags().StringVar(&cixCIProvider, "provider", "echo", "LLM provider (default echo, offline)")
 
+	// `tag ci diagnose <log>` — the second spelling Python exposes for PRD-060
+	// (cmd_ci_ext dispatches "diagnose" and "ci-diagnose" to the same handler).
+	// Attaching it as a subcommand keeps the legacy `tag ci <task>` form working:
+	// cobra routes a first arg of "diagnose" to the subcommand and anything else
+	// falls through to this command's own RunE.
+	ci.AddCommand(newCIDiagnoseCmd(app, "diagnose"))
+
 	root.AddCommand(loop, ci)
 }
 
