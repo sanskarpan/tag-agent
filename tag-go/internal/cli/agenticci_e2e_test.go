@@ -208,7 +208,7 @@ func TestE2EFixVulnJSONErrorObject(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("--json must NOT swallow the failure into exit 0: %s", out)
 	}
-	line := firstJSONLine(t, out)
+	line := firstJSONLineT(t, out)
 	var obj map[string]any
 	if err := json.Unmarshal([]byte(line), &obj); err != nil {
 		t.Fatalf("no JSON error object emitted: %v\n%s", err, out)
@@ -705,9 +705,9 @@ func TestE2EAgenticCISubcommandsEmitSpans(t *testing.T) {
 	}
 }
 
-// firstJSONLine returns the first line of out that parses as a JSON object,
+// firstJSONLineT returns the first line of out that parses as a JSON object,
 // so an assertion is not confused by a trailing human-readable "error:" line.
-func firstJSONLine(t *testing.T, out string) string {
+func firstJSONLineT(t *testing.T, out string) string {
 	t.Helper()
 	for _, ln := range strings.Split(out, "\n") {
 		ln = strings.TrimSpace(ln)
