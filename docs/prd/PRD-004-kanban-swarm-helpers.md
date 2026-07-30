@@ -1,6 +1,6 @@
 # PRD-004: Kanban Swarm Topology Helpers
 
-**Status:** Shipped (Python only) — the kanban root/workers/verifier/synthesizer topology (`tag swarm "<task>"`) is NOT ported to Go; it needs an `internal/kanban` package that does not exist. Distinct from PRD-023, which IS now in Go
+**Status:** Deliberate non-port (Go) / Shipped (Python) — this PRD wraps `hermes kanban swarm`, and `kanban` is on the documented managed-Hermes passthrough non-port list (`tag-go/MIGRATION_STATUS.md`). `create_swarm` writes cards into Hermes's kanban DB and Hermes agents consume them; Go has no kanban board and no consumer, so porting it would create a producer with no consumer — the same defect class as #590 (spans with no producer) and the read-only `swarm list` this repo just fixed. **Distinct from PRD-023**, which IS shipped in Go.
 **Priority:** P1  
 **Estimated Effort:** M (2 weeks)  
 **Affects:** `controller.py` (`cmd_submit`, new `cmd_swarm`), `default.yaml` routing config
