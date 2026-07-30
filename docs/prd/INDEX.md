@@ -100,7 +100,7 @@ These PRDs address capabilities where Sakana leads and where TAG can close the g
 | [001](PRD-001-structured-memory-configuration.md) | Structured Memory Configuration Per Profile | P0 (Highest Impact) | M (2–3 weeks) | Shipped (Go + Python) |
 | [002](PRD-002-cross-session-memory-journal.md) | TAG-Native Cross-Session Memory Journal | P0 (Highest Impact) | S (1 week) | Shipped (Go + Python) |
 | [003](PRD-003-rich-streaming-tui.md) | Rich Streaming TUI Output | P0 (Highest Visible Impact) | M (2 weeks) | Shipped (Go + Python) |
-| [004](PRD-004-kanban-swarm-helpers.md) | Kanban Swarm Topology Helpers | P1 | M (2 weeks) | Shipped (Python only) — kanban path not ported to Go (PRD-023 is) |
+| [004](PRD-004-kanban-swarm-helpers.md) | Kanban Swarm Topology Helpers | P1 | M (2 weeks) | Deliberate non-port (Go) / Shipped (Python) — wraps `kanban`, itself a non-port |
 | [005](PRD-005-execution-backend-selection.md) | Execution Backend Selection Per Profile | P1 | S–M (1–2 weeks) | Shipped (Go + Python) |
 | [006](PRD-006-tool-gateway-opt-in.md) | Tool Gateway Opt-in Wiring | P1 | XS (2–3 days) | Shipped (Go + Python) |
 | [007](PRD-007-tag-desktop.md) | `tag desktop` Subcommand | P2 | M (2 weeks) | Shipped (Python only) — Deliberate non-port in Go (OS desktop packaging; see `tag-go/MIGRATION_STATUS.md`) |
