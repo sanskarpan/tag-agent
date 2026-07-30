@@ -3,9 +3,6 @@ package ciauto
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/google/uuid"
 
@@ -103,34 +100,14 @@ func (r *Runner) Flush() {
 }
 
 // DefaultWorkRootName is the directory under TAG_HOME holding per-invocation
-// working directories.
-//
-// NOTE (#591 follow-up): this is the THIRD copy of worker.jobWorkDir's logic
-// (worker, and one other porter's command family, being the first two).
-// worker.jobWorkDir is unexported and internal/worker imports the store, so it
-// cannot simply be called from here. Hoisting it into a tiny shared package
-// (e.g. internal/paths.JobWorkDir) is now clearly warranted -- flagged rather
-// than done here because internal/worker is owned by another agent.
-const DefaultWorkRootName = "work"
+// working directories. The #591 helper it used to carry its own copy of now
+// lives in internal/paths, shared with worker, swarm, eval and loop.
+const DefaultWorkRootName = paths.DefaultWorkRootName
 
-// WorkDir creates a private working directory for one command invocation and
-// returns it with a cleanup func that removes the dir only if it was left
-// empty. id is sanitised so it can never steer the path outside workRoot.
+// WorkDir creates a private working directory for one command invocation at
+// <workRoot>/<id> and returns it with a cleanup func that removes the dir only
+// if it was left empty. id is sanitised so it can never steer the path outside
+// workRoot; a degenerate id falls back to "job".
 func WorkDir(workRoot, id string) (string, func(), error) {
-	if workRoot == "" {
-		workRoot = filepath.Join(paths.Home(), DefaultWorkRootName)
-	}
-	safe := filepath.Base(filepath.Clean("/" + strings.ReplaceAll(id, string(os.PathSeparator), "_")))
-	if safe == "." || safe == string(os.PathSeparator) || safe == "" {
-		safe = "job"
-	}
-	dir := filepath.Join(workRoot, safe)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", func() {}, err
-	}
-	return dir, func() {
-		if entries, err := os.ReadDir(dir); err == nil && len(entries) == 0 {
-			_ = os.Remove(dir)
-		}
-	}, nil
+	return paths.WorkDir(workRoot, paths.SafeSegment(id, "job"))
 }

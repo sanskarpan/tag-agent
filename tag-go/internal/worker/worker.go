@@ -21,8 +21,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -395,40 +393,18 @@ func runJob(ctx context.Context, db *sql.DB, opts Options, j jobRow) (string, er
 
 // DefaultWorkRootName is the directory under TAG_HOME that holds per-job working
 // directories when Options.WorkRoot is unset.
-const DefaultWorkRootName = "work"
+const DefaultWorkRootName = paths.DefaultWorkRootName
 
-// jobWorkDir creates the private working directory for one job and returns it
-// with a cleanup func.
+// jobWorkDir creates the private working directory for one job at
+// <WorkRoot>/<job-id> and returns it with a cleanup func.
 //
-// Behaviour (#591), chosen to be the least surprising of the options:
-//   - the job starts in an EMPTY scratch dir, not a copy or checkout of the
-//     repo. Copying a tree would be surprisingly expensive and would silently
-//     diverge from disk; a checkout is git-worktree isolation, which is
-//     specified separately as PRD-130 and deliberately out of scope here.
-//   - the dir is <WorkRoot>/<job-id>, i.e. stable and derivable from the job id,
-//     so an operator can find a job's artifacts after the fact.
-//   - cleanup removes the dir ONLY if the job left it empty. A job that produced
-//     files keeps them; a job that produced nothing leaves no litter.
+// The #591 contract itself — an EMPTY scratch dir (not a copy or checkout), a
+// stable derivable path, a confined path segment, and a cleanup that removes the
+// dir only if the job left it empty — lives in paths.WorkDir, which is shared
+// with swarm, eval, ciauto and loop. The job id comes from the DB and is
+// normally a uuid; a degenerate one falls back to "job".
 func jobWorkDir(workRoot, jobID string) (string, func(), error) {
-	if workRoot == "" {
-		workRoot = filepath.Join(paths.Home(), DefaultWorkRootName)
-	}
-	// The job id comes from the DB and is normally a uuid, but it must never be
-	// able to steer the path outside WorkRoot.
-	safe := filepath.Base(filepath.Clean("/" + strings.ReplaceAll(jobID, string(os.PathSeparator), "_")))
-	if safe == "." || safe == string(os.PathSeparator) || safe == "" {
-		safe = "job"
-	}
-	dir := filepath.Join(workRoot, safe)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", func() {}, err
-	}
-	return dir, func() {
-		entries, err := os.ReadDir(dir)
-		if err == nil && len(entries) == 0 {
-			_ = os.Remove(dir)
-		}
-	}, nil
+	return paths.WorkDir(workRoot, paths.SafeSegment(jobID, "job"))
 }
 
 // ensureResultColumn self-heals the schema: it adds a `result TEXT` column to

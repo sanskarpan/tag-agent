@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -20,7 +19,6 @@ import (
 	"github.com/tag-agent/tag/internal/pricing"
 	"github.com/tag-agent/tag/internal/tool"
 	"github.com/tag-agent/tag/internal/trace"
-	"github.com/tag-agent/tag/internal/worker"
 )
 
 // DefaultTimeoutPerAgent mirrors Python's --timeout-per-agent default.
@@ -604,33 +602,13 @@ func spanID(s *trace.Span) string {
 	return s.ID
 }
 
-// taskWorkDir gives one sub-agent its own tool root, mirroring
-// internal/worker.jobWorkDir (#591) with a swarm-scoped layout:
-// <WorkRoot>/swarm/<swarm-id>/<task-id>. The dir is removed on exit only if the
-// agent left it empty, so real artifacts survive but nothing litters.
+// taskWorkDir gives one sub-agent its own tool root: paths.WorkDir's #591
+// contract (empty scratch dir, confined segments, removed on exit only if the
+// agent left it empty) under a swarm-scoped layout,
+// <WorkRoot>/swarm/<swarm-id>/<task-id>.
 func taskWorkDir(workRoot, swarmID, taskID string) (string, func(), error) {
-	if workRoot == "" {
-		workRoot = filepath.Join(paths.Home(), worker.DefaultWorkRootName)
-	}
-	dir := filepath.Join(workRoot, "swarm", safeSegment(swarmID, "swarm"), safeSegment(taskID, "task"))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", func() {}, err
-	}
-	return dir, func() {
-		if entries, err := os.ReadDir(dir); err == nil && len(entries) == 0 {
-			_ = os.Remove(dir)
-		}
-	}, nil
-}
-
-// safeSegment reduces an id to a single path segment so a hostile task_id can
-// never steer the working directory out of the work root.
-func safeSegment(id, fallback string) string {
-	s := filepath.Base(filepath.Clean("/" + strings.ReplaceAll(id, string(os.PathSeparator), "_")))
-	if s == "." || s == string(os.PathSeparator) || s == "" || s == ".." {
-		return fallback
-	}
-	return s
+	return paths.WorkDir(workRoot,
+		"swarm", paths.SafeSegment(swarmID, "swarm"), paths.SafeSegment(taskID, "task"))
 }
 
 // listArtifacts names the files a sub-agent left in its working directory.

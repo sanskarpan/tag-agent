@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -423,29 +422,21 @@ func joinReason(a, b string) string {
 // <WorkRoot>/<run-id>/<case-id>, stable and derivable so artifacts are findable
 // afterwards, removed on exit only if the case left it empty.
 func caseWorkDir(workRoot, runID, caseID string) (string, func(), error) {
+	// eval keeps its own default root name ("eval-work", not the shared "work")
+	// so eval artifacts live in their own subtree; resolve it before delegating.
 	if workRoot == "" {
 		workRoot = filepath.Join(paths.Home(), DefaultWorkRootName)
 	}
-	dir := filepath.Join(workRoot, safeSegment(runID, "run"), safeSegment(caseID, "case"))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", func() {}, err
+	dir, cleanup, err := paths.WorkDir(workRoot,
+		paths.SafeSegment(runID, "run"), paths.SafeSegment(caseID, "case"))
+	if err != nil {
+		return dir, cleanup, err
 	}
+	// eval additionally prunes the per-run dir, which the other callers have no
+	// equivalent of: once the last empty case dir goes, an empty run dir would
+	// otherwise linger.
 	return dir, func() {
-		if entries, err := os.ReadDir(dir); err == nil && len(entries) == 0 {
-			_ = os.Remove(dir)
-			_ = os.Remove(filepath.Dir(dir)) // removes the run dir only when empty
-		}
+		cleanup()
+		paths.RemoveIfEmpty(filepath.Dir(dir))
 	}, nil
-}
-
-// safeSegment reduces an id to a single path element so a case id from a suite
-// file can never steer the working directory outside WorkRoot.
-func safeSegment(s, fallback string) string {
-	s = strings.ReplaceAll(s, string(os.PathSeparator), "_")
-	s = strings.ReplaceAll(s, "/", "_")
-	seg := filepath.Base(filepath.Clean("/" + s))
-	if seg == "." || seg == string(os.PathSeparator) || seg == "" {
-		return fallback
-	}
-	return seg
 }
