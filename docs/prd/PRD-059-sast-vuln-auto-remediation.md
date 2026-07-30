@@ -1,6 +1,6 @@
 # PRD-059: SAST Vulnerability Auto-Remediation from SARIF (`tag ci fix-vuln`)
 
-**Status:** Shipped (Python only) — `tag agentic-ci fix-vuln <sarif>`; no Go equivalent
+**Status:** Shipped (Go) — Go `agentic-ci fix-vuln` ported 2026-07-30. **The Python command does not run** (`cmd_ci_ext` TypeError); Go is the only working implementation
 **Priority:** P2
 **Estimated Effort:** M (1-2 weeks)
 **Category:** CI/CD & Agentic Dev Workflows

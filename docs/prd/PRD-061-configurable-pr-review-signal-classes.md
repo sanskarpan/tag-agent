@@ -1,6 +1,6 @@
 # PRD-061: Configurable PR Review Signal Classes (`tag ci review --signals`)
 
-**Status:** Shipped (Python only) — `tag agentic-ci review <pr> --signals`; no Go equivalent
+**Status:** Shipped (Go) — Go `agentic-ci review --signals` ported 2026-07-30 with real verdict parsing. **The Python command does not run** (`cmd_ci_ext` TypeError), and its signal detection could never report clean
 **Priority:** P3
 **Estimated Effort:** S (3-5 days)
 **Category:** CI/CD & Agentic Dev Workflows

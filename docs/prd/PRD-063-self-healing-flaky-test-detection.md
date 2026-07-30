@@ -1,6 +1,6 @@
 # PRD-063: Self-Healing Flaky Test Detection (`tag ci flaky-fix`)
 
-**Status:** Shipped (Python only) — `tag agentic-ci flaky-fix <log>`; no Go equivalent
+**Status:** Shipped (Go + Python) — Go `agentic-ci flaky-fix` ported 2026-07-30; Go refuses the unparseable-rewrite path that let Python clobber a test file with prose
 **Priority:** P3
 **Estimated Effort:** L (2-4 weeks)
 **Category:** CI/CD & Agentic Dev Workflows

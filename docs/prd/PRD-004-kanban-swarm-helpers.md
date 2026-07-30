@@ -1,6 +1,6 @@
 # PRD-004: Kanban Swarm Topology Helpers
 
-**Status:** Shipped (Python only) — Go `swarm` is read-only (`list`/`status`/`results`); `swarm run`/`abort` are not implemented in Go  
+**Status:** Shipped (Python only) — the kanban root/workers/verifier/synthesizer topology (`tag swarm "<task>"`) is NOT ported to Go; it needs an `internal/kanban` package that does not exist. Distinct from PRD-023, which IS now in Go
 **Priority:** P1  
 **Estimated Effort:** M (2 weeks)  
 **Affects:** `controller.py` (`cmd_submit`, new `cmd_swarm`), `default.yaml` routing config

@@ -1,6 +1,6 @@
 # PRD-027: Eval Framework (tag eval)
 
-**Status:** Shipped (Python only) — Go `eval` is `list`/`show`; `eval run` is not implemented in Go  
+**Status:** Shipped (Go + Python) — Go `eval run` ported 2026-07-30; **Python's scorer is broken** (it scores the `tag submit` queue acknowledgement, not the model output), so Go is the only correct implementation
 **Priority:** P1  
 **Estimated Effort:** M (1 sprint, ~2 weeks)  
 **Affects:** `controller.py` (new `cmd_eval`), new `src/tag/eval.py`, new `evals/` directory convention, `tag.sqlite3` (new `eval_results` table)

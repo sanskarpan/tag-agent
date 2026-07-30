@@ -100,7 +100,7 @@ These PRDs address capabilities where Sakana leads and where TAG can close the g
 | [001](PRD-001-structured-memory-configuration.md) | Structured Memory Configuration Per Profile | P0 (Highest Impact) | M (2–3 weeks) | Shipped (Go + Python) |
 | [002](PRD-002-cross-session-memory-journal.md) | TAG-Native Cross-Session Memory Journal | P0 (Highest Impact) | S (1 week) | Shipped (Go + Python) |
 | [003](PRD-003-rich-streaming-tui.md) | Rich Streaming TUI Output | P0 (Highest Visible Impact) | M (2 weeks) | Shipped (Go + Python) |
-| [004](PRD-004-kanban-swarm-helpers.md) | Kanban Swarm Topology Helpers | P1 | M (2 weeks) | Shipped (Python only) — Go `swarm` is read-only (`list`/`status`/`results`); `swarm run`/`abort` are not implemented in Go |
+| [004](PRD-004-kanban-swarm-helpers.md) | Kanban Swarm Topology Helpers | P1 | M (2 weeks) | Shipped (Python only) — kanban path not ported to Go (PRD-023 is) |
 | [005](PRD-005-execution-backend-selection.md) | Execution Backend Selection Per Profile | P1 | S–M (1–2 weeks) | Shipped (Go + Python) |
 | [006](PRD-006-tool-gateway-opt-in.md) | Tool Gateway Opt-in Wiring | P1 | XS (2–3 days) | Shipped (Go + Python) |
 | [007](PRD-007-tag-desktop.md) | `tag desktop` Subcommand | P2 | M (2 weeks) | Shipped (Python only) — Deliberate non-port in Go (OS desktop packaging; see `tag-go/MIGRATION_STATUS.md`) |
@@ -117,13 +117,13 @@ These PRDs address capabilities where Sakana leads and where TAG can close the g
 | [018](PRD-018-context-window-management.md) | Context Window & Long-Context Management | P1 | M (2–3 weeks) | Shipped (Go + Python) |
 | [019](PRD-019-natural-language-shell.md) | Natural Language Shell Mode (`tag shell`) | P2 | M (2 weeks) | Shipped (Go + Python) |
 | [020](PRD-020-cicd-integration.md) | CI/CD Integration & Automated Code Review | P2 | L (3–4 weeks) | Shipped (Go + Python) |
-| [021](PRD-021-agent-loop-autonomous-mode.md) | Agent Loop / Autonomous Mode | P1 | M (2–3 weeks) | Shipped (Python only) — Go `loop` is a single-shot `--iterations` driver with no `start`/`status`/`abort`/`approve` lifecycle |
+| [021](PRD-021-agent-loop-autonomous-mode.md) | Agent Loop / Autonomous Mode | P1 | M (2–3 weeks) | Shipped (Go + Python) |
 | [022](PRD-022-cron-scheduled-agents.md) | Cron / Scheduled Agents (`tag cron`) | P1 | M (2 weeks) | Shipped (Go + Python) |
-| [023](PRD-023-multi-agent-swarm-context-routing.md) | Multi-Agent Swarm with Context-Centric Routing | P1 | L (2 sprints, ~4 weeks) | Shipped (Python only) — Go `swarm` is read-only; no `swarm run` |
+| [023](PRD-023-multi-agent-swarm-context-routing.md) | Multi-Agent Swarm with Context-Centric Routing | P1 | L (2 sprints, ~4 weeks) | Shipped (Go + Python) |
 | [024](PRD-024-repo-map-workspace-context.md) | Repo-Map / Workspace Context | P1 | L (2 sprints, ~4 weeks) | Shipped (Go + Python) |
 | [025](PRD-025-semantic-memory-confidence-decay.md) | Semantic Memory with Confidence Decay (`tag memory`) | P1 (High Impact) | L (2 sprints, ~4 weeks) | Shipped (Go + Python) |
 | [026](PRD-026-profile-marketplace.md) | Profile Marketplace (tag profile pull/push) | P1 | M (1 sprint, ~2 weeks) | Shipped (Go + Python) — ships as `tag marketplace pull/push/list`, not `tag profile pull/push` |
-| [027](PRD-027-eval-framework.md) | Eval Framework (tag eval) | P1 | M (1 sprint, ~2 weeks) | Shipped (Python only) — Go `eval` is `list`/`show`; `eval run` is not implemented in Go |
+| [027](PRD-027-eval-framework.md) | Eval Framework (tag eval) | P1 | M (1 sprint, ~2 weeks) | Shipped (Go + Python) |
 | [028](PRD-028-sandbox-code-execution.md) | Sandbox Code Execution (`tag sandbox`) | P0 Critical | L (2 sprints / ~4 weeks) | Shipped (Go + Python) — Go has `sandbox run` only (no `list`/`result`) |
 | [029](PRD-029-streaming-tui-dashboard.md) | Streaming TUI Dashboard (`tag serve` / `tag dashboard`) | P1 (High Impact, Differentiating) | L (TUI sub-feature: M ~1 sprint; Web bridge sub-feature: L ~2 sprints; total: 2–3 sprints) | Shipped (Go + Python) |
 | [030](PRD-030-prompt-cache-analytics.md) | Prompt Cache Analytics | P1 | S (2–3 days) | Shipped (Go + Python) |
@@ -185,13 +185,13 @@ Cluster A–K. Same audit pass and same label vocabulary as the table above.
 | [054](PRD-054-local-browser-devui.md) | Local Browser-Based Agent Execution Visualizer (`tag devui`) | P3 | L (2-4 weeks) | Shipped (Go + Python) |
 | [055](PRD-055-issue-to-pr-autonomous-loop.md) | Issue-to-PR Autonomous Loop (`tag issue-solve`) | P1 | M (1-2 weeks) | Shipped (Go + Python) |
 | [056](PRD-056-inbound-webhook-trigger-server.md) | Inbound Webhook Trigger Server with HMAC Verification (`tag hooks listen`) | P1 | M (1-2 weeks) | Shipped (Go + Python) |
-| [057](PRD-057-automated-test-generation.md) | Automated Test Generation on PR/Commit (`tag ci test-gen`) | P2 | M (1-2 weeks) | Shipped (Python only) — `tag agentic-ci test-gen`; Go `agentic-ci` is a single check→fix command (workflow scaffold only, via `eval-ci scaffold --type test-gen`) |
+| [057](PRD-057-automated-test-generation.md) | Automated Test Generation on PR/Commit (`tag ci test-gen`) | P2 | M (1-2 weeks) | Shipped (Go + Python) |
 | [058](PRD-058-github-actions-workflow-scaffold.md) | GitHub Actions Workflow Scaffold (`tag ci install-action`) | P2 | XS (1-2 days) | Shipped (Go + Python) — `agentic-ci install-action` (Python) / `eval-ci scaffold` (Go) |
-| [059](PRD-059-sast-vuln-auto-remediation.md) | SAST Vulnerability Auto-Remediation from SARIF (`tag ci fix-vuln`) | P2 | M (1-2 weeks) | Shipped (Python only) — `tag agentic-ci fix-vuln <sarif>`; no Go equivalent |
-| [060](PRD-060-ci-diagnose-auto-fix.md) | CI Failure Root-Cause Analysis + Auto-Fix PR (`tag ci diagnose --auto-fix`) | P2 | M (1-2 weeks) | Shipped (Python only) — `tag agentic-ci ci-diagnose` and `tag ci diagnose`; no Go equivalent |
-| [061](PRD-061-configurable-pr-review-signal-classes.md) | Configurable PR Review Signal Classes (`tag ci review --signals`) | P3 | S (3-5 days) | Shipped (Python only) — `tag agentic-ci review <pr> --signals`; no Go equivalent |
-| [062](PRD-062-gitlab-ci-pipeline-autogen.md) | GitLab CI/CD Pipeline Auto-Generation (`tag ci gen-pipeline --platform gitlab`) | P3 | M (1-2 weeks) | Shipped (Python only) — `tag agentic-ci gen-pipeline`; no Go equivalent |
-| [063](PRD-063-self-healing-flaky-test-detection.md) | Self-Healing Flaky Test Detection (`tag ci flaky-fix`) | P3 | L (2-4 weeks) | Shipped (Python only) — `tag agentic-ci flaky-fix <log>`; no Go equivalent |
+| [059](PRD-059-sast-vuln-auto-remediation.md) | SAST Vulnerability Auto-Remediation from SARIF (`tag ci fix-vuln`) | P2 | M (1-2 weeks) | Shipped (Go) |
+| [060](PRD-060-ci-diagnose-auto-fix.md) | CI Failure Root-Cause Analysis + Auto-Fix PR (`tag ci diagnose --auto-fix`) | P2 | M (1-2 weeks) | Shipped (Go) |
+| [061](PRD-061-configurable-pr-review-signal-classes.md) | Configurable PR Review Signal Classes (`tag ci review --signals`) | P3 | S (3-5 days) | Shipped (Go) |
+| [062](PRD-062-gitlab-ci-pipeline-autogen.md) | GitLab CI/CD Pipeline Auto-Generation (`tag ci gen-pipeline --platform gitlab`) | P3 | M (1-2 weeks) | Shipped (Go) |
+| [063](PRD-063-self-healing-flaky-test-detection.md) | Self-Healing Flaky Test Detection (`tag ci flaky-fix`) | P3 | L (2-4 weeks) | Shipped (Go + Python) |
 | [064](PRD-064-swe-agent-bash-editor-harness.md) | SWE-Agent-Style Structured Bash+Editor Harness (`tag solve --harness swe`) | P2 | M (1-2 weeks) | Shipped (Go + Python) — ships as `tag swe-solve`, not `tag solve --harness swe` |
 | [065](PRD-065-automatic-post-run-memory-extraction.md) | Automatic Post-Run Memory Extraction (`tag memory config set auto_extract`) | P1 | M (1-2 weeks) | Partial — `mem2 extract <run-id>` ships in both, but extraction is manual; there is no automatic post-run trigger or `auto_extract` config toggle |
 | [066](PRD-066-hybrid-memory-search.md) | Hybrid Memory Search (`tag mem search --mode hybrid`) | P1 | M (5-8 days) | Partial — `mem search` is FTS/BM25 only (no `--mode hybrid`); vector search exists separately as `mem2 store search`; no RRF fusion of the two |
