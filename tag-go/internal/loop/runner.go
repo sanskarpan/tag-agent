@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -428,39 +426,17 @@ func waitForApproval(ctx context.Context, db *sql.DB, id string, iter int, outpu
 
 // DefaultWorkRootName is the directory under TAG_HOME holding per-iteration
 // working directories when Options.WorkRoot is unset. Matches
-// worker.DefaultWorkRootName so a deployment has one artifacts root.
-const DefaultWorkRootName = "work"
+// paths.DefaultWorkRootName so a deployment has one artifacts root.
+const DefaultWorkRootName = paths.DefaultWorkRootName
 
-// iterWorkDir creates the private working directory for one iteration.
-//
-// Deliberately the same shape as worker.jobWorkDir (#591): an EMPTY scratch dir
-// (not a repo copy or checkout), a stable derivable path so an operator can find
-// artifacts afterwards, and a cleanup that removes the dir only if the iteration
-// left it empty. It is reimplemented rather than imported because
-// worker.jobWorkDir is unexported and internal/worker is owned elsewhere.
+// iterWorkDir creates the private working directory for one iteration, using
+// paths.WorkDir's #591 contract (empty scratch dir, confined segments, removed
+// only if the iteration left it empty) under the loop layout
+// <WorkRoot>/loop-<loop-id>/iter-<n>. The iteration number is formatted here
+// rather than widening the shared string-segment API.
 func iterWorkDir(workRoot, loopID string, iter int) (string, func(), error) {
-	if workRoot == "" {
-		workRoot = filepath.Join(paths.Home(), DefaultWorkRootName)
-	}
-	dir := filepath.Join(workRoot, "loop-"+safeSegment(loopID), fmt.Sprintf("iter-%d", iter))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", func() {}, err
-	}
-	return dir, func() {
-		if entries, err := os.ReadDir(dir); err == nil && len(entries) == 0 {
-			_ = os.Remove(dir)
-		}
-	}, nil
-}
-
-// safeSegment reduces an id to a single path segment so it can never steer the
-// path outside WorkRoot.
-func safeSegment(s string) string {
-	out := filepath.Base(filepath.Clean("/" + strings.ReplaceAll(s, string(os.PathSeparator), "_")))
-	if out == "." || out == string(os.PathSeparator) || out == "" {
-		return "loop"
-	}
-	return out
+	return paths.WorkDir(workRoot,
+		"loop-"+paths.SafeSegment(loopID, "loop"), fmt.Sprintf("iter-%d", iter))
 }
 
 func truncate(s string, n int) string {
