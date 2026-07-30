@@ -1,6 +1,6 @@
 # PRD-023: Multi-Agent Swarm with Context-Centric Routing
 
-**Status:** Shipped (Python only) — Go `swarm` is read-only; no `swarm run`  
+**Status:** Shipped (Go + Python) — Go `swarm run`/`abort` ported 2026-07-30 (coordinator manifest, dependency waves, write-once context bus)
 **Priority:** P1  
 **Estimated Effort:** L (2 sprints, ~4 weeks)  
 **Affects:** `controller.py` (new `cmd_swarm_run`, `cmd_swarm_list`, `cmd_swarm_status`, `cmd_swarm_abort`, `cmd_swarm_results`), new `src/tag/swarm.py`, `tag.sqlite3` schema (3 new tables)

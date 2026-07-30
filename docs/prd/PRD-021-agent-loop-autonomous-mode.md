@@ -1,6 +1,6 @@
 # PRD-021: Agent Loop / Autonomous Mode
 
-**Status:** Shipped (Python only) — Go `loop` is a single-shot `--iterations` driver with no `start`/`status`/`abort`/`approve` lifecycle  
+**Status:** Shipped (Go + Python) — Go lifecycle (`start/list/status/abort/approve/deny`) ported 2026-07-30; Go additionally fixes Python's fabricated-success bug (the GOAL_ACHIEVED sentinel appears in its own prompt)
 **Priority:** P1  
 **Estimated Effort:** M (2–3 weeks)  
 **Affects:** `controller.py` (new `cmd_loop`), new `src/tag/loop.py`, `queue_worker.py`, `pyproject.toml`, `tag.sqlite3` schema
