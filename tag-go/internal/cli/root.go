@@ -126,6 +126,7 @@ func NewRoot() *cobra.Command {
 	registerMCPServe(root, app)
 	registerEvalCI(root, app)
 	registerCI(root, app)
+	registerLoop(root, app) // PRD-021 lifecycle; must follow registerCI (see loop.go)
 	registerMarketplace(root, app)
 	registerAgentops(root, app)
 	registerShell(root, app)
