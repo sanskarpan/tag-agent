@@ -20,10 +20,24 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Action is the three-valued policy verdict for a tool call.
 type Action string
+
+// Via values that name the mechanism which finalised a verdict. The pre-existing
+// ones ("rule", "session", "prompt", "auto-approve", "non-interactive",
+// "dangerously-allow-all") are string literals at their sites; the two added by
+// PRD-078/PRD-123 are named so the audit log and tests agree on the spelling.
+const (
+	// ViaPause means an out-of-process reviewer decided it (PRD-078).
+	ViaPause = "approval-gate"
+	// ViaTripwire means a content guardrail decided it (PRD-123).
+	ViaTripwire = "tripwire"
+	// SourceTripwire labels the synthetic rule recorded for a guardrail block.
+	SourceTripwire = "guardrail"
+)
 
 const (
 	// Allow executes the tool with no human interaction.
@@ -180,6 +194,45 @@ type Prompter interface {
 	Ask(ctx context.Context, req Request) (Response, error)
 }
 
+// Pauser adjudicates an `ask` OUT OF PROCESS: it publishes a durable approval
+// request that a human answers from another shell (`tag permissions approve
+// <id>`), then resumes. This is PRD-078's pause/resume gate.
+//
+// Contract, and it is not negotiable:
+//
+//   - Pause MUST return within `timeout`. There is no "wait forever" mode. The
+//     Guard refuses to install a Pauser without a positive timeout precisely so
+//     a future wiring mistake cannot produce a run that blocks on a human who is
+//     never coming.
+//   - Pause MUST NOT return an allow response unless a human actually recorded
+//     one. Expiry is a DENY, not a default-approve.
+//   - Pause MUST honour ctx cancellation.
+//
+// A nil Pauser means the pause gate is off, which is the default everywhere.
+type Pauser interface {
+	Pause(ctx context.Context, req Request, timeout time.Duration) (Response, error)
+}
+
+// Screener is the CONTENT guardrail seam (PRD-123). The rule engine adjudicates
+// a request's SUBJECT (a path, a command name); a Screener adjudicates its
+// CONTENT — a credential in a write_file body, `rm -rf /` inside a command, a
+// private key coming back in a tool result.
+//
+// It is expressed with primitive types on purpose: this package deliberately has
+// no I/O or policy dependencies of its own, and the guardrail implementation
+// (internal/guardrail) must stay swappable and independently testable.
+//
+// Both methods return (blocked, reason). A Screener that CANNOT evaluate must
+// return blocked=true with a reason that says so — never (false, "").
+type Screener interface {
+	// ScreenToolInput runs before the tool executes. blocked=true refuses the call.
+	ScreenToolInput(ctx context.Context, tool string, args map[string]any) (bool, string)
+	// ScreenToolResult runs after the tool executes, before the model sees the
+	// result. The side effect has already happened, so blocked=true means "withhold
+	// this result and tell the model why" — it cannot un-run the tool.
+	ScreenToolResult(ctx context.Context, tool string, result string) (bool, string)
+}
+
 // Recorder persists permission decisions for after-the-fact review. Errors are
 // ignored by the Guard: auditing must never block or fail a security decision.
 type Recorder interface {
@@ -203,6 +256,17 @@ type Guard struct {
 	Policy Policy
 	// Prompter is consulted for `ask`. Nil = non-interactive (ask -> deny).
 	Prompter Prompter
+	// Pauser is the out-of-process approval gate for `ask` (PRD-078). Nil = off,
+	// which is the default on every surface: it is installed ONLY when the
+	// operator passes --approval-gate on that invocation. Background surfaces
+	// (queue worker, dag run --execute, cron run --execute, loop) never pass it,
+	// so they can never park on it. See PauseTimeout.
+	Pauser Pauser
+	// PauseTimeout bounds a Pauser wait. A Pauser with a non-positive timeout is
+	// a wiring bug and is treated as a DENY rather than an unbounded wait.
+	PauseTimeout time.Duration
+	// Screener is the optional content guardrail (PRD-123). Nil = inert.
+	Screener Screener
 	// Recorder receives every decision (nil = no audit).
 	Recorder Recorder
 	// NonInteractiveHint explains, in the deny reason, WHY no human could be
@@ -220,8 +284,15 @@ func NewGuard(p Policy, prompter Prompter, rec Recorder) *Guard {
 	return &Guard{Policy: p, Prompter: prompter, Recorder: rec}
 }
 
-// Interactive reports whether an `ask` can reach a human.
-func (g *Guard) Interactive() bool { return g != nil && g.Prompter != nil }
+// Interactive reports whether an `ask` can reach a human, by either route: a
+// terminal prompt or a durable out-of-process approval request.
+func (g *Guard) Interactive() bool { return g != nil && (g.Prompter != nil || g.Pauser != nil) }
+
+// Prompting reports whether an `ask` reaches a human on THIS terminal.
+func (g *Guard) Prompting() bool { return g != nil && g.Prompter != nil }
+
+// PauseGated reports whether the out-of-process approval gate is installed.
+func (g *Guard) PauseGated() bool { return g != nil && g.Pauser != nil }
 
 // resolve walks the ruleset and returns the first matching rule. The ruleset
 // always ends in a catch-all, so a match is guaranteed for a well-formed Policy;
@@ -285,6 +356,24 @@ func (g *Guard) decide(ctx context.Context, req Request) Decision {
 		return Decision{Action: Allow, Via: "dangerously-allow-all",
 			Reason: "--dangerously-allow-all bypassed the permission gate"}
 	}
+
+	// Content guardrail (PRD-123) runs BEFORE rule resolution, so a fired
+	// tripwire outranks an `allow` rule. That ordering is deliberate: the rule
+	// engine grants on the SUBJECT ("bash is allowed"), the guardrail refuses on
+	// the CONTENT ("...but this particular command is `rm -rf /`"). A subject
+	// grant must not be able to smuggle content the operator banned. Only
+	// --dangerously-allow-all, which announces itself, is above it.
+	if g.Screener != nil {
+		if blocked, reason := g.Screener.ScreenToolInput(ctx, req.Tool, req.Args); blocked {
+			if reason == "" {
+				reason = "blocked by a content guardrail"
+			}
+			return Decision{Action: Deny, Via: ViaTripwire,
+				Rule:   Rule{Tool: req.Tool, Action: Deny, Source: SourceTripwire},
+				Reason: reason}
+		}
+	}
+
 	rule, _ := g.resolve(req)
 	switch rule.Action {
 	case Allow:
@@ -304,6 +393,39 @@ func (g *Guard) decide(ctx context.Context, req Request) Decision {
 		return Decision{Action: Allow, Rule: rule, Via: "auto-approve",
 			Reason: fmt.Sprintf("auto-approved by --auto-approve (rule %s)", rule.String())}
 	}
+
+	// Out-of-process approval (PRD-078). Checked before the TTY prompter because
+	// installing it is an explicit per-invocation opt-in (--approval-gate) that
+	// says "adjudicate this durably and audibly", which is a stronger statement
+	// than "there happens to be a terminal attached".
+	if g.Pauser != nil {
+		if g.PauseTimeout <= 0 {
+			// Fail CLOSED. An unbounded human gate is the silent-hang failure mode
+			// this whole design exists to prevent, so a Pauser without a deadline is
+			// refused rather than honoured.
+			return Decision{Action: Deny, Rule: rule, Via: ViaPause,
+				Reason: fmt.Sprintf("%s requires approval and an approval gate is installed, but it has no "+
+					"bounded timeout; refusing to wait indefinitely (this is a wiring bug)", req.Describe())}
+		}
+		resp, err := g.Pauser.Pause(ctx, req, g.PauseTimeout)
+		if err != nil {
+			return Decision{Action: Deny, Rule: rule, Via: ViaPause,
+				Reason: fmt.Sprintf("%s requires approval but the approval gate failed (%v); denying", req.Describe(), err)}
+		}
+		switch resp {
+		case ResponseAllowOnce:
+			return Decision{Action: Allow, Rule: rule, Via: ViaPause,
+				Reason: fmt.Sprintf("approved out-of-band by a reviewer (%s)", req.Describe())}
+		case ResponseAllowSession:
+			g.grantSession(req.Tool)
+			return Decision{Action: Allow, Rule: rule, Via: ViaPause,
+				Reason: fmt.Sprintf("approved out-of-band for this session (tool %q)", req.Tool)}
+		default:
+			return Decision{Action: Deny, Rule: rule, Via: ViaPause,
+				Reason: fmt.Sprintf("denied at the approval gate (%s)", req.Describe())}
+		}
+	}
+
 	if g.Prompter == nil {
 		// THE non-interactive contract: return immediately, deny, and say why.
 		hint := g.NonInteractiveHint
