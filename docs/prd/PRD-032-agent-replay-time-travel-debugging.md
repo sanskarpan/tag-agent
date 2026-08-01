@@ -1,6 +1,6 @@
 # PRD-032: Agent Replay / Time-Travel Debugging (`tag trace replay`)
 
-**Status:** Partial — `trace replay/diff/checkpoint/snapshot` ship in both, but replay has nothing to replay until span emission is fixed (see PRD-013)
+**Status:** Partial — `trace replay/diff/checkpoint/snapshot` ship in both AND now work end-to-end: the PRD-013 blocker is gone (#590/#594), so replay reconstructs real emitted spans and diff reports real token deltas, covered by `TestTraceReplayAgainstProducedSpans`. What remains is the PRD's advanced surface, unimplemented in **both** engines: `--step-mode` / `--from-step N` / `--live-model` stepped re-execution (§7.4), `SecretRedactor` on snapshots (§7.3), checkpoint *fork* (`--step N`, §7.6), `trace prune` (§7.9), and `trace list --failed/--last`.
 **Priority:** P2 Medium
 **Estimated Effort:** L (2 sprints, ~4 weeks)
 **Category:** Observability
