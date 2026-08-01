@@ -109,7 +109,7 @@ These PRDs address capabilities where Sakana leads and where TAG can close the g
 | [010](PRD-010-dashboard-admin-panel.md) | Dashboard & Admin Panel Integration | P2 | XS (2 days) | Shipped (Python only) — Deliberate non-port in Go (managed-runtime passthrough; `serve`/`web`/`devui` replace it) |
 | [011](PRD-011-plugin-management.md) | Plugin Management System (`tag plugins`) | P1 | M (2 weeks) | Shipped (Go + Python) |
 | [012](PRD-012-cost-tracking-budget.md) | Cost Tracking & Budget Management | P1 | M (2 weeks) | Shipped (Go + Python) |
-| [013](PRD-013-agent-tracing-observability.md) | Distributed Agent Tracing & Observability | P1 | L (3–4 weeks) | Partial — the `trace` command surface (`list/show/export/replay/diff/checkpoint/snapshot`) and `otel-export` ship in both, but the Go native agent loop emits no spans (`tag run` then `tag trace list` reports "No spans recorded") |
+| [013](PRD-013-agent-tracing-observability.md) | Distributed Agent Tracing & Observability | P1 | L (3–4 weeks) | Shipped (Go + Python) |
 | [014](PRD-014-mcp-server-registry.md) | MCP Server Registry & Discovery | P1 | M (2 weeks) | Shipped (Go + Python) |
 | [015](PRD-015-profile-templates-sharing.md) | Profile Templates & Sharing | P2 | M (2 weeks) | Shipped (Go + Python) |
 | [016](PRD-016-webhook-event-triggers.md) | Webhook Event Triggers & Automation | P2 | L (3–4 weeks) | Shipped (Go + Python) |
@@ -128,7 +128,7 @@ These PRDs address capabilities where Sakana leads and where TAG can close the g
 | [029](PRD-029-streaming-tui-dashboard.md) | Streaming TUI Dashboard (`tag serve` / `tag dashboard`) | P1 (High Impact, Differentiating) | L (TUI sub-feature: M ~1 sprint; Web bridge sub-feature: L ~2 sprints; total: 2–3 sprints) | Shipped (Go + Python) |
 | [030](PRD-030-prompt-cache-analytics.md) | Prompt Cache Analytics | P1 | S (2–3 days) | Shipped (Go + Python) |
 | [031](PRD-031-model-fallback-chains.md) | Model Fallback Chains | P1 | M (1 sprint, ~2 weeks) | Shipped (Go + Python) |
-| [032](PRD-032-agent-replay-time-travel-debugging.md) | Agent Replay / Time-Travel Debugging (`tag trace replay`) | P2 Medium | L (2 sprints, ~4 weeks) | Partial — `trace replay/diff/checkpoint/snapshot` ship in both, but replay has nothing to replay until span emission is fixed (see PRD-013) |
+| [032](PRD-032-agent-replay-time-travel-debugging.md) | Agent Replay / Time-Travel Debugging (`tag trace replay`) | P2 Medium | L (2 sprints, ~4 weeks) | Partial |
 | [033](PRD-033-dependency-aware-task-queue.md) | Dependency-Aware Task Queue (`tag queue`) | P1 High | M (1 sprint, ~2 weeks) | Shipped (Go + Python) — Go covers this via `dag` only; Python adds `queue-dep add/promote/list` |
 | [034](PRD-034-secret-scanning.md) | Secret Scanning (`tag security scan`) | P0 Critical | S (3–5 days) | Shipped (Go + Python) |
 | [035](PRD-035-ide-bridge-lsp.md) | IDE Bridge — LSP Server & VS Code Extension | P2 | XL (3–4 sprints, ~8–10 weeks) | Shipped (Go + Python) — `tag lsp start/status` verified; the VS Code extension package was not verified |
@@ -139,7 +139,7 @@ These PRDs address capabilities where Sakana leads and where TAG can close the g
 | [040](PRD-040-notification-hooks.md) | Notification Hooks (`tag hooks notify`) | P1 | M (1 sprint, ~1 week) | Shipped (Go + Python) — ships as `tag notify`, not `tag hooks notify` |
 | [041](PRD-041-otel-genai-span-cost-attribution.md) | OTel GenAI Span Cost Attribution | P1 | S (1–2 days) | Shipped (Go + Python) — `tag otel-export` emits OTLP/JSON with OTel GenAI semconv 1.28.0 |
 | [042](PRD-042-architect-editor-agent-split.md) | Architect/Editor Agent Split (`tag run --architect ... --editor ...`) | P2 — Medium | S–M (1 week) | Shipped (Go + Python) |
-| [043](PRD-043-vector-based-tool-retrieval.md) | Vector-Based Tool Retrieval (`tag mcp-registry index`) | P1 | M (1 sprint, ~2 weeks) | Partial — `tool-index index/search/status` ships in both, but retrieval is keyword-based, not vector/embedding-based |
+| [043](PRD-043-vector-based-tool-retrieval.md) | Vector-Based Tool Retrieval (`tag mcp-registry index`) | P1 | M (1 sprint, ~2 weeks) | Shipped (Go) |
 | [044](PRD-044-agentops-session-observability.md) | AgentOps Session Observability (`tag config set agentops.api_key`) | P3 — Nice-to-have | S (2–3 days) | Shipped (Go + Python) |
 
 ---
@@ -174,7 +174,7 @@ Cluster A–K. Same audit pass and same label vocabulary as the table above.
 | PRD | Feature | Priority | Effort | Status |
 |-----|---------|----------|--------|--------|
 | [045](PRD-045-llm-as-judge-evaluators.md) | LLM-as-Judge Evaluators (`tag eval run --judge`) | P1 | S (3-5 days) | Shipped (Go + Python) |
-| [046](PRD-046-per-span-usd-cost-attribution.md) | Per-Span USD Cost Attribution (`tag trace show --cost / tag stats --cost`) | P1 | XS (1-2 days) | Partial — cost attribution ships via `costs`/`pricing`/`otel-export`; there is no `trace show --cost` flag and no `tag stats` command, and no spans are emitted to attribute against (see PRD-013) |
+| [046](PRD-046-per-span-usd-cost-attribution.md) | Per-Span USD Cost Attribution (`tag trace show --cost / tag stats --cost`) | P1 | XS (1-2 days) | Shipped (Go) |
 | [047](PRD-047-eval-ci-gate-pr-comment.md) | Eval CI Gate with PR Comment Integration (`tag eval ci`) | P1 | S (3-5 days) | Shipped (Go + Python) — Go `eval-ci run` is offline/dry-run |
 | [048](PRD-048-structured-tool-call-child-spans.md) | Structured Tool-Call Child Spans with TOOL Kind (`tag trace show --kind tool`) | P2 | S (3-5 days) | Proposed (unverified) — no `--kind` filter on `trace show` in either CLI, and no spans are emitted to inspect |
 | [049](PRD-049-versioned-eval-dataset-management.md) | Versioned Eval Dataset Management (`tag eval dataset`) | P2 | S (3-5 days) | Shipped (Go + Python) — Python lacks `eval-dataset add-case` |
@@ -193,10 +193,10 @@ Cluster A–K. Same audit pass and same label vocabulary as the table above.
 | [062](PRD-062-gitlab-ci-pipeline-autogen.md) | GitLab CI/CD Pipeline Auto-Generation (`tag ci gen-pipeline --platform gitlab`) | P3 | M (1-2 weeks) | Shipped (Go) |
 | [063](PRD-063-self-healing-flaky-test-detection.md) | Self-Healing Flaky Test Detection (`tag ci flaky-fix`) | P3 | L (2-4 weeks) | Shipped (Go + Python) |
 | [064](PRD-064-swe-agent-bash-editor-harness.md) | SWE-Agent-Style Structured Bash+Editor Harness (`tag solve --harness swe`) | P2 | M (1-2 weeks) | Shipped (Go + Python) — ships as `tag swe-solve`, not `tag solve --harness swe` |
-| [065](PRD-065-automatic-post-run-memory-extraction.md) | Automatic Post-Run Memory Extraction (`tag memory config set auto_extract`) | P1 | M (1-2 weeks) | Partial — `mem2 extract <run-id>` ships in both, but extraction is manual; there is no automatic post-run trigger or `auto_extract` config toggle |
-| [066](PRD-066-hybrid-memory-search.md) | Hybrid Memory Search (`tag mem search --mode hybrid`) | P1 | M (5-8 days) | Partial — `mem search` is FTS/BM25 only (no `--mode hybrid`); vector search exists separately as `mem2 store search`; no RRF fusion of the two |
+| [065](PRD-065-automatic-post-run-memory-extraction.md) | Automatic Post-Run Memory Extraction (`tag memory config set auto_extract`) | P1 | M (1-2 weeks) | Shipped (Go) |
+| [066](PRD-066-hybrid-memory-search.md) | Hybrid Memory Search (`tag mem search --mode hybrid`) | P1 | M (5-8 days) | Shipped (Go) |
 | [067](PRD-067-hierarchical-memory-tiers.md) | Hierarchical Memory Tiers: Core / Recall / Archival (`tag mem tier`) | P2 | L (2-4 weeks) | Shipped (Go + Python) — `mem2 tier` |
-| [068](PRD-068-background-sleep-time-memory-consolidation.md) | Background Sleep-Time Memory Consolidation Agent (`tag memory gc`) | P3 | M (1-2 weeks) | Partial — `mem2 gc` ships the consolidation/eviction/promotion logic, but it runs on demand only; there is no background sleep-time agent |
+| [068](PRD-068-background-sleep-time-memory-consolidation.md) | Background Sleep-Time Memory Consolidation Agent (`tag memory gc`) | P3 | M (1-2 weeks) | Shipped (Go) |
 | [069](PRD-069-temporal-fact-versioning.md) | Temporal Fact Versioning with valid_at/invalid_at (`tag mem fact`) | P3 | M (1-2 weeks) | Shipped (Go + Python) — `mem2 fact` |
 | [070](PRD-070-entity-relationship-graph-community-detection.md) | Entity-Relationship Graph with Community Detection (`tag mem graph`) | P3 | L (2-4 weeks) | Shipped (Go + Python) — ships as `tag graph show/query/build`, not `tag mem graph` |
 | [071](PRD-071-episodic-memory-session-episodes.md) | Episodic Memory: Structured Session Episode Storage (`tag mem episode`) | P3 | M (1-2 weeks) | Shipped (Go + Python) — `mem2 episode` |
@@ -204,9 +204,9 @@ Cluster A–K. Same audit pass and same label vocabulary as the table above.
 | [073](PRD-073-live-mcp-registry-sync.md) | Live MCP Registry Sync from modelcontextprotocol.io (`tag mcp registry update`) | P1 | S (3-5 days) | Proposed — `mcp-registry` serves an embedded catalog; neither CLI has a registry `update`/sync verb |
 | [074](PRD-074-mcp-oauth-pkce-device-flow.md) | MCP OAuth 2.1 with PKCE + Device Authorization Flow (`tag mcp auth`) | P2 | M (1-2 weeks) | Proposed |
 | [075](PRD-075-per-user-entity-scoped-multi-tenant-tool-auth.md) | Per-User Entity-Scoped Multi-Tenant Tool Auth (`tag entity`) | P2 | L (2-4 weeks) | Proposed — no `tag entity` command in either CLI |
-| [076](PRD-076-high-value-mcp-server-bundle.md) | High-Value MCP Server Bundle (`tag mcp registry add-curated`) | P2 | XS (1-2 days) | Partial — `mcp-registry list/install` ships a curated embedded catalog, but there is no `add-curated` bundle verb |
+| [076](PRD-076-high-value-mcp-server-bundle.md) | High-Value MCP Server Bundle (`tag mcp registry add-curated`) | P2 | XS (1-2 days) | Partial |
 | [077](PRD-077-scope-based-tool-filtering.md) | Scope-Based Tool Filtering + Schema Transformation (`tag mcp filter`) | P3 | M (1-2 weeks) | Proposed — no `mcp filter` command in either CLI |
-| [078](PRD-078-hitl-tool-approval-audit-trail.md) | Human-in-the-Loop Tool Approval with Pause/Resume + Audit Trail (`tag mcp approve`) | P3 | L (2-4 weeks) | Partial — Go `permissions show/log` provides allow/deny/ask tool rules plus a decision log; there is no pause/resume approval flow and no Python equivalent |
+| [078](PRD-078-hitl-tool-approval-audit-trail.md) | Human-in-the-Loop Tool Approval with Pause/Resume + Audit Trail (`tag mcp approve`) | P3 | L (2-4 weeks) | Partial |
 | [079](PRD-079-cloud-hosted-tool-execution.md) | Cloud-Hosted Tool Execution with Version Pinning (`tag mcp host`) | P3 | L (2-4 weeks) | Proposed |
 | [080](PRD-080-enterprise-idp-sso-mcp-servers.md) | Enterprise IdP SSO Across MCP Servers (`tag mcp sso`) | P3 | XL (4-8 weeks) | Proposed |
 | [081](PRD-081-a2a-agent-card-publication.md) | A2A Agent Card Publication (`tag agent-card`) | P1 | S (3-5 days) | Proposed — no `agent-card` command in either CLI |
@@ -222,7 +222,7 @@ Cluster A–K. Same audit pass and same label vocabulary as the table above.
 | [091](PRD-091-configurable-sandbox-ttl-session-refresh.md) | Configurable Sandbox TTL + Session Refresh (`tag sandbox set-ttl`) | P2 | S (3-5 days) | Proposed — no `sandbox set-ttl` verb in either CLI |
 | [092](PRD-092-desktop-gui-sandbox-vnc.md) | Desktop/GUI Sandbox for Computer-Use (Ubuntu + Xfce + VNC Stream) (`tag sandbox run --gui`) | P2 | XL (4–8 weeks) | Proposed — no `sandbox run --gui` flag in either CLI |
 | [093](PRD-093-gpu-sandbox-modal-backend.md) | GPU Sandbox via Modal Backend (Complete the Modal Integration Stub) (`tag sandbox run --backend modal --gpu`) | P3 | M (1-2 weeks) | Proposed — `import-modal` configures the Modal backend, but `sandbox run --backend` only accepts `restricted`/`docker` |
-| [094](PRD-094-per-sandbox-egress-firewall.md) | Per-Sandbox Egress Firewall Rules (CIDR/Hostname Allow/Deny Lists) (`tag sandbox firewall`) | P3 | M (1-2 weeks) | Partial — Go `sandbox run --network none` isolates the container network, but there are no CIDR/hostname allow/deny firewall rules |
+| [094](PRD-094-per-sandbox-egress-firewall.md) | Per-Sandbox Egress Firewall Rules (CIDR/Hostname Allow/Deny Lists) (`tag sandbox firewall`) | P3 | M (1-2 weeks) | Partial |
 | [095](PRD-095-sandbox-pause-resume.md) | Sandbox Pause/Resume with Billing Pause (`tag sandbox pause / tag sandbox resume`) | P3 | M (1-2 weeks) | Proposed — no `sandbox pause`/`resume` verbs in either CLI |
 | [096](PRD-096-persistent-volume-mounts.md) | Persistent Volume Mounts Across Sandbox Runs (`tag sandbox volume`) | P3 | M (1-2 weeks) | Proposed — no `sandbox volume` verb in either CLI |
 | [097](PRD-097-sandbox-secrets-vault.md) | Sandbox-Level Secrets Injection via Encrypted Vault (`tag sandbox secret`) | P3 | M (1-2 weeks) | Proposed — no `sandbox secret` verb in either CLI |
@@ -237,10 +237,10 @@ Cluster A–K. Same audit pass and same label vocabulary as the table above.
 | [106](PRD-106-speculative-action-execution.md) | Speculative Action Execution for Latency Reduction (SPAgent Pattern) (`tag loop start --speculative`) | P3 | L (2-4 weeks) | Proposed — `loop` has no `--speculative` flag in either CLI |
 | [107](PRD-107-confidence-aware-model-routing.md) | Confidence-Aware Model Routing with Cost/Accuracy Pareto Optimization (`tag route optimize`) | P3 | L (2-4 weeks) | Proposed — `tag route` has no `optimize` verb |
 | [108](PRD-108-magentic-one-orchestrator.md) | MagenticOne Dual-Ledger Orchestrator (`tag orchestrate --mode magentic-one`) | P1 | L (8-13 days) | Proposed — no `orchestrate` command in either CLI |
-| [109](PRD-109-human-in-the-loop-interrupt.md) | HITL interrupt()+Command(resume=) (`tag workflow interrupt`) | P1 | M (5-8 days) | Partial — Python `loop start --approval human` plus `loop approve`/`deny` gives a HITL gate; there is no `workflow interrupt`/`Command(resume=)` primitive and no Go equivalent |
+| [109](PRD-109-human-in-the-loop-interrupt.md) | HITL interrupt()+Command(resume=) (`tag workflow interrupt`) | P1 | M (5-8 days) | Partial |
 | [110](PRD-110-loop-state-serialization.md) | Loop State Serialization (`tag workflow checkpoint`) | P1 | M (5-8 days) | Proposed — no `workflow checkpoint` command (`trace checkpoint` is unrelated) |
 | [111](PRD-111-dynamic-fan-out-map-reduce.md) | Dynamic Fan-Out/Map-Reduce (`tag workflow fan-out`) | P1 | M (5-8 days) | Proposed — no `workflow fan-out` command in either CLI |
-| [112](PRD-112-graph-based-workflow.md) | Graph-Based Workflow Engine (`tag workflow graph`) | P1 | L (8-13 days) | Partial — `dag save/run/show/list` ships a DAG workflow engine in both, but without conditional edges or state reducers |
+| [112](PRD-112-graph-based-workflow.md) | Graph-Based Workflow Engine (`tag workflow graph`) | P1 | L (8-13 days) | Partial |
 | [113](PRD-113-time-travel-debugging.md) | Time-Travel Debugging (`tag workflow rewind`) | P2 | M (5-8 days) | Proposed — no `workflow rewind` command; see PRD-032 for the `trace replay` surface |
 | [114](PRD-114-team-orchestration-primitives.md) | Five Team Orchestration Primitives (`tag team`) | P1 | L (8-13 days) | Proposed — no `team` command in either CLI |
 | [115](PRD-115-stateful-process-framework.md) | Stateful Process Framework (`tag process`) | P2 | M (5-8 days) | Proposed — no `process` command in either CLI |
@@ -251,7 +251,7 @@ Cluster A–K. Same audit pass and same label vocabulary as the table above.
 | [120](PRD-120-desktop-gui-sandbox-vnc.md) | Desktop GUI Sandbox VNC (`tag sandbox --vnc`) | P2 | L (8-13 days) | Proposed — duplicate scope of PRD-092; no VNC sandbox in either CLI |
 | [121](PRD-121-output-guardrail-processor.md) | Output Guardrail Processor (`tag guardrail output`) | P1 | M (5-8 days) | Proposed — no `guardrail` command in either CLI |
 | [122](PRD-122-input-guardrail-validator.md) | Input Guardrail Validator (`tag guardrail input`) | P1 | M (5-8 days) | Proposed — no `guardrail` command in either CLI |
-| [123](PRD-123-runtime-guardrail-hooks.md) | Runtime Guardrail Hooks/Tripwire (`tag guardrail runtime`) | P1 | M (5-8 days) | Partial — Go `permissions` deny rules act as a runtime tool tripwire; there is no content-guardrail processor and no Python equivalent |
+| [123](PRD-123-runtime-guardrail-hooks.md) | Runtime Guardrail Hooks/Tripwire (`tag guardrail runtime`) | P1 | M (5-8 days) | Partial |
 | [124](PRD-124-guardrail-result-dataclass.md) | GuardrailResult Type (`tag guardrail result`) | P1 | S (1-2 days) | Proposed — no `guardrail` command in either CLI |
 | [125](PRD-125-constitutional-ai-policy.md) | Constitutional AI Policy (`tag constitutional`) | P2 | M (5-8 days) | Proposed — no `constitutional` command in either CLI |
 | [126](PRD-126-inference-time-tree-search-solve.md) | Inference-Time Multi-Model Tree Search (`tag solve`) | P1 | L (2–3 sprints, ~5 weeks) | Proposed — no `solve` command in either CLI (`swe-solve`/`issue-solve` are unrelated single-model solvers) |
