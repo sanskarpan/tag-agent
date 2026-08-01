@@ -193,5 +193,9 @@ func buildIsolation(runDir string, _ time.Duration, _ bool) (*isolationPlan, *Re
 	return &isolationPlan{
 		Prefix:    []string{se, "-p", profile},
 		Isolation: darwinIsolationString(weakened),
+		// `(deny network*)` is emitted unconditionally by sbplProfile and is
+		// never carved back out, so this plan really does deny every outbound
+		// destination for every protocol.
+		DeniesAllEgress: true,
 	}, nil, nil
 }

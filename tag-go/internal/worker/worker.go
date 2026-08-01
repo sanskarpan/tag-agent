@@ -41,6 +41,13 @@ var claimableStatuses = []string{"queued", "ready", "pending"}
 // 'done', so a dependent must be cascade-failed (mirrors dag.py _FAILED_DEP_STATUSES).
 var failedDepStatuses = map[string]bool{"failed": true, "cancelled": true, "timed_out": true}
 
+// skippedDepStatus is the terminal status of a node whose conditional edge was
+// false (PRD-112). It is NOT a failure — the branch was simply not taken — so a
+// dependent is cascade-SKIPPED rather than cascade-failed. Without this a node
+// behind an untaken branch would sit 'pending' forever, which is the silent hang
+// this project forbids.
+const skippedDepStatus = "skipped"
+
 // staleClaimLease is how long a job may sit in 'running' before it is treated
 // as abandoned (worker crash/SIGKILL) and requeued for another drainer.
 const staleClaimLease = 30 * time.Minute
@@ -54,7 +61,13 @@ type Summary struct {
 	Claimed int `json:"claimed"`
 	Done    int `json:"done"`
 	Failed  int `json:"failed"`
+	// Skipped is how many jobs were still BLOCKED on unmet dependencies at the
+	// end of the terminal pass. It is not a terminal outcome.
 	Skipped int `json:"skipped"`
+	// Pruned is how many jobs were terminally 'skipped' because a conditional
+	// edge was false, or because they sat behind such a node (PRD-112). It is
+	// reported separately from Skipped precisely because it IS terminal.
+	Pruned int `json:"pruned"`
 }
 
 // Options configures Drain.
@@ -95,9 +108,17 @@ type Options struct {
 }
 
 // Drain executes ready jobs. In RunOnce mode (Watch=false) it repeatedly drains
-// passes until a pass claims nothing (so DAG dependency chains resolve fully),
-// then returns. In Watch mode it loops on PollInterval until ctx is cancelled or
-// MaxJobs is reached.
+// passes until a pass makes NO PROGRESS (so DAG dependency chains resolve
+// fully), then returns. In Watch mode it loops on PollInterval until ctx is
+// cancelled or MaxJobs is reached.
+//
+// "Progress" is deliberately wider than "claimed a job": a pass that only
+// cascade-failed or cascade-skipped dependents still changed the graph, and the
+// nodes behind those can only be resolved by another pass. Keying the loop on
+// claims alone left the tail of a cascade chain stranded in 'pending' — with
+// PRD-112's conditional edges that is the common case (a fork's untaken branch
+// is pruned, never claimed), and a job stuck 'pending' forever is exactly the
+// silent hang this project forbids.
 func Drain(ctx context.Context, db *sql.DB, opts Options) (Summary, error) {
 	if opts.Provider == nil {
 		opts.Provider = llm.EchoProvider{}
@@ -108,13 +129,16 @@ func Drain(ctx context.Context, db *sql.DB, opts Options) (Summary, error) {
 	if err := ensureResultColumn(db); err != nil {
 		return Summary{}, err
 	}
+	if err := ensureFlowColumn(db); err != nil {
+		return Summary{}, err
+	}
 
 	var sum Summary
 	for {
 		if err := ctx.Err(); err != nil {
 			return sum, nil
 		}
-		claimed, err := drainPass(ctx, db, opts, &sum)
+		progressed, err := drainPass(ctx, db, opts, &sum)
 		if err != nil {
 			return sum, err
 		}
@@ -122,7 +146,7 @@ func Drain(ctx context.Context, db *sql.DB, opts Options) (Summary, error) {
 			return sum, nil
 		}
 		if !opts.Watch {
-			if claimed == 0 {
+			if progressed == 0 {
 				return sum, nil
 			}
 			continue
@@ -141,10 +165,20 @@ type jobRow struct {
 	profile string
 	task    string
 	deps    []string
+	// flow is the PRD-112 workflow metadata (conditional edge, output key,
+	// reducer). Nil for every job that predates the feature or was enqueued by
+	// plain `queue add`, which is why the whole feature is opt-in per job.
+	flow *Flow
+	// flowErr is set when flow_json is present but unparseable. Such a job is
+	// failed rather than run: its guard is unknown, and running it would be the
+	// one outcome the guard might have forbidden.
+	flowErr error
 }
 
-// drainPass performs one drain pass and returns how many jobs it claimed.
-// Cascade-fail and skip counts are folded into sum; Skipped reflects the jobs
+// drainPass performs one drain pass and returns how many jobs it MOVED to a
+// terminal state, whether by executing them or by cascading a dependency's
+// outcome onto them (see Drain on why claims alone are not enough).
+// Cascade-fail and prune counts are folded into sum; Skipped reflects the jobs
 // still blocked at the end of this pass (so the terminal pass reports the true
 // blocked set rather than accumulating across passes).
 func drainPass(ctx context.Context, db *sql.DB, opts Options, sum *Summary) (int, error) {
@@ -155,7 +189,7 @@ func drainPass(ctx context.Context, db *sql.DB, opts Options, sum *Summary) (int
 	// writes: the store uses a single writer connection, so an open SELECT
 	// cursor would deadlock a concurrent UPDATE on the same conn.
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(claimableStatuses)), ",")
-	q := `SELECT id, profile, task, COALESCE(deps_json,'[]') FROM queue_jobs
+	q := `SELECT id, profile, task, COALESCE(deps_json,'[]'), COALESCE(flow_json,'') FROM queue_jobs
 	      WHERE status IN (` + placeholders + `) ORDER BY priority DESC, created_at ASC, id ASC`
 	args := make([]any, len(claimableStatuses))
 	for i, s := range claimableStatuses {
@@ -168,12 +202,24 @@ func drainPass(ctx context.Context, db *sql.DB, opts Options, sum *Summary) (int
 	var jobs []jobRow
 	for rows.Next() {
 		var j jobRow
-		var depsJSON string
-		if err := rows.Scan(&j.id, &j.profile, &j.task, &depsJSON); err != nil {
+		var depsJSON, flowJSON string
+		if err := rows.Scan(&j.id, &j.profile, &j.task, &depsJSON, &flowJSON); err != nil {
 			rows.Close()
 			return 0, err
 		}
 		_ = json.Unmarshal([]byte(depsJSON), &j.deps)
+		if flowJSON != "" {
+			var f Flow
+			// A flow we cannot parse must NOT be treated as "no flow": that would
+			// silently run a node whose guard was meant to hold it back. It is
+			// recorded and turned into a job failure below, once the cursor is
+			// closed (the store pins a single writer connection).
+			if err := json.Unmarshal([]byte(flowJSON), &f); err != nil {
+				j.flowErr = fmt.Errorf("job %s has a malformed flow_json and cannot be dispatched safely: %w", j.id, err)
+			} else {
+				j.flow = &f
+			}
+		}
 		jobs = append(jobs, j)
 	}
 	if err := rows.Err(); err != nil {
@@ -190,7 +236,7 @@ func drainPass(ctx context.Context, db *sql.DB, opts Options, sum *Summary) (int
 		}
 	}
 
-	claimedThisPass := 0
+	progressThisPass := 0
 	skippedThisPass := 0
 	for _, j := range jobs {
 		if ctx.Err() != nil {
@@ -202,17 +248,41 @@ func drainPass(ctx context.Context, db *sql.DB, opts Options, sum *Summary) (int
 		if only != nil && !only[j.id] {
 			continue
 		}
+		if j.flowErr != nil {
+			if ok, err := cascadeFail(ctx, db, j.id, j.flowErr.Error()); err != nil {
+				return progressThisPass, err
+			} else if ok {
+				sum.Failed++
+				progressThisPass++
+			}
+			continue
+		}
 		if len(j.deps) > 0 {
 			satisfied, failedDep, failedStatus, err := depState(ctx, db, j.deps)
 			if err != nil {
-				return claimedThisPass, err
+				return progressThisPass, err
+			}
+			if failedStatus == skippedDepStatus {
+				// Cascade-SKIP (PRD-112): this node sits behind a conditional edge
+				// that was not taken. That is not a failure, and it must not be
+				// reported as one — but it is terminal, so the node cannot be left
+				// 'pending' either.
+				if ok, err := cascadeSkip(ctx, db, j.id,
+					fmt.Sprintf("branch not taken: dependency %s was skipped", failedDep)); err != nil {
+					return progressThisPass, err
+				} else if ok {
+					sum.Pruned++
+					progressThisPass++
+				}
+				continue
 			}
 			if failedDep != "" {
 				// Cascade-fail: a dependency reached a non-recoverable terminal state.
 				if ok, err := cascadeFail(ctx, db, j.id, fmt.Sprintf("dependency %s %s", failedDep, failedStatus)); err != nil {
-					return claimedThisPass, err
+					return progressThisPass, err
 				} else if ok {
 					sum.Failed++
+					progressThisPass++
 				}
 				continue
 			}
@@ -221,23 +291,74 @@ func drainPass(ctx context.Context, db *sql.DB, opts Options, sum *Summary) (int
 				continue
 			}
 		}
+		// PRD-112: resolve this node's conditional edge and its {{state.<key>}}
+		// references against the run's reduced state. Both happen BEFORE the
+		// claim, so a node whose guard is false is never marked 'running'.
+		if j.flow != nil {
+			state, err := RunState(ctx, db, j.flow.RunID)
+			if err != nil {
+				if ok, err := cascadeFail(ctx, db, j.id, err.Error()); err != nil {
+					return progressThisPass, err
+				} else if ok {
+					sum.Failed++
+					progressThisPass++
+				}
+				continue
+			}
+			if j.flow.When != nil {
+				take, err := j.flow.When.Eval(state)
+				if err != nil {
+					if ok, err := cascadeFail(ctx, db, j.id, err.Error()); err != nil {
+						return progressThisPass, err
+					} else if ok {
+						sum.Failed++
+						progressThisPass++
+					}
+					continue
+				}
+				if !take {
+					if ok, err := cascadeSkip(ctx, db, j.id, fmt.Sprintf(
+						"conditional edge not taken: state[%q] %s %q is false",
+						j.flow.When.Source, j.flow.When.Op, j.flow.When.Value)); err != nil {
+						return progressThisPass, err
+					} else if ok {
+						sum.Pruned++
+						progressThisPass++
+					}
+					continue
+				}
+			}
+			if len(StateRefs(j.task)) > 0 {
+				resolved, err := Interpolate(j.task, state)
+				if err != nil {
+					if ok, err := cascadeFail(ctx, db, j.id, err.Error()); err != nil {
+						return progressThisPass, err
+					} else if ok {
+						sum.Failed++
+						progressThisPass++
+					}
+					continue
+				}
+				j.task = resolved
+			}
+		}
 		// Atomic claim: compare-and-set status -> 'running'. RowsAffected!=1 means
 		// another drainer already claimed it, so we move on without executing.
 		claimed, err := claim(ctx, db, j.id)
 		if err != nil {
-			return claimedThisPass, err
+			return progressThisPass, err
 		}
 		if !claimed {
 			continue
 		}
 		sum.Claimed++
-		claimedThisPass++
+		progressThisPass++
 
 		text, runErr := runJob(ctx, db, opts, j)
 		if runErr != nil {
 			applied, err := finish(db, j.id, "failed", "", runErr.Error())
 			if err != nil {
-				return claimedThisPass, err
+				return progressThisPass, err
 			}
 			if applied {
 				sum.Failed++
@@ -245,7 +366,7 @@ func drainPass(ctx context.Context, db *sql.DB, opts Options, sum *Summary) (int
 		} else {
 			applied, err := finish(db, j.id, "done", text, "")
 			if err != nil {
-				return claimedThisPass, err
+				return progressThisPass, err
 			}
 			if applied {
 				sum.Done++
@@ -253,13 +374,18 @@ func drainPass(ctx context.Context, db *sql.DB, opts Options, sum *Summary) (int
 		}
 	}
 	sum.Skipped = skippedThisPass
-	return claimedThisPass, nil
+	return progressThisPass, nil
 }
 
 // depState reports whether every dep has reached 'done'. If any dep is in a
 // terminal failed status it returns that dep id + status so the caller can
 // cascade-fail. A missing dep counts as unsatisfied (never cascade-failed),
 // matching dag.py which leaves such jobs pending.
+//
+// A dep in the terminal 'skipped' status (PRD-112: its conditional edge was not
+// taken) is returned the same way, with failedStatus == skippedDepStatus, so the
+// caller can cascade-SKIP instead of cascade-fail. It is checked first: a
+// not-taken branch is not an error and must never be reported as one.
 func depState(ctx context.Context, db *sql.DB, deps []string) (satisfied bool, failedDep, failedStatus string, err error) {
 	allDone := true
 	for _, dep := range deps {
@@ -271,6 +397,9 @@ func depState(ctx context.Context, db *sql.DB, deps []string) (satisfied bool, f
 		}
 		if e != nil {
 			return false, "", "", e
+		}
+		if status == skippedDepStatus {
+			return false, dep, skippedDepStatus, nil
 		}
 		if failedDepStatuses[status] {
 			return false, dep, status, nil
@@ -309,6 +438,28 @@ func cascadeFail(ctx context.Context, db *sql.DB, id, reason string) (bool, erro
 		args = append(args, s)
 	}
 	r, err := db.ExecContext(ctx, `UPDATE queue_jobs SET status='failed', error=?, finished_at=?
+		WHERE id=? AND status IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return false, err
+	}
+	n, _ := r.RowsAffected()
+	return n == 1, nil
+}
+
+// cascadeSkip marks a still-claimable job terminally 'skipped' because its
+// conditional edge was false, or because it sits behind a node that was skipped
+// (PRD-112). The reason is written to the `error` column — the column is the
+// only free-text field on the row, and `dag state` surfaces it as `reason`, so
+// an operator can always tell WHY a node did not run. The status guard means a
+// concurrent `queue cancel` still wins.
+func cascadeSkip(ctx context.Context, db *sql.DB, id, reason string) (bool, error) {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(claimableStatuses)), ",")
+	args := make([]any, 0, len(claimableStatuses)+3)
+	args = append(args, reason, time.Now().UTC().Format(time.RFC3339), id)
+	for _, s := range claimableStatuses {
+		args = append(args, s)
+	}
+	r, err := db.ExecContext(ctx, `UPDATE queue_jobs SET status='`+skippedDepStatus+`', error=?, finished_at=?
 		WHERE id=? AND status IN (`+placeholders+`)`, args...)
 	if err != nil {
 		return false, err
@@ -410,7 +561,21 @@ func jobWorkDir(workRoot, jobID string) (string, func(), error) {
 // ensureResultColumn self-heals the schema: it adds a `result TEXT` column to
 // queue_jobs if the running DB predates it. schema.sql is intentionally left
 // untouched (it is owned elsewhere); this keeps the worker package independent.
-func ensureResultColumn(db *sql.DB) error {
+func ensureResultColumn(db *sql.DB) error { return ensureQueueColumn(db, "result") }
+
+// EnsureFlowColumn is ensureFlowColumn for callers outside this package: the
+// DAG submitter has to INSERT flow_json before any drainer has ever run, so it
+// cannot rely on Drain having self-healed the schema first.
+func EnsureFlowColumn(db *sql.DB) error { return ensureFlowColumn(db) }
+
+// ensureFlowColumn self-heals the PRD-112 `flow_json TEXT` column the same way.
+// It is called from every entry point that reads flow_json (Drain and the
+// RunState/RunNodes readers) so a DB that predates the feature never surfaces a
+// raw "no such column" error to a user who simply ran `dag state`.
+func ensureFlowColumn(db *sql.DB) error { return ensureQueueColumn(db, "flow_json") }
+
+// ensureQueueColumn adds a TEXT column to queue_jobs if it is absent.
+func ensureQueueColumn(db *sql.DB, column string) error {
 	rows, err := db.Query(`PRAGMA table_info(queue_jobs)`)
 	if err != nil {
 		return err
@@ -425,15 +590,21 @@ func ensureResultColumn(db *sql.DB) error {
 			rows.Close()
 			return err
 		}
-		if name == "result" {
+		if name == column {
 			found = true
 		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
 	}
 	rows.Close()
 	if found {
 		return nil
 	}
-	if _, err := db.Exec(`ALTER TABLE queue_jobs ADD COLUMN result TEXT`); err != nil {
+	// The column name is a package-internal constant, never user input, so the
+	// interpolation below cannot be steered from outside.
+	if _, err := db.Exec(`ALTER TABLE queue_jobs ADD COLUMN ` + column + ` TEXT`); err != nil {
 		// A concurrent drainer may have added the column between our check and
 		// the ALTER; SQLite reports that as a duplicate-column error we can ignore.
 		if strings.Contains(strings.ToLower(err.Error()), "duplicate column") {

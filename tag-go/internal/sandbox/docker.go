@@ -30,6 +30,19 @@ type DockerOptions struct {
 	// Network is the docker network mode (--network). Empty defaults to "none",
 	// isolating the container from the network.
 	Network string
+	// Egress is the PRD-094 per-sandbox egress policy. Nil (or an open policy)
+	// keeps the pre-existing behaviour exactly. A policy that denies everything
+	// is satisfied by Network=none. Anything in between is ENFORCED with routes
+	// in a helper-owned network namespace (firewall_docker.go), and the run fails
+	// closed if that policy cannot be installed.
+	Egress *Policy
+	// EgressHelperImage overrides the image the namespace-owning helper runs.
+	// Empty uses DefaultEgressHelperImage.
+	EgressHelperImage string
+	// NetworkExplicit tells ExecDocker that Network came from the user rather
+	// than from the default, so a contradiction between `--network none` and an
+	// allow list can be reported instead of silently resolved.
+	NetworkExplicit bool
 }
 
 // DefaultDockerMemory / DefaultDockerCPUs / DefaultDockerNetwork are the
@@ -70,6 +83,13 @@ func lookDockerPath() (string, error) {
 //
 // Layout: run --rm [--name <name>] --memory <m> --cpus <c> --network <n> [--workdir <d>] <image> sh -c <command>
 func dockerArgs(opts DockerOptions, name string) []string {
+	return dockerArgsWith(opts, name, nil)
+}
+
+// dockerArgsWith is dockerArgs plus flags the egress enforcer needs to inject
+// (the namespace to join and the pinned hosts file). It exists as a separate
+// entry point so dockerArgs keeps the exact shape its tests pin.
+func dockerArgsWith(opts DockerOptions, name string, extra []string) []string {
 	mem := orDefault(opts.Memory, DefaultDockerMemory)
 	cpus := orDefault(opts.CPUs, DefaultDockerCPUs)
 	network := orDefault(opts.Network, DefaultDockerNetwork)
@@ -83,6 +103,7 @@ func dockerArgs(opts DockerOptions, name string) []string {
 		"--cpus", cpus,
 		"--network", network,
 	)
+	args = append(args, extra...)
 	if strings.TrimSpace(opts.Dir) != "" {
 		args = append(args, "--workdir", opts.Dir)
 	}
@@ -123,6 +144,20 @@ func ExecDocker(ctx context.Context, opts DockerOptions) (*Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
+	// PRD-094: install the egress policy BEFORE the workload starts, and fail
+	// closed if it cannot be installed. Everything after this point either runs
+	// under the policy or does not run at all.
+	enf, egressClaim, err := applyDockerEgress(ctx, dockerPath, &opts)
+	if err != nil {
+		return &Result{
+			Exit:      127,
+			Stderr:    "sandbox: " + err.Error() + "\n",
+			Isolation: egressFailClosedIsolation,
+		}, nil
+	}
+	defer enf.Close()
+
 	cctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
 
@@ -131,7 +166,11 @@ func ExecDocker(ctx context.Context, opts DockerOptions) (*Result, error) {
 	// daemon-managed container (SIGKILL cannot be proxied), so without this the
 	// container would be orphaned and --rm would never fire.
 	name := containerName()
-	cmd := exec.CommandContext(cctx, dockerPath, dockerArgs(opts, name)...)
+	var extra []string
+	if enf != nil && enf.HostsPath != "" {
+		extra = append(extra, "-v", enf.HostsPath+":/etc/hosts:ro")
+	}
+	cmd := exec.CommandContext(cctx, dockerPath, dockerArgsWith(opts, name, extra)...)
 	cmd.Cancel = func() error {
 		rmCtx, rmCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer rmCancel()
@@ -152,6 +191,9 @@ func ExecDocker(ctx context.Context, opts DockerOptions) (*Result, error) {
 		Isolation: fmt.Sprintf("docker container: image=%s network=%s memory=%s cpus=%s",
 			opts.Image, orDefault(opts.Network, DefaultDockerNetwork),
 			orDefault(opts.Memory, DefaultDockerMemory), orDefault(opts.CPUs, DefaultDockerCPUs)),
+	}
+	if egressClaim != "" {
+		res.Isolation += "; " + egressClaim
 	}
 
 	if cctx.Err() == context.DeadlineExceeded {

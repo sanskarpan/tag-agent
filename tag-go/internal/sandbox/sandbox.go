@@ -55,6 +55,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -74,6 +75,13 @@ type Options struct {
 	// running. It has no effect on macOS or on unsupported platforms, where the
 	// alternative is not "weaker confinement" but "none whatsoever".
 	AllowUnconfined bool
+	// Egress is the PRD-094 egress policy. The restricted backend has NO
+	// per-destination primitive on any OS, so exactly two shapes are accepted
+	// here: an open policy (no constraint) and a blanket denial (which every
+	// supported platform already delivers, and which is then required rather
+	// than degraded to). Any policy in between fails closed with exit 127 and
+	// points at --backend docker. See firewall.go.
+	Egress *Policy
 }
 
 // Result is the captured outcome of a sandboxed run.
@@ -105,6 +113,14 @@ type isolationPlan struct {
 	// Alt is a weaker fallback plan used only when the process cannot be
 	// started with this plan (e.g. unprivileged netns denied by the kernel).
 	Alt *isolationPlan
+	// DeniesAllEgress records whether this plan blocks EVERY outbound
+	// destination for every protocol. It is set by the platform that builds the
+	// plan (darwin: SBPL `(deny network*)`; linux: the user+network-namespace
+	// plan only), and it is what Options.Egress checks against instead of
+	// pattern-matching the Isolation prose — a claim string is for humans, and
+	// deciding whether to fail closed on it would be exactly the kind of
+	// coupling that lets a reworded message silently weaken a guarantee.
+	DeniesAllEgress bool
 	// FailClosedExit / FailClosedMarker / FailClosedIsolation describe the one
 	// way this plan can fail AFTER the process has started: a confinement layer
 	// installed by a helper inside the child (Linux's Landlock re-exec) can
@@ -165,12 +181,39 @@ func Exec(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 
+	// PRD-094: an egress policy this backend cannot honour is refused BEFORE any
+	// confinement is assembled, so the user never gets a run that quietly
+	// ignored their firewall.
+	if opts.Egress.NeedsDestinationGranularity() {
+		return &Result{
+			Exit:      127,
+			Stderr:    restrictedEgressRefusalMsg(opts.Egress, runtime.GOOS) + "\n",
+			Isolation: restrictedEgressRefusalIsolation,
+		}, nil
+	}
+
 	plan, failClosed, err := buildIsolation(runDir, opts.Timeout, opts.AllowUnconfined)
 	if err != nil {
 		return nil, err
 	}
 	if failClosed != nil {
 		return failClosed, nil
+	}
+
+	// A blanket denial is the one policy this backend can express. It must be
+	// DELIVERED, not approximated: the weaker fallback plan (no network
+	// namespace) blocks at most TCP, so it is removed from the chain and a
+	// kernel that refuses the strong plan fails the run instead of degrading it.
+	requireFullDenial := opts.Egress.DeniesEverything()
+	if requireFullDenial {
+		if !plan.DeniesAllEgress {
+			return &Result{
+				Exit:      127,
+				Stderr:    restrictedDenyAllUnenforceableMsg + "\n",
+				Isolation: restrictedDenyAllUnenforceableIsolation,
+			}, nil
+		}
+		plan.Alt = nil
 	}
 
 	if ctx == nil {
@@ -188,6 +231,16 @@ func Exec(ctx context.Context, opts Options) (*Result, error) {
 			continue
 		}
 		if startErr != nil {
+			if requireFullDenial {
+				// --deny-all removed the fallback, so a start failure here means
+				// the denial could not be delivered. Report that, rather than a
+				// raw exec error the caller cannot act on.
+				return &Result{
+					Exit:      127,
+					Stderr:    restrictedDenyAllUnenforceableMsg + " (" + startErr.Error() + ")\n",
+					Isolation: restrictedDenyAllUnenforceableIsolation,
+				}, nil
+			}
 			return nil, startErr
 		}
 		return res, nil

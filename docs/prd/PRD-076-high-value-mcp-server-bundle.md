@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Partial — `mcp-registry list/install` ships a curated embedded catalog, but there is no `add-curated` bundle verb
+**Status:** Partial — the bundle verb now ships: `mcp-registry add-curated` / `list-curated` select the embedded curated catalog (all of it, or one `--category`) and, following the `plugin install` precedent, do a NATIVE record + enable with no npm/pip — the ledger is `mcp_curated_installs` and "enabled" means the server's `config` block written into the profile's `config.yaml` `mcp_servers`. The bundle is atomic and honesty-guarded: any selected server whose declared `requires_env` secret is absent (checked in the process env AND the profile `.env`) refuses the WHOLE bundle by name, naming the exact variables, and writes nothing; `--skip-missing-env` is the explicit opt-in to install only the satisfiable subset and still reports what was left out and why. `--dry-run` prints the plan and writes nothing; `--json` emits `[]` not `null`; an unknown `--category` is exit 2 and lists the real categories. NOT implemented: the PRD's expansion from 10 to 20 curated servers, the tool-budget pre-flight (`--no-budget-check`/`--disable-playwright`), `tag mcp creds`, and the `mcp list --json` status columns
 **Priority:** P2
 **Estimated Effort:** XS (1-2 days)
 **Category:** MCP Ecosystem & Tool Connectivity
