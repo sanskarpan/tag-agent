@@ -41,8 +41,15 @@ const defaultHalfLifeDays = 60.0
 
 func nowISO() string { return time.Now().UTC().Format(time.RFC3339) }
 
-// Add inserts a memory, validating confidence in (0,1].
+// Add inserts a memory with source='manual', validating confidence in (0,1].
 func Add(db *sql.DB, profile, content, memType string, confidence float64) (string, error) {
+	return AddWithSource(db, profile, content, memType, confidence, "manual")
+}
+
+// AddWithSource is Add with an explicit provenance tag. The post-run extractor
+// (PRD-065) writes source='auto_extract' so extracted memories can be audited,
+// filtered, and bulk-deleted separately from ones a human typed.
+func AddWithSource(db *sql.DB, profile, content, memType string, confidence float64, source string) (string, error) {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return "", fmt.Errorf("memory content required")
@@ -56,10 +63,13 @@ func Add(db *sql.DB, profile, content, memType string, confidence float64) (stri
 	if _, ok := halfLives[memType]; !ok {
 		return "", fmt.Errorf("memory_type must be one of convention/decision/gotcha/fact/other, got %q", memType)
 	}
+	if strings.TrimSpace(source) == "" {
+		source = "manual"
+	}
 	id := uuid.NewString()[:16]
 	now := nowISO()
 	_, err := db.Exec(`INSERT INTO semantic_memories(id,profile,content,memory_type,confidence,created_at,accessed_at,access_count,source,tier)
-		VALUES(?,?,?,?,?,?,?,0,'manual','archival')`, id, profile, content, memType, confidence, now, now)
+		VALUES(?,?,?,?,?,?,?,0,?,'archival')`, id, profile, content, memType, confidence, now, now, source)
 	if err != nil {
 		return "", err
 	}
