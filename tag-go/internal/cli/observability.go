@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"time"
 
@@ -233,11 +232,18 @@ func aggregateCosts(db *store.DB, label, table, costCol string) (costSourceAgg, 
 
 func registerObservability(root *cobra.Command, app *App) {
 	// costs
+	var costsRunID, costsBy string
 	costs := &cobra.Command{Use: "costs", Short: "Token usage & cost estimates", GroupID: "obs",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			db, err := app.OpenDB()
 			if err != nil {
-				return err
+				return jsonErrorMaybe(err)
+			}
+			// PRD-046 §7.4: an itemized single-run report for CI. The default
+			// (no --run-id) path below is unchanged — it must keep reporting
+			// `runs` and `spans` as separate populations with an overlap warning.
+			if costsRunID != "" {
+				return jsonErrorMaybe(costsRunReport(db, costsRunID, costsBy))
 			}
 			// `runs` and `spans` are written by different engines (Go writes
 			// runs; Python's tracing writes spans), so aggregating only one of
@@ -291,6 +297,9 @@ func registerObservability(root *cobra.Command, app *App) {
 			}
 			return nil
 		}}
+	costs.Flags().StringVar(&costsRunID, "run-id", "", "itemized per-span cost report for a single run")
+	costs.Flags().StringVar(&costsBy, "by", "span", "with --run-id: span or model")
+
 	// pricing
 	var model string
 	var inTok, outTok int
@@ -337,7 +346,7 @@ func registerObservability(root *cobra.Command, app *App) {
 			}
 			p, ok := lookupPrice(model)
 			if !ok {
-				return fmt.Errorf("model not found: %q", model)
+				return jsonErrorMaybe(fmt.Errorf("model not found: %q", model))
 			}
 			cost := float64(inTok)/1e6*p.In + float64(outTok)/1e6*p.Out
 			// `pricing get` used to ignore the global --json flag entirely and
@@ -361,7 +370,15 @@ func registerObservability(root *cobra.Command, app *App) {
 	prGet.Flags().StringVar(&model, "model", "", "model id")
 	prGet.Flags().IntVar(&inTok, "input-tokens", 0, "input tokens")
 	prGet.Flags().IntVar(&outTok, "output-tokens", 0, "output tokens")
-	pricing.AddCommand(prList, prGet)
+	// PRD-046 §7.5: inspect the active rate table (and one model's provenance)
+	// before trusting any cost figure derived from it.
+	var showModel string
+	prShow := &cobra.Command{Use: "show", Short: "Inspect the active pricing table", Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return jsonErrorMaybe(runPricingShow(showModel))
+		}}
+	prShow.Flags().StringVar(&showModel, "model", "", "show only this model id")
+	pricing.AddCommand(prList, prGet, prShow)
 
 	// trace
 	trace := &cobra.Command{Use: "trace", Short: "View trace spans", GroupID: "obs"}
@@ -399,66 +416,89 @@ func registerObservability(root *cobra.Command, app *App) {
 			}
 			return nil
 		}}
+	// PRD-046 §7.1: `--cost` turns `trace show` into a per-span USD waterfall;
+	// `--min-cost-usd` trims a large trace down to the expensive spans.
+	var showCost bool
+	var showMinCost float64
 	trShow := &cobra.Command{Use: "show TRACE_ID", Short: "Show all spans in a trace", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if showMinCost < 0 {
+				return jsonErrorMaybe(usageErrorf("--min-cost-usd must be >= 0"))
+			}
 			db, err := app.OpenDB()
 			if err != nil {
-				return err
+				return jsonErrorMaybe(err)
 			}
-			rows, err := db.Query(`SELECT id,trace_id,COALESCE(parent_id,''),name,COALESCE(profile,''),COALESCE(model_id,''),
-				started_at,COALESCE(finished_at,''),COALESCE(duration_ms,0),status,prompt_tokens,completion_tokens,COALESCE(attributes,'{}'),error_msg
-				FROM spans WHERE trace_id=? ORDER BY started_at`, args[0])
+			spans, err := loadCostSpans(db, args[0])
 			if err != nil {
-				return err
+				return jsonErrorMaybe(err)
 			}
-			defer rows.Close()
-			type showRec struct {
-				id, tid, pid, name, profile, model, start, fin, status, attrs string
-				dur, pt, ct                                                   int
-				errMsg                                                        *string
-			}
-			var recs []showRec
-			for rows.Next() {
-				var r showRec
-				if err := rows.Scan(&r.id, &r.tid, &r.pid, &r.name, &r.profile, &r.model, &r.start, &r.fin, &r.dur, &r.status, &r.pt, &r.ct, &r.attrs, &r.errMsg); err != nil {
-					return err
-				}
-				recs = append(recs, r)
-			}
-			if err := rows.Err(); err != nil {
-				return err
-			}
-			if len(recs) == 0 {
+			if len(spans) == 0 {
+				// Python parity: an empty ARRAY plus exit 1, never `null`. The
+				// status is carried out as an error value rather than os.Exit so
+				// deferred cleanup (db handles, temp state) still runs.
 				if flagJSON {
 					fmt.Println("[]")
 				} else {
 					fmt.Printf("No spans found for trace %s\n", args[0])
 				}
-				os.Exit(1)
+				return exitCodeErr{code: 1}
+			}
+			// Captured before filtering so a filter that removes every row still
+			// names the trace's profile.
+			traceProfile := ""
+			for _, s := range spans {
+				if s.Profile != "" {
+					traceProfile = s.Profile
+					break
+				}
+			}
+			// Filtering breaks the parent chain, so the nested view is only used
+			// when the whole trace is present.
+			nested := true
+			if cmd.Flags().Changed("min-cost-usd") {
+				nested = false
+				kept := make([]costSpan, 0, len(spans))
+				for _, s := range spans {
+					if s.CostUSD != nil && *s.CostUSD >= showMinCost {
+						kept = append(kept, s)
+					}
+				}
+				spans = kept
 			}
 			if flagJSON {
-				items := make([]map[string]any, 0, len(recs))
-				for _, r := range recs {
-					var em any
-					if r.errMsg != nil {
-						em = *r.errMsg
-					}
-					var at map[string]any
-					json.Unmarshal([]byte(r.attrs), &at)
-					items = append(items, map[string]any{"id": r.id, "trace_id": r.tid, "parent_id": r.pid,
-						"name": r.name, "profile": r.profile, "model_id": r.model, "started_at": r.start,
-						"finished_at": r.fin, "duration_ms": r.dur, "status": r.status,
-						"prompt_tokens": r.pt, "completion_tokens": r.ct, "attributes": at, "error_msg": em})
+				items := make([]map[string]any, 0, len(spans))
+				var totals costTotals
+				for _, s := range spans {
+					totals.add(s)
+					item := costSpanJSON(s)
+					item["trace_id"] = args[0]
+					items = append(items, item)
 				}
-				b, _ := json.MarshalIndent(items, "", "  ")
-				fmt.Println(string(b))
+				if !showCost {
+					// Back-compatible shape: a plain array of spans, now carrying
+					// the cost/kind columns the schema already stores (FR-20).
+					b, _ := json.MarshalIndent(items, "", "  ")
+					fmt.Println(string(b))
+					return nil
+				}
+				return emitJSON(map[string]any{
+					"run_id": args[0], "profile": traceProfile, "population": "spans",
+					"span_count": totals.Spans, "prompt_tokens": totals.PromptTokens,
+					"completion_tokens": totals.CompTokens, "total_cost_usd": totals.CostUSD,
+					"unpriced_spans": totals.Unpriced, "includes_estimated_rates": totals.Estimated,
+					"spans": items,
+				})
+			}
+			if showCost {
+				renderCostWaterfall(args[0], traceProfile, spans, nested)
 				return nil
 			}
-			for _, r := range recs {
-				fmt.Printf("  %-40s %-8s %dms\n", r.name, r.status, r.dur)
-			}
+			renderFlameChart(spans, nested)
 			return nil
 		}}
+	trShow.Flags().BoolVar(&showCost, "cost", false, "render the per-span USD cost waterfall")
+	trShow.Flags().Float64Var(&showMinCost, "min-cost-usd", 0, "only show spans costing at least this much")
 
 	var exportEndpoint, exportTrace string
 	trExport := &cobra.Command{Use: "export", Short: "Export spans as OTLP/JSON", Args: cobra.NoArgs,
@@ -468,7 +508,7 @@ func registerObservability(root *cobra.Command, app *App) {
 				return err
 			}
 			q := `SELECT id,trace_id,COALESCE(parent_id,''),name,COALESCE(profile,''),COALESCE(model_id,''),
-				started_at,COALESCE(finished_at,''),COALESCE(duration_ms,0),status,prompt_tokens,completion_tokens
+				started_at,COALESCE(finished_at,''),COALESCE(duration_ms,0),status,prompt_tokens,completion_tokens,cost_usd
 				FROM spans`
 			var qargs []any
 			if exportTrace != "" {
@@ -486,11 +526,13 @@ func registerObservability(root *cobra.Command, app *App) {
 			for rows.Next() {
 				var id, tid, pid, name, prof, model, start, fin, status string
 				var dur, pt, ct int
-				if err := rows.Scan(&id, &tid, &pid, &name, &prof, &model, &start, &fin, &dur, &status, &pt, &ct); err != nil {
+				var stored *float64
+				if err := rows.Scan(&id, &tid, &pid, &name, &prof, &model, &start, &fin, &dur, &status, &pt, &ct, &stored); err != nil {
 					return err
 				}
 				attrs := []map[string]any{otelAttr("gen_ai.request.model", model), otelAttr("tag.profile", prof),
 					otelAttrInt("gen_ai.usage.input_tokens", pt), otelAttrInt("gen_ai.usage.output_tokens", ct)}
+				attrs = otelAppendCost(attrs, model, stored, pt, ct)
 				spans = append(spans, otelSpanJSON(id, tid, pid, name, start, fin, status, attrs))
 			}
 			if err := rows.Err(); err != nil {
@@ -572,10 +614,12 @@ func registerObservability(root *cobra.Command, app *App) {
 			}
 			snap, err := traceLoadSnapshot(db, args[0])
 			if err != nil {
-				return err
+				return jsonErrorMaybe(err)
 			}
 			if snap == nil {
-				return fmt.Errorf("No snapshot found for trace %s", args[0])
+				// #530: a --json consumer must get a parseable error object on
+				// stdout, not just the "error:" line on stderr.
+				return jsonErrorMaybe(fmt.Errorf("No snapshot found for trace %s", args[0]))
 			}
 			spans := traceSnapshotSpans(snap)
 			if flagJSON {
@@ -603,17 +647,17 @@ func registerObservability(root *cobra.Command, app *App) {
 			}
 			snapA, err := traceLoadSnapshot(db, args[0])
 			if err != nil {
-				return err
+				return jsonErrorMaybe(err)
 			}
 			if snapA == nil {
-				return fmt.Errorf("No snapshot for trace %s", args[0])
+				return jsonErrorMaybe(fmt.Errorf("No snapshot for trace %s", args[0]))
 			}
 			snapB, err := traceLoadSnapshot(db, args[1])
 			if err != nil {
-				return err
+				return jsonErrorMaybe(err)
 			}
 			if snapB == nil {
-				return fmt.Errorf("No snapshot for trace %s", args[1])
+				return jsonErrorMaybe(fmt.Errorf("No snapshot for trace %s", args[1]))
 			}
 			// A trace normally contains several spans with the same name (e.g.
 			// one `llm.call` per turn), so spans are keyed by (name, ordinal
@@ -701,6 +745,7 @@ func registerObservability(root *cobra.Command, app *App) {
 
 	trace.AddCommand(trList, trShow, trExport, trSnapshot, trCheckpoint, trReplay, trDiff)
 	root.AddCommand(costs, pricing, trace)
+	registerStats(root, app)
 }
 
 // traceSnapshot captures a snapshot of a trace into trace_snapshots (port of
