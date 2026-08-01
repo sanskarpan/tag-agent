@@ -59,11 +59,19 @@ func registerSandbox(root *cobra.Command, app *App) {
 	var cpus string
 	var network string
 	var allowUnconfined bool
+	var egress egressFlags
+	var egressImage string
 	run := &cobra.Command{Use: "run <command>", Short: "Execute a command in the sandbox (restricted or docker backend)", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			timeout := time.Duration(timeoutSec) * time.Second
+			// A malformed or self-contradictory egress policy is a usage error
+			// (exit 2), and it is resolved BEFORE anything is executed: a
+			// firewall the user got wrong must stop the run, not be dropped.
+			policy, err := egress.policy()
+			if err != nil {
+				return usageErrorf("%v", err)
+			}
 			var res *sandbox.Result
-			var err error
 			switch backend {
 			case "", "restricted":
 				res, err = sandbox.Exec(context.Background(), sandbox.Options{
@@ -71,16 +79,20 @@ func registerSandbox(root *cobra.Command, app *App) {
 					Dir:             dir,
 					Timeout:         timeout,
 					AllowUnconfined: allowUnconfined,
+					Egress:          policy,
 				})
 			case "docker":
 				res, err = sandbox.ExecDocker(context.Background(), sandbox.DockerOptions{
-					Command: args[0],
-					Image:   image,
-					Dir:     dir,
-					Timeout: timeout,
-					Memory:  memory,
-					CPUs:    cpus,
-					Network: network,
+					Command:           args[0],
+					Image:             image,
+					Dir:               dir,
+					Timeout:           timeout,
+					Memory:            memory,
+					CPUs:              cpus,
+					Network:           network,
+					NetworkExplicit:   cmd.Flags().Changed("network"),
+					Egress:            policy,
+					EgressHelperImage: egressImage,
 				})
 			default:
 				return fmt.Errorf("unknown backend %q: use 'restricted' or 'docker'", backend)
@@ -133,7 +145,11 @@ func registerSandbox(root *cobra.Command, app *App) {
 	run.Flags().StringVar(&memory, "memory", sandbox.DefaultDockerMemory, "docker memory limit (docker backend)")
 	run.Flags().StringVar(&cpus, "cpus", sandbox.DefaultDockerCPUs, "docker CPU limit (docker backend)")
 	run.Flags().StringVar(&network, "network", sandbox.DefaultDockerNetwork, "docker network mode (docker backend; 'none' isolates)")
+	egress.bind(run)
+	run.Flags().StringVar(&egressImage, "egress-helper-image", sandbox.DefaultEgressHelperImage,
+		"image for the network-namespace helper that installs egress rules (docker backend; needs a shell and `ip`)")
 
 	c.AddCommand(run)
+	registerSandboxFirewall(c)
 	root.AddCommand(c)
 }

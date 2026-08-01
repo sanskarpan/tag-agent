@@ -254,6 +254,11 @@ func buildIsolation(runDir string, timeout time.Duration, allowUnconfined bool) 
 		},
 		Isolation: strings.Join([]string{rl, fsClaim,
 			"network namespace: all egress denied (loopback only)"}, "; "),
+		// Only THIS plan denies everything. `weak` deliberately leaves
+		// DeniesAllEgress false: with Landlock ABI>=4 it blocks TCP and nothing
+		// else, and without it nothing at all. An egress policy of --deny-all
+		// therefore refuses to fall back to it (see Exec).
+		DeniesAllEgress:     true,
 		Alt:                 weak,
 		FailClosedExit:      failExit,
 		FailClosedMarker:    failMarker,
