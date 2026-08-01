@@ -1,6 +1,6 @@
 # PRD-043: Vector-Based Tool Retrieval (`tag mcp-registry index`)
 
-**Status:** Partial — `tool-index index/search/status` ships in both, but retrieval is keyword-based, not vector/embedding-based
+**Status:** Shipped (Go) — `tool-index index/search/status` retrieves by **vector cosine similarity** when an embeddings backend is configured (`TAG_EMBED_BASE_URL`/`TAG_EMBED_API_KEY`, falling back to `OPENAI_API_KEY`), reusing the `internal/memory` embedder + float32 BLOB storage that backs `mem2 store search`. `index` embeds each `"{name}: {description}"` document (opt out with `--no-embed`); `search` embeds the query and cosine-ranks. Keyword term-overlap remains the honest fallback when no backend is configured, the index carries no vectors, the query cannot be embedded, or the stored vectors were written by a different model — the mode used is always reported (`search --json` → `{"mode": "vector"|"keyword", ...}`, `status` → `backend`/`vector_ready`). Deferred vs. the PRD text: ChromaDB/sentence-transformers (a Python-only dependency; the Go build uses an OpenAI-compatible endpoint instead), `mtime`-based stale-index detection, top-K injection into the agent system prompt, and the `--tools` override.
 **Priority:** P1
 **Estimated Effort:** M (1 sprint, ~2 weeks)
 **Affects:** `controller.py` (new `cmd_mcp_registry_index`, `cmd_mcp_registry_search`; patch `cmd_mcp_registry`, `cmd_shell`), new `src/tag/tool_retrieval.py`

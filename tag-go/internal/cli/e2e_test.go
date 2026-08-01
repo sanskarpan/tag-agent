@@ -1021,7 +1021,6 @@ func TestE2EEmptyJSONListsAreArrays(t *testing.T) {
 		{"memory-journal", "list", "--json"},
 		// F5: two commands the #559 sweep missed — both still emitted `null`.
 		{"marketplace", "list", "--json"},
-		{"tool-index", "search", "foo", "--json"},
 	}
 	for _, c := range cases {
 		out, code := run(t, h, c...)
@@ -1032,6 +1031,26 @@ func TestE2EEmptyJSONListsAreArrays(t *testing.T) {
 		if trimmed != "[]" {
 			t.Errorf("%v empty --json must be [] not %q", c, trimmed)
 		}
+	}
+	// `tool-index search --json` is an object since PRD-043 (it has to report the
+	// retrieval mode, exactly as `mem2 store search --json` does), so the #559
+	// contract applies to its `results` member: empty must still be [], not null.
+	out, code := run(t, h, "tool-index", "search", "foo", "--json")
+	if code != 0 {
+		t.Errorf("tool-index search --json exit %d: %q", code, out)
+	}
+	var ti struct {
+		Mode    string `json:"mode"`
+		Results []any  `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &ti); err != nil {
+		t.Fatalf("tool-index search --json is not an object: %v: %q", err, out)
+	}
+	if ti.Results == nil {
+		t.Errorf("tool-index search --json: empty results must be [] not null: %q", out)
+	}
+	if ti.Mode == "" {
+		t.Errorf("tool-index search --json must report the retrieval mode: %q", out)
 	}
 }
 
