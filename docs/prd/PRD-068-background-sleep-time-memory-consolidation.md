@@ -1,6 +1,6 @@
 # PRD-068: Background Sleep-Time Memory Consolidation Agent (`tag memory gc`)
 
-**Status:** Partial — `mem2 gc` ships the consolidation/eviction/promotion logic, but it runs on demand only; there is no background sleep-time agent
+**Status:** Shipped (Go) — `tag mem2 gc --daemon [--interval 1h] [--profile P|--all-profiles]` runs the existing evict/merge/promote pipeline continuously, following the `cron daemon` shape: `signal.NotifyContext` wraps the command context so SIGINT/SIGTERM interrupts the wait immediately (verified: exit 0, "consolidation daemon stopping"), a single reusable `time.Timer` replaces per-iteration `time.After`, and no goroutine is spawned per cycle. Each cycle closes every cursor before it mutates, so the `SetMaxOpenConns(1)` write lock is never held across a read — foreground `mem add`/`mem list` keep succeeding while it runs. A cycle error is reported and the loop continues rather than silently dying. Verified live: fd count flat at 14 and thread count flat at 9 across 23 cycles over 45 s. `--daemon --dry-run` and a non-positive `--interval` are usage errors (exit 2). On-demand `mem2 gc` behavior is unchanged. Deferred vs. the PRD text: LLM-based cluster consolidation, `memory_archive`/`memory_merge_provenance`/`memory_gc_snapshots` and `--rollback`, the `kg_entities`/`kg_edges` graph rebuild, cost estimation/`--max-cost`, and the advisory lock table.
 **Priority:** P3
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Memory & Knowledge
