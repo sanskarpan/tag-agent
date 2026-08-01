@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Partial — Go `permissions show/log` provides allow/deny/ask tool rules plus a decision log; there is no pause/resume approval flow and no Python equivalent
+**Status:** Partial — Go now ships the pause/resume approval flow: `--approval-gate` parks a gated tool call pre-execution, `tag permissions pending|approve|deny|audit` decides it out-of-process, the wait is always bounded by `--approval-gate-timeout` (expiry = audited auto-deny; there is no wait-forever mode), args are frozen and SHA-256'd at gate entry, and every decision appends to `hitl_audit`, which is append-only via SQLite triggers. Background surfaces (`queue worker`, `dag run --execute`, `cron run --execute`, `loop`) refuse the gate out loud so they can never park. Not built: the separate `tool_approval_rules` table and `tag mcp approve-required` verbs (gating is driven by the existing `permissions` ruleset instead — there is no `tag mcp` namespace in Go), the webhook approval server, notification channels, NDJSON export, hash chaining, and detached `run --resume`. No Python equivalent
 **Priority:** P3
 **Estimated Effort:** L (2-4 weeks)
 **Category:** MCP Ecosystem & Tool Connectivity

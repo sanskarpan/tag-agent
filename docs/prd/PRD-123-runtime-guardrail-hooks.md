@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Partial — Go `permissions` deny rules act as a runtime tool tripwire; there is no content-guardrail processor and no Python equivalent
+**Status:** Partial — Go now ships the content-guardrail processor (`internal/guardrail`): regex and built-in (`secrets`, `destructive`) detectors plus store-backed per-session tripwire counters, evaluated at four stages, wired as PRE and POST hooks *inside* `permission.Wrap` so the existing `tool.Register`/`RegisterMCP` choke point covers them and no caller can bypass. A guardrail block outranks an `allow` rule; only `--dangerously-allow-all` and the explicit `--no-tripwire` escape it. Surface is `tag tripwire list|check|test|history` — deliberately NOT `tag guardrail runtime`, which is left free for the still-Proposed PRDs 121/122/124/125. A fired tripwire exits 3 (`--exit-zero` to downgrade); anything it cannot evaluate fails CLOSED and is reported as `undecidable` rather than passed. Not built: the `runtime_guardrail_configs` table and `tag guardrail runtime add|remove` (rules are config-driven and immutable at process start, per NFR-03), and the `interrupt` action (needs the PRD-109 engine integration that does not exist yet). No Python equivalent
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Security/Guardrails

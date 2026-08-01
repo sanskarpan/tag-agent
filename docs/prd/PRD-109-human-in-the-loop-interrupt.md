@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Partial — Python `loop start --approval human` plus `loop approve`/`deny` gives a HITL gate; there is no `workflow interrupt`/`Command(resume=)` primitive and no Go equivalent
+**Status:** Partial — Go now ships the interrupt/resume primitive: `hitl.Interrupt` returns the `ErrInterrupt` sentinel on a new pause and the stored operator input on the resumed re-run (deterministic step id, `--auto-approve`/`--auto-input` opt-out), with `tag workflow interrupt raise|show|list|wait`, `tag workflow resume --input`, and `tag workflow list --filter interrupted`. It shares one table and one BOUNDED wait with PRD-078's tool-approval gate (`internal/hitl`) rather than duplicating it; `loop start --approval human` remains a separate iteration-level gate. Waits always have a deadline and exit 3 when the gate does not pass. Not built: graph-engine integration and state checkpointing — PRD-110 and PRD-112 do not exist yet, so no workflow engine calls `Interrupt` in production code; the guardrail `interrupt` action (PRD-123 FR-03/FR-07) is the intended first consumer. No Python equivalent
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Workflow State

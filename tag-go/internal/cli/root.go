@@ -147,6 +147,8 @@ func NewRoot() *cobra.Command {
 	registerReviewPR(root, app)
 	registerContext(root, app)
 	registerSplit(root, app)
+	registerWorkflow(root, app) // PRD-109 human-in-the-loop interrupt/resume
+	registerTripwire(root, app) // PRD-123 runtime content guardrail + tripwire
 
 	// #562: cobra adds its `completion` command lazily at Execute() time, after
 	// NewRoot() runs — so enforceUnknownSubcommand never walks it, and both a
