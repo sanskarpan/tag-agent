@@ -148,6 +148,9 @@ func registerMCPRegistry(root *cobra.Command, app *App) {
 	disable.Flags().StringVar(&disProfile, "profile", "", "profile (default master)")
 
 	m.AddCommand(list, install, enable, disable)
+	// PRD-076: the bundle verbs (add-curated / list-curated) live in
+	// mcpcurated.go so the one-server-at-a-time surface above stays readable.
+	registerMCPCurated(m, app)
 	root.AddCommand(m)
 }
 
