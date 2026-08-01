@@ -1,6 +1,6 @@
 # PRD-066: Hybrid Memory Search (`tag mem search --mode hybrid`)
 
-**Status:** Partial — `mem search` is FTS/BM25 only (no `--mode hybrid`); vector search exists separately as `mem2 store search`; no RRF fusion of the two
+**Status:** Shipped (Go) — `mem search` fuses the FTS5/BM25 leg and the vector leg with **reciprocal rank fusion** (k=60, FR-04) via `--mode hybrid|fts|dense` (aliases `bm25`/`vector`), `--alpha` (0 = pure BM25, 1 = pure vector; endpoints collapse exactly onto the pure modes per AC-03/AC-04), `--limit`, `--type` and `--verbose` (per-hit `dense_score`/`sparse_score`/`hybrid_score`). Default mode is `hybrid`. The sparse leg is `memory.Search` verbatim, so the unconditional `LIKE ... ESCAPE '\'` union that fixed CJK/partial-word recall (#574 / Python #567) still governs it — guarded by `TestHybridDoesNotRegressCJKRecall` and `TestE2EMemSearchHybridCJKNotRegressed`. A dense/hybrid request degrades to `fts` (never to an empty result) when no embedding backend is configured, the query cannot be embedded, or no memory carries a vector for the active model; the effective mode is reported and an explicitly-requested downgrade is announced on stderr. Deferred vs. the PRD text: `--entity` boost, `--recency-weight`, `--tier`/`--since` filters, and the persisted BM25 index (SQLite FTS5 already provides BM25 in-engine).
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Memory

@@ -418,17 +418,34 @@ tag dag show --json
 ### Vector Tool Retrieval
 
 ```bash
-# Index all tools in the current profile
+# Index all tools (embeds each "name: description" when a backend is configured)
 tag tool-index index
 
 # Semantic search for the right tool
 tag tool-index search "send a Slack message"
 
-# Status
+# Skip embedding even when a backend is configured
+tag tool-index index --no-embed
+
+# Status — reports which backend is live
 tag tool-index status --json
 ```
 
-High-cardinality MCP server catalogs are indexed and searched by **keyword** — case-insensitive substring matching over tool names and descriptions, not embeddings or semantic similarity — so only the relevant subset enters the context window. Semantic (vector) retrieval is not implemented for tools; it exists separately for memories via `tag mem2 store search`.
+High-cardinality MCP server catalogs are indexed once and then retrieved with
+**vector similarity** when an embeddings backend is configured
+(`TAG_EMBED_BASE_URL` / `TAG_EMBED_API_KEY`, falling back to `OPENAI_API_KEY`) —
+the same machinery that backs `tag mem2 store search`. `tool-index index` embeds
+each tool document and stores the float32 vector alongside the row; `tool-index
+search` embeds the query and ranks by cosine similarity, so a query with no
+literal word overlap still finds the right server.
+
+With no backend configured — or when the index has not been embedded, the query
+cannot be embedded, or the stored vectors were written by a different model — it
+falls back to **keyword** retrieval (case-insensitive substring matching over
+tool names and descriptions). The mode used is always reported: `--json` emits
+`{"mode": "vector"|"keyword", "query": ..., "results": [...]}`, and
+`tool-index status` prints the live backend. A keyword result is never presented
+as a semantic one.
 
 ---
 
@@ -662,6 +679,11 @@ tag run "..." --tools --auto-approve             # upgrade every `ask` to allow
 | `tag workspace index` | Index repo for context |
 | `tag workspace status` | Indexing status |
 | `tag mem list` | List memory entries |
+| `tag mem search` | Hybrid retrieval (RRF over FTS/BM25 + vector); `--mode hybrid\|fts\|dense`, `--alpha`, `--verbose` |
+| `tag mem2 extract` | Extract memories from a run's transcript (`--dry-run`, `--provider`) |
+| `tag mem2 extractions` | Post-run extraction history |
+| `tag mem2 config` | Show/set `auto_extract`, `extractor_provider`, `extractor_timeout_s` |
+| `tag mem2 gc` | Consolidate memory (evict/merge/promote); `--daemon --interval` for sleep-time consolidation |
 | `tag memory-journal add` | Append to journal |
 | `tag memory-journal search` | Full-text search |
 | `tag memory-journal list` | Recent entries |

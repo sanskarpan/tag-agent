@@ -13,6 +13,7 @@ import (
 
 	"github.com/tag-agent/tag/internal/agent"
 	"github.com/tag-agent/tag/internal/llm"
+	"github.com/tag-agent/tag/internal/memory"
 	"github.com/tag-agent/tag/internal/tool"
 	"github.com/tag-agent/tag/internal/trace"
 )
@@ -30,6 +31,10 @@ func registerRun(root *cobra.Command, app *App) {
 	var enableWeb bool
 	var disableTools []string
 	var perms permFlags
+	// PRD-065 FR-13: --auto-memorize / --no-auto-memorize force post-run
+	// extraction on or off for this invocation, overriding the profile/global
+	// config either way. Neither flag → follow config (default: off).
+	var forceMemorize, forceNoMemorize bool
 
 	c := &cobra.Command{
 		Use:     "run <prompt>",
@@ -141,6 +146,10 @@ func registerRun(root *cobra.Command, app *App) {
 					return fmt.Errorf("recording run: %w", ierr)
 				}
 			}
+			// PRD-065 post-run hook. Deliberately AFTER the run row is recorded and
+			// (below) after the run's own output, so nothing it does can change the
+			// run's result or exit code. Opt-in only.
+			defer maybeAutoExtract(cmd.Context(), app, prov, runID, app.profile(profile), forceMemorize, forceNoMemorize)
 			if flagJSON {
 				return emitJSON(map[string]any{
 					"run_id": runID, "provider": provider, "stopped": res.Stopped,
@@ -172,8 +181,68 @@ func registerRun(root *cobra.Command, app *App) {
 	c.Flags().BoolVar(&enableWeb, "web", false, "add the Exa web_search tool (requires --tools and EXA_API_KEY)")
 	c.Flags().StringSliceVar(&disableTools, "disable-tools", nil, "tool-budget: comma-list of tool names to omit (e.g. bash,write_file)")
 	c.Flags().BoolVar(&useFallback, "fallback", false, "on a retryable provider error, walk the profile's route-fallback chain")
+	c.Flags().BoolVar(&forceMemorize, "auto-memorize", false, "extract memories from this run when it finishes (overrides memory.auto_extract)")
+	c.Flags().BoolVar(&forceNoMemorize, "no-auto-memorize", false, "skip post-run memory extraction even if memory.auto_extract is on")
 	perms.bind(c)
 	root.AddCommand(c)
+}
+
+// maybeAutoExtract is the PRD-065 post-run hook.
+//
+// Three properties are load-bearing:
+//
+//   - OPT-IN. It returns immediately unless the user asked for extraction, via
+//     --auto-memorize or memory.auto_extract (profile, then global, then
+//     TAG_MEMORY_AUTO_EXTRACT). Extraction calls an LLM, so no `tag run` may
+//     acquire cost or latency it was not asked for.
+//   - NON-FATAL. Every failure — rate limit, timeout, provider error — becomes a
+//     stderr warning. It runs from a deferred call after the run's own output,
+//     so it cannot change what `tag run` printed or the exit code it returns.
+//   - QUIET ON STDOUT. The summary goes to stderr, so `tag run --json` stdout
+//     stays a single parseable object.
+//
+// It runs synchronously rather than in a detached goroutine on purpose: a CLI
+// process exits as soon as RunE returns, so a background goroutine would be
+// killed mid-flight and the "extraction" would be a silent no-op — the exact
+// class of fake success this project bars.
+func maybeAutoExtract(ctx context.Context, app *App, prov llm.Provider, runID, profile string, forceOn, forceOff bool) {
+	if forceOff {
+		return
+	}
+	if !forceOn {
+		enabled, _ := autoExtractSetting(app, profile)
+		if !enabled {
+			return
+		}
+	}
+	db, err := app.OpenDB()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: post-run memory extraction skipped (db: %v)\n", err)
+		return
+	}
+	// The extractor uses the same provider the run used, so `--provider echo`
+	// stays entirely offline and honestly extracts nothing.
+	if p := memoryCfgString(app, profile, "extractor_provider", ""); p != "" {
+		if alt, ok := llm.Registry[p]; ok {
+			prov = alt
+		} else {
+			fmt.Fprintf(os.Stderr, "  warning: memory.extractor_provider %q is not a registered provider — using %q\n", p, prov.Name())
+		}
+	}
+	res, err := memory.Extract(ctx, db.DB, prov, runID, memory.ExtractOptions{
+		Profile: profile,
+		Model:   app.Cfg.String("profiles."+profile+".config.model.default", ""),
+		Timeout: extractTimeout(app),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: post-run memory extraction failed (run is unaffected): %v\n", err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  memory: extracted %d, skipped %d, redacted %d from run %s\n",
+		res.Added, res.Skipped, res.Redacted, short(res.RunID))
+	if res.Note != "" {
+		fmt.Fprintf(os.Stderr, "  memory: %s\n", res.Note)
+	}
 }
 
 // buildFallbackProvider constructs an llm.FallbackProvider from a profile's
