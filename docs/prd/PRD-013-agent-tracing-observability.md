@@ -1,6 +1,6 @@
 # PRD-013: Distributed Agent Tracing & Observability
 
-**Status:** Partial — the `trace` command surface (`list/show/export/replay/diff/checkpoint/snapshot`) and `otel-export` ship in both, but the Go native agent loop emits no spans (`tag run` then `tag trace list` reports "No spans recorded")  
+**Status:** Shipped (Go + Python) — the Go agent loop emits spans (#590/#594: `agent.run` → `llm.call` → tool child spans, correctly nested and priced), and the full `trace` surface (`list/show/export/replay/diff/checkpoint/snapshot`) plus `otel-export` now resolve them; `trace show` renders the nested flame chart of G3 (was a flat list). Deferred, tracked as risks rather than goals: 30-day span auto-pruning (§9) and `--otlp-header` auth for a live collector POST — the Go build emits OTLP/JSON to stdout instead of POSTing.  
 **Priority:** P1  
 **Estimated Effort:** L (3–4 weeks)  
 **Affects:** `controller.py` (`run_chat_step`, `cmd_submit`, `insert_step`), new `tag/tracing.py`, `tag.sqlite3`

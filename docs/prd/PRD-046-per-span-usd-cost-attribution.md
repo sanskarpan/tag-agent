@@ -1,6 +1,6 @@
 # PRD-046: Per-Span USD Cost Attribution (`tag trace show --cost / tag stats --cost`)
 
-**Status:** Partial — cost attribution ships via `costs`/`pricing`/`otel-export`; there is no `trace show --cost` flag and no `tag stats` command, and no spans are emitted to attribute against (see PRD-013)
+**Status:** Shipped (Go) — spans now carry `cost_usd` (#590/#594) and the Go CLI ships `trace show --cost [--min-cost-usd]` (G4/FR-12), `tag stats --cost --since/--until/--by model|profile|day|week/--profile` (G5), `tag costs --run-id <id> [--by span|model]` (§7.4), `tag pricing show [--model]` (§7.5) and `gen_ai.usage.cost_usd` on OTLP export (§10.7). Unknown rates stay NULL/em-dash and are excluded from totals (G10/NFR-07); estimated rates are flagged `~` / `includes_estimated_rates`. **Not** in Python (no `--cost`, no `stats`). Deferred: `tag budget set --limit-usd --per-run/--per-day` USD enforcement (§7.3/G6 — `budget` is token-based today), cache-read pricing at 0.1× (§7 U7 — the rate table has no cache-read column), and `tag pricing update` from a remote source.
 **Priority:** P1
 **Estimated Effort:** XS (1-2 days)
 **Category:** Evaluation & Observability
