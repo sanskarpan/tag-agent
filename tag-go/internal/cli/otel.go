@@ -29,7 +29,7 @@ func registerOtelExport(root *cobra.Command, app *App) {
 				return err
 			}
 			q := `SELECT id, trace_id, COALESCE(parent_id,''), name, COALESCE(profile,''), COALESCE(model_id,''),
-				started_at, COALESCE(finished_at,''), COALESCE(duration_ms,0), status, prompt_tokens, completion_tokens
+				started_at, COALESCE(finished_at,''), COALESCE(duration_ms,0), status, prompt_tokens, completion_tokens, cost_usd
 				FROM spans`
 			var qargs []any
 			if traceID != "" {
@@ -47,7 +47,8 @@ func registerOtelExport(root *cobra.Command, app *App) {
 			for rows.Next() {
 				var id, tid, pid, name, prof, model, start, fin, status string
 				var dur, pt, ct int
-				if err := rows.Scan(&id, &tid, &pid, &name, &prof, &model, &start, &fin, &dur, &status, &pt, &ct); err != nil {
+				var stored *float64
+				if err := rows.Scan(&id, &tid, &pid, &name, &prof, &model, &start, &fin, &dur, &status, &pt, &ct, &stored); err != nil {
 					return err
 				}
 				attrs := []map[string]any{
@@ -57,6 +58,7 @@ func registerOtelExport(root *cobra.Command, app *App) {
 					otelAttrInt("gen_ai.usage.input_tokens", pt),
 					otelAttrInt("gen_ai.usage.output_tokens", ct),
 				}
+				attrs = otelAppendCost(attrs, model, stored, pt, ct)
 				spans = append(spans, otelSpanJSON(id, tid, pid, name, start, fin, status, attrs))
 			}
 			if err := rows.Err(); err != nil {
@@ -172,6 +174,29 @@ func otelAttr(k, v string) map[string]any {
 }
 func otelAttrInt(k string, v int) map[string]any {
 	return map[string]any{"key": k, "value": map[string]any{"intValue": v}}
+}
+func otelAttrDouble(k string, v float64) map[string]any {
+	return map[string]any{"key": k, "value": map[string]any{"doubleValue": v}}
+}
+
+// otelAppendCost adds the per-span cost attributes of PRD-046 §10.7 / PRD-041.
+//
+// The attribute is OMITTED entirely when no rate is known for the model — a
+// literal 0.0 would tell a backend the turn was free, which is a different claim
+// from "TAG cannot price this model". When the rate behind the number is an
+// estimate, `tag.cost.rate_estimated=true` rides along so a dashboard summing
+// gen_ai.usage.cost_usd can tell corroborated dollars from guessed ones.
+func otelAppendCost(attrs []map[string]any, model string, stored *float64, promptTokens, completionTokens int) []map[string]any {
+	cost, estimated, _ := resolveSpanCost(model, stored, promptTokens, completionTokens)
+	if cost == nil {
+		return attrs
+	}
+	attrs = append(attrs, otelAttrDouble("gen_ai.usage.cost_usd", *cost))
+	if estimated {
+		attrs = append(attrs, map[string]any{
+			"key": "tag.cost.rate_estimated", "value": map[string]any{"boolValue": true}})
+	}
+	return attrs
 }
 
 // otelProviderNamespaces / otelProviderPrefixes mirror otel_semconv.py's
