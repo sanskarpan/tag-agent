@@ -151,28 +151,94 @@ func registerMemory(root *cobra.Command, app *App) {
 	memAdd.Flags().StringVar(&memType, "type", "fact", "memory type")
 	memAdd.Flags().Float64Var(&confidence, "confidence", 1.0, "confidence (0,1]")
 
-	var searchType string
-	memSearch := &cobra.Command{Use: "search QUERY", Short: "Search memories (FTS/BM25)", Args: cobra.ExactArgs(1),
+	var searchType, searchMode string
+	var searchAlpha float64
+	var searchVerbose bool
+	memSearch := &cobra.Command{Use: "search QUERY", Short: "Search memories (hybrid RRF over FTS/BM25 + vector)", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := checkMemLimit(limit); err != nil {
 				return err
+			}
+			// Reject a bad --mode/--alpha as a USAGE error (exit 2), not a runtime
+			// failure, since they are bad flag values.
+			mode, err := memory.ValidateHybridMode(searchMode)
+			if err != nil {
+				return jsonErrorMaybe(usageErr{err})
+			}
+			if searchAlpha < 0 || searchAlpha > 1 {
+				return jsonErrorMaybe(usageErrorf("--alpha must be in [0,1], got %g", searchAlpha))
 			}
 			db, err := app.OpenDB()
 			if err != nil {
 				return err
 			}
+			prof := app.profile(profile)
 			// memory.Search has always accepted a memory_type filter (as Python's
 			// search_memories does); the CLI just never exposed it, so
 			// `mem search q --type fact` died with "unknown flag: --type", exit 2.
-			res, err := memory.Search(db.DB, app.profile(profile), args[0], limit, searchType)
+			if mode == memory.ModeFTS {
+				// Pure-sparse keeps the historical output shape verbatim.
+				res, serr := memory.Search(db.DB, prof, args[0], limit, searchType)
+				if serr != nil {
+					return jsonErrorMaybe(serr)
+				}
+				if searchVerbose && !flagJSON {
+					fmt.Printf("mode: %s\n", memory.ModeFTS)
+				}
+				if searchVerbose && flagJSON {
+					if res == nil {
+						res = []memory.Mem{}
+					}
+					return emitJSON(map[string]any{"mode": memory.ModeFTS, "results": res})
+				}
+				printMems(res, args[0])
+				return nil
+			}
+			// Embeddings cost money: the backend is only contacted when the user
+			// configured one. Unconfigured → nil interface → honest fts degradation.
+			hits, used, err := memory.SearchHybrid(cmd.Context(), db.DB, memory.EmbedderFromEnvIface(), prof, args[0],
+				memory.HybridOptions{Mode: mode, Alpha: searchAlpha, Limit: limit, MemType: searchType})
 			if err != nil {
 				return jsonErrorMaybe(err)
 			}
-			printMems(res, args[0])
+			if hits == nil {
+				hits = []memory.HybridHit{}
+			}
+			// Only nag when the user explicitly asked for a mode we could not give
+			// them; the default must not print a warning on every keyless search.
+			if used != mode && cmd.Flags().Changed("mode") {
+				fmt.Fprintf(os.Stderr,
+					"  note: %s retrieval unavailable (no embedding backend configured, or no memory carries a vector for the active model) — answered with %s\n",
+					mode, used)
+			}
+			if flagJSON {
+				if searchVerbose {
+					return emitJSON(map[string]any{"mode": used, "results": hits})
+				}
+				return emitJSON(hits)
+			}
+			if len(hits) == 0 {
+				fmt.Printf("No memories found for: %q (mode: %s)\n", args[0], used)
+				return nil
+			}
+			if searchVerbose {
+				fmt.Printf("mode: %s  (alpha=%g, rrf k=60)\n", used, searchAlpha)
+			}
+			for _, m := range hits {
+				if searchVerbose {
+					fmt.Printf("[%s] (%s conf=%.2f hybrid=%.6f dense=%.4f sparse=%.6f) %s\n",
+						short(m.ID), m.MemoryType, m.Confidence, m.HybridScore, m.DenseScore, m.SparseScore, truncate(m.Content, 80))
+					continue
+				}
+				fmt.Printf("[%s] (%s conf=%.2f) %s\n", short(m.ID), m.MemoryType, m.Confidence, truncate(m.Content, 80))
+			}
 			return nil
 		}}
 	memSearch.Flags().IntVar(&limit, "limit", 10, "max results")
 	memSearch.Flags().StringVar(&searchType, "type", "", "filter type")
+	memSearch.Flags().StringVar(&searchMode, "mode", memory.ModeHybrid, "retrieval mode: hybrid|fts|dense (bm25=fts, vector=dense)")
+	memSearch.Flags().Float64Var(&searchAlpha, "alpha", 0.5, "hybrid fusion weight: 0=pure BM25, 1=pure vector")
+	memSearch.Flags().BoolVar(&searchVerbose, "verbose", false, "show the retrieval mode and per-path scores")
 
 	memList := &cobra.Command{Use: "list", Short: "List memories",
 		RunE: func(cmd *cobra.Command, args []string) error {
