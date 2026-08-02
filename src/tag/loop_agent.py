@@ -151,7 +151,46 @@ def _run_iteration(
 
 
 def _is_goal_achieved(output: str) -> bool:
-    return "GOAL_ACHIEVED" in output
+    """Report whether the model DECLARED success, not merely mentioned the word.
+
+    A bare ``"GOAL_ACHIEVED" in output`` completes the loop on iteration 1 for
+    any provider that echoes its input, because the sentinel is in the PROMPT
+    ("...output GOAL_ACHIEVED when done"). It also completes on a model that
+    restates the instruction ("I will output GOAL_ACHIEVED when done. Not
+    finished yet.") — which says the opposite of what the loop then reports.
+
+    So the marker must be a declaration: it stands alone on a line, or it is the
+    whole final clause of the output. A mid-sentence mention is not a claim of
+    completion. This errs toward continuing — a missed declaration costs extra
+    iterations and ends at max_iters, which is honest, where a false one reports
+    a goal met that was not.
+
+    Mirrors internal/loop.goalAchieved in the Go harness.
+    """
+    lines = output.split("\n")
+    last = max((i for i, ln in enumerate(lines) if ln.strip()), default=-1)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if _trim_decoration(stripped) == "GOAL_ACHIEVED":
+            return True
+        if i == last and _trim_decoration(_last_clause(stripped)) == "GOAL_ACHIEVED":
+            return True
+    return False
+
+
+_DECORATION = " \t.!?;:,*_`\"'()[]"
+
+
+def _trim_decoration(text: str) -> str:
+    """Strip whitespace, sentence punctuation and light markdown emphasis."""
+    return text.strip(_DECORATION)
+
+
+def _last_clause(text: str) -> str:
+    """Return the text after the final sentence/clause boundary."""
+    body = text.rstrip(" \t.!?;:")
+    idx = max((body.rfind(c) for c in ".!?;:"), default=-1)
+    return text[idx + 1:] if idx >= 0 else text
 
 
 def _request_approval(
