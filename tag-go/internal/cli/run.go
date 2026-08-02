@@ -145,11 +145,11 @@ func registerRun(root *cobra.Command, app *App) {
 			modelID := app.Cfg.String("profiles."+app.profile(profile)+".config.model.default", "")
 			durMs := time.Since(started).Milliseconds()
 			if db, derr := app.OpenDB(); derr == nil {
-				if _, ierr := db.Exec(`INSERT INTO runs(id,created_at,kind,task_type,execution,master_profile,board,prompt,route_json,status,
+				if _, ierr := db.Exec(`INSERT INTO runs(id,created_at,kind,task_type,execution,master_profile,board,prompt,route_json,status,metadata_json,
 					model_id,prompt_tokens,completion_tokens,cache_read_tokens,duration_ms,completed_at)
-					VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+					VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 					runID, started.Format(time.RFC3339), "agent", "chat", "native", app.profile(profile), "default",
-					args[0], "{}", "completed", modelID, res.TotalUsage.PromptTokens, res.TotalUsage.CompletionTokens,
+					args[0], "{}", "completed", "{}", modelID, res.TotalUsage.PromptTokens, res.TotalUsage.CompletionTokens,
 					res.TotalUsage.CacheReadTokens, durMs, time.Now().UTC().Format(time.RFC3339)); ierr != nil {
 					return fmt.Errorf("recording run: %w", ierr)
 				}
