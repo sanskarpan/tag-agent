@@ -344,17 +344,55 @@ func TestE2EAgenticCIConverges(t *testing.T) {
 	}
 }
 
+// A check that never passes is "ran fine, found problems" — exit 3, the same
+// contract fix-vuln/flaky-fix/review honour. It used to exit 0, so a pipeline
+// running `tag agentic-ci "fix" --check "make test"` was told the build was
+// fixed while make test still failed.
 func TestE2EAgenticCINeverConverges(t *testing.T) {
 	h := newHome(t)
 	repo := t.TempDir()
 	out, code := run(t, h, "agentic-ci", "impossible", "--repo", repo, "--check", "exit 1", "--max-iters", "2")
-	if code != 0 {
-		t.Fatalf("agentic-ci exit %d: %q", code, out)
+	if code != 3 {
+		t.Fatalf("agentic-ci exit %d (want 3): %q", code, out)
 	}
 	if !strings.Contains(out, "NOT converged") {
 		t.Errorf("expected non-convergence: %q", out)
 	}
 	if !strings.Contains(out, "did not converge") {
 		t.Errorf("expected honest non-convergence note: %q", out)
+	}
+
+	// --exit-zero is the documented advisory escape hatch.
+	out2, code2 := run(t, h, "agentic-ci", "impossible", "--repo", repo, "--check", "exit 1",
+		"--max-iters", "2", "--exit-zero")
+	if code2 != 0 {
+		t.Errorf("--exit-zero should force 0, got %d: %q", code2, out2)
+	}
+	if !strings.Contains(out2, "NOT converged") {
+		t.Errorf("--exit-zero must not change the REPORT, only the code: %q", out2)
+	}
+}
+
+// TestE2EAgenticCIJSONCarriesConverged is the F4 regression: `converged` was
+// tagged omitempty, so the one key a --json consumer needs to detect failure
+// disappeared in exactly the failing case.
+func TestE2EAgenticCIJSONCarriesConverged(t *testing.T) {
+	h := newHome(t)
+	repo := t.TempDir()
+	for _, tc := range []struct {
+		check string
+		want  string
+		code  int
+	}{
+		{"true", `"converged": true`, 0},
+		{"false", `"converged": false`, 3},
+	} {
+		out, code := run(t, h, "--json", "agentic-ci", "fix", "--repo", repo, "--check", tc.check, "--max-iters", "1")
+		if code != tc.code {
+			t.Errorf("--check %q: exit %d, want %d: %q", tc.check, code, tc.code, out)
+		}
+		if !strings.Contains(out, tc.want) {
+			t.Errorf("--check %q: --json must carry %s: %q", tc.check, tc.want, out)
+		}
 	}
 }
