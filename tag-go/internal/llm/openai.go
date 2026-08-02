@@ -173,6 +173,7 @@ func parseOpenAISSE(r io.Reader, ch chan<- Event, errLabel string) {
 	}
 	toolAcc := map[int]*acc{}
 	var order []int
+	var bounds toolAccountant
 
 	flush := func() {
 		for _, idx := range order {
@@ -246,6 +247,12 @@ func parseOpenAISSE(r io.Reader, ch chan<- Event, errLabel string) {
 			for _, tc := range c.Delta.ToolCalls {
 				a := toolAcc[tc.Index]
 				if a == nil {
+					// The map is keyed by a PEER-SUPPLIED index, so an unbounded
+					// number of distinct accumulators is reachable from the wire.
+					if err := bounds.addCall(errLabel); err != nil {
+						ch <- Event{Type: EventError, Err: err}
+						return
+					}
 					a = &acc{}
 					toolAcc[tc.Index] = a
 					order = append(order, tc.Index)
@@ -255,6 +262,10 @@ func parseOpenAISSE(r io.Reader, ch chan<- Event, errLabel string) {
 				}
 				if tc.Function.Name != "" {
 					a.name = tc.Function.Name
+				}
+				if err := bounds.addArgs(errLabel, a.args.Len(), len(tc.Function.Arguments)); err != nil {
+					ch <- Event{Type: EventError, Err: err}
+					return
 				}
 				a.args.WriteString(tc.Function.Arguments)
 			}
