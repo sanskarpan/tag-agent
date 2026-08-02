@@ -112,7 +112,9 @@ type Result struct {
 	TestResult *CmdOutcome `json:"test_result,omitempty"`
 	// Iterations / Converged describe an agentic-ci check→fix loop.
 	Iterations []Iteration `json:"iterations,omitempty"`
-	Converged  bool        `json:"converged,omitempty"`
+	// Converged carries no omitempty on purpose: `false` IS the answer a --json
+	// consumer needs, and omitempty deleted the key in exactly the failing case.
+	Converged bool `json:"converged"`
 }
 
 // Solve gathers context for opts.Kind, drives the native agent loop through the
