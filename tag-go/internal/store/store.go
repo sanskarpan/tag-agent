@@ -69,7 +69,10 @@ func migrateWithRetry(sqldb *sql.DB) error {
 	var err error
 	for i := 0; i < attempts; i++ {
 		if _, err = sqldb.Exec(schemaSQL); err == nil {
-			return nil
+			// CREATE TABLE IF NOT EXISTS skips an existing table wholesale, so a
+			// database created by an older schema is missing every column added
+			// since. Bring it forward before anyone writes to it (see #664).
+			return reconcileColumns(sqldb)
 		}
 		if !isBusy(err) {
 			return err
