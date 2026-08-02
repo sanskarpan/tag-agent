@@ -429,11 +429,11 @@ func truncate(s string, n int) string {
 // recordRun persists a completed solver run to the runs table (best-effort;
 // mirrors internal/cli/run.go's recording convention).
 func recordRun(db *store.DB, id, kind, model, prompt string, started time.Time) error {
-	_, err := db.Exec(`INSERT INTO runs(id,created_at,kind,task_type,execution,master_profile,board,prompt,route_json,status,
+	_, err := db.Exec(`INSERT INTO runs(id,created_at,kind,task_type,execution,master_profile,board,prompt,route_json,status,metadata_json,
 		model_id,prompt_tokens,completion_tokens,cache_read_tokens,duration_ms,completed_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		id, started.Format(time.RFC3339), kind, "solve", "native", "default", "default",
-		prompt, "{}", "completed", model, 0, 0, 0, time.Since(started).Milliseconds(),
+		prompt, "{}", "completed", "{}", model, 0, 0, 0, time.Since(started).Milliseconds(),
 		time.Now().UTC().Format(time.RFC3339))
 	return err
 }
