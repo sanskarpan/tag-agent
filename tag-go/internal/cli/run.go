@@ -121,10 +121,18 @@ func registerRun(root *cobra.Command, app *App) {
 				defer cancel()
 			}
 			started := time.Now().UTC()
+			// A provider that accepts the connection and then stalls produces NO
+			// output until ResponseHeaderTimeout (60s by default) fires. That is
+			// bounded and it does fail honestly — but a full minute of silence
+			// reads as a hang, which is the one thing this project promises not
+			// to look like. Say we are still waiting, on stderr so stdout stays
+			// parseable and --json is unaffected.
+			stopWait := startWaitNotice(cmd.ErrOrStderr())
 			res, err := loop.Run(ctx, args[0], agent.Options{
 				Model:  app.Cfg.String("profiles."+app.profile(profile)+".config.model.default", ""),
 				System: system, MaxSteps: maxSteps,
 			})
+			stopWait()
 			if err != nil {
 				// Report a deadline as a deadline, not as an opaque transport error.
 				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
