@@ -160,10 +160,7 @@ func Handler(opts Options) http.Handler {
 			writeErr(w, 400, "invalid_request_error", err.Error())
 			return
 		}
-		maxTok := req.MaxTokens
-		if maxTok <= 0 {
-			maxTok = opts.MaxTokens
-		}
+		maxTok := clampMaxTokens(req.MaxTokens, opts.MaxTokens)
 		msgs, err := toLLMMessages(req.Messages)
 		if err != nil {
 			writeErr(w, 400, "invalid_request_error", err.Error())
@@ -376,4 +373,24 @@ func writeErr(w http.ResponseWriter, code int, typ, msg string) {
 func randID(seed int64) string {
 	n := idCounter.Add(1)
 	return strconv.FormatInt(seed, 36) + strconv.FormatUint(n, 36)
+}
+
+// clampMaxTokens resolves the effective completion cap for a request.
+//
+// opts.MaxTokens is a CEILING, not merely a default. A client-supplied
+// max_tokens used to be forwarded verbatim however large, so the configured
+// limit bounded only the requests that omitted the field — exactly the requests
+// that were not trying to exceed it (CWE-770). A local gateway that can be
+// pointed at a paid provider must not let its caller choose an unbounded
+// completion: both cost and memory scale with it.
+//
+// A configured cap of 0 means "no cap", and is left alone.
+func clampMaxTokens(requested, configured int) int {
+	if requested <= 0 {
+		return configured
+	}
+	if configured > 0 && requested > configured {
+		return configured
+	}
+	return requested
 }
