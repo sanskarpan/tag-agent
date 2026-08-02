@@ -23,7 +23,10 @@ import (
 //	      action: allow
 //
 // A malformed entry is a hard error: a permission block that silently
-// half-loads is worse than one that refuses to start.
+// half-loads is worse than one that refuses to start. That applies to a field of
+// the wrong TYPE as much as to an unknown action word — the zero value of a
+// dropped `tool` or `pattern` is the permissive one, so tolerating it would turn
+// a typo into a broader grant than the operator wrote.
 func ParseLayer(block map[string]any, source string) (Layer, bool, error) {
 	var l Layer
 	autoApprove := false
@@ -80,25 +83,67 @@ func ParseLayer(block map[string]any, source string) (Layer, bool, error) {
 			if !ok {
 				return l, false, fmt.Errorf("%s: permissions.rules[%d] must be a mapping", source, i)
 			}
-			tool, _ := m["tool"].(string)
-			if strings.TrimSpace(tool) == "" {
-				tool = "*"
+			// Every field is TYPE-CHECKED before it is used. A comma-ok assertion
+			// whose failure is discarded would hand back the zero value, and the
+			// zero values here are the PERMISSIVE ones: an empty Tool becomes "*"
+			// and an empty Pattern matches ANY subject (see Rule.matches). So
+			// `pattern: 42` — an unquoted scalar, the easiest typo in the file —
+			// would quietly turn `write_file: "*.md" = allow` into a blanket
+			// `write_file: * = allow`. Widening a grant on a typo is exactly the
+			// silent half-load this function refuses to do everywhere else.
+			tool := "*"
+			if v, ok := m["tool"]; ok && v != nil {
+				s, ok := v.(string)
+				if !ok {
+					return l, false, fmt.Errorf(
+						"%s: permissions.rules[%d].tool must be a string (a tool name or \"*\"), got %T; "+
+							"refusing to load rather than widen the rule to every tool", source, i, v)
+				}
+				if strings.TrimSpace(s) != "" {
+					tool = s
+				}
 			}
-			pattern, _ := m["pattern"].(string)
-			actStr, _ := m["action"].(string)
+			pattern := ""
+			if v, ok := m["pattern"]; ok && v != nil {
+				s, ok := v.(string)
+				if !ok {
+					return l, false, fmt.Errorf(
+						"%s: permissions.rules[%d].pattern must be a string, got %T; refusing to load rather "+
+							"than widen the rule to every subject (quote it, e.g. pattern: \"*.md\")", source, i, v)
+				}
+				pattern = s
+			}
+			actStr := ""
+			if v, ok := m["action"]; ok && v != nil {
+				s, ok := v.(string)
+				if !ok {
+					return l, false, fmt.Errorf(
+						"%s: permissions.rules[%d].action must be a string (allow, ask or deny), got %T",
+						source, i, v)
+				}
+				actStr = s
+			}
 			a, err := ParseAction(actStr)
 			if err != nil {
 				return l, false, fmt.Errorf("%s: permissions.rules[%d].action: %w", source, i, err)
 			}
 			kind := KindFor(tool)
-			if k, ok := m["kind"].(string); ok && strings.TrimSpace(k) != "" {
-				switch Kind(strings.ToLower(strings.TrimSpace(k))) {
-				case KindPath:
-					kind = KindPath
-				case KindCommand:
-					kind = KindCommand
-				default:
-					return l, false, fmt.Errorf("%s: permissions.rules[%d].kind must be path or command", source, i)
+			if v, ok := m["kind"]; ok && v != nil {
+				k, ok := v.(string)
+				if !ok {
+					return l, false, fmt.Errorf(
+						"%s: permissions.rules[%d].kind must be a string (path or command), got %T",
+						source, i, v)
+				}
+				if strings.TrimSpace(k) != "" {
+					switch Kind(strings.ToLower(strings.TrimSpace(k))) {
+					case KindPath:
+						kind = KindPath
+					case KindCommand:
+						kind = KindCommand
+					default:
+						return l, false, fmt.Errorf("%s: permissions.rules[%d].kind must be path or command", source, i)
+					}
 				}
 			}
 			l.Rules = append(l.Rules, Rule{

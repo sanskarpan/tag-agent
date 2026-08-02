@@ -276,6 +276,16 @@ func swarmRunCmd(app *App) *cobra.Command {
 	return c
 }
 
+// isTerminalSwarmStatus reports whether a run has already finished, in which
+// case its status is a record and not something to overwrite.
+func isTerminalSwarmStatus(status string) bool {
+	switch status {
+	case "completed", "failed", "partial", "aborted":
+		return true
+	}
+	return false
+}
+
 // swarmExitCode maps a run status to Python's exit-code table.
 func swarmExitCode(status string) int {
 	switch status {
@@ -387,12 +397,20 @@ func swarmAbortCmd(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			var exists int
-			if err := db.QueryRow(`SELECT 1 FROM swarm_runs WHERE swarm_id=? LIMIT 1`, swarmID).Scan(&exists); err != nil {
+			var cur string
+			if err := db.QueryRow(`SELECT status FROM swarm_runs WHERE swarm_id=? LIMIT 1`, swarmID).Scan(&cur); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return swarmJSONError(swarmID, fmt.Sprintf("swarm %s not found", swarmID))
 				}
 				return err
+			}
+			// Aborting a run that already reached a terminal state would rewrite
+			// history: a completed run would be relabelled `aborted` and its real
+			// outcome lost, with exit 0 reporting that as a successful abort. Python
+			// has the same unguarded UPDATE; this is a deliberate divergence.
+			if isTerminalSwarmStatus(cur) {
+				return swarmJSONError(swarmID, fmt.Sprintf(
+					"swarm %s is not running (status: %s); nothing to abort", swarmID, cur))
 			}
 			// Python SIGTERMs each running task's process group. Go sub-agents are
 			// goroutines inside `swarm run`, so there is no PID to signal: the run

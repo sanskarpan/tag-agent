@@ -575,8 +575,15 @@ func (r *Runner) synthesize(ctx context.Context, successful []TaskResult, root *
 	}
 	fallback := strings.Join(concat, "\n\n---\n\n")
 
+	// With no synthesis profile the answer is the concatenation, NOT the prompt.
+	// Returning `prompt` handed the caller an instruction telling an LLM to write
+	// the answer, presented as the answer, with status=completed and
+	// degraded=false — fake success. (Python reaches the same branch but resolves
+	// synthesis_profile or coordinator_profile first, so it rarely lands here.
+	// Falling back to the concatenation instead of silently spending an extra
+	// model call is the more honest of the two repairs.)
 	if r.m.SynthesisProfile == "" {
-		return prompt
+		return fallback
 	}
 	// The synthesizer never gets tools: it summarises text.
 	sctx, cancel := context.WithTimeout(ctx, r.opts.TimeoutPerAgent)

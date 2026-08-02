@@ -440,6 +440,28 @@ func applyDockerEgress(ctx context.Context, dockerPath string, opts *DockerOptio
 		return nil, "", fmt.Errorf("egress policy %q permits specific destinations but --network none was "+
 			"requested, which permits none; these contradict, so nothing was run", p.Name)
 	}
+	// The helper OWNS whatever namespace it lands in: it holds CAP_NET_ADMIN and
+	// it blackholes the connected subnets and replaces the default route. That is
+	// the enforcement mechanism when the namespace is one TAG created for this
+	// run — and a machine-wide outage (or worse) when it is not.
+	//
+	//   - `--network host` puts the helper in the HOST's namespace, so the routes
+	//     it installs are the host's routes. It would also not confine anything:
+	//     the workload joins the same namespace, and "the sandbox cannot modify
+	//     these routes" stops being true.
+	//   - `--network container:<id>` reprograms a namespace belonging to something
+	//     else, which TAG neither created nor tears down.
+	//
+	// Both are refused BEFORE the helper is started, consistent with how the rest
+	// of this package handles a policy it cannot honestly enforce: fail closed,
+	// exit 127, run nothing.
+	if reason := unownableNamespace(orDefault(opts.Network, DefaultDockerNetwork)); reason != "" {
+		return nil, "", fmt.Errorf("egress policy %q permits specific destinations, which TAG enforces with "+
+			"routes installed by a helper container holding CAP_NET_ADMIN in the namespace it joins. %s "+
+			"The egress policy was NOT applied and the command was NOT run. Use the default network (or a named "+
+			"docker network) for a granular policy, or drop the policy if you meant to keep --network %s",
+			p.Name, reason, orDefault(opts.Network, DefaultDockerNetwork))
+	}
 	plan, err := buildEgressPlan(ctx, p, egressResolver())
 	if err != nil {
 		return nil, "", err
@@ -459,6 +481,22 @@ func applyDockerEgress(ctx context.Context, dockerPath string, opts *DockerOptio
 	opts.Network = enf.NetworkMode
 	enf.Isolation = egressIsolationClaim(p, plan, enf.Routes)
 	return enf, enf.Isolation, nil
+}
+
+// unownableNamespace reports why a docker network mode cannot be handed to the
+// egress helper, or "" when it can. It names namespaces TAG does not create and
+// therefore must not reprogram.
+func unownableNamespace(network string) string {
+	switch n := strings.ToLower(strings.TrimSpace(network)); {
+	case n == "host":
+		return "--network host would make that namespace the HOST's own, so the helper would rewrite the " +
+			"machine's routing table (and the workload, sharing the namespace, would not be confined at all)."
+	case strings.HasPrefix(n, "container:"):
+		return "--network " + network + " would make that namespace another container's, which TAG did not " +
+			"create and does not tear down, so the helper would rewrite that container's routing table."
+	default:
+		return ""
+	}
 }
 
 // hostIPsForTest is the resolver seam used by the integration tests, which need

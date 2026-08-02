@@ -300,16 +300,24 @@ func (g *Guard) PauseGated() bool { return g != nil && g.Pauser != nil }
 // headless).
 //
 // One deliberate exception to "first match wins": a BLANKET allow (an allow rule
-// with no pattern, e.g. `--allow-tool read_file`, `permissions.tools.read_file:
-// allow`, or a `default: allow` catch-all) is skipped for a credential-shaped
-// path. Typing `--allow-tool read_file` must not silently hand the model your
-// .env or ~/.ssh/id_rsa. To cover such a path you have to name it — an allow
-// rule WITH a pattern applies normally — or use --dangerously-allow-all.
-// Deny and ask rules are never skipped, so an explicit refusal always wins.
+// that names nothing in particular — `--allow-tool read_file`,
+// `permissions.tools.read_file: allow`, a `default: allow` catch-all, or a
+// universal wildcard such as `*` / `**` / `.*`) is skipped for a
+// credential-shaped path. Typing `--allow-tool read_file` must not silently hand
+// the model your .env or ~/.ssh/id_rsa. To cover such a path you have to NAME it
+// — an allow rule with a genuinely restrictive pattern applies normally — or use
+// --dangerously-allow-all. Deny and ask rules are never skipped, so an explicit
+// refusal always wins.
+//
+// "Blanket" is classified by WHAT THE PATTERN MATCHES, not how it is spelled;
+// see IsBlanketPattern in blanket.go. Testing `r.Pattern == ""` here was a real
+// bypass: every universal wildcard carries a non-empty pattern, so
+// `--allow-tool 'read_file:*'` outranked all 28 built-in credential denies and
+// leaked .env and *.pem.
 func (g *Guard) resolve(req Request) (Rule, bool) {
 	sensitive := IsCredentialPath(req)
 	for _, r := range g.Policy.Rules {
-		if sensitive && r.Action == Allow && r.Pattern == "" {
+		if sensitive && r.Action == Allow && IsBlanketPattern(r.Pattern) {
 			continue
 		}
 		if r.matches(req) {
@@ -334,6 +342,33 @@ func IsCredentialPath(req Request) bool {
 	return false
 }
 
+// StaticDeny re-adjudicates a request against the RULESET ALONE — no prompting,
+// no pause gate, no session grants, no auto-approve, no audit record — and
+// reports the rule when the verdict is an explicit `deny`.
+//
+// It exists for exactly one job: the post-resolution re-check that closes the
+// TOCTOU window in the path tools. A file tool resolves its path argument a
+// second time immediately before the side effect and asks whether THAT path is
+// refused; if a symlink was swapped between Check and open, the swapped-in
+// target is caught here.
+//
+// Two properties make this safe to call after a verdict has already been
+// reached. It can only ever turn an allow into a deny, never the reverse, so it
+// cannot widen anything. And it never prompts, so a human is never asked the
+// same question twice — an `ask` the operator already approved for path A is
+// simply not a deny for path B, and only a rule that says `deny` stops the call.
+func (g *Guard) StaticDeny(req Request) (Rule, bool) {
+	if g == nil {
+		// Mirrors decide(): a nil Guard is a wiring bug and fails CLOSED.
+		return Rule{Tool: req.Tool, Action: Deny, Source: "nil-guard"}, true
+	}
+	if g.Policy.DangerouslyAllowAll {
+		return Rule{}, false
+	}
+	rule, _ := g.resolve(req)
+	return rule, rule.Action == Deny
+}
+
 // Check adjudicates a tool call. It NEVER blocks without a Prompter and never
 // returns Allow for an `ask` it could not put in front of a human unless
 // AutoApprove was explicitly set.
@@ -355,6 +390,21 @@ func (g *Guard) decide(ctx context.Context, req Request) Decision {
 	if g.Policy.DangerouslyAllowAll {
 		return Decision{Action: Allow, Via: "dangerously-allow-all",
 			Reason: "--dangerously-allow-all bypassed the permission gate"}
+	}
+
+	// A command that names a credential path is refused here — before rule
+	// resolution, and therefore before any prompter or pause gate. The credential
+	// rules are KindPath, so `bash "cat .env"` used to bypass all of them, and at
+	// an approval gate it was offered to a human as a plausible one-keystroke
+	// approval. Short-circuiting here means a reviewer is never shown it.
+	// See CommandTouchesCredentialPath for what this does and does not catch.
+	if req.Kind == KindCommand && req.Subject != "" {
+		if tok, hit := CommandTouchesCredentialPath(req.Subject); hit {
+			return Decision{Action: Deny, Via: "credential-guard",
+				Reason: "the command references the credential-shaped path " + tok +
+					"; credential paths are denied by default and this is not offered for approval" +
+					" (use --dangerously-allow-all to override, or run it under --backend docker)"}
+		}
 	}
 
 	// Content guardrail (PRD-123) runs BEFORE rule resolution, so a fired

@@ -191,6 +191,7 @@ func parseAnthropicSSE(r io.Reader, ch chan<- Event) {
 	// accumulate the current tool_use block (id/name + streamed partial JSON)
 	var curToolID, curToolName string
 	var curToolJSON strings.Builder
+	var bounds toolAccountant
 	inToolBlock := false
 
 	flushTool := func() {
@@ -277,6 +278,10 @@ func parseAnthropicSSE(r io.Reader, ch chan<- Event) {
 		case "content_block_start":
 			if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" {
 				flushTool()
+				if err := bounds.addCall("anthropic"); err != nil {
+					ch <- Event{Type: EventError, Err: err}
+					return
+				}
 				inToolBlock = true
 				curToolID = ev.ContentBlock.ID
 				curToolName = ev.ContentBlock.Name
@@ -291,6 +296,12 @@ func parseAnthropicSSE(r io.Reader, ch chan<- Event) {
 					ch <- Event{Type: EventTextDelta, Text: ev.Delta.Text}
 				}
 			case "input_json_delta":
+				// Fragments accumulate across frames, so the 4 MiB per-LINE
+				// scanner cap does not bound this (CWE-400).
+				if err := bounds.addArgs("anthropic", curToolJSON.Len(), len(ev.Delta.PartialJSON)); err != nil {
+					ch <- Event{Type: EventError, Err: err}
+					return
+				}
 				curToolJSON.WriteString(ev.Delta.PartialJSON)
 			}
 		case "content_block_stop":

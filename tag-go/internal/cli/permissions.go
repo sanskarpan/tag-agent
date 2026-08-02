@@ -353,8 +353,27 @@ func registerPermissions(root *cobra.Command, app *App) {
 				fmt.Printf("content guardrail (tripwire): %d rule(s) — see `tag tripwire list`\n", len(tw))
 			}
 			fmt.Printf("resolved ruleset (%d rules, first match wins):\n", len(pol.Rules))
+			// Mark any allow rule ordered ABOVE the built-in credential denies.
+			// Ordering is what made `--allow-tool 'read_file:*'` a credential
+			// bypass; printing the rule without saying where it sits relative to
+			// the guards is what made the bypass invisible. A blanket allow is
+			// now skipped for credential paths at decision time, so the note also
+			// tells the operator the rule is narrower than it looks.
+			outranking := map[int]bool{}
+			for _, i := range permission.AllowsOutrankingCredentialGuards(pol.Rules) {
+				outranking[i] = true
+			}
 			for i, r := range pol.Rules {
-				fmt.Printf("  %2d. %s\n", i+1, r.String())
+				note := ""
+				if outranking[i] {
+					if permission.IsBlanketPattern(r.Pattern) {
+						note = "   <-- ordered above the credential guards, but does NOT cover" +
+							" credential paths (blanket allows are skipped for them)"
+					} else {
+						note = "   <-- ordered above the credential guards and NAMES a credential path"
+					}
+				}
+				fmt.Printf("  %2d. %s%s\n", i+1, r.String(), note)
 			}
 			return nil
 		},
