@@ -319,12 +319,56 @@ func signalStop(db *sql.DB, id string, out Outcome, iterations int) Outcome {
 // no-fake-success bar. Removing the prompt text before scanning makes an echoed
 // instruction inert while a genuine "GOAL_ACHIEVED" from the model still counts,
 // including when the model quotes the instruction and then declares success.
+//
+// Stripping the prompt as one blob is not enough on its own: a model that
+// RESTATES the instruction in its own words ("I will output GOAL_ACHIEVED when
+// done. Not finished yet.") leaves the sentinel in the residue while explicitly
+// saying it is not finished. So the marker must also be a DECLARATION rather
+// than a mention — it stands alone on a line, or it terminates the output. A
+// mid-sentence occurrence is a mention and does not end the loop.
+//
+// This errs toward continuing: a missed declaration costs extra iterations and
+// ends at max_iters, which is honest. A false one reports a goal met that was
+// not, which is the failure this project treats as a hard bar.
 func goalAchieved(prompt, output string) bool {
 	residue := output
 	if prompt != "" {
 		residue = strings.ReplaceAll(residue, prompt, "")
 	}
-	return strings.Contains(residue, goalMarker)
+	lines := strings.Split(residue, "\n")
+	last := -1
+	for i, ln := range lines {
+		if strings.TrimSpace(ln) != "" {
+			last = i
+		}
+	}
+	for i, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if trimDecoration(t) == goalMarker {
+			return true
+		}
+		// Trailing declaration: "All tests pass now. GOAL_ACHIEVED". The marker must
+		// be the whole final CLAUSE, not merely the final word — "I'll say
+		// GOAL_ACHIEVED." ends with the marker and means the opposite.
+		if i == last && trimDecoration(lastClause(t)) == goalMarker {
+			return true
+		}
+	}
+	return false
+}
+
+// trimDecoration strips surrounding whitespace, sentence punctuation and light
+// markdown emphasis, so "**GOAL_ACHIEVED**!" reduces to the bare marker.
+func trimDecoration(s string) string {
+	return strings.Trim(s, " \t.!?;:,*_`\"'()[]")
+}
+
+// lastClause returns the text after the final sentence/clause boundary.
+func lastClause(s string) string {
+	if i := strings.LastIndexAny(strings.TrimRight(s, " \t.!?;:"), ".!?;:"); i >= 0 {
+		return s[i+1:]
+	}
+	return s
 }
 
 // buildPrompt reproduces loop_agent._run_iteration's two prompt shapes verbatim.
