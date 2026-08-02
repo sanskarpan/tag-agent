@@ -48,9 +48,14 @@ const exitFindings = 3
 func registerAgenticCI(root *cobra.Command, app *App) {
 	var provider, check, repo string
 	var maxIters int
+	var exitZero bool
 	c := &cobra.Command{
-		Use:     "agentic-ci <task>",
-		Short:   "Agentic CI: check→fix loop, test-gen, fix-vuln, ci-diagnose, review, gen-pipeline, flaky-fix",
+		Use:   "agentic-ci <task>",
+		Short: "Agentic CI: check→fix loop, test-gen, fix-vuln, ci-diagnose, review, gen-pipeline, flaky-fix",
+		Long: "Agentic CI: check→fix loop, test-gen, fix-vuln, ci-diagnose, review, gen-pipeline, flaky-fix.\n\n" +
+			"With --check, exit codes match the gating subcommands: 0 = the check passes; " +
+			strconv.Itoa(exitFindings) + " = ran fine but the check still fails after --max-iters " +
+			"(pass --exit-zero for advisory, non-gating use); 1 = the run itself failed; 2 = usage error.",
 		GroupID: "orch",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -72,13 +77,24 @@ func registerAgenticCI(root *cobra.Command, app *App) {
 			if err != nil {
 				return jsonErrorMaybe(err)
 			}
-			return emitSolveResult(res)
+			if err := emitSolveResult(res); err != nil {
+				return err
+			}
+			// A check that still fails after every iteration is "ran fine, found
+			// problems" — exitFindings, the same contract fix-vuln/flaky-fix/review
+			// honour. Exiting 0 here told a pipeline the build was fixed when it was
+			// not, which is the whole point of running this in CI.
+			if len(res.Iterations) > 0 && !res.Converged && !exitZero {
+				return exitCodeErr{code: exitFindings}
+			}
+			return nil
 		},
 	}
 	c.Flags().StringVar(&provider, "provider", "echo", "llm provider (echo = offline)")
 	c.Flags().IntVar(&maxIters, "max-iters", 1, "max check→fix iterations")
 	c.Flags().StringVar(&check, "check", "", "check command (build/test); enables the real check→fix loop")
 	c.Flags().StringVar(&repo, "repo", "", "working directory for the check command")
+	c.Flags().BoolVar(&exitZero, "exit-zero", false, "exit 0 even when the check never converges (advisory, non-gating)")
 
 	c.AddCommand(
 		newTestGenCmd(app),
@@ -551,13 +567,18 @@ func newFixVulnCmd(app *App) *cobra.Command {
 				}
 				res.Results = append(res.Results, rec)
 			}
-			for _, rr := range res.Results {
-				if !rr.FixApplied {
-					res.Unfixed++
-				}
+			// Unfixed counts every SELECTED finding that did not get a fix written,
+			// not just the ones the loop reached. An interrupt breaks out early, so
+			// deriving it from Results alone reported "3 selected, 0 applied, 1
+			// unfixed" — a dashboard reading Unfixed under-counted the exposure by
+			// exactly the findings that were never looked at.
+			res.Unfixed = res.Selected - res.Applied
+			if res.Unfixed < 0 {
+				res.Unfixed = 0
 			}
 			if ctx.Err() != nil {
-				ns.add("interrupted by a signal: processing stopped early; already-written files were left in place.")
+				ns.add("interrupted by a signal: processing stopped early; already-written files were left in place. %d of %d selected finding(s) were never examined.",
+					res.Selected-len(res.Results), res.Selected)
 			}
 			res.Notes = ns.slice()
 
@@ -922,6 +943,15 @@ func newGenPipelineCmd(app *App) *cobra.Command {
 			yaml := ciauto.GenerateGitLabPipeline(stack, ciauto.PipelineOptions{
 				Stages: stages, IncludeDeploy: includeDeploy,
 			})
+			// The job templates declare fixed stages. A --stages list that omits one
+			// renders a pipeline GitLab rejects, so refuse rather than write a broken
+			// file and exit 0.
+			if missing := ciauto.UndeclaredStages(yaml, stages); len(missing) > 0 {
+				return aciFail(usageErrorf(
+					"--stages %v does not declare %v, which the generated jobs for stack %v use; "+
+						"GitLab rejects a job whose stage is not declared. Include those stages or drop --stages.",
+					stages, missing, stack))
+			}
 			dest := out
 			if dest == "" {
 				dest = filepath.Join(root, ".gitlab-ci.yml")
@@ -1064,7 +1094,14 @@ func newFlakyFixCmd(app *App) *cobra.Command {
 				}
 			}
 			if len(flaky) == 0 {
-				ns.add("no test both passed AND failed in %s. That means either the suite is stable, or the log holds only ONE run — flakiness cannot be detected from a single run.", args[0])
+				if ciauto.OutcomeCount(log) == 0 {
+					// The third explanation, and the one that used to be missing: for an
+					// exit-3 command, "0 flaky" reads as a clean bill of health, so an
+					// unparsed log must not be reported the same way as a stable suite.
+					ns.add("no test outcome of ANY supported format (pytest, Jest, go test -v, cargo test) was recognised in %s, so nothing was analysed. This is NOT a clean bill of health — check that the log is real test output.", args[0])
+				} else {
+					ns.add("no test both passed AND failed in %s. That means either the suite is stable, or the log holds only ONE run — flakiness cannot be detected from a single run.", args[0])
+				}
 			}
 			if r.Offline() {
 				res.Degraded = true
