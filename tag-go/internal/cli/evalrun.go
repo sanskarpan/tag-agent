@@ -71,6 +71,19 @@ func registerEvalRun(parent *cobra.Command, app *App) {
 			if concurrency < 1 {
 				return usageErrorf("--concurrency must be >= 1")
 			}
+			// The remaining numeric flags were unvalidated, so nonsense was accepted
+			// silently: --case-timeout 0 meant "no timeout at all" (a stalled
+			// provider ran forever and exited 0), and a --judge-threshold outside
+			// 0..1 contradicted the flag's own help while still scoring cases.
+			if caseTimeout <= 0 {
+				return usageErrorf("--case-timeout must be > 0 (got %s); a non-positive value would disable the per-case timeout entirely", caseTimeout)
+			}
+			if judgeThresh < 0 || judgeThresh > 1 {
+				return usageErrorf("--judge-threshold must be between 0 and 1 (got %v)", judgeThresh)
+			}
+			if maxSteps < 0 {
+				return usageErrorf("--max-steps must be >= 0 (got %d; 0 means the loop default)", maxSteps)
+			}
 			prov, ok := llm.Registry[provider]
 			if !ok {
 				return usageErrorf("unknown provider %q (available: %v)", provider, providerNames())
