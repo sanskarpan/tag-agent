@@ -1,7 +1,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -178,9 +177,12 @@ func ExecDocker(ctx context.Context, opts DockerOptions) (*Result, error) {
 		return cmd.Process.Kill()
 	}
 	cmd.WaitDelay = 15 * time.Second
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Bounded capture (see capture.go): --memory bounds the CONTAINER, not the
+	// pipe reader on this side, so an unbounded buffer here let a sandboxed
+	// `cat /dev/zero` exhaust the supervisor's memory instead of its own.
+	stdout, stderr := newCapBuffer(), newCapBuffer()
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	runErr := cmd.Run()
 	res := &Result{

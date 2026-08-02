@@ -49,7 +49,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -273,9 +272,11 @@ func runPlan(cctx context.Context, plan *isolationPlan, runDir, command string) 
 	cmd.Cancel = func() error { return KillProcessGroup(cmd) }
 	cmd.WaitDelay = waitDelay
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Bounded capture (see capture.go): the sandboxed command's output is copied
+	// into THIS process, which the sandbox does not confine.
+	stdout, stderr := newCapBuffer(), newCapBuffer()
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
 		return nil, err
