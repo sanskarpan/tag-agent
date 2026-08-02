@@ -21,6 +21,12 @@ func registerCI(root *cobra.Command, app *App) {
 		GroupID: "orch",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Unvalidated, --iterations 0 or -2 silently ran ONE pass and exited 0,
+			// so a caller asking for zero passes got work done and a caller with an
+			// off-by-one got no signal.
+			if cixLoopIters < 1 {
+				return usageErrorf("--iterations must be >= 1 (got %d)", cixLoopIters)
+			}
 			return cixRunLoop(cixLoopProvider, args[0], cixLoopIters)
 		},
 	}

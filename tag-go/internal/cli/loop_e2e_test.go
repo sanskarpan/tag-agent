@@ -177,10 +177,13 @@ func TestE2ELoopJSONContracts(t *testing.T) {
 		t.Errorf("bad --approval exit=%d, want 2", code)
 	}
 
-	// Runtime failures are exit 1 with a JSON error object.
+	// An invalid flag VALUE is a usage error: exit 2, the same as --approval and
+	// as every swarm/eval numeric flag (#537a). Python reports 1 here, but two
+	// adjacent validations disagreeing about one class of mistake is not a parity
+	// property worth keeping.
 	m, code = loopJSON(t, h, "loop", "start", "--goal", "x", "--max-iters", "0")
-	if code != 1 {
-		t.Errorf("--max-iters 0 exit=%d, want 1", code)
+	if code != 2 {
+		t.Errorf("--max-iters 0 exit=%d, want 2 (usage)", code)
 	}
 	if s, _ := m["error"].(string); !strings.Contains(s, "max-iters") {
 		t.Errorf("error = %v", m)
@@ -294,8 +297,11 @@ func TestE2ELoopAbortFromAnotherProcess(t *testing.T) {
 	if !ok {
 		t.Fatalf("loop process did not exit after an out-of-process abort\n%s", bg.output())
 	}
-	if exit != 0 {
-		t.Errorf("aborted loop exit=%d, want 0\n%s", exit, bg.output())
+	// An aborted loop is not a successful one: 4, the code swarm already uses for
+	// the identical situation. Exiting 0 left a CI wrapper unable to tell a
+	// finished loop from a killed one.
+	if exit != 4 {
+		t.Errorf("aborted loop exit=%d, want 4\n%s", exit, bg.output())
 	}
 	_, st, _ := newestLoop(t, h)
 	if st != "aborted" {
@@ -365,8 +371,11 @@ func TestE2ELoopBackgroundApprovalDoesNotHang(t *testing.T) {
 	if !ok {
 		t.Fatalf("unattended --approval human loop HUNG with no TTY\n%s", bg.output())
 	}
-	if exit != 0 {
-		t.Errorf("exit=%d, want 0\n%s", exit, bg.output())
+	// The loop ends `aborted` (the approval timed out), which is exit 4 — the
+	// point of the test is that it EXITS rather than hanging, not that it
+	// reports success.
+	if exit != 4 {
+		t.Errorf("exit=%d, want 4 (aborted)\n%s", exit, bg.output())
 	}
 	if !strings.Contains(bg.output(), "timed out") {
 		t.Errorf("the timeout was not reported plainly:\n%s", bg.output())

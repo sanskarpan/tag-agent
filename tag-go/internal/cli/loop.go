@@ -68,12 +68,21 @@ func registerLoop(root *cobra.Command, app *App) {
 				return jsonErrorMaybe(usageErrorf("--goal TEXT is required"))
 			}
 			if startMaxIters < 1 {
-				// Python parity: this is _emit_error(...) -> exit 1, not argparse.
-				return jsonErrorMaybe(fmt.Errorf("--max-iters must be >= 1"))
+				// #537a: a semantically invalid flag VALUE is exit 2, the same as the
+				// --approval check three lines down and as every swarm/eval numeric
+				// flag. Python emits 1 here through its own error helper, but the two
+				// adjacent validations disagreeing about the exit code for one class of
+				// mistake is not a parity property worth keeping.
+				return jsonErrorMaybe(usageErrorf("--max-iters must be >= 1"))
 			}
 			if startApproval != looppkg.ApprovalAuto && startApproval != looppkg.ApprovalHuman {
 				// Python parity: argparse choices=[auto,human] -> exit 2.
 				return jsonErrorMaybe(usageErrorf("--approval must be 'auto' or 'human'"))
+			}
+			if rf.approvalTimeout <= 0 {
+				// Silently coercing 0/-1s to the 5m default let an operator believe
+				// they had disabled (or shortened) the wait while it ran unchanged.
+				return jsonErrorMaybe(usageErrorf("--approval-timeout must be > 0 (got %s)", rf.approvalTimeout))
 			}
 			if _, err := rf.provider(); err != nil {
 				return jsonErrorMaybe(err)
@@ -327,9 +336,15 @@ func finishLoop(out looppkg.Outcome, err error) error {
 			fmt.Println("note: " + out.Note)
 		}
 	}
-	if out.Status == looppkg.StatusFailed {
-		// Already reported above; carry only the exit status.
+	// Already reported above; carry only the exit status. `aborted` (SIGTERM, or
+	// a cross-process `loop deny`) is NOT success: a CI wrapper could not tell a
+	// killed loop from a finished one. 4 is the code swarm already uses for the
+	// identical situation.
+	switch out.Status {
+	case looppkg.StatusFailed:
 		return exitCodeErr{1}
+	case looppkg.StatusAborted:
+		return exitCodeErr{4}
 	}
 	return nil
 }
@@ -351,7 +366,7 @@ func (f *loopRunFlags) bind(c *cobra.Command) {
 	c.Flags().IntVar(&f.maxSteps, "max-steps", 0, "cap agent-loop turns per iteration (0 = default)")
 	c.Flags().BoolVar(&f.tools, "tools", false, "enable built-in tools (bash/read_file/write_file/list_dir)")
 	c.Flags().DurationVar(&f.approvalTimeout, "approval-timeout", looppkg.DefaultApprovalTimeout,
-		"how long `--approval human` waits for a decision before denying")
+		"how long `--approval human` waits for a decision before denying (must be > 0)")
 	f.perms.bind(c)
 }
 

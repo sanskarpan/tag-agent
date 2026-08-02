@@ -3,6 +3,7 @@ package cli_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -279,8 +280,11 @@ func TestE2ESwarmExitCodesAndJSONErrors(t *testing.T) {
 	}
 }
 
-// `swarm abort` marks the run aborted and leaves no task 'running'.
-func TestE2ESwarmAbort(t *testing.T) {
+// `swarm abort` refuses a run that already finished: rewriting a completed run
+// to 'aborted' destroyed the record of what actually happened, and reported
+// that as a successful abort. Aborting a LIVE run is covered by
+// TestE2ESwarmAbortFromAnotherProcess.
+func TestE2ESwarmAbortRefusesFinishedRun(t *testing.T) {
 	h := newHome(t)
 	srv := startSwarmServer(t, swarmManifest, false)
 	if out, code := runEnv(t, h, localEnv(srv.URL), "swarm", "run", "--goal", "g", "--provider", "local"); code != 0 {
@@ -289,8 +293,63 @@ func TestE2ESwarmAbort(t *testing.T) {
 	sid := firstSwarmID(t, h)
 
 	out, code := run(t, h, "--json", "swarm", "abort", sid)
+	if code == 0 {
+		t.Fatalf("aborting a finished run must not report success: %q", out)
+	}
+	var res map[string]any
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("abort --json: %v (%q)", err, out)
+	}
+	if e, _ := res["error"].(string); !strings.Contains(e, "not running") {
+		t.Errorf("expected a 'not running' explanation, got %v", res)
+	}
+	if res["swarm_id"] != sid {
+		t.Errorf("the error payload must identify the run: %v", res)
+	}
+	// The real outcome survives the refused abort.
+	if lst, _ := run(t, h, "--json", "swarm", "list", "--status", "aborted"); strings.Contains(lst, sid) {
+		t.Errorf("a completed run must not be relabelled aborted: %q", lst)
+	}
+	if lst, _ := run(t, h, "--json", "swarm", "list", "--status", "completed"); !strings.Contains(lst, sid) {
+		t.Errorf("the completed run should still be listed as completed: %q", lst)
+	}
+}
+
+// Aborting a LIVE run really stops it, from another process. This is the
+// capability TestE2ESwarmAbortRefusesFinishedRun deliberately does not cover:
+// the run row IS the abort channel, so `swarm abort` has to be a real signal
+// and not just a status rewrite.
+func TestE2ESwarmAbortFromAnotherProcess(t *testing.T) {
+	h := newHome(t)
+	srv := startSwarmServer(t, swarmManifest, true) // sub-agent turns hang
+	cmd := exec.Command(tagBin, "swarm", "run", "--goal", "g", "--provider", "local",
+		"--timeout-per-agent", "300")
+	cmd.Env = append(append(os.Environ(), "TAG_HOME="+h), localEnv(srv.URL)...)
+	var buf syncBuf
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+
+	sid := ""
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if sid == "" {
+			sid = firstSwarmIDSoft(t, h)
+		}
+		if sid != "" && swarmHasTaskStatus(t, h, sid, "running") {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if sid == "" {
+		t.Fatalf("swarm run never persisted a run: %q", buf.String())
+	}
+
+	out, code := run(t, h, "--json", "swarm", "abort", sid)
 	if code != 0 {
-		t.Fatalf("abort exit %d: %q", code, out)
+		t.Fatalf("aborting a running swarm should succeed: exit %d %q", code, out)
 	}
 	var res map[string]any
 	if err := json.Unmarshal([]byte(out), &res); err != nil {
@@ -301,6 +360,23 @@ func TestE2ESwarmAbort(t *testing.T) {
 	}
 	if _, ok := res["signalled"]; !ok {
 		t.Error("abort --json must keep Python's 'signalled' field")
+	}
+
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	select {
+	case err := <-waited:
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() != 4 {
+			t.Errorf("an aborted run exits 4, got %d: %q", ee.ExitCode(), buf.String())
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("swarm run ignored a cross-process abort: %q", buf.String())
+	}
+
+	if swarmHasTaskStatus(t, h, sid, "running") {
+		st, _ := run(t, h, "--json", "swarm", "status", sid)
+		t.Errorf("abort left a task in 'running': %s", st)
 	}
 	if lst, _ := run(t, h, "--json", "swarm", "list", "--status", "aborted"); !strings.Contains(lst, sid) {
 		t.Errorf("aborted run not visible via list --status aborted: %q", lst)
