@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -214,6 +215,35 @@ func GenerateGitLabPipeline(stack []string, opts PipelineOptions) string {
 		fmt.Fprintf(&b, "# --- deploy ---\n%s", deploySnippet)
 	}
 	return b.String()
+}
+
+// reJobStage finds the stage each generated job declares.
+var reJobStage = regexp.MustCompile(`(?m)^\s*stage:\s*(\S+)\s*$`)
+
+// UndeclaredStages returns the stages referenced by jobs in the rendered
+// pipeline that the `stages:` block does not declare, in first-seen order.
+//
+// The job templates hard-code stage: build/test/deploy, so a custom --stages
+// list that omits one of them produced a .gitlab-ci.yml GitLab rejects outright
+// — emitted with exit 0 and no warning, by a command whose help calls itself
+// deterministic. Callers must refuse rather than write a broken artifact and
+// call it done.
+func UndeclaredStages(pipeline string, declared []string) []string {
+	have := make(map[string]bool, len(declared))
+	for _, s := range declared {
+		have[strings.TrimSpace(s)] = true
+	}
+	var missing []string
+	seen := map[string]bool{}
+	for _, m := range reJobStage.FindAllStringSubmatch(pipeline, -1) {
+		s := m[1]
+		if have[s] || seen[s] {
+			continue
+		}
+		seen[s] = true
+		missing = append(missing, s)
+	}
+	return missing
 }
 
 // frameworkMarkers maps a test framework to its marker files, ordered so the

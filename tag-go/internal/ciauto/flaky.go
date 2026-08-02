@@ -30,11 +30,24 @@ type FlakyTest struct {
 const DefaultQuarantineThreshold = 0.5
 
 var (
-	rePytest = regexp.MustCompile(`(PASSED|FAILED)\s+([\w/.\-:]+::[\w\[\]\-.]+)`)
-	reJest   = regexp.MustCompile(`(?m)^\s*([\x{2713}\x{2717}\x{00D7}])\s+(.+)$`)
-	reJestMs = regexp.MustCompile(`\s+\(\d+\s*ms\)$`)
-	reGo     = regexp.MustCompile(`--- (PASS|FAIL): (\S+)`)
-	reRust   = regexp.MustCompile(`test (\S+) \.\.\. (ok|FAILED)`)
+	// pytest prints the outcome first in its short summary (`FAILED a.py::b`) and
+	// LAST under -v (`a.py::b FAILED`). Only the first shape was matched, so a
+	// verbose log parsed to zero outcomes and flaky-fix reported a clean suite —
+	// exit 0 — on a log full of failures. Both shapes are now recognised.
+	//
+	// The character classes are explicit Unicode (\p{L}\p{N}) rather than \w:
+	// Go's \w is ASCII-only where Python's re.\w is Unicode-aware, so non-ASCII
+	// test names silently vanished here while Python found them.
+	pytestName = `[\p{L}\p{N}_/.\-:]+::[\p{L}\p{N}_\[\]\-.]+`
+	// [ \t]+ rather than \s+: with the -v form now also parsed, a newline-crossing
+	// \s+ would pair one line's trailing PASSED with the NEXT line's test name.
+	rePytest = regexp.MustCompile(`(PASSED|FAILED)[ \t]+(` + pytestName + `)`)
+	// Line-anchored so the trailing form only matches a real `-v` result line.
+	rePytestSuffix = regexp.MustCompile(`(?m)^\s*(` + pytestName + `)\s+(PASSED|FAILED)\b`)
+	reJest         = regexp.MustCompile(`(?m)^\s*([\x{2713}\x{2717}\x{00D7}])\s+(.+)$`)
+	reJestMs       = regexp.MustCompile(`\s+\(\d+\s*ms\)$`)
+	reGo           = regexp.MustCompile(`--- (PASS|FAIL): (\S+)`)
+	reRust         = regexp.MustCompile(`test (\S+) \.\.\. (ok|FAILED)`)
 )
 
 // DetectFlaky parses a concatenated multi-run test log and returns the tests
@@ -47,41 +60,7 @@ func DetectFlaky(log string, quarantineThreshold float64) []FlakyTest {
 	if quarantineThreshold <= 0 {
 		quarantineThreshold = DefaultQuarantineThreshold
 	}
-	pass := map[string]int{}
-	fail := map[string]int{}
-
-	for _, m := range rePytest.FindAllStringSubmatch(log, -1) {
-		if m[1] == "PASSED" {
-			pass[m[2]]++
-		} else {
-			fail[m[2]]++
-		}
-	}
-	for _, m := range reGo.FindAllStringSubmatch(log, -1) {
-		if m[1] == "PASS" {
-			pass[m[2]]++
-		} else {
-			fail[m[2]]++
-		}
-	}
-	for _, m := range reRust.FindAllStringSubmatch(log, -1) {
-		if m[2] == "ok" {
-			pass[m[1]]++
-		} else {
-			fail[m[1]]++
-		}
-	}
-	for _, m := range reJest.FindAllStringSubmatch(log, -1) {
-		name := strings.TrimSpace(reJestMs.ReplaceAllString(strings.TrimSpace(m[2]), ""))
-		if name == "" {
-			continue
-		}
-		if m[1] == "✓" {
-			pass[name]++
-		} else {
-			fail[name]++
-		}
-	}
+	pass, fail := parseOutcomes(log)
 
 	names := make([]string, 0, len(pass)+len(fail))
 	seen := map[string]bool{}
@@ -276,4 +255,68 @@ func SplitFlakyFix(raw string) (code, explanation string, ok bool) {
 		return raw, "", false
 	}
 	return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i+len("EXPLANATION:"):]), true
+}
+
+// parseOutcomes extracts per-test pass/fail counts from a concatenated log in
+// any supported format.
+func parseOutcomes(log string) (pass, fail map[string]int) {
+	pass = map[string]int{}
+	fail = map[string]int{}
+	for _, m := range rePytest.FindAllStringSubmatch(log, -1) {
+		if m[1] == "PASSED" {
+			pass[m[2]]++
+		} else {
+			fail[m[2]]++
+		}
+	}
+	for _, m := range rePytestSuffix.FindAllStringSubmatch(log, -1) {
+		if m[2] == "PASSED" {
+			pass[m[1]]++
+		} else {
+			fail[m[1]]++
+		}
+	}
+	for _, m := range reGo.FindAllStringSubmatch(log, -1) {
+		if m[1] == "PASS" {
+			pass[m[2]]++
+		} else {
+			fail[m[2]]++
+		}
+	}
+	for _, m := range reRust.FindAllStringSubmatch(log, -1) {
+		if m[2] == "ok" {
+			pass[m[1]]++
+		} else {
+			fail[m[1]]++
+		}
+	}
+	for _, m := range reJest.FindAllStringSubmatch(log, -1) {
+		name := strings.TrimSpace(reJestMs.ReplaceAllString(strings.TrimSpace(m[2]), ""))
+		if name == "" {
+			continue
+		}
+		if m[1] == "✓" {
+			pass[name]++
+		} else {
+			fail[name]++
+		}
+	}
+
+	return pass, fail
+}
+
+// OutcomeCount reports how many test outcomes were recognised in log, in any
+// supported format. Zero means the log's format was not understood — which is a
+// different answer from "the suite is stable", and callers must say so rather
+// than reporting a clean bill of health.
+func OutcomeCount(log string) int {
+	pass, fail := parseOutcomes(log)
+	n := 0
+	for _, c := range pass {
+		n += c
+	}
+	for _, c := range fail {
+		n += c
+	}
+	return n
 }
