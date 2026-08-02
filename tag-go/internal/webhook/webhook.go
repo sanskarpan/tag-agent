@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -256,42 +255,15 @@ func buildTaskText(platform, eventType string, info EventInfo) string {
 	return strings.Join(parts, "\n\n")
 }
 
-// maxSeenDeliveryIDs bounds the in-memory replay-protection set.
-const maxSeenDeliveryIDs = 4096
-
-// deliveryCache is a bounded, thread-safe set of recently seen webhook
-// delivery IDs used to reject replays of captured signed payloads.
-type deliveryCache struct {
-	mu    sync.Mutex
-	seen  map[string]struct{}
-	order []string
-}
-
-// markSeen records id and reports whether it was new (false = replay).
-func (c *deliveryCache) markSeen(id string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, dup := c.seen[id]; dup {
-		return false
-	}
-	if c.seen == nil {
-		c.seen = make(map[string]struct{})
-	}
-	c.seen[id] = struct{}{}
-	c.order = append(c.order, id)
-	if len(c.order) > maxSeenDeliveryIDs {
-		delete(c.seen, c.order[0])
-		c.order = c.order[1:]
-	}
-	return true
-}
-
 // Handler builds the webhook HTTP mux. When secret is empty, events are only
 // accepted if allowUnsigned is true (an explicit operator opt-in); otherwise
 // every event POST is rejected 401 so unauthenticated callers cannot inject
 // queue jobs.
 func Handler(db *store.DB, secret string, allowUnsigned bool) http.Handler {
-	deliveries := &deliveryCache{}
+	// Replay protection is durable (SQLite), not an in-memory set: the old
+	// bounded cache lapsed on eviction and on every restart.
+	_ = EnsureReplaySchema(db)
+	pruneDeliveries(db)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, 200, map[string]any{"status": "ok"})
@@ -336,8 +308,15 @@ func Handler(db *store.DB, secret string, allowUnsigned bool) http.Handler {
 			sendJSON(w, 401, map[string]any{"error": "invalid signature"})
 			return
 		}
-		if deliveryID := firstHeader(r, "X-GitHub-Delivery", "Linear-Delivery"); deliveryID != "" {
-			if !deliveries.markSeen(platform + ":" + deliveryID) {
+		// Replay protection. Only meaningful for a request we actually
+		// authenticated — an unsigned event accepted under --allow-unsigned has
+		// no identity to trust, and deduping it would imply a guarantee we do
+		// not have. The fingerprint falls back to the signature when the sender
+		// supplies no delivery id, which is what closes the generic-webhook and
+		// Slack-tolerance replay windows.
+		if secret != "" && valid {
+			fp := deliveryFingerprint(platform, firstHeader(r, "X-GitHub-Delivery", "Linear-Delivery"), sig)
+			if !markDelivered(db, platform, fp) {
 				sendJSON(w, 409, map[string]any{"error": "duplicate delivery"})
 				return
 			}
