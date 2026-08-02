@@ -6,6 +6,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -113,6 +114,14 @@ func (l *Loop) Run(ctx context.Context, userMessage string, opts Options) (*Resu
 	l.Tracer.Attr(root, "tag.max_steps", opts.MaxSteps)
 	if l.Provider != nil {
 		l.Tracer.Attr(root, "tag.provider", l.Provider.Name())
+	}
+	// The attribute above already treats a nil provider as reachable; the stream
+	// call below would then panic. A misconfigured loop must fail as an error the
+	// caller can report, not as a crash.
+	if l.Provider == nil {
+		err := errors.New("agent: no provider configured")
+		l.Tracer.End(root, trace.StatusError, err.Error(), 0, 0)
+		return nil, err
 	}
 	closeRoot := func(err error) {
 		if err != nil {
