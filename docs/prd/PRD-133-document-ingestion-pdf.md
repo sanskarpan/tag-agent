@@ -10,6 +10,8 @@
 **Category:** Core / DX
 **Affects:** `tag-go/internal/tool` (`read_file` binary refusal), `src/tag` (new document-loading path), `pyproject.toml` (new optional extra), `tag-go/internal/ciauto`+`internal/security` (both already skip `.pdf` — they become consistent with a real answer rather than a silent skip)
 **Depends on:** — (Tier 0 depends on nothing)
+**Revised 2026-08-03** after an adversarial review: §5.2's central conclusion was wrong (npm ships a prebuilt binary), the tier order changed as a result, and `pages_needing_ocr` is no longer treated as trustworthy on its own. See §5.2 and §3.
+
 **Inspired by:** [firecrawl/pdf-inspector](https://github.com/firecrawl/pdf-inspector) (MIT, Rust, 6.4k stars, created 2026-02)
 
 ---
@@ -83,7 +85,11 @@ That is a **~70–100× token reduction** and the difference between garbage and
 
 The published benchmark (0.875 overall, fastest of five engines on a 200-PDF corpus) is **vendor-reported** and is not load-bearing for this PRD. The single-file result above is ours and is.
 
-The genuinely differentiating design choice is `pages_needing_ocr`: per-page OCR routing rather than all-or-nothing. That is the field TAG needs even if it never adopts the extractor, because it is what turns "I can't read this" into "pages 3 and 7 are scans".
+The differentiating design choice is `pages_needing_ocr`: per-page OCR routing rather than all-or-nothing. It is what turns "I can't read this" into "pages 3 and 7 are scans".
+
+**It must not be trusted unverified.** A review of this PRD reports that on documents with scanned pages the document-level aggregate **under-reports** against the per-page `needs_ocr` flags — returning `[]` while individual pages report `needs_ocr=True` and extract zero characters. I could not reproduce that here (both test documents are fully text-based and the two agree), so it is recorded as **reported, not confirmed**. What I did confirm is the indexing split that would cause a silent off-by-one: `extract_pages_markdown().pages[].page` is **0-based**, while `process_pdf().pages_needing_ocr` is 1-based.
+
+Either way the consequence for Tier 1 is the same and is not optional: derive OCR routing from the **per-page** flags, normalise indexing in exactly one place, and **cross-check that a page claimed as read actually produced text**. Built naively, Tier 1 would report "fully text-based" and hand back blank pages — reintroducing the fabricated-success pattern this PRD exists to remove, one layer up.
 
 ---
 
@@ -113,15 +119,18 @@ The interesting finding is not "pdf-inspector is good" — it is. It is that **t
 
 `pyo3` with `abi3-py38`, so one wheel per platform covers every Python version. Wheels published for macOS x86_64 + arm64, manylinux x86_64 + aarch64, win_amd64. **Missing: win_arm64 and musl/Alpine** — those fall back to an sdist build, which needs a Rust toolchain.
 
-It must go in `[project.optional-dependencies]` with lazy install via `tools/lazy_deps.py`, not in core `dependencies`. The scope rule in `pyproject.toml` is explicit — *"only packages used by EVERY hermes session belong here"* — and a PDF parser is not that. The exact-pin discipline (added after the Mini Shai-Hulud worm hit `mistralai` on PyPI) applies: pin `pdf-inspector==0.2.6`, regenerate `uv.lock`. A 6-month-old package on a 0.x line is precisely the kind of dependency that pin discipline exists for.
+It must go in `[project.optional-dependencies]` with lazy install via the vendored `tools/lazy_deps.py` (**not** `src/tag/tools/lazy_deps.py`, which does not exist), not in core `dependencies`. The scope rule in `pyproject.toml` is explicit — *"only packages used by EVERY hermes session belong here"* — and a PDF parser is not that. The exact-pin discipline (added after the Mini Shai-Hulud worm hit `mistralai` on PyPI) applies: pin `pdf-inspector==0.2.6`, regenerate `uv.lock`. A 6-month-old package on a 0.x line is precisely the kind of dependency that pin discipline exists for.
 
-### 5.2 Go: every in-process path is closed
+### 5.2 Go: every *in-process* path is closed — but the process boundary is open
+
+**This section originally concluded that the Go harness could not use pdf-inspector at all. That was wrong**, and an adversarial review caught it: the evaluation checked GitHub releases and the Rust crate, and never checked npm. The in-process findings below all still hold; the conclusion drawn from them did not.
 
 | path | verdict | why |
 |---|---|---|
 | CGO → Rust `cdylib` | **closed** | `crate-type = ["lib", "cdylib"]` looks promising, but there is **no `extern "C"` and no `#[no_mangle]` anywhere in `src/`** — the cdylib *is* the pyo3 extension module. There is no C ABI to link against. And CGO would break the CGO-free static binary the project has committed to. |
 | WASM via wazero | **closed** | The wasm crate is `wasm-bindgen` + `js-sys` + `serde-wasm-bindgen`, targeting browsers. There is no `wasm32-wasip1` target. wazero runs WASI, not wasm-bindgen's JS glue. This was the one option that would have preserved the static binary; it does not exist. |
-| subprocess `pdf2md` | **impractical** | The CLI exists (`pdf2md`, `detect-pdf`, `dump_ops`) and the Go harness already shells out to `gh`, `git`, `pip` and `npm` — so the *pattern* is fine. But the repo has **zero GitHub releases**, so there are no prebuilt binaries. The user would need a Rust toolchain and `cargo install`. That is a hard dependency dressed as an optional one. |
+| subprocess the npm CLI | **VIABLE — this is the answer** | `npm install @firecrawl/pdf-inspector` installs a **prebuilt native binary** (`pdf-inspector.darwin-arm64.node`) plus a working CLI in **3 seconds**, no Rust toolchain. Verified: `pdf-inspector <file>` returned correct markdown for the same 896 KB test document. TAG already ships an npm distribution, so this is a channel the project uses. |
+| subprocess `pdf2md` from source | impractical | The Rust CLI exists but the repo publishes **zero GitHub releases**, so obtaining it means `cargo install`. Superseded by the npm path above. |
 | port the extractor | **rejected** | `extractor/` 10.8k LOC + `markdown/` 8.0k + `tables/` 16.3k + ~24.8k of glyph/CMap tables. Not a port; a rewrite of somebody else's actively-developed product. |
 
 ### 5.3 The classifier is smaller — but not as small as it looks, and a naive version is wrong
@@ -149,24 +158,29 @@ The message should be actionable, in the style the rest of the codebase already 
 
 > `read_file: doc.pdf is a PDF, not text — 38% of its bytes are unprintable. Reading it would spend ~100k tokens on deflate output. Use the document loader (tag doc read) or convert it first.`
 
-### Tier 1 — Python document loader on pdf-inspector (P1, M)
+### Tier 1 — the npm-distributed CLI, serving BOTH distributions (P1, S–M)
 
-Optional extra + lazy install. Exposed as a tool the agent can call, returning markdown plus the structural metadata (`page_count`, `pages_with_tables`, `pages_needing_ocr`, `has_encoding_issues`). Scanned pages are **reported, never guessed at**.
+Promoted from the old Tier 3 and reordered ahead of the Python binding, because one integration covers both harnesses — including the Go one this PRD said could never have it.
 
-### Tier 2 — Go classification via an existing pure-Go PDF library (P2, M)
+Discovered like `gh`: used when present, never assumed. Output is parsed from `--json`. **OCR routing comes from the per-page flags with a text-non-empty cross-check**, per §3.
 
-Enough to answer "text-based or scanned, how many pages, which pages need OCR" and to extract text from straightforwardly text-based documents. Explicitly *not* pdf-inspector-quality layout, reading order or table reconstruction — and the docs must say that rather than implying parity.
+### Tier 2 — Python in-process binding (P2, S)
 
-### Tier 3 — optional `pdf2md` discovery (P3, S, only if demand appears)
+`pdf-inspector` as an optional extra, lazy-installed via the vendored `tools/lazy_deps.py`, pinned exactly. Lower priority than Tier 1 now: it is faster and avoids a subprocess, but it only serves one distribution and duplicates routing logic that must then agree with Tier 1's.
 
-If a user has `pdf2md` on `PATH`, use it and say so. Same shape as the existing `gh` dependency: discovered, optional, never assumed. Not worth building until Tier 1 shows the capability is used.
+### Tier 3 — Go-native classification (DROPPED)
+
+The review established this is *feasible* — a correct decomposition on `pdfcpu` plus a real text extractor matches poppler's ground truth in a CGO-free binary — so my "the classifier needs an object layer, so this is a trap" framing was wrong about the difficulty.
+
+It is dropped anyway, on a better reason: **two engines disagree about the same file, in both directions.** "Which pages need OCR" is a threshold judgement, not a fact. Shipping Go-native classification alongside Tier 1 would have TAG's two distributions confidently give different answers about the same document — the incoherence §7's risk table waved off as "say so in the docs". The candidate library survey also killed most options on their own merits (silent zero-text returns on CID fonts, a multi-minute hang on ordinary input, obfuscated source, a "CGO-free" build that panics needing a dylib).
 
 ### Explicitly rejected
 
 - Vendoring or porting the extractor.
 - CGO. There is no C ABI, and the static binary is a project commitment.
-- WASM. wasm-bindgen is not WASI.
+- WASM via wazero. wasm-bindgen is not WASI.
 - Making `pdf-inspector` a core Python dependency.
+- Go-native classification — see Tier 3 above. Dropped on coherence, not feasibility.
 
 ---
 
