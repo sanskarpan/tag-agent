@@ -413,6 +413,33 @@ def cmd_profile_marketplace(args: argparse.Namespace) -> int:
 # PRD-027: Eval Framework
 # ---------------------------------------------------------------------------
 
+def _extract_model_output(result) -> tuple[str, str | None]:
+    """Pull the model's answer out of `tag submit --json`.
+
+    Returns (output, error_reason). A non-None error_reason means the output
+    could NOT be obtained and the case must not be scored — grading the wrong
+    text is worse than reporting that the run could not be evaluated.
+
+    The previous implementation scored ``result.stdout`` directly, which is the
+    submission acknowledgement ("run_id: … status: queued"), not the answer.
+    """
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        first = detail[0] if detail else f"exit {result.returncode}"
+        return "", f"submit failed: {first}"
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        return "", f"could not parse submit --json output: {exc}"
+    steps = payload.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return "", "submit returned no steps, so there is no model output to score"
+    parts = [str(st.get("output", "")) for st in steps if isinstance(st, dict) and st.get("output")]
+    if not parts:
+        return "", "submit returned steps but none carried output"
+    return "\n\n".join(parts), None
+
+
 def cmd_eval(args: argparse.Namespace) -> int:
     """PRD-027: Run eval suites against TAG profiles."""
     import subprocess
@@ -424,7 +451,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
 
     try:
         from tag.eval_framework import (
-            load_suite, score_case, create_eval_run,
+            load_suite, score_case, create_eval_run, NO_CHECKS_REASON,
             record_case_result, finalize_eval_run,
             list_eval_runs, get_eval_run_detail,
         )
@@ -460,45 +487,74 @@ def cmd_eval(args: argparse.Namespace) -> int:
 
         passed = 0
         failed = 0
+        unchecked = 0
         for case in cases:
             case_id = case.get("id", f"case_{cases.index(case)+1}")
             input_text = case.get("input", "")
 
             if dry_run:
+                # A dry run validates the suite; it does not produce results.
+                # Writing passed=1/score=1.0 rows made a dry run indistinguishable
+                # from a real all-green run in `eval list`.
                 output = "(dry-run — no agent invocation)"
-                ok, score, reason = True, 1.0, None
+                ok, score, reason = None, None, "dry run: the case was not executed"
             else:
-                # Run the case via hermes
+                # --json so the MODEL's output can be scored.
+                #
+                # This used to score `result.stdout` -- the human-readable
+                # submission acknowledgement ("run_id: ... status: queued"), not
+                # the model's answer. Every score Python produced was computed
+                # against a receipt.
                 result = subprocess.run(
                     [sys.executable, "-m", "tag", "--config",
                      str(config_path(getattr(args, "config", None)) or ""),
                      "submit", "--task-type", "mixed", "--prompt", input_text,
-                     "--master-profile", profile, "--source", "eval"],
+                     "--master-profile", profile, "--source", "eval", "--json"],
                     capture_output=True, text=True, timeout=300,
                 )
-                output = result.stdout
-                ok, score, reason = score_case(case, output)
+                output, extract_err = _extract_model_output(result)
+                if extract_err:
+                    # Refuse to score rather than score the wrong text. A case
+                    # whose output could not be obtained is an ERROR, not a
+                    # failure of the model and certainly not a pass.
+                    ok, score, reason = False, 0.0, extract_err
+                else:
+                    ok, score, reason = score_case(case, output)
 
-            record_case_result(
-                db, run_id, case_id, input_text, output,
-                passed=ok, score=score, failure_reason=reason,
-            )
-            if ok:
-                passed += 1
-            else:
-                failed += 1
-            status_char = "✓" if ok else "✗"
             if not dry_run:
+                record_case_result(
+                    db, run_id, case_id, input_text, output,
+                    passed=ok, score=score, failure_reason=reason,
+                )
+                if ok:
+                    passed += 1
+                else:
+                    failed += 1
+                if reason == NO_CHECKS_REASON:
+                    unchecked += 1
+                status_char = "✓" if ok else "✗"
                 print(f"  [{status_char}] {case_id}  score={score:.2f}" +
                       (f"  {reason}" if reason else ""))
 
+        if dry_run:
+            # Nothing ran, so there is nothing to finalize. Leaving a
+            # `completed` run behind was the other half of the dry-run lie.
+            db.close()
+            print(f"dry run: {len(cases)} case(s) validated in {suite_name}; nothing was executed or recorded.")
+            return 0
+
         summary = finalize_eval_run(db, run_id)
+        if unchecked:
+            summary["unchecked"] = unchecked
         db.close()
 
         if getattr(args, "json", False):
             print(json.dumps(summary, indent=2))
         else:
             print(f"\nResults: {passed}/{len(cases)} passed")
+            if unchecked:
+                print(f"WARNING: {unchecked} case(s) define no assertions and could not have failed; "
+                      f"they are counted as passes but verify nothing.")
         return 0 if failed == 0 else 1
 
     if sub == "list":
