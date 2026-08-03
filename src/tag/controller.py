@@ -1491,6 +1491,21 @@ def ensure_hermes_ready(
         skip_tui_build=not need_tui,
         json=False,
     )
+    # Deferred import, not a bare global.
+    #
+    # cmd_setup reaches this module only through the _CMD_ATTR_MAP lazy
+    # re-export below, and a module-level __getattr__ is consulted for attribute
+    # access on the MODULE (tag.controller.cmd_setup) -- never for a bare name
+    # lookup inside a function defined in that same module. So `cmd_setup(...)`
+    # here was a plain global lookup that raised
+    # `NameError: name 'cmd_setup' is not defined`.
+    #
+    # It only fired on the fresh-install path (the function returns early when
+    # the hermes binary already exists), which is why it survived: every
+    # developer machine and every CI run that had already bootstrapped skipped
+    # it. A new user running `tag submit` got the NameError instead of setup.
+    from tag.cmd.system import cmd_setup  # noqa: PLC0415 — circular at module level
+
     cmd_setup(setup_args)
 
 

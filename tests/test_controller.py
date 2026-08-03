@@ -346,7 +346,16 @@ def test_cmd_submit_auto_bootstraps_when_hermes_missing(tmp_path, monkeypatch):
         state["ready"] = True
         return 0
 
-    monkeypatch.setattr(TAG, "cmd_setup", fake_setup)
+    # Patch where it is USED, not where it was assumed to be.
+    #
+    # These tests used to patch TAG.cmd_setup — which set a module global on
+    # tag.controller that the production code's bare `cmd_setup(...)` call then
+    # found. That is precisely why they passed while the real fresh-install path
+    # raised NameError: the mock supplied the name the code was missing. The
+    # call is now a deferred import from tag.cmd.system, so patch that.
+    import tag.cmd.system as _system
+
+    monkeypatch.setattr(_system, "cmd_setup", fake_setup)
     fake_step = {
         "profile": "researcher",
         "status": "ok",
@@ -410,8 +419,17 @@ def test_cmd_hermes_passthrough_auto_bootstraps_for_tui(tmp_path, monkeypatch):
     calls = []
     state = {"ready": False}
     monkeypatch.setattr(TAG, "discover_local_hermes_checkout", lambda: None)
+    # Patch where it is USED, not where it was assumed to be.
+    #
+    # These tests used to patch TAG.cmd_setup — which set a module global on
+    # tag.controller that the production code's bare `cmd_setup(...)` call then
+    # found. That is precisely why they passed while the real fresh-install path
+    # raised NameError: the mock supplied the name the code was missing. The
+    # call is now a deferred import from tag.cmd.system, so patch that.
+    import tag.cmd.system as _system
+
     monkeypatch.setattr(
-        TAG,
+        _system,
         "cmd_setup",
         lambda args: calls.append(("setup", args.skip_tui_build)) or state.__setitem__("ready", True) or 0,
     )
