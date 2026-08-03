@@ -598,12 +598,26 @@ def cmd_ci_ext(args: argparse.Namespace) -> int:
         return 0
     if sub == "fix-vuln":
         sarif_path = Path(args.sarif)
-        vulns = parse_sarif(sarif_path)
+        # A SARIF the tool cannot understand is a USAGE error (exit 2), never a
+        # clean bill of health. parse_sarif used to return [] for a top-level
+        # array or an object with no "runs" key, which printed "No
+        # vulnerabilities found" and exited 0 -- on a security gate.
+        try:
+            vulns = parse_sarif(sarif_path)
+        except (ValueError, FileNotFoundError) as exc:
+            print_error(str(exc))
+            return 2
         if not vulns:
             print("No vulnerabilities found")
             return 0
         result = fix_sarif_vulns(vulns, profile, cfg, dry_run=getattr(args, "dry_run", False))
         print(result)
+        # "Ran fine and found problems" is exit 3, matching the Go harness and
+        # the rest of this command family. Exiting 0 with vulnerabilities left
+        # unfixed told a pipeline the gate had passed.
+        unfixed = sum(1 for r in result if not r.get("fix_applied")) if isinstance(result, list) else 0
+        if unfixed and not getattr(args, "exit_zero", False):
+            return 3
         return 0
     if sub in ("diagnose", "ci-diagnose"):
         log_text = Path(args.log).read_text()
@@ -1082,6 +1096,9 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     aci_sast.add_argument("sarif", metavar="SARIF_FILE")
     aci_sast.add_argument("--profile", default=None)
     aci_sast.add_argument("--dry-run", action="store_true")
+    aci_sast.add_argument(
+        "--exit-zero", action="store_true",
+        help="exit 0 even when vulnerabilities remain unfixed (advisory, non-gating)")
     aci_diag = aci_sub.add_parser("ci-diagnose", help="Diagnose and auto-fix CI failures")
     aci_diag.add_argument("log", metavar="LOG_FILE")
     aci_diag.add_argument("--profile", default=None)
