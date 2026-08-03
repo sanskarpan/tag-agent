@@ -380,6 +380,28 @@ func readFileTool(opts Options) agent.Tool {
 			if err != nil {
 				return "", err
 			}
+			// The tool promises a UTF-8 text file. Handing back a PDF's bytes and
+			// reporting success is the fabricated-success pattern, and an expensive
+			// one: ~100k tokens of deflate output before the model can discover it
+			// has nothing. See textcheck.go for why the checks are conservative.
+			if reason := notTextReason(b); reason != "" {
+				size := int64(len(b))
+				if st, serr := f.Stat(); serr == nil {
+					size = st.Size()
+				}
+				return "", binaryRefusal(strArg(in, "path"), reason, size)
+			}
+			// Truncation has to be stated even for text. Returning 29% of a file and
+			// reporting success is the same broken guarantee in a quieter form.
+			if int64(len(b)) == opts.MaxReadBytes {
+				if st, serr := f.Stat(); serr == nil && st.Size() > opts.MaxReadBytes {
+					return string(b) + fmt.Sprintf(
+						"\n\n[read_file: TRUNCATED — returned the first %s of %s. "+
+							"%s was not read.]",
+						humanBytes(opts.MaxReadBytes), humanBytes(st.Size()),
+						humanBytes(st.Size()-opts.MaxReadBytes)), nil
+				}
+			}
 			return string(b), nil
 		},
 	}
