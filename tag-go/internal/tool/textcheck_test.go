@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // The false-positive side matters at least as much as the true-positive side:
@@ -172,5 +173,136 @@ func TestReadFileEmptyFileIsFine(t *testing.T) {
 	got, err := readFileExec(t, root)("empty.txt")
 	if err != nil || got != "" {
 		t.Errorf("an empty file is a legitimate read: %q %v", got, err)
+	}
+}
+
+// --- findings from the adversarial review of this change --------------------
+
+// Nine of the magic numbers are plain printable ASCII, matched at offset 0 with
+// no corroboration — so any text file starting with those characters was
+// refused. `MZ,Region,Total` was reported as a Windows executable.
+func TestPrintableMagicsNeedCorroboration(t *testing.T) {
+	cases := map[string]string{
+		"MZ csv":     "MZ,Region,Total\nEU,3,4\n",
+		"MZ prose":   "MZ Corporation quarterly report for the period ending 31 March.\n",
+		"MZ base64":  "MZqQAAMAAAAEAAAA//8AALgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+		"ID3 csv":    "ID3,ID4,Name\n1,2,alice\n",
+		"ID3 sql":    "CREATE TABLE t (\n  ID3 INT NOT NULL,\n  ID4 INT\n);\n",
+		"BZh prose":  "BZh is the bzip2 magic number, three ASCII characters.\n",
+		"RIFF doc":   "RIFF containers hold WAV and AVI data. See the spec for details.\n",
+		"OggS notes": "OggS pages carry the codec payload.\n",
+		"fLaC notes": "fLaC is the FLAC stream marker.\n",
+		"OTTO notes": "OTTO indicates CFF outlines in an OpenType font.\n",
+		"wOFF notes": "wOFF and wOF2 are the two web font wrappers.\n",
+	}
+	for name, body := range cases {
+		if r := notTextReason([]byte(body)); r != "" {
+			t.Errorf("%s: text wrongly refused as %q", name, r)
+		}
+	}
+}
+
+// The corroborated forms must still be caught.
+func TestCorroboratedBinariesAreStillRefused(t *testing.T) {
+	pe := make([]byte, 0x80)
+	copy(pe, "MZ")
+	pe[0x3c] = 0x40
+	copy(pe[0x40:], "PE\x00\x00")
+	riff := append([]byte("RIFF"), append([]byte{0, 0, 0, 0}, []byte("WAVE")...)...)
+	for name, body := range map[string][]byte{
+		"real PE":    pe,
+		"real RIFF":  riff,
+		"real bzip2": []byte("BZh9\x31\x41\x59\x26\x53\x59"),
+		"real ID3":   append([]byte("ID3"), []byte{0x03, 0x00, 0x00}...),
+	} {
+		if notTextReason(body) == "" {
+			t.Errorf("%s: not refused", name)
+		}
+	}
+}
+
+// A ratio over a handful of bytes is not evidence. Progress bars and bells are
+// ordinary in the build logs an agent is pointed at.
+func TestControlRatioNeedsASample(t *testing.T) {
+	for name, body := range map[string]string{
+		"tiny with DEL":  "a\x7f",
+		"short with SOH": "hi\x01there",
+		"backspace bar":  "progress \x08\x08\x08 50%\ndone\n",
+		"bell log":       "beep\x07\x07\x07 done\n",
+	} {
+		if r := notTextReason([]byte(body)); r != "" {
+			t.Errorf("%s: wrongly refused as %q", name, r)
+		}
+	}
+	// A genuinely control-heavy large file is still caught.
+	noisy := make([]byte, 4096)
+	for i := range noisy {
+		noisy[i] = byte(i % 0x1f)
+	}
+	if notTextReason(noisy) == "" {
+		t.Error("a large control-heavy file must still be refused")
+	}
+}
+
+// The signature loop was anchored at offset 0, so one leading newline defeated
+// it and the PDF came back as text.
+func TestLeadingWhitespaceDoesNotHideASignature(t *testing.T) {
+	body := append([]byte("\n  \t"), []byte("%PDF-1.4\nstream\n")...)
+	if r := notTextReason(body); r == "" {
+		t.Error("a PDF behind leading whitespace was accepted as text")
+	}
+}
+
+// The head window is 8 KiB of a 256 KiB read, so binary further in was missed.
+func TestBinaryPastTheHeadWindowIsCaught(t *testing.T) {
+	body := append([]byte(strings.Repeat("plain ascii text\n", 600)), make([]byte, 20000)...)
+	for i := 10200; i < len(body); i++ {
+		body[i] = byte((i * 7) % 256)
+	}
+	if r := notTextReason(body); r == "" {
+		t.Error("binary past the head window was accepted as text")
+	}
+}
+
+// Truncation must not hand back invalid UTF-8 from a tool whose contract is
+// UTF-8 text, and the notice must lead so it cannot be written back silently.
+func TestTruncatedReadIsValidUTF8AndLeadsWithTheNotice(t *testing.T) {
+	root := t.TempDir()
+	opts := DefaultOptions()
+	// Multibyte content guarantees the cap lands mid-rune.
+	body := strings.Repeat("日", int(opts.MaxReadBytes/3)+2000)
+	os.WriteFile(filepath.Join(root, "big.txt"), []byte(body), 0o644)
+
+	got, err := readFileExec(t, root)("big.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.ValidString(got) {
+		t.Error("a truncated read returned invalid UTF-8")
+	}
+	if !strings.HasPrefix(got, TruncationMarker) {
+		t.Errorf("the notice must lead, got %.80q", got)
+	}
+	if !strings.Contains(got, "do not write it back") {
+		t.Error("the notice must tell the model not to write it back")
+	}
+}
+
+// ...and write_file must enforce that, since read-whole/write-whole is the only
+// edit path available.
+func TestWriteFileRefusesTruncatedContent(t *testing.T) {
+	root := t.TempDir()
+	opts := DefaultOptions()
+	opts.Root = root
+	w := writeFileTool(opts)
+	_, err := w.Exec(context.Background(), map[string]any{
+		"path":    "out.txt",
+		"content": TruncationMarker + " ...]\n\nsome partial content",
+	})
+	if err == nil {
+		t.Fatal("writing back a truncated read must be refused")
+	}
+	if _, serr := os.Stat(filepath.Join(root, "out.txt")); serr == nil {
+		t.Error("nothing may be written on refusal")
 	}
 }
