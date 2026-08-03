@@ -111,10 +111,19 @@ func TestReadFileRefusesBinary(t *testing.T) {
 	if out != "" {
 		t.Errorf("no bytes may reach the caller on refusal, got %d", len(out))
 	}
-	for _, want := range []string{"doc.pdf", "PDF", "Convert it"} {
+	for _, want := range []string{"doc.pdf", "PDF"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal should mention %q: %v", want, err)
 		}
+	}
+	// The advice must be actionable, and which advice is right depends on
+	// whether the document engine is installed — so assert that ONE of the two
+	// real answers is offered rather than pinning a fixed string. This test
+	// previously required "Convert it", which stopped being the best advice for
+	// a PDF once read_document existed.
+	msg := err.Error()
+	if !strings.Contains(msg, "read_document") && !strings.Contains(msg, "npm install") {
+		t.Errorf("the refusal must say what would work: %v", err)
 	}
 }
 
