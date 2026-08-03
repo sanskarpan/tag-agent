@@ -429,10 +429,10 @@ func runIteration(ctx context.Context, rec *trace.Recorder, parent *trace.Span,
 //
 // Returns (approved, reason, err).
 func waitForApproval(ctx context.Context, db *sql.DB, id string, iter int, output string, opts Options) (bool, string, error) {
-	if err := requestApprovalRow(db, id, iter, truncate(output, 500)); err != nil {
-		return false, "", err
-	}
-	if err := setStatus(context.Background(), db, id, StatusWaitingApproval); err != nil {
+	// One transaction: a checkpoint is one fact about the run, and writing it as
+	// two left a window where a pending approval was visible on a loop whose
+	// status still said `running`.
+	if err := openApprovalCheckpoint(context.Background(), db, id, iter, truncate(output, 500)); err != nil {
 		return false, "", err
 	}
 	deadline := time.Now().Add(opts.ApprovalTimeout)
