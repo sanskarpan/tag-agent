@@ -612,17 +612,21 @@ _GH_ACTION_TEMPLATES: dict[str, str] = {
                   python-version: "3.12"
 
               - name: Install tag-agent
-                # Pinned deliberately: an unpinned install lets a PyPI release change
-                # this pipeline's behaviour, including its exit codes, with no
-                # review on your side. Bump it once you've read the release notes.
-                run: pip install 'tag-agent=={pinned_version}'
+                # Version-bounded deliberately: an unbounded install lets a PyPI
+                # release change this pipeline's behaviour, including its exit
+                # codes, with no review on your side. A compatible-release bound
+                # rather than ==, so patch and minor fixes still reach you.
+                # Dependabot cannot see a pin inside a run: line; the marker is
+                # what lets Renovate bump it.
+                # renovate: datasource=pypi depName=tag-agent
+                run: pip install 'tag-agent~={pinned_version}'
 
               - name: Run TAG eval
                 env:
                   TAG_PROFILE: {profile}
                   TAG_THRESHOLD: "{threshold}"
                 run: |
-                  tag eval --profile "$TAG_PROFILE" --threshold "$TAG_THRESHOLD"
+                  tag eval-ci run tests/eval_suite.yaml --profile "$TAG_PROFILE" --threshold "$TAG_THRESHOLD"
         """
     ),
     "review": textwrap.dedent(
@@ -650,21 +654,25 @@ _GH_ACTION_TEMPLATES: dict[str, str] = {
                   python-version: "3.12"
 
               - name: Install tag-agent
-                # Pinned deliberately: an unpinned install lets a PyPI release change
-                # this pipeline's behaviour, including its exit codes, with no
-                # review on your side. Bump it once you've read the release notes.
-                run: pip install 'tag-agent=={pinned_version}'
+                # Version-bounded deliberately: an unbounded install lets a PyPI
+                # release change this pipeline's behaviour, including its exit
+                # codes, with no review on your side. A compatible-release bound
+                # rather than ==, so patch and minor fixes still reach you.
+                # Dependabot cannot see a pin inside a run: line; the marker is
+                # what lets Renovate bump it.
+                # renovate: datasource=pypi depName=tag-agent
+                run: pip install 'tag-agent~={pinned_version}'
 
               - name: Run TAG PR review
                 env:
                   GH_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
                   TAG_PROFILE: {profile}
                 run: |
-                  tag ci review \\
+                  tag review-pr \\
                     --repo "${{{{ github.repository }}}}" \\
                     --pr "${{{{ github.event.pull_request.number }}}}" \\
                     --profile "$TAG_PROFILE" \\
-                    --post-comment
+                    --post-comments
         """
     ),
     "test-gen": textwrap.dedent(
@@ -694,19 +702,23 @@ _GH_ACTION_TEMPLATES: dict[str, str] = {
                   python-version: "3.12"
 
               - name: Install tag-agent
-                # Pinned deliberately: an unpinned install lets a PyPI release change
-                # this pipeline's behaviour, including its exit codes, with no
-                # review on your side. Bump it once you've read the release notes.
-                run: pip install 'tag-agent=={pinned_version}'
+                # Version-bounded deliberately: an unbounded install lets a PyPI
+                # release change this pipeline's behaviour, including its exit
+                # codes, with no review on your side. A compatible-release bound
+                # rather than ==, so patch and minor fixes still reach you.
+                # Dependabot cannot see a pin inside a run: line; the marker is
+                # what lets Renovate bump it.
+                # renovate: datasource=pypi depName=tag-agent
+                run: pip install 'tag-agent~={pinned_version}'
 
               - name: Generate tests for PR diff
                 env:
                   GH_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
                   TAG_PROFILE: {profile}
                 run: |
-                  tag ci test-gen \\
-                    --repo "${{{{ github.repository }}}}" \\
-                    --pr "${{{{ github.event.pull_request.number }}}}" \\
+                  git diff "origin/${{{{ github.base_ref }}}}"...HEAD > diff.patch
+                  tag agentic-ci test-gen \\
+                    --diff diff.patch \\
                     --profile "$TAG_PROFILE"
         """
     ),
@@ -742,10 +754,14 @@ _GH_ACTION_TEMPLATES: dict[str, str] = {
                   python-version: "3.12"
 
               - name: Install tag-agent
-                # Pinned deliberately: an unpinned install lets a PyPI release change
-                # this pipeline's behaviour, including its exit codes, with no
-                # review on your side. Bump it once you've read the release notes.
-                run: pip install 'tag-agent=={pinned_version}'
+                # Version-bounded deliberately: an unbounded install lets a PyPI
+                # release change this pipeline's behaviour, including its exit
+                # codes, with no review on your side. A compatible-release bound
+                # rather than ==, so patch and minor fixes still reach you.
+                # Dependabot cannot see a pin inside a run: line; the marker is
+                # what lets Renovate bump it.
+                # renovate: datasource=pypi depName=tag-agent
+                run: pip install 'tag-agent~={pinned_version}'
 
               - name: Fix vulnerabilities from SARIF
                 env:
@@ -753,11 +769,8 @@ _GH_ACTION_TEMPLATES: dict[str, str] = {
                   TAG_PROFILE: {profile}
                 run: |
                   SARIF="${{{{ github.event.inputs.sarif_path || 'results.sarif' }}}}"
-                  tag ci fix-vuln \\
-                    --sarif "$SARIF" \\
-                    --profile "$TAG_PROFILE" \\
-                    --auto-commit \\
-                    --create-pr
+                  tag agentic-ci fix-vuln "$SARIF" \\
+                    --profile "$TAG_PROFILE"
         """
     ),
 }
@@ -932,10 +945,24 @@ def parse_sarif(sarif_path: Path) -> list[dict]:
             )
         # Build rule-id → severity lookup from the run's tool rules.
         rule_severity: dict[str, str] = {}
-        rules = (
-            run.get("tool", {}).get("driver", {}).get("rules", [])
-            or run.get("tool", {}).get("extensions", [{}])[0].get("rules", [])
-        )
+        # Collect rules from the driver AND every extension.
+        #
+        # This was `extensions[0]`, which raised IndexError on `extensions: []`
+        # -- spec-legal, and emitted by tools that declare the key
+        # unconditionally. It also read only the first extension, so rules from
+        # a second CodeQL query pack silently fell back to severity "warning".
+        tool = run.get("tool", {})
+        if tool is None:
+            tool = {}
+        if not isinstance(tool, dict):
+            raise ValueError(
+                f"Malformed SARIF file {sarif_path}: 'tool' is a "
+                f"{type(tool).__name__}, expected an object"
+            )
+        rules = list((tool.get("driver") or {}).get("rules") or [])
+        for ext in tool.get("extensions") or []:
+            if isinstance(ext, dict):
+                rules.extend(ext.get("rules") or [])
         for rule in rules:
             rid = rule.get("id", "")
             level = (
@@ -957,7 +984,17 @@ def parse_sarif(sarif_path: Path) -> list[dict]:
             )
             severity = result.get("level") or rule_severity.get(rule_id, "warning")
 
-            for location in result.get("locations", [{}]):
+            # `or [{}]` rather than a .get default: a result with locations: []
+            # took the default branch AND the no-locations branch below, so
+            # every location-less finding was counted twice. That mattered
+            # little when nothing read the count; it now drives the exit code.
+            locations = result.get("locations") or [{}]
+            for location in locations:
+                if not isinstance(location, dict):
+                    raise ValueError(
+                        f"Malformed SARIF file {sarif_path}: a 'locations' entry is a "
+                        f"{type(location).__name__}, expected an object"
+                    )
                 physical = location.get("physicalLocation", {})
                 artifact = physical.get("artifactLocation", {})
                 region = physical.get("region", {})
@@ -975,8 +1012,9 @@ def parse_sarif(sarif_path: Path) -> list[dict]:
                     }
                 )
 
-            # Result with no locations still gets an entry.
-            if not result.get("locations"):
+            # Intentionally no second append here: `locations or [{}]` above
+            # already yields exactly one entry for a location-less result.
+            if False:
                 findings.append(
                     {
                         "rule_id": rule_id,
@@ -1547,6 +1585,30 @@ def build_review_prompt_with_signals(
     )
 
 
+_VERDICT_RE_TEMPLATE = r"(?mi)^\s*[-*#\s]*{cls}\s*:\s*(findings|clean)\b"
+
+
+def _parse_signal_verdicts(review_text: str, active_signals: list[str]) -> tuple[list[str], bool]:
+    """Return (classes reporting findings, whether any verdict line was parsed).
+
+    ``verdict_parsed is False`` means the model emitted no ``<class>: FINDINGS``
+    or ``<class>: CLEAN`` line for any requested class, so nothing can be
+    concluded. The caller must report that as inconclusive rather than clean --
+    "I could not tell" and "there is nothing wrong" are different answers, and
+    only one of them is safe to act on.
+    """
+    found: list[str] = []
+    parsed = False
+    for cls in active_signals:
+        m = re.search(_VERDICT_RE_TEMPLATE.format(cls=re.escape(cls)), review_text)
+        if not m:
+            continue
+        parsed = True
+        if m.group(1).lower() == "findings":
+            found.append(cls)
+    return found, parsed
+
+
 def review_pr_with_signals(
     repo: str,
     pr_number: int,
@@ -1583,6 +1645,7 @@ def review_pr_with_signals(
 
     diff = fetch_pr_diff(repo, pr_number)
     metadata = fetch_pr_metadata(repo, pr_number)
+    active_signals = signals if signals else list(SIGNAL_CLASSES)
     prompt = build_review_prompt_with_signals(diff, metadata, signals)
 
     proc = subprocess.run(
@@ -1593,8 +1656,18 @@ def review_pr_with_signals(
     )
     review_text = proc.stdout.strip()
 
-    # Detect which signal classes appear in the output.
-    signals_found = [s for s in SIGNAL_CLASSES if s.lower() in review_text.lower()]
+    # Detect which signal classes reported findings.
+    #
+    # This used to substring-match the class NAME against the review text --
+    # while the prompt orders the model to name every class it considered. A
+    # spotless review saying "security: CLEAN" therefore contained the word
+    # "security" and was reported as a finding. It could never report clean.
+    #
+    # An explicit per-class verdict line is required instead, matching
+    # internal/ciauto/signals.go. When the model emitted no verdict lines at
+    # all, the result is INCONCLUSIVE -- which must not be presented as a clean
+    # bill of health.
+    signals_found, verdict_parsed = _parse_signal_verdicts(review_text, active_signals)
 
     posted = False
     if post_comment and review_text:
@@ -1605,7 +1678,12 @@ def review_pr_with_signals(
         )
         posted = post_pr_comment(repo, pr_number, body)
 
-    return {"review_text": review_text, "signals_found": signals_found, "posted": posted}
+    return {
+        "review_text": review_text,
+        "signals_found": signals_found,
+        "verdict_parsed": verdict_parsed,
+        "posted": posted,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1633,15 +1711,15 @@ _STACK_JOB_SNIPPETS: dict[str, str] = {
           image: python:3.12-slim
           script:
             - pip install --upgrade pip
-            - pip install -e ".[dev]" || pip install -r requirements.txt || true
-            - python -m pytest --tb=short -q || true
+            - pip install -e ".[dev]" || pip install -r requirements.txt
+            - python -m pytest --tb=short -q
 
         python-type-check:
           stage: test
           image: python:3.12-slim
           script:
-            - pip install mypy || true
-            - mypy . --ignore-missing-imports || true
+            - pip install mypy
+            - mypy . --ignore-missing-imports
         """
     ),
     "node": textwrap.dedent(
@@ -1650,7 +1728,7 @@ _STACK_JOB_SNIPPETS: dict[str, str] = {
           stage: build
           image: node:20-alpine
           script:
-            - npm ci || yarn install --frozen-lockfile || true
+            - npm ci || yarn install --frozen-lockfile
           cache:
             paths:
               - node_modules/
@@ -1659,7 +1737,7 @@ _STACK_JOB_SNIPPETS: dict[str, str] = {
           stage: test
           image: node:20-alpine
           script:
-            - npm test || yarn test || true
+            - npm test || yarn test
           needs: [node-install]
         """
     ),
@@ -1701,13 +1779,13 @@ _STACK_JOB_SNIPPETS: dict[str, str] = {
           stage: build
           image: eclipse-temurin:21-jdk
           script:
-            - ./mvnw package -DskipTests || ./gradlew build -x test || true
+            - ./mvnw package -DskipTests || ./gradlew build -x test
 
         java-test:
           stage: test
           image: eclipse-temurin:21-jdk
           script:
-            - ./mvnw test || ./gradlew test || true
+            - ./mvnw test || ./gradlew test
           needs: [java-build]
         """
     ),
@@ -1718,7 +1796,7 @@ _STACK_JOB_SNIPPETS: dict[str, str] = {
           image: ruby:3.3-slim
           script:
             - bundle install
-            - bundle exec rspec || true
+            - bundle exec rspec
         """
     ),
     "docker": textwrap.dedent(
@@ -1732,7 +1810,7 @@ _STACK_JOB_SNIPPETS: dict[str, str] = {
             DOCKER_TLS_CERTDIR: "/certs"
           script:
             - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA .
-            - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA || true
+            - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
         """
     ),
     "k8s": textwrap.dedent(
@@ -1741,7 +1819,7 @@ _STACK_JOB_SNIPPETS: dict[str, str] = {
           stage: test
           image: bitnami/kubectl:latest
           script:
-            - kubectl apply --dry-run=client -f k8s/ || kubectl apply --dry-run=client -f kubernetes/ || true
+            - kubectl apply --dry-run=client -f k8s/ || kubectl apply --dry-run=client -f kubernetes/
         """
     ),
 }
