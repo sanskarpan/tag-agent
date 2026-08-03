@@ -564,6 +564,67 @@ def cmd_webhook_server(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # PRD-057/058/059/060/061/062/063: ci extensions command handler
 # ---------------------------------------------------------------------------
+def cmd_doc(args: argparse.Namespace) -> int:
+    """`tag doc` — document ingestion (PRD-133).
+
+    Mirrors `tag doc` in the Go harness; keep the two in step.
+    """
+    from tag import docs as docsmod
+
+    sub = getattr(args, "doc_subcommand", None)
+
+    if sub == "check":
+        path = docsmod.engine_path()
+        target = getattr(args, "file", None)
+        out = {"available": path is not None, "engine": path}
+        if path is None:
+            out["hint"] = docsmod.INSTALL_HINT
+        if target:
+            out["file"] = target
+            out["supported"] = docsmod.supported(target)
+        if getattr(args, "json", False):
+            print(json.dumps(out, indent=2))
+        elif path is None:
+            print(f"document support: NOT available\n  {docsmod.INSTALL_HINT}")
+        else:
+            print(f"document support: available ({path})")
+        if target and not getattr(args, "json", False):
+            print(f"{target}: " + ("supported" if docsmod.supported(target)
+                                   else "not a supported document type"))
+        # Absence is information, not failure: a caller scripting around this
+        # needs to branch on it, not catch it.
+        return 0
+
+    if sub == "read":
+        try:
+            doc = docsmod.extract(
+                args.file,
+                max_bytes=getattr(args, "max_bytes", 0) or docsmod.MAX_MARKDOWN_BYTES,
+                skip_verify=getattr(args, "skip_verify", False),
+            )
+        except docsmod.DocumentUnavailable as exc:
+            print_error(str(exc))
+            return 2
+        except docsmod.DocumentError as exc:
+            print_error(str(exc))
+            return 1
+        if getattr(args, "json", False):
+            print(json.dumps(doc.to_dict(), indent=2))
+        else:
+            print(doc.markdown)
+            # Caveats to stderr so stdout stays a usable document — the obvious
+            # use of this command is a redirect into a file.
+            for n in doc.notes:
+                print(f"note: {n}", file=sys.stderr)
+        # A partial read is "ran fine, and what you got is not everything".
+        # Reporting success for a document with unreadable pages is how a caller
+        # ends up acting on half a spec.
+        return 0 if doc.complete else 3
+
+    print_error(f"Unknown doc subcommand: {sub!r}")
+    return 2
+
+
 def cmd_ci_ext(args: argparse.Namespace) -> int:
     sub = getattr(args, "ci_subcommand", None)
     try:
@@ -1128,6 +1189,20 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     aci_flaky.add_argument("--dry-run", action="store_true")
     for ap in [aci_cmd, aci_testgen, aci_action, aci_sast, aci_diag, aci_review, aci_pipeline, aci_flaky]:
         ap.set_defaults(func=cmd_ci_ext)
+
+    # ── PRD-133: document ingestion ─────────────────────────────────────────
+    doc_cmd = sub.add_parser("doc", help="Read documents (PDF) as text")
+    doc_sub = doc_cmd.add_subparsers(dest="doc_subcommand")
+    doc_read = doc_sub.add_parser("read", help="Extract a document as markdown")
+    doc_read.add_argument("file", metavar="FILE")
+    doc_read.add_argument("--max-bytes", type=int, default=0,
+                          help="cap the extracted text (0 = default 1 MiB)")
+    doc_read.add_argument("--skip-verify", action="store_true",
+                          help="skip the per-page check that confirms each page produced text")
+    doc_check = doc_sub.add_parser("check", help="Report whether document support is available")
+    doc_check.add_argument("file", metavar="FILE", nargs="?")
+    for ap in [doc_cmd, doc_read, doc_check]:
+        ap.set_defaults(func=cmd_doc)
 
     # ── PRD-064: swe-agent harness ──────────────────────────────────────────
     swe_cmd = sub.add_parser("swe-solve", help="SWE-Agent style agentic task solver")
