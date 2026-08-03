@@ -95,12 +95,16 @@ func ScaffoldGitHubAction(workflowType string) string {
 	b.WriteString("          python-version: '3.11'\n")
 	b.WriteString("\n")
 	b.WriteString("      - name: Install TAG\n")
-	b.WriteString("        run: pip install tag-agent\n")
+	fmt.Fprintf(&b, "        # Pinned deliberately. An unpinned install lets a PyPI release change\n")
+	fmt.Fprintf(&b, "        # this pipeline's behaviour -- including its exit codes -- with no review\n")
+	fmt.Fprintf(&b, "        # on your side. Bump this when you have read the release notes.\n")
+	fmt.Fprintf(&b, "        run: pip install 'tag-agent==%s'\n", ScaffoldPinnedVersion)
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "      - name: Run TAG %s\n", title)
 	b.WriteString("        env:\n")
 	b.WriteString("          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}\n")
 	b.WriteString("          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n")
+	b.WriteString(exitCodeComment(workflowType))
 	fmt.Fprintf(&b, "        run: %s\n", runCmd)
 	return b.String()
 }
@@ -116,4 +120,45 @@ func TypesHint() string {
 	ts := append([]string(nil), WorkflowTypes...)
 	sort.Strings(ts)
 	return strings.Join(ts, ", ")
+}
+
+// ScaffoldPinnedVersion is the tag-agent release the generated workflow installs.
+//
+// The generated workflow used to say `pip install tag-agent`, unpinned. That
+// handed every user's CI whatever PyPI served at run time -- so a release that
+// changes an exit code (0.10.0 changed several) silently changes the meaning of
+// their pipeline, with no review on their side and no way to notice until a
+// build goes red or, worse, stops going red.
+//
+// This is the same reasoning pyproject.toml already applies to TAG's own
+// dependencies, where every pin is exact because "ranges allow PyPI to ship a
+// fresh version at any time without a code review on our side". Generating
+// unpinned installs for other people while pinning our own was inconsistent.
+//
+// Keep this in step with the released version when cutting a release.
+const ScaffoldPinnedVersion = "0.10.0"
+
+// exitCodeComment documents what a non-zero exit means for the generated step,
+// so a red build is self-explaining rather than a mystery.
+//
+// A gate that fails the build without saying which of "the tool broke", "you
+// invoked it wrong" and "it worked and found problems" happened is a gate people
+// disable.
+func exitCodeComment(workflowType string) string {
+	var what string
+	switch workflowType {
+	case "fix-vuln":
+		what = "vulnerabilities remain unfixed"
+	case "review":
+		what = "a requested signal class reported findings"
+	case "flaky-fix":
+		what = "flaky tests were detected"
+	default:
+		// test-gen, eval and anything else are advisory: they do not emit
+		// exitFindings, so there is no third case to explain.
+		return "        # Exit codes: 0 = ok, 1 = the run failed, 2 = usage error.\n"
+	}
+	return "        # Exit codes: 0 = ok; 3 = ran fine but " + what + " (this fails the\n" +
+		"        # step on purpose -- add --exit-zero to make it advisory);\n" +
+		"        # 1 = the run itself failed; 2 = usage error.\n"
 }
