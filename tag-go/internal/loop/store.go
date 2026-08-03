@@ -400,19 +400,61 @@ type ApprovalRequest struct {
 	RequestedAt   string `json:"requested_at"`
 }
 
-// requestApprovalRow publishes a pending checkpoint. It replaces any previous
-// request for this loop so a stale decision from an earlier iteration can never
-// auto-approve a later one.
-func requestApprovalRow(db *sql.DB, id string, iteration int, preview string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	_, err := execRetry(ctx, db,
-		`INSERT INTO loop_approvals(loop_id, iteration, output_preview, decision, requested_at, decided_at)
-		 VALUES(?,?,?,'pending',?,NULL)
-		 ON CONFLICT(loop_id) DO UPDATE SET iteration=excluded.iteration,
-		   output_preview=excluded.output_preview, decision='pending',
-		   requested_at=excluded.requested_at, decided_at=NULL`,
-		id, iteration, preview, now())
+// openApprovalCheckpoint records the pending approval AND flips the run to
+// waiting_approval in one transaction.
+//
+// These used to be two statements. Between them any other process — the CLI,
+// another connection — saw a pending approval on a loop whose status still said
+// `running`, so an observer polling status to answer "is this gated?" got the
+// wrong answer. The window was small, which is why it surfaced as a flaky test
+// rather than a bug report:
+//
+//	loop_test.go:362: status while gated = "running", want waiting_approval
+//
+// A checkpoint is one fact about the run. Writing it as one fact removes both
+// the flake and the inconsistency it was reporting.
+func openApprovalCheckpoint(ctx context.Context, db *sql.DB, id string, iteration int, preview string) error {
+	const attempts = 40
+	delay := 25 * time.Millisecond
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = func() error {
+			tx, terr := db.BeginTx(ctx, nil)
+			if terr != nil {
+				return terr
+			}
+			defer tx.Rollback() //nolint:errcheck // no-op after a successful commit
+			if _, e := tx.ExecContext(ctx,
+				`INSERT INTO loop_approvals(loop_id, iteration, output_preview, decision, requested_at, decided_at)
+				 VALUES(?,?,?,'pending',?,NULL)
+				 ON CONFLICT(loop_id) DO UPDATE SET iteration=excluded.iteration,
+				   output_preview=excluded.output_preview, decision='pending',
+				   requested_at=excluded.requested_at, decided_at=NULL`,
+				id, iteration, preview, now()); e != nil {
+				return e
+			}
+			ts := now()
+			if _, e := tx.ExecContext(ctx,
+				`UPDATE loop_runs SET status=?, updated_at=?, completed_at=NULL WHERE id=?`,
+				StatusWaitingApproval, ts, id); e != nil {
+				return e
+			}
+			return tx.Commit()
+		}(); err == nil {
+			return nil
+		}
+		if !isBusy(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay < 400*time.Millisecond {
+			delay *= 2
+		}
+	}
 	return err
 }
 
