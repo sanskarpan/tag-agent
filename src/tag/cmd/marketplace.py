@@ -488,53 +488,62 @@ def cmd_eval(args: argparse.Namespace) -> int:
         passed = 0
         failed = 0
         unchecked = 0
-        for case in cases:
-            case_id = case.get("id", f"case_{cases.index(case)+1}")
-            input_text = case.get("input", "")
+        # An interrupted run left `status='running'` forever, so `eval list`
+        # accumulated phantom in-flight runs that nothing would ever finish.
+        # KeyboardInterrupt and SIGTERM both land here.
+        interrupted = False
+        try:
+            for case in cases:
+                case_id = case.get("id", f"case_{cases.index(case)+1}")
+                input_text = case.get("input", "")
 
-            if dry_run:
-                # A dry run validates the suite; it does not produce results.
-                # Writing passed=1/score=1.0 rows made a dry run indistinguishable
-                # from a real all-green run in `eval list`.
-                output = "(dry-run — no agent invocation)"
-                ok, score, reason = None, None, "dry run: the case was not executed"
-            else:
-                # --json so the MODEL's output can be scored.
-                #
-                # This used to score `result.stdout` -- the human-readable
-                # submission acknowledgement ("run_id: ... status: queued"), not
-                # the model's answer. Every score Python produced was computed
-                # against a receipt.
-                result = subprocess.run(
-                    [sys.executable, "-m", "tag", "--config",
-                     str(config_path(getattr(args, "config", None)) or ""),
-                     "submit", "--task-type", "mixed", "--prompt", input_text,
-                     "--master-profile", profile, "--source", "eval", "--json"],
-                    capture_output=True, text=True, timeout=300,
-                )
-                output, extract_err = _extract_model_output(result)
-                if extract_err:
-                    # Refuse to score rather than score the wrong text. A case
-                    # whose output could not be obtained is an ERROR, not a
-                    # failure of the model and certainly not a pass.
-                    ok, score, reason = False, 0.0, extract_err
+                if dry_run:
+                    # A dry run validates the suite; it does not produce results.
+                    # Writing passed=1/score=1.0 rows made a dry run indistinguishable
+                    # from a real all-green run in `eval list`.
+                    output = "(dry-run — no agent invocation)"
+                    ok, score, reason = None, None, "dry run: the case was not executed"
                 else:
-                    ok, score, reason = score_case(case, output)
+                    # --json so the MODEL's output can be scored.
+                    #
+                    # This used to score `result.stdout` -- the human-readable
+                    # submission acknowledgement ("run_id: ... status: queued"), not
+                    # the model's answer. Every score Python produced was computed
+                    # against a receipt.
+                    result = subprocess.run(
+                        [sys.executable, "-m", "tag", "--config",
+                         str(config_path(getattr(args, "config", None)) or ""),
+                         "submit", "--task-type", "mixed", "--prompt", input_text,
+                         "--master-profile", profile, "--source", "eval", "--json"],
+                        capture_output=True, text=True, timeout=300,
+                    )
+                    output, extract_err = _extract_model_output(result)
+                    if extract_err:
+                        # Refuse to score rather than score the wrong text. A case
+                        # whose output could not be obtained is an ERROR, not a
+                        # failure of the model and certainly not a pass.
+                        ok, score, reason = False, 0.0, extract_err
+                    else:
+                        ok, score, reason = score_case(case, output)
 
-            if not dry_run:
-                record_case_result(
-                    db, run_id, case_id, input_text, output,
-                    passed=ok, score=score, failure_reason=reason,
-                )
-                if ok:
-                    passed += 1
-                else:
-                    failed += 1
-                if reason == NO_CHECKS_REASON:
-                    unchecked += 1
-                status_char = "✓" if ok else "✗"
-                print(f"  [{status_char}] {case_id}  score={score:.2f}" +
-                      (f"  {reason}" if reason else ""))
+                if not dry_run:
+                    record_case_result(
+                        db, run_id, case_id, input_text, output,
+                        passed=ok, score=score, failure_reason=reason,
+                    )
+                    if ok:
+                        passed += 1
+                    else:
+                        failed += 1
+                    if reason == NO_CHECKS_REASON:
+                        unchecked += 1
+                    status_char = "✓" if ok else "✗"
+                    print(f"  [{status_char}] {case_id}  score={score:.2f}" +
+                          (f"  {reason}" if reason else ""))
+
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\ninterrupted: recording the run as cancelled.", file=sys.stderr)
 
         if dry_run:
             # Nothing ran, so there is nothing to finalize. Leaving a
@@ -544,6 +553,11 @@ def cmd_eval(args: argparse.Namespace) -> int:
             return 0
 
         summary = finalize_eval_run(db, run_id)
+        if interrupted:
+            db.execute("UPDATE eval_runs SET status='cancelled' WHERE id=?", (run_id,))
+            db.commit()
+            summary["status"] = "cancelled"
+            summary["interrupted"] = True
         if unchecked:
             summary["unchecked"] = unchecked
         db.close()
@@ -555,6 +569,8 @@ def cmd_eval(args: argparse.Namespace) -> int:
             if unchecked:
                 print(f"WARNING: {unchecked} case(s) define no assertions and could not have failed; "
                       f"they are counted as passes but verify nothing.")
+        if interrupted:
+            return 130
         return 0 if failed == 0 else 1
 
     if sub == "list":
