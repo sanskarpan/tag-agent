@@ -12,6 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from tag import __version__
+
+# Pinned so a PyPI release cannot silently change a user's pipeline; see ci.py.
+_PINNED_VERSION = __version__
+
 
 @dataclass
 class EvalCIResult:
@@ -190,7 +195,7 @@ def scaffold_github_action(
                   python-version: '3.11'
 
               - name: Install TAG
-                run: pip install tag-agent
+                run: pip install 'tag-agent=={_PINNED_VERSION}'
 
               - name: Run TAG {workflow_type.replace('-', ' ').title()}
                 env:
