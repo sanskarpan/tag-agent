@@ -94,3 +94,53 @@ def test_the_old_receipt_text_would_now_be_refused():
     receipt = "run_id: run-mixed-4a54aa3687\nstatus: queued\nresearcher: ok\ncoder: ok\n"
     out, err = _extract_model_output(_result(stdout=receipt))
     assert err and out == ""
+
+
+# --- an interrupted run must not be stranded ---------------------------------
+
+def test_interrupted_run_is_marked_cancelled(tmp_path, monkeypatch):
+    """An interrupted eval left status='running' forever.
+
+    `eval list` then accumulated phantom in-flight runs that nothing would ever
+    finish, and a caller could not tell a run still going from one that died.
+    """
+    import sqlite3
+    import tag.cmd.marketplace as mk
+
+    suite = tmp_path / "s.yaml"
+    suite.write_text("name: s\ncases:\n  - id: c1\n    input: hi\n    expect_contains: [hi]\n")
+
+    monkeypatch.setenv("TAG_HOME", str(tmp_path / "home"))
+
+    # Interrupt during the first case, exactly as Ctrl-C would.
+    # cmd_eval imports subprocess locally, so patch the module it resolves to.
+    import subprocess as _sp
+
+    def boom(*a, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_sp, "run", boom)
+
+    args = mk.argparse.Namespace(
+        eval_subcommand="run", suite=str(suite), profile="orchestrator",
+        dry_run=False, config=None, json=False,
+    )
+    rc = mk.cmd_eval(args)
+    assert rc == 130, f"an interrupted run should report 130, got {rc}"
+
+    # Find the run row and confirm it is not stranded.
+    home = tmp_path / "home"
+    dbs = list(home.rglob("*.sqlite3")) + list(home.rglob("*.db"))
+    assert dbs, "no database was created"
+    for p in dbs:
+        conn = sqlite3.connect(p)
+        try:
+            rows = conn.execute("SELECT status FROM eval_runs").fetchall()
+        except sqlite3.OperationalError:
+            continue
+        finally:
+            conn.close()
+        if rows:
+            assert all(r[0] != "running" for r in rows), \
+                f"an interrupted run was left in 'running': {rows}"
+            return

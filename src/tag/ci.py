@@ -2180,15 +2180,36 @@ def fix_flaky_test(
     raw_output = proc.stdout.strip()
 
     # Split out the explanation line.
+    #
+    # The marker is the CONTRACT SIGNAL, not a nicety. The prompt requires the
+    # model to emit "EXPLANATION:" after the corrected file; without it there is
+    # no evidence the response is a test file at all. The old code set
+    # `fixed_code = raw_output` in that case and wrote the whole reply into the
+    # test -- so a model answering "I cannot fix this because the race is in the
+    # fixture" had its prose written over the test, and the tool reported
+    # fix_applied=True. Overwriting a working test with an apology is worse than
+    # not fixing it.
     explanation = ""
-    fixed_code = raw_output
-    if "EXPLANATION:" in raw_output:
+    fixed_code = ""
+    contract_ok = "EXPLANATION:" in raw_output
+    if contract_ok:
         idx = raw_output.rfind("EXPLANATION:")
         explanation = raw_output[idx + len("EXPLANATION:"):].strip()
         fixed_code = raw_output[:idx].strip()
 
+    skipped = None
+    if proc.returncode != 0:
+        skipped = f"the model call failed (exit {proc.returncode})"
+    elif not contract_ok:
+        skipped = (
+            "the model did not emit the required EXPLANATION: marker, so its reply "
+            "is not a corrected test file; nothing was written"
+        )
+    elif not fixed_code:
+        skipped = "the model emitted an explanation but no file content"
+
     fix_applied = False
-    if not dry_run and fixed_code and proc.returncode == 0:
+    if not dry_run and not skipped:
         test_file.write_text(fixed_code, encoding="utf-8")
         fix_applied = True
 
@@ -2197,6 +2218,7 @@ def fix_flaky_test(
         "fixed_code": fixed_code,
         "fix_applied": fix_applied,
         "explanation": explanation,
+        "skipped": skipped,
     }
 
 
