@@ -616,3 +616,66 @@ func waitFor(t *testing.T, limit time.Duration, cond func() bool) {
 	}
 	t.Fatalf("condition not met within %s", limit)
 }
+
+// TestApprovalCheckpointIsAtomic pins the fix for a CI flake that was reporting
+// a real inconsistency.
+//
+// The pending-approval row and the waiting_approval status used to be two
+// statements, so between them another connection saw a gated loop still
+// reporting `running`. An observer polling status to answer "is this gated?"
+// got the wrong answer, and the test that caught it looked merely flaky:
+//
+//	loop_test.go:362: status while gated = "running", want waiting_approval
+//
+// The window is only observable by a CONCURRENT reader on a SECOND connection —
+// reading after the write returns sees both halves and proves nothing, which is
+// how the first version of this test managed to pass against the broken code.
+func TestApprovalCheckpointIsAtomic(t *testing.T) {
+	db := testDB(t)
+	id, _ := Create(db.DB, "p", "goal", 1, ApprovalHuman)
+	other, err := store.OpenPath(db.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+
+	stop := make(chan struct{})
+	bad := make(chan string, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			a, aerr := PendingApproval(other.DB, id)
+			s, serr := Status(other.DB, id)
+			if aerr == nil && serr == nil && a != nil && a.Decision == "pending" &&
+				s != StatusWaitingApproval {
+				select {
+				case bad <- s:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 200; i++ {
+		if err := openApprovalCheckpoint(context.Background(), db.DB, id, i+1, "preview"); err != nil {
+			close(stop)
+			t.Fatal(err)
+		}
+		if err := Decide(db.DB, id, true); err != nil {
+			close(stop)
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+
+	select {
+	case s := <-bad:
+		t.Fatalf("a pending approval was visible while the status still said %q", s)
+	default:
+	}
+}
