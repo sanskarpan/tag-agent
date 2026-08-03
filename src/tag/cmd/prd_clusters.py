@@ -607,10 +607,22 @@ def cmd_ci_ext(args: argparse.Namespace) -> int:
         except (ValueError, FileNotFoundError) as exc:
             print_error(str(exc))
             return 2
+        except (AttributeError, TypeError, IndexError, KeyError) as exc:
+            # A shape the validator did not anticipate is still a malformed
+            # file, not a runtime failure of ours. Without this it escaped as
+            # exit 1, so a CI gate could not tell "your SARIF is broken" from
+            # "the tool crashed". The Go harness returns 2 for all of these.
+            print_error(f"Malformed SARIF file {sarif_path}: {type(exc).__name__}: {exc}")
+            return 2
         if not vulns:
             print("No vulnerabilities found")
             return 0
-        result = fix_sarif_vulns(vulns, profile, cfg, dry_run=getattr(args, "dry_run", False))
+        # fix_sarif_vulns takes the SARIF PATH, not the parsed findings.
+        # Passing `vulns` raised "argument should be a str or os.PathLike, not
+        # 'list'" on every SARIF that actually had a finding -- so the
+        # has-findings path had never run, and the exit-3 gate below was
+        # unreachable code.
+        result = fix_sarif_vulns(sarif_path, profile, cfg, dry_run=getattr(args, "dry_run", False))
         print(result)
         # "Ran fine and found problems" is exit 3, matching the Go harness and
         # the rest of this command family. Exiting 0 with vulnerabilities left

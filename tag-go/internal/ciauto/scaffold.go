@@ -95,10 +95,16 @@ func ScaffoldGitHubAction(workflowType string) string {
 	b.WriteString("          python-version: '3.11'\n")
 	b.WriteString("\n")
 	b.WriteString("      - name: Install TAG\n")
-	fmt.Fprintf(&b, "        # Pinned deliberately. An unpinned install lets a PyPI release change\n")
-	fmt.Fprintf(&b, "        # this pipeline's behaviour -- including its exit codes -- with no review\n")
-	fmt.Fprintf(&b, "        # on your side. Bump this when you have read the release notes.\n")
-	fmt.Fprintf(&b, "        run: pip install 'tag-agent==%s'\n", ScaffoldPinnedVersion)
+	fmt.Fprintf(&b, "        # Version-bounded deliberately. An unbounded install lets a PyPI release\n")
+	fmt.Fprintf(&b, "        # change this pipeline's behaviour -- including its exit codes -- with no\n")
+	fmt.Fprintf(&b, "        # review on your side.\n")
+	fmt.Fprintf(&b, "        #\n")
+	fmt.Fprintf(&b, "        # A compatible-release bound rather than ==: patch and minor fixes still\n")
+	fmt.Fprintf(&b, "        # reach you, while the next major (which is where exit codes change) does\n")
+	fmt.Fprintf(&b, "        # not. Dependabot cannot see a pin inside a run: line, so the marker below\n")
+	fmt.Fprintf(&b, "        # is what lets Renovate bump it for you.\n")
+	fmt.Fprintf(&b, "        # renovate: datasource=pypi depName=tag-agent\n")
+	fmt.Fprintf(&b, "        run: pip install 'tag-agent~=%s'\n", ScaffoldPinnedVersion)
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "      - name: Run TAG %s\n", title)
 	b.WriteString("        env:\n")
@@ -141,24 +147,30 @@ const ScaffoldPinnedVersion = "0.10.0"
 // exitCodeComment documents what a non-zero exit means for the generated step,
 // so a red build is self-explaining rather than a mystery.
 //
-// A gate that fails the build without saying which of "the tool broke", "you
-// invoked it wrong" and "it worked and found problems" happened is a gate people
-// disable.
+// It is keyed on the COMMAND the step actually runs, not on the workflow name.
+// An earlier version keyed on the workflow name and advertised --exit-zero next
+// to `tag review-pr`, which has no such flag on either harness -- the exit-3
+// contract lives in `agentic-ci review`, a different command. A comment that
+// describes a flag the step does not accept is worse than no comment.
 func exitCodeComment(workflowType string) string {
-	var what string
 	switch workflowType {
 	case "fix-vuln":
-		what = "vulnerabilities remain unfixed"
+		// runCommand emits `tag agentic-ci fix-vuln`, which does gate.
+		return "        # Exit codes: 0 = ok; 3 = ran fine but vulnerabilities remain unfixed\n" +
+			"        # (this fails the step on purpose — add --exit-zero to make it advisory);\n" +
+			"        # 1 = the run itself failed; 2 = usage error.\n"
+	case "eval":
+		// `tag eval-ci run` fails the build with exit 1 when the suite is under
+		// threshold. Calling that advisory would be wrong.
+		return "        # Exit codes: 0 = the suite met the threshold; 1 = it did not, OR the run\n" +
+			"        # failed (eval-ci does not distinguish the two); 2 = usage error.\n"
 	case "review":
-		what = "a requested signal class reported findings"
-	case "flaky-fix":
-		what = "flaky tests were detected"
+		// `tag review-pr` reports and returns 0; it is not a gate.
+		return "        # Exit codes: 0 = the review ran (findings are reported, not gated);\n" +
+			"        # 1 = the run failed; 2 = usage error. For a gating review use\n" +
+			"        # `tag agentic-ci review <PR_REF>`, which exits 3 on findings.\n"
 	default:
-		// test-gen, eval and anything else are advisory: they do not emit
-		// exitFindings, so there is no third case to explain.
+		// test-gen and anything else are advisory by nature.
 		return "        # Exit codes: 0 = ok, 1 = the run failed, 2 = usage error.\n"
 	}
-	return "        # Exit codes: 0 = ok; 3 = ran fine but " + what + " (this fails the\n" +
-		"        # step on purpose -- add --exit-zero to make it advisory);\n" +
-		"        # 1 = the run itself failed; 2 = usage error.\n"
 }

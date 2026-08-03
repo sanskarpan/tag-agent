@@ -195,7 +195,8 @@ def scaffold_github_action(
                   python-version: '3.11'
 
               - name: Install TAG
-                run: pip install 'tag-agent=={_PINNED_VERSION}'
+                # renovate: datasource=pypi depName=tag-agent
+                run: pip install 'tag-agent~={_PINNED_VERSION}'
 
               - name: Run TAG {workflow_type.replace('-', ' ').title()}
                 env:

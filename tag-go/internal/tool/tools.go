@@ -380,6 +380,13 @@ func readFileTool(opts Options) agent.Tool {
 			if err != nil {
 				return "", err
 			}
+			// A byte cap can land mid-rune, which would make an ordinary text file
+			// look like invalid UTF-8 and be refused as binary. Trim before the
+			// check, not after it.
+			truncated := int64(len(b)) == opts.MaxReadBytes
+			if truncated {
+				b = trimPartialRune(b)
+			}
 			// The tool promises a UTF-8 text file. Handing back a PDF's bytes and
 			// reporting success is the fabricated-success pattern, and an expensive
 			// one: ~100k tokens of deflate output before the model can discover it
@@ -393,13 +400,17 @@ func readFileTool(opts Options) agent.Tool {
 			}
 			// Truncation has to be stated even for text. Returning 29% of a file and
 			// reporting success is the same broken guarantee in a quieter form.
-			if int64(len(b)) == opts.MaxReadBytes {
+			if truncated {
 				if st, serr := f.Stat(); serr == nil && st.Size() > opts.MaxReadBytes {
-					return string(b) + fmt.Sprintf(
-						"\n\n[read_file: TRUNCATED — returned the first %s of %s. "+
-							"%s was not read.]",
-						humanBytes(opts.MaxReadBytes), humanBytes(st.Size()),
-						humanBytes(st.Size()-opts.MaxReadBytes)), nil
+					// The notice goes FIRST and is phrased as an instruction. The
+					// only way to edit a file here is read-whole then write-whole
+					// (write_file takes full content), so a trailing marker invites
+					// the model to write the truncated content back and destroy the
+					// unread remainder -- turning a read-side limit into data loss.
+					return fmt.Sprintf(
+						"%s\n\n%s",
+						truncationNotice(opts.MaxReadBytes, st.Size()),
+						string(b)), nil
 				}
 			}
 			return string(b), nil
@@ -423,6 +434,17 @@ func writeFileTool(opts Options) agent.Tool {
 				return "", err
 			}
 			content := strArg(in, "content")
+			// Refuse to write back a truncated read. The only edit path here is
+			// read-whole then write-whole, so a model that reads a >MaxReadBytes
+			// file and writes it back would destroy everything past the cap and
+			// inject the notice into the source. The read side warns; this side
+			// makes the warning enforceable.
+			if strings.Contains(content, TruncationMarker) {
+				return "", fmt.Errorf(
+					"write_file: refusing to write content that contains the read_file " +
+						"truncation notice — it is an INCOMPLETE read of a larger file, and " +
+						"writing it back would discard everything past the cap")
+			}
 			if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 				return "", err
 			}

@@ -34,7 +34,7 @@ def _scaffolds():
 @pytest.mark.parametrize("name,out", list(_scaffolds()))
 def test_install_is_pinned(name, out):
     assert "pip install tag-agent\n" not in out, f"{name}: unpinned install"
-    assert f"tag-agent=={__version__}" in out, f"{name}: not pinned to {__version__}"
+    assert f"tag-agent~={__version__}" in out, f"{name}: not pinned to {__version__}"
 
 
 @pytest.mark.parametrize("name,out", list(_scaffolds()))
@@ -47,6 +47,9 @@ def test_no_unrendered_placeholder(name, out):
 
 @pytest.mark.parametrize("name,out", list(_scaffolds()))
 def test_generated_yaml_parses(name, out):
-    yaml = pytest.importorskip("yaml")
+    # pyyaml is a hard dependency; importorskip on a required dep turns a
+    # real failure into a silent skip.
+    import yaml
+
     doc = yaml.safe_load(out)
     assert isinstance(doc, dict) and "jobs" in doc, f"{name}: not a valid workflow"

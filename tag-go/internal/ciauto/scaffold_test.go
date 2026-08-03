@@ -117,7 +117,7 @@ func TestScaffoldPinsTheInstall(t *testing.T) {
 		if strings.Contains(out, "pip install tag-agent\n") {
 			t.Errorf("%s: the generated workflow installs tag-agent unpinned", wf)
 		}
-		if !strings.Contains(out, "tag-agent=="+ScaffoldPinnedVersion) {
+		if !strings.Contains(out, "tag-agent~="+ScaffoldPinnedVersion) {
 			t.Errorf("%s: expected a pinned install of %s:\n%s", wf, ScaffoldPinnedVersion, out)
 		}
 	}
@@ -127,18 +127,32 @@ func TestScaffoldPinsTheInstall(t *testing.T) {
 // invoked it wrong" and "it worked and found problems" happened is a gate people
 // disable. The gating workflows must explain their exit codes.
 func TestScaffoldDocumentsExitCodes(t *testing.T) {
-	for _, wf := range []string{"fix-vuln", "review"} {
+	// fix-vuln is the only generated workflow whose command actually gates.
+	out := ScaffoldGitHubAction("fix-vuln")
+	if !strings.Contains(out, "3 = ran fine but") {
+		t.Errorf("fix-vuln: exit 3 is not explained:\n%s", out)
+	}
+	if !strings.Contains(out, "--exit-zero") {
+		t.Errorf("fix-vuln: the advisory escape hatch is not mentioned")
+	}
+
+	// The comment must describe the command the step RUNS. review-pr has no
+	// --exit-zero on either harness, and eval-ci fails the build with exit 1 —
+	// an earlier version advertised a flag the step does not accept and called
+	// a real gate advisory.
+	for wf, mustNot := range map[string]string{
+		"review":   "--exit-zero",
+		"test-gen": "3 = ran fine but",
+		"eval":     "--exit-zero",
+	} {
 		out := ScaffoldGitHubAction(wf)
-		if !strings.Contains(out, "3 = ran fine but") {
-			t.Errorf("%s: exit 3 is not explained:\n%s", wf, out)
-		}
-		if !strings.Contains(out, "--exit-zero") {
-			t.Errorf("%s: the advisory escape hatch is not mentioned", wf)
+		if strings.Contains(out, mustNot) {
+			t.Errorf("%s: comment mentions %q, which does not apply to the command it runs:\n%s",
+				wf, mustNot, out)
 		}
 	}
-	// Advisory workflows have no exit-3 case and must not claim one.
-	if out := ScaffoldGitHubAction("test-gen"); strings.Contains(out, "3 = ran fine but") {
-		t.Errorf("test-gen is advisory and must not document an exit-3 case:\n%s", out)
+	if out := ScaffoldGitHubAction("eval"); !strings.Contains(out, "1 = it did not") {
+		t.Errorf("eval gates with exit 1 and the comment must say so:\n%s", out)
 	}
 }
 
@@ -152,7 +166,7 @@ func TestScaffoldDocumentsExitCodes(t *testing.T) {
 func TestScaffoldPinMatchesPythonRelease(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join("..", "..", "..", "pyproject.toml"))
 	if err != nil {
-		t.Skipf("pyproject.toml not readable from here: %v", err)
+		t.Fatalf("pyproject.toml not readable from here: %v — a guard that skips is not a guard", err)
 	}
 	m := regexp.MustCompile(`(?m)^version = "([^"]+)"`).FindSubmatch(b)
 	if m == nil {

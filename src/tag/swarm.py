@@ -488,7 +488,9 @@ class SwarmRunner:
                     ))
                 remaining = set()
                 break
-            wave = list(ready)[: self._max_agents]
+            # Deterministic order, so which tasks make the cut is reproducible
+            # rather than dependent on set iteration order.
+            wave = sorted(ready)[: self._max_agents]
             wave_results = self._run_wave(wave, task_by_id)
             for r in wave_results:
                 results.append(r)
@@ -499,7 +501,14 @@ class SwarmRunner:
                     if self._failure_policy == "abort_on_any":
                         self._aborted = True
                         break
-            remaining -= ready
+            # Retire only what actually RAN.
+            #
+            # This was `remaining -= ready`, which retired the whole ready set
+            # while only max_agents of them were dispatched. Every task past the
+            # cap was silently dropped: never run, left `pending`, and the run
+            # still reported `completed`. Work vanished and the status said
+            # everything was fine.
+            remaining -= set(wave)
 
         if self._aborted:
             self._conn.execute(
