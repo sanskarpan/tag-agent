@@ -26,41 +26,61 @@ import (
 // without reading the whole file twice.
 const binaryProbeBytes = 8192
 
+// minRatioSample is the smallest window the control-byte ratio is trusted on.
+const minRatioSample = 512
+
+// tailProbeBytes is sampled from the END of the buffer as well as the head.
+// The head window covers 8 KiB of a 256 KiB read -- 3% -- so a file with an
+// ASCII preamble and binary further in sailed through.
+const tailProbeBytes = 4096
+
 // signature couples a magic-number prefix with the human name of the format, so
 // the refusal can say "PDF" rather than "binary data".
+//
+// confirm is required for magics that are PLAIN PRINTABLE ASCII. Those match
+// ordinary text far too easily -- `MZ` is two letters, so `MZ,Region,Total` in a
+// CSV, base64 starting `MZqQ`, and any prose beginning "MZ " were all refused as
+// Windows executables. `ID3,ID4,Name` was refused as MP3 audio. A printable
+// magic is a hint; it needs a second structural byte before it is evidence.
 type signature struct {
-	magic []byte
-	name  string
+	magic   []byte
+	name    string
+	confirm func(b []byte) bool
 }
 
 // signatures covers the formats a coding agent is actually pointed at by
 // accident. It is not exhaustive and does not need to be — the byte-class
 // heuristic below is the general case, and this list only improves the message.
 var signatures = []signature{
-	{[]byte("%PDF-"), "PDF"},
-	{[]byte("PK\x03\x04"), "ZIP archive (or a zip-based format such as .docx/.xlsx/.pptx/.jar)"},
-	{[]byte("\x89PNG\r\n\x1a\n"), "PNG image"},
-	{[]byte("\xff\xd8\xff"), "JPEG image"},
-	{[]byte("GIF87a"), "GIF image"},
-	{[]byte("GIF89a"), "GIF image"},
-	{[]byte("RIFF"), "RIFF container (WAV/AVI/WebP)"},
-	{[]byte("\x1f\x8b"), "gzip archive"},
-	{[]byte("BZh"), "bzip2 archive"},
-	{[]byte("\xfd7zXZ\x00"), "xz archive"},
-	{[]byte("7z\xbc\xaf\x27\x1c"), "7-Zip archive"},
-	{[]byte("\x7fELF"), "ELF binary"},
-	{[]byte("MZ"), "Windows executable"},
-	{[]byte("\xca\xfe\xba\xbe"), "Mach-O universal binary or Java class file"},
-	{[]byte("\xcf\xfa\xed\xfe"), "Mach-O binary"},
-	{[]byte("SQLite format 3\x00"), "SQLite database"},
-	{[]byte("OggS"), "Ogg media"},
-	{[]byte("fLaC"), "FLAC audio"},
-	{[]byte("ID3"), "MP3 audio"},
-	{[]byte("\x00\x61\x73\x6d"), "WebAssembly module"},
-	{[]byte("wOFF"), "WOFF font"},
-	{[]byte("wOF2"), "WOFF2 font"},
-	{[]byte("\x00\x01\x00\x00\x00"), "TrueType font"},
-	{[]byte("OTTO"), "OpenType font"},
+	{[]byte("%PDF-"), "PDF", nil},
+	{[]byte("PK\x03\x04"), "ZIP archive (or a zip-based format such as .docx/.xlsx/.pptx/.jar)", nil},
+	{[]byte("\x89PNG\r\n\x1a\n"), "PNG image", nil},
+	{[]byte("\xff\xd8\xff"), "JPEG image", nil},
+	{[]byte("GIF87a"), "GIF image", nil},
+	{[]byte("GIF89a"), "GIF image", nil},
+	{[]byte("RIFF"), "RIFF container (WAV/AVI/WebP)", riffForm},
+	{[]byte("\x1f\x8b"), "gzip archive", nil},
+	{[]byte("BZh"), "bzip2 archive", func(b []byte) bool { return len(b) > 3 && b[3] >= '1' && b[3] <= '9' }},
+	{[]byte("\xfd7zXZ\x00"), "xz archive", nil},
+	{[]byte("7z\xbc\xaf\x27\x1c"), "7-Zip archive", nil},
+	{[]byte("\x7fELF"), "ELF binary", nil},
+	{[]byte("MZ"), "Windows executable", hasPEHeader},
+	{[]byte("\xca\xfe\xba\xbe"), "Mach-O universal binary or Java class file", nil},
+	{[]byte("\xcf\xfa\xed\xfe"), "Mach-O binary", nil},
+	{[]byte("SQLite format 3\x00"), "SQLite database", nil},
+	{[]byte("OggS"), "Ogg media", func(b []byte) bool { return len(b) > 4 && b[4] == 0x00 }},
+	{[]byte("fLaC"), "FLAC audio", func(b []byte) bool { return len(b) > 4 && b[4]&0x7f <= 6 }},
+	{[]byte("ID3"), "MP3 audio", func(b []byte) bool {
+		// ID3v2 major version is 2-4 and the size is 7-bit safe. "ID3,ID4,Name"
+		// in a CSV header has ',' here and is text.
+		return len(b) > 9 && b[3] >= 2 && b[3] <= 4 && b[4] != 0xff &&
+			b[6] < 0x80 && b[7] < 0x80 && b[8] < 0x80 && b[9] < 0x80
+	}},
+	{[]byte("\x00\x61\x73\x6d"), "WebAssembly module", nil},
+	{[]byte("wOFF"), "WOFF font", sfntFlavor},
+	{[]byte("wOF2"), "WOFF2 font", sfntFlavor},
+	{[]byte("\x00\x01\x00\x00\x00"), "TrueType font", nil},
+	{[]byte("OTTO"), "OpenType font", func(b []byte) bool { return len(b) > 5 && b[4] == 0x00 }},
 }
 
 // notTextReason returns a human explanation when b is not readable text, or ""
@@ -70,14 +90,32 @@ func notTextReason(b []byte) string {
 		return ""
 	}
 	probe := b
+	var tail []byte
 	if len(probe) > binaryProbeBytes {
 		probe = probe[:binaryProbeBytes]
+		// A tail sample as well as the head: the head window is 3% of a 256 KiB
+		// read, so a file with an ASCII preamble and binary further in slipped
+		// through. Checked SEPARATELY rather than concatenated — splicing two
+		// windows together invents an invalid-UTF-8 junction that is not in the
+		// file.
+		tail = b[len(b)-tailProbeBytes:]
 	}
 
-	for _, s := range signatures {
-		if len(probe) >= len(s.magic) && string(probe[:len(s.magic)]) == string(s.magic) {
-			return "it is a " + s.name
+	// Skip leading whitespace before matching. The loop was anchored at offset
+	// 0, so a single newline in front of "%PDF-" defeated it entirely and the
+	// PDF was returned to the model as text.
+	head := probe
+	for len(head) > 0 && (head[0] == ' ' || head[0] == '\n' || head[0] == '\r' || head[0] == '\t') {
+		head = head[1:]
+	}
+	for _, sig := range signatures {
+		if len(head) < len(sig.magic) || string(head[:len(sig.magic)]) != string(sig.magic) {
+			continue
 		}
+		if sig.confirm != nil && !sig.confirm(head) {
+			continue // printable magic with no corroborating structure: treat as text
+		}
+		return "it is a " + sig.name
 	}
 
 	// UTF-16/UTF-32 are text, but not text this tool can return: the caller gets
@@ -110,22 +148,69 @@ func notTextReason(b []byte) string {
 	// Threshold is deliberately loose: minified JS, base64 blobs, JSON with
 	// escapes and source in any language are all far above it, while a
 	// compressed or encoded payload is far below.
-	ctrl := 0
-	for _, c := range probe {
-		// ESC is deliberately not counted: ANSI colour sequences are ordinary in
-		// build and test logs, which are exactly the files an agent is pointed at.
-		// A short coloured log is >10% ESC and is unambiguously text.
-		if c == 0x1b {
-			continue
+	// A ratio over a handful of bytes is not evidence of anything: "a\x7f" is
+	// 50% control characters and is plainly text. Require a real sample first.
+	if len(probe) >= minRatioSample {
+		ctrl := 0
+		for _, c := range probe {
+			// ESC, BEL and BS are not counted. ANSI colour, progress bars that
+			// backspace over themselves, and terminal bells are all ordinary in
+			// build and test logs -- which are exactly the files an agent is
+			// pointed at. A short coloured log is well over 10% ESC.
+			if c == 0x1b || c == 0x07 || c == 0x08 {
+				continue
+			}
+			if c < 0x09 || (c > 0x0d && c < 0x20) || c == 0x7f {
+				ctrl++
+			}
 		}
-		if c < 0x09 || (c > 0x0d && c < 0x20) || c == 0x7f {
-			ctrl++
+		if ratio := float64(ctrl) / float64(len(probe)); ratio > 0.10 {
+			return fmt.Sprintf("%.0f%% of its bytes are control characters, so it is not text", ratio*100)
 		}
 	}
-	if ratio := float64(ctrl) / float64(len(probe)); ratio > 0.10 {
-		return fmt.Sprintf("%.0f%% of its bytes are control characters, so it is not text", ratio*100)
+	if len(tail) > 0 {
+		if idxByte(tail, 0x00) >= 0 {
+			return "it contains NUL bytes further into the file, so it is not text"
+		}
+		if !utf8.Valid(trimPartialRune(tail[firstRuneStart(tail):])) {
+			return "it is not valid UTF-8 further into the file"
+		}
 	}
 	return ""
+}
+
+// riffForm requires a known RIFF form type, so prose about RIFF containers is
+// not mistaken for one.
+func riffForm(b []byte) bool {
+	if len(b) < 12 {
+		return false
+	}
+	switch string(b[8:12]) {
+	case "WAVE", "AVI ", "WEBP", "RMID":
+		return true
+	}
+	return false
+}
+
+// hasPEHeader checks the PE offset at 0x3c, so "MZ,Region,Total" stays a CSV.
+func hasPEHeader(b []byte) bool {
+	if len(b) < 0x40 {
+		return false
+	}
+	off := int(b[0x3c]) | int(b[0x3d])<<8 | int(b[0x3e])<<16 | int(b[0x3f])<<24
+	return off >= 0 && off+4 <= len(b) && string(b[off:off+4]) == "PE\x00\x00"
+}
+
+// sfntFlavor requires a plausible sfnt flavor field after a web-font magic.
+func sfntFlavor(b []byte) bool {
+	if len(b) < 8 {
+		return false
+	}
+	switch string(b[4:8]) {
+	case "\x00\x01\x00\x00", "OTTO", "true", "ttcf":
+		return true
+	}
+	return false
 }
 
 func idxByte(b []byte, c byte) int {
@@ -174,4 +259,29 @@ func humanBytes(n int64) string {
 	default:
 		return fmt.Sprintf("%d bytes", n)
 	}
+}
+
+// TruncationMarker leads a truncated read_file result. write_file refuses
+// content containing it: the model's only edit path is read-whole then
+// write-whole, so writing back a truncated read would silently destroy
+// everything past the cap.
+const TruncationMarker = "[read_file: TRUNCATED"
+
+func truncationNotice(cap, size int64) string {
+	return fmt.Sprintf(
+		"%s — this is the FIRST %s of a %s file. %s was NOT read. "+
+			"The content below is INCOMPLETE: do not write it back to the file, "+
+			"and do not treat the end of it as the end of the file.]",
+		TruncationMarker, humanBytes(cap), humanBytes(size), humanBytes(size-cap))
+}
+
+// firstRuneStart returns the offset of the first rune boundary in b, so a tail
+// window that begins mid-character is not read as corruption.
+func firstRuneStart(b []byte) int {
+	for i := 0; i < len(b) && i < 4; i++ {
+		if b[i]&0xc0 != 0x80 {
+			return i
+		}
+	}
+	return 0
 }
