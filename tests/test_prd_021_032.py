@@ -708,7 +708,25 @@ class TestEvalFramework:
         with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
             TAG.cmd_eval(args)
         out = capsys.readouterr().out
-        assert "1/1 passed" in out or "Results" in out
+        # A dry run validates the suite; it does not produce results. This
+        # previously asserted "1/1 passed" — pinning the exact lie, because the
+        # runner wrote passed=1/score=1.0 rows and a `completed` run for cases
+        # that were never executed, making a dry run indistinguishable from a
+        # real all-green run in `eval list`.
+        assert "dry run" in out.lower()
+        assert "passed" not in out, f"a dry run must not claim passes: {out!r}"
+        # And nothing may be recorded.
+        import sqlite3 as _sq
+        conn = _sq.connect(cfg["paths"]["db"] if "db" in cfg.get("paths", {}) else str(tmp_path / "tag.db"))
+        try:
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM eval_case_results"
+            ).fetchone()[0]
+            assert rows == 0, f"a dry run recorded {rows} case result(s)"
+        except _sq.OperationalError:
+            pass  # table never created — also acceptable, nothing was recorded
+        finally:
+            conn.close()
 
 
 # ===========================================================================
