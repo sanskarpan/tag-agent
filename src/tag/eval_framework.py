@@ -99,6 +99,17 @@ def load_suite(suite_path: Path) -> dict[str, Any]:
     return data
 
 
+# Marker returned for a case that defines no assertions. The runner counts these
+# separately so "everything passed" cannot be built out of cases that could not
+# have failed.
+NO_CHECKS_REASON = "NO CHECKS: this case defines no assertions and cannot fail"
+
+
+def _normalize(text: str) -> str:
+    """Collapse whitespace and case for expected_output comparison."""
+    return " ".join(text.split()).lower()
+
+
 def score_case(case: dict[str, Any], output: str) -> tuple[bool, float, str | None]:
     """Score a single eval case against the model output.
 
@@ -132,6 +143,23 @@ def score_case(case: dict[str, Any], output: str) -> tuple[bool, float, str | No
         else:
             reasons.append(f"regex not matched: {pattern!r}")
 
+    # expected_output
+    #
+    # This was accepted in suites and never checked. `eval-dataset export`
+    # emits cases whose ONLY field is expected_output, so every dataset-derived
+    # suite had zero checks and passed unconditionally. The Go port scores it
+    # (internal/eval/score.go); this brings Python in line.
+    #
+    # Compared on normalised whitespace and case: an exact byte match would fail
+    # on trailing newlines and make the check useless in practice.
+    expected = case.get("expected_output")
+    if expected is not None:
+        checks += 1
+        if _normalize(str(expected)) == _normalize(output):
+            passed_checks += 1
+        else:
+            reasons.append("output does not match expected_output")
+
     # min_length
     min_len = case.get("min_length")
     if min_len is not None:
@@ -151,8 +179,12 @@ def score_case(case: dict[str, Any], output: str) -> tuple[bool, float, str | No
             reasons.append(f"output too long ({len(output)} > {max_len})")
 
     if checks == 0:
-        # No checks defined — always passes
-        return True, 1.0, None
+        # A case with no assertions CANNOT FAIL. Returning a bare (True, 1.0)
+        # made it indistinguishable from a case that was actually verified, so a
+        # suite of unchecked cases reported a perfect score. It still cannot
+        # fail -- inventing a failure would be its own lie -- but it now says so,
+        # and the runner counts it separately.
+        return True, 1.0, NO_CHECKS_REASON
 
     score = passed_checks / checks
     passed = len(reasons) == 0
