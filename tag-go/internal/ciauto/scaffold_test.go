@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -103,5 +104,62 @@ func TestRunLoopEchoTerminates(t *testing.T) {
 func TestRunLoopUnknownProvider(t *testing.T) {
 	if _, err := RunLoop(context.Background(), "nope", "x", 1); err == nil {
 		t.Error("expected unknown-provider error")
+	}
+}
+
+// TestScaffoldPinsTheInstall is the supply-chain regression: the generated
+// workflow used to say `pip install tag-agent`, unpinned, so every user's CI
+// picked up whatever PyPI served at run time. A release that changes an exit
+// code then changes the meaning of their pipeline with no review on their side.
+func TestScaffoldPinsTheInstall(t *testing.T) {
+	for _, wf := range []string{"eval", "review", "test-gen", "fix-vuln"} {
+		out := ScaffoldGitHubAction(wf)
+		if strings.Contains(out, "pip install tag-agent\n") {
+			t.Errorf("%s: the generated workflow installs tag-agent unpinned", wf)
+		}
+		if !strings.Contains(out, "tag-agent=="+ScaffoldPinnedVersion) {
+			t.Errorf("%s: expected a pinned install of %s:\n%s", wf, ScaffoldPinnedVersion, out)
+		}
+	}
+}
+
+// A gate that fails a build without saying which of "the tool broke", "you
+// invoked it wrong" and "it worked and found problems" happened is a gate people
+// disable. The gating workflows must explain their exit codes.
+func TestScaffoldDocumentsExitCodes(t *testing.T) {
+	for _, wf := range []string{"fix-vuln", "review"} {
+		out := ScaffoldGitHubAction(wf)
+		if !strings.Contains(out, "3 = ran fine but") {
+			t.Errorf("%s: exit 3 is not explained:\n%s", wf, out)
+		}
+		if !strings.Contains(out, "--exit-zero") {
+			t.Errorf("%s: the advisory escape hatch is not mentioned", wf)
+		}
+	}
+	// Advisory workflows have no exit-3 case and must not claim one.
+	if out := ScaffoldGitHubAction("test-gen"); strings.Contains(out, "3 = ran fine but") {
+		t.Errorf("test-gen is advisory and must not document an exit-3 case:\n%s", out)
+	}
+}
+
+// The pin must track the PYTHON release (the generated workflow runs
+// `pip install tag-agent`), or it silently freezes every user on an old version
+// — which is the opposite failure to the one pinning fixes, and just as quiet.
+//
+// Deliberately reads pyproject.toml rather than comparing against
+// internal/version: that constant is the GO harness's version, a separate
+// release track, and asserting against it would pass while being wrong.
+func TestScaffoldPinMatchesPythonRelease(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "..", "pyproject.toml"))
+	if err != nil {
+		t.Skipf("pyproject.toml not readable from here: %v", err)
+	}
+	m := regexp.MustCompile(`(?m)^version = "([^"]+)"`).FindSubmatch(b)
+	if m == nil {
+		t.Fatal("could not find the version in pyproject.toml")
+	}
+	if got := string(m[1]); got != ScaffoldPinnedVersion {
+		t.Errorf("ScaffoldPinnedVersion = %q but pyproject.toml is at %q — the generated "+
+			"workflow would install a version that is not this release", ScaffoldPinnedVersion, got)
 	}
 }

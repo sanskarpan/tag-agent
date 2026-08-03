@@ -17,6 +17,8 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+from tag import __version__
+
 
 # ---------------------------------------------------------------------------
 # GitHub PR helpers
@@ -566,6 +568,22 @@ def generate_tests(
 # PRD-058: GitHub Actions workflow scaffold
 # ---------------------------------------------------------------------------
 
+# The tag-agent release the generated workflow installs.
+#
+# These templates used to emit a bare ``pip install tag-agent``. That handed
+# every user's CI whatever PyPI served at run time, so a release that changes an
+# exit code (0.10.0 changed several) silently changed the meaning of their
+# pipeline -- with no review on their side, and no way to notice until a build
+# went red or, worse, stopped going red.
+#
+# It is also the same reasoning pyproject.toml already applies to TAG's own
+# dependencies, where every pin is exact because ranges let PyPI ship a fresh
+# version "without a code review on our side". Pinning ours and generating
+# unpinned installs for other people was inconsistent.
+#
+# Sourced from __version__ so it cannot drift from the release.
+_PINNED_VERSION = __version__
+
 _GH_ACTION_TEMPLATES: dict[str, str] = {
     "eval": textwrap.dedent(
         """\
@@ -594,7 +612,10 @@ _GH_ACTION_TEMPLATES: dict[str, str] = {
                   python-version: "3.12"
 
               - name: Install tag-agent
-                run: pip install tag-agent
+                # Pinned deliberately: an unpinned install lets a PyPI release change
+                # this pipeline's behaviour, including its exit codes, with no
+                # review on your side. Bump it once you've read the release notes.
+                run: pip install 'tag-agent=={pinned_version}'
 
               - name: Run TAG eval
                 env:
@@ -629,7 +650,10 @@ _GH_ACTION_TEMPLATES: dict[str, str] = {
                   python-version: "3.12"
 
               - name: Install tag-agent
-                run: pip install tag-agent
+                # Pinned deliberately: an unpinned install lets a PyPI release change
+                # this pipeline's behaviour, including its exit codes, with no
+                # review on your side. Bump it once you've read the release notes.
+                run: pip install 'tag-agent=={pinned_version}'
 
               - name: Run TAG PR review
                 env:
@@ -670,7 +694,10 @@ _GH_ACTION_TEMPLATES: dict[str, str] = {
                   python-version: "3.12"
 
               - name: Install tag-agent
-                run: pip install tag-agent
+                # Pinned deliberately: an unpinned install lets a PyPI release change
+                # this pipeline's behaviour, including its exit codes, with no
+                # review on your side. Bump it once you've read the release notes.
+                run: pip install 'tag-agent=={pinned_version}'
 
               - name: Generate tests for PR diff
                 env:
@@ -715,7 +742,10 @@ _GH_ACTION_TEMPLATES: dict[str, str] = {
                   python-version: "3.12"
 
               - name: Install tag-agent
-                run: pip install tag-agent
+                # Pinned deliberately: an unpinned install lets a PyPI release change
+                # this pipeline's behaviour, including its exit codes, with no
+                # review on your side. Bump it once you've read the release notes.
+                run: pip install 'tag-agent=={pinned_version}'
 
               - name: Fix vulnerabilities from SARIF
                 env:
@@ -766,7 +796,9 @@ def scaffold_github_action(
             f"Unknown workflow_type {workflow_type!r}. Valid types: {valid}"
         )
     template = _GH_ACTION_TEMPLATES[workflow_type]
-    return template.format(profile=profile, threshold=threshold)
+    return template.format(
+        profile=profile, threshold=threshold, pinned_version=_PINNED_VERSION
+    )
 
 
 def install_github_action(
@@ -866,8 +898,38 @@ def parse_sarif(sarif_path: Path) -> list[dict]:
     except json.JSONDecodeError as exc:
         raise ValueError(f"Cannot parse SARIF file {sarif_path}: {exc}") from exc
 
+    # Validate the envelope before believing the answer.
+    #
+    # ``data.get("runs", [])`` alone returned [] for a top-level array, for
+    # ``{"hello": 1}``, and for any object missing ``runs`` -- which the caller
+    # printed as "No vulnerabilities found" and exited 0. On a security gate,
+    # "I could not understand this file" and "this file is clean" must never
+    # produce the same answer. (The Go port raises ErrMalformedSARIF here and
+    # exits 2; this brings Python in line.)
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Malformed SARIF file {sarif_path}: the top level is a "
+            f"{type(data).__name__}, but SARIF requires an object"
+        )
+    if "runs" not in data:
+        raise ValueError(
+            f"Malformed SARIF file {sarif_path}: no 'runs' key. This is not a "
+            f"clean result -- the file was not understood."
+        )
+    runs = data["runs"]
+    if not isinstance(runs, list):
+        raise ValueError(
+            f"Malformed SARIF file {sarif_path}: 'runs' is a "
+            f"{type(runs).__name__}, expected a list"
+        )
+
     findings: list[dict] = []
-    for run in data.get("runs", []):
+    for run in runs:
+        if not isinstance(run, dict):
+            raise ValueError(
+                f"Malformed SARIF file {sarif_path}: a 'runs' entry is a "
+                f"{type(run).__name__}, expected an object"
+            )
         # Build rule-id → severity lookup from the run's tool rules.
         rule_severity: dict[str, str] = {}
         rules = (
@@ -881,7 +943,13 @@ def parse_sarif(sarif_path: Path) -> list[dict]:
             )
             rule_severity[rid] = level
 
-        for result in run.get("results", []):
+        results = run.get("results", [])
+        if not isinstance(results, list):
+            raise ValueError(
+                f"Malformed SARIF file {sarif_path}: 'results' is a "
+                f"{type(results).__name__}, expected a list"
+            )
+        for result in results:
             rule_id = result.get("ruleId", result.get("rule", {}).get("id", "unknown"))
             message = (
                 result.get("message", {}).get("text", "")
