@@ -144,6 +144,7 @@ func NewRoot() *cobra.Command {
 	registerSWESolve(root, app)
 	registerIssueSolve(root, app)
 	registerAgenticCI(root, app)
+	registerDoc(root, app)
 	registerReviewPR(root, app)
 	registerContext(root, app)
 	registerSplit(root, app)
