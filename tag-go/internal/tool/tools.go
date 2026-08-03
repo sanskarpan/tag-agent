@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tag-agent/tag/internal/agent"
+	"github.com/tag-agent/tag/internal/docs"
 	"github.com/tag-agent/tag/internal/llm"
 	"github.com/tag-agent/tag/internal/permission"
 	"github.com/tag-agent/tag/internal/sandbox"
@@ -100,6 +101,12 @@ func Register(reg *agent.Registry, opts Options) {
 		add(bashTool(opts), commandSubject)
 	}
 	add(readFileTool(opts), pathSubject(opts, "path"))
+	// Registered only when the engine is installed: a tool that is always
+	// present and always fails teaches the model that the capability is broken
+	// rather than absent. See readdoc.go.
+	if _, ok := docs.Available(); ok {
+		add(readDocumentTool(opts), pathSubject(opts, "path"))
+	}
 	add(writeFileTool(opts), pathSubject(opts, "path"))
 	add(listDirTool(opts), pathSubject(opts, "path"))
 	if opts.EnableExa && opts.exaKey() != "" {
