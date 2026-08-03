@@ -2,6 +2,8 @@ package tool
 
 import (
 	"fmt"
+
+	"github.com/tag-agent/tag/internal/docs"
 	"strings"
 	"unicode/utf8"
 )
@@ -246,7 +248,8 @@ func binaryRefusal(displayPath, reason string, size int64) error {
 		fmt.Fprintf(&b, " (%s)", humanBytes(size))
 	}
 	b.WriteString(". Returning its bytes would spend a large amount of context on content " +
-		"the model cannot read. Convert it to text first, or use a tool built for this format.")
+		"the model cannot read.")
+	b.WriteString(" " + readAdvice(displayPath))
 	return fmt.Errorf("%s", b.String())
 }
 
@@ -284,4 +287,18 @@ func firstRuneStart(b []byte) int {
 		}
 	}
 	return 0
+}
+
+// readAdvice tells the caller what WOULD work. A refusal that does not is a
+// dead end, and for PDFs the answer depends on whether the engine is installed
+// — so the message says which situation the reader is in rather than offering
+// advice that may not apply.
+func readAdvice(path string) string {
+	if !docs.Supported(path) {
+		return "Convert it to text first, or use a tool built for this format."
+	}
+	if _, ok := docs.Available(); ok {
+		return "Use read_document, which reads PDFs as text."
+	}
+	return "PDF support is available but not installed: " + docs.InstallHint + "."
 }
