@@ -142,7 +142,7 @@ func TypesHint() string {
 // unpinned installs for other people while pinning our own was inconsistent.
 //
 // Keep this in step with the released version when cutting a release.
-const ScaffoldPinnedVersion = "0.10.0"
+const ScaffoldPinnedVersion = "0.11.0"
 
 // exitCodeComment documents what a non-zero exit means for the generated step,
 // so a red build is self-explaining rather than a mystery.
