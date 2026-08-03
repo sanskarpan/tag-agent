@@ -336,17 +336,35 @@ func Status(db *sql.DB, id string) (string, error) { return statusRetry(db, id) 
 // Divergence from Python (intentional): Python matches only status='running', so
 // aborting a loop that is parked on a human-approval gate silently did nothing.
 // Here both active statuses are abortable.
+// abortWriteBudget bounds how long an abort waits for the write lock.
+const abortWriteBudget = 45 * time.Second
+
 func Abort(db *sql.DB, id string) (bool, error) {
 	if err := EnsureSchema(db); err != nil {
 		return false, err
 	}
 	ts := now()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// A loop iterating with no model latency writes almost continuously (journal
+	// row, status, spans), and SQLite serialises writers -- so an abort issued
+	// from another process can starve behind it. 15s was not enough on a loaded
+	// machine and the operator got a bare "context deadline exceeded", which
+	// says nothing about what to do.
+	//
+	// The budget is raised, and a timeout now explains itself. Both matter: an
+	// abort that gives up is bad, and an abort that gives up illegibly is worse,
+	// because the operator cannot tell it from a loop that ignored them.
+	ctx, cancel := context.WithTimeout(context.Background(), abortWriteBudget)
 	defer cancel()
 	r, err := execRetry(ctx, db,
 		`UPDATE loop_runs SET status='aborted', updated_at=?, completed_at=?
 		 WHERE id=? AND status IN ('running','waiting_approval')`, ts, ts, id)
 	if err != nil {
+		if ctx.Err() != nil {
+			return false, fmt.Errorf(
+				"could not write the abort for loop %s within %s: the loop is writing to the "+
+					"store continuously and the write never got through. It is still running; "+
+					"retry the abort", id, abortWriteBudget)
+		}
 		return false, err
 	}
 	n, _ := r.RowsAffected()
