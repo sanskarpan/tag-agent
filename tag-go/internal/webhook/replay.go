@@ -44,14 +44,27 @@ func EnsureReplaySchema(db *store.DB) error {
 // The signature is hashed rather than stored raw: it is derived from the shared
 // secret, and a replay table is not a place to keep that material.
 func deliveryFingerprint(platform, deliveryID, signature string) string {
+	// The platform is DELIBERATELY not part of the key.
+	//
+	// It used to be, and it is caller-controlled — the path segment. Since the
+	// generic/linear branch validates a bare HMAC of the body, byte-identical to
+	// GitHub's, one captured github delivery replayed freely by changing the
+	// path: /webhook/linear accepted it as new because the fingerprint was
+	// prefixed "linear:" instead of "github:". Partitioning a replay namespace
+	// by a value the attacker chooses is not a namespace.
+	//
+	// A delivery id and a signature are both already globally unique in
+	// practice; the cost of the collision this invites — two platforms sending
+	// the identical id — is one delivery rejected as a duplicate, which is the
+	// safe direction.
 	if deliveryID != "" {
-		return platform + ":id:" + deliveryID
+		return "id:" + deliveryID
 	}
 	if signature == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(platform + ":" + signature))
-	return platform + ":sig:" + hex.EncodeToString(sum[:])
+	sum := sha256.Sum256([]byte(signature))
+	return "sig:" + hex.EncodeToString(sum[:])
 }
 
 // markDelivered records a fingerprint durably and reports whether it was new
