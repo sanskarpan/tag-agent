@@ -316,3 +316,65 @@ def get_eval_run_detail(conn: sqlite3.Connection, run_id: str) -> dict | None:
         ],
     }
 
+
+def extract_model_output(result) -> tuple[str, str | None]:
+    """Pull the model's answer out of `tag submit --json`.
+
+    Returns ``(output, error_reason)``. A non-None reason means the output could
+    NOT be obtained and the case must not be scored — grading the wrong text is
+    worse than reporting that the run could not be evaluated.
+
+    This lives here, not in a caller, because there were two scorers and only
+    one of them was ever fixed: ``cmd_eval`` was corrected to read
+    ``steps[].output`` while ``eval_ci`` kept scoring ``proc.stdout`` — the
+    human-readable submission receipt ("run_id: … status: queued"). Its comment
+    claimed to use "the same path the `tag eval run` command uses", which had
+    silently stopped being true. Two implementations of one contract are two
+    contracts.
+
+    It also rejects output that is a Kanban task-creation record rather than a
+    model answer. In the default ``kanban`` execution mode ``steps[].output`` is
+    the created task's JSON, so a case asserting any word from its own prompt —
+    or any of ``ready``/``researcher``/``coder``/``scratch`` — passed
+    unconditionally, for every prompt, forever.
+    """
+    import json as _json
+
+    if getattr(result, "returncode", 0) != 0:
+        detail = ((result.stderr or result.stdout or "")).strip().splitlines()
+        return "", f"submit failed: {detail[0] if detail else result.returncode}"
+    try:
+        payload = _json.loads(result.stdout)
+    except (_json.JSONDecodeError, TypeError) as exc:
+        return "", f"could not parse submit --json output: {exc}"
+    steps = payload.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return "", "submit returned no steps, so there is no model output to score"
+    parts = [str(st.get("output", "")) for st in steps if isinstance(st, dict) and st.get("output")]
+    if not parts:
+        return "", "submit returned steps but none carried output"
+    text = "\n\n".join(parts)
+    if _is_task_record(text):
+        return "", (
+            "the run produced a task record, not a model answer — the profile's execution "
+            "mode queued the work instead of answering it, so there is nothing to score"
+        )
+    return text, None
+
+
+def _is_task_record(text: str) -> bool:
+    """True when the text is a Kanban task-creation record rather than an answer."""
+    import json as _json
+
+    t = text.strip()
+    if not t.startswith("{"):
+        return False
+    try:
+        obj = _json.loads(t)
+    except _json.JSONDecodeError:
+        return False
+    if not isinstance(obj, dict):
+        return False
+    # The shape written by cmd_submit when it creates a task.
+    markers = {"id", "title", "assignee", "status", "workspace_kind"}
+    return len(markers & set(obj)) >= 4
