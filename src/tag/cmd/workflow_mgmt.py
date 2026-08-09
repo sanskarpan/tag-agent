@@ -332,14 +332,47 @@ def cmd_mcp_registry(args: argparse.Namespace) -> int:
 # PRD-015: Profile Templates
 # ---------------------------------------------------------------------------
 
+# Name patterns, widened after an audit found SLACK_WEBHOOK exported verbatim.
+# Anchored on word boundaries so BYPASS_CACHE and PASSTHROUGH are not swept up.
+# Mirrors redactRe in tag-go/internal/cli/template.go.
 _REDACT_PATTERNS = re.compile(
-    r"(api[_-]?key|secret|token|password|credential|auth|url)",
+    r"(api[_-]?key|secret|token|password|credential|auth|url|webhook"
+    r"|(^|[_-])(pass|pwd|pat|sk|key|cookie|session|private)([_-]|$))",
     re.IGNORECASE,
 )
 
+# Value SHAPES, because a secret does not announce itself in its variable name.
+# Mirrors secretValueRes in tag-go/internal/cli/template.go.
+_SECRET_VALUE_PATTERNS = [
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"^(sk|pk|rk)_(live|test)_[A-Za-z0-9]{8,}"),
+    re.compile(r"^gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"^github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"^(AKIA|ASIA)[0-9A-Z]{16}$"),
+    re.compile(r"^sk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"^xox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\."),
+    re.compile(r"^glpat-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"^AIza[0-9A-Za-z_-]{30,}"),
+    re.compile(r"^https://hooks\.slack\.com/services/"),
+    re.compile(r"^https://discord(app)?\.com/api/webhooks/"),
+]
+
+
+def _looks_secret(val: str) -> bool:
+    """True when a VALUE looks like a credential, whatever it is named."""
+    v = (val or "").strip()
+    return bool(v) and any(p.search(v) for p in _SECRET_VALUE_PATTERNS)
+
 
 def _redact_env(key: str, val: str) -> str:
-    if _REDACT_PATTERNS.search(key):
+    """Mask secret-like env values on export.
+
+    Name matching alone is not redaction: a profile with five secrets had four
+    masked and SLACK_WEBHOOK emitted verbatim — from a command whose help says
+    "secrets redacted" and whose output `tag marketplace push` publishes.
+    """
+    if _REDACT_PATTERNS.search(key) or _looks_secret(val):
         return f"<{key.upper()}>"
     return val
 
