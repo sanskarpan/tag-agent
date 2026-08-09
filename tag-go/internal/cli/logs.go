@@ -17,6 +17,11 @@ func registerLogs(root *cobra.Command, app *App) {
 	var limit int
 	c := &cobra.Command{Use: "logs", Short: "Tail recent activity (runs + spans)", GroupID: "obs", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// out[:limit] panicked with a Go stack trace on a negative value:
+			//   panic: runtime error: slice bounds out of range [:-1]
+			if limit < 0 {
+				return usageErrorf("--limit must be >= 0 (got %d)", limit)
+			}
 			db, err := app.OpenDB()
 			if err != nil {
 				return err
@@ -70,7 +75,16 @@ func registerLogs(root *cobra.Command, app *App) {
 
 			// Merge newest-first across both sources, then cap at limit.
 			// ISO timestamps sort lexicographically; stable to keep source order on ties.
-			sort.SliceStable(out, func(i, j int) bool { return out[i].Timestamp > out[j].Timestamp })
+			// Mixed timestamp precision, normalised before sorting.
+			//
+			// runs.created_at is second-precision RFC3339 ("...:26Z") while
+			// spans.started_at is microsecond ("...:26.739020Z"). Sorting those
+			// lexicographically puts 'Z' (0x5A) above '.' (0x2E) at index 19, so
+			// EVERY run sorted above EVERY span regardless of real time and this
+			// command returned the OLDEST rows — the reverse of a tail.
+			sort.SliceStable(out, func(i, j int) bool {
+				return normalizeTS(out[i].Timestamp) > normalizeTS(out[j].Timestamp)
+			})
 			if len(out) > limit {
 				out = out[:limit]
 			}
@@ -93,4 +107,16 @@ func registerLogs(root *cobra.Command, app *App) {
 		}}
 	c.Flags().IntVar(&limit, "limit", 20, "max events to return")
 	root.AddCommand(c)
+}
+
+// normalizeTS pads a second-precision RFC3339 stamp with a zero fraction so it
+// compares correctly against a microsecond one.
+func normalizeTS(ts string) string {
+	if i := strings.IndexByte(ts, '.'); i >= 0 {
+		return ts
+	}
+	if len(ts) >= 20 && ts[19] == 'Z' {
+		return ts[:19] + ".000000Z" + ts[20:]
+	}
+	return ts
 }

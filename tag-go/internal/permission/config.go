@@ -91,6 +91,22 @@ func ParseLayer(block map[string]any, source string) (Layer, bool, error) {
 			// would quietly turn `write_file: "*.md" = allow` into a blanket
 			// `write_file: * = allow`. Widening a grant on a typo is exactly the
 			// silent half-load this function refuses to do everywhere else.
+			// Keys are enumerated, not just values type-checked.
+			//
+			// Values were strict but KEYS were unchecked, and the zero value of
+			// both Pattern and Tool is the permissive one — so `path:` written
+			// where `pattern:` was meant produced `<tool>: * = allow`, i.e. every
+			// subject, at exit 0 with no warning. `tol:` for `tool:` widened to
+			// every tool. A typo must not widen a grant in the one file whose job
+			// is to narrow them.
+			for k := range m {
+				if !allowedRuleKeys[k] {
+					return l, false, fmt.Errorf(
+						"%s: permissions.rules[%d] has unknown key %q (allowed: %s); refusing to load "+
+							"rather than silently ignoring it — an ignored key means the rule is wider "+
+							"than written", source, i, k, strings.Join(sortedRuleKeys(), ", "))
+				}
+			}
 			tool := "*"
 			if v, ok := m["tool"]; ok && v != nil {
 				s, ok := v.(string)
@@ -153,4 +169,18 @@ func ParseLayer(block map[string]any, source string) (Layer, bool, error) {
 		}
 	}
 	return l, autoApprove, nil
+}
+
+// allowedRuleKeys is the closed set of keys a permissions rule may carry.
+var allowedRuleKeys = map[string]bool{
+	"tool": true, "pattern": true, "action": true, "reason": true, "kind": true,
+}
+
+func sortedRuleKeys() []string {
+	out := make([]string, 0, len(allowedRuleKeys))
+	for k := range allowedRuleKeys {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

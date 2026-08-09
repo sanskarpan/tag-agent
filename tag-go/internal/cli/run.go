@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -114,7 +116,17 @@ func registerRun(root *cobra.Command, app *App) {
 			// `tag run` silent for the HTTP client's 10-minute timeout — TAG must
 			// never hang silently. Deriving from cmd.Context() also lets an
 			// interrupt propagate into the in-flight request.
-			ctx := cmd.Context()
+			// SIGINT/SIGTERM must cancel the run, not just kill this process.
+			//
+			// Without this, a `--tools` run killed by Ctrl-C left its bash
+			// children reparented to init and still running (`sleep 300`, an
+			// `npm run dev`, anything the MODEL chose to start). The bash tool's
+			// process-group kill hangs off context cancellation, and a default-
+			// disposition signal death never reaches it. `queue worker`, `loop`,
+			// `swarm`, `dag`, `cron`, `eval run` and `agentic-ci` all already do
+			// this; `run`, `shell` and `benchmark run` did not.
+			ctx, stopSignals := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stopSignals()
 			if timeoutSecs > 0 {
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
@@ -144,7 +156,18 @@ func registerRun(root *cobra.Command, app *App) {
 			// record the run with usage (best-effort; runtime tables exist from bootstrap)
 			modelID := app.Cfg.String("profiles."+app.profile(profile)+".config.model.default", "")
 			durMs := time.Since(started).Milliseconds()
-			if db, derr := app.OpenDB(); derr == nil {
+			// A failed open is NOT best-effort.
+			//
+			// This was `if derr == nil { ... }`, so on a read-only TAG_HOME the
+			// command printed "done in 1 step(s)", exited 0, wrote nothing, and
+			// said nothing on stderr. Repeated runs all "succeeded" and `runs
+			// list` stayed empty. `queue add` gets this right, with the message
+			// reused below.
+			db, derr := app.OpenDB()
+			if derr != nil {
+				return fmt.Errorf("cannot record the run — check that TAG_HOME is writable: %w", derr)
+			}
+			{
 				if _, ierr := db.Exec(`INSERT INTO runs(id,created_at,kind,task_type,execution,master_profile,board,prompt,route_json,status,metadata_json,
 					model_id,prompt_tokens,completion_tokens,cache_read_tokens,duration_ms,completed_at)
 					VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,

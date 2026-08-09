@@ -265,7 +265,15 @@ function switchPanel(name) {
 async function apiFetch(url) {
   try { const r = await fetch(url); if (!r.ok) return []; return await r.json(); } catch (e) { return []; }
 }
-function badge(val) { if (!val) return ''; return '<span class="badge badge-' + String(val).toLowerCase() + '">' + esc(val) + '</span>'; }
+function badge(val) { if (!val) return ''; return '<span class="badge badge-' + cssToken(val) + '">' + esc(val) + '</span>'; }
+// A CSS class is not a text node: esc() does not make a value safe inside an
+// attribute, and this one interpolated a DB column straight into class="".
+// Any status containing "> broke out and injected live DOM (stored XSS —
+// spans.status, eval_runs.status and alert_firings.severity are all written
+// from model- and tool-influenced execution outcomes). Restricting to the
+// charset a class name can legally use closes it by construction rather than
+// by escaping, which is the stronger property here.
+function cssToken(s) { return String(s).toLowerCase().replace(/[^a-z0-9_-]/g, ''); }
 function esc(s) { if (s === null || s === undefined) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function renderTable(rows, cols) {
   if (!rows || rows.length === 0) return '<div class="empty">No data yet.</div>';

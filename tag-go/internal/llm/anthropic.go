@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/tag-agent/tag/internal/redact"
 	"io"
 	"net/http"
 	"os"
@@ -84,7 +85,10 @@ func (p AnthropicProvider) Stream(ctx context.Context, req Request) (<-chan Even
 	if resp.StatusCode != 200 {
 		defer resp.Body.Close()
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return nil, fmt.Errorf("anthropic API %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		// See openai.go: an upstream that echoes the auth header must not put
+		// the key into our error, stderr, or the spans table.
+		return nil, fmt.Errorf("anthropic API %d: %s", resp.StatusCode,
+			redact.Secrets(strings.TrimSpace(string(msg))))
 	}
 	// A 200 is not proof of a stream — see checkStreamResponse.
 	if err := checkStreamResponse(resp, "anthropic"); err != nil {

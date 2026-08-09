@@ -20,7 +20,13 @@ import (
 // export and written 0600 on import; profile names are validated against path
 // traversal. The network `fetch` subcommand reuses the marketplace SSRF guard.
 var (
-	redactRe      = regexp.MustCompile(`(?i)(api[_-]?key|secret|token|password|credential|auth|url)`)
+	// Name patterns, widened after an audit found PRIVATE_KEY, DB_PASS,
+	// SESSION_COOKIE and friends exported in the clear. Anchored on word
+	// boundaries so BYPASS_CACHE and PASSTHROUGH are not swept up — over-
+	// redaction costs someone a re-entered value, but a template full of
+	// <REDACTED> noise stops being useful, which is its own failure.
+	redactRe = regexp.MustCompile(`(?i)(api[_-]?key|secret|token|password|credential|auth|url` +
+		`|(^|[_-])(pass|pwd|pat|sk|key|cookie|session|private)([_-]|$))`)
 	profileNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 )
 
@@ -162,9 +168,49 @@ func registerTemplate(root *cobra.Command, app *App) {
 }
 
 // redactEnv masks secret-like env values (port of _redact_env).
+//
+// Name matching alone is not redaction. The original allowlist regex covered
+// only key names containing api_key/secret/token/password/credential/auth/url,
+// so PRIVATE_KEY, STRIPE_SK, GH_PAT, DB_PASS, SESSION_COOKIE and
+// AWS_ACCESS_KEY_ID were all exported verbatim — from a command whose own help
+// says "secrets redacted" and whose output feeds a template-sharing workflow.
+//
+// The value is now inspected too. A secret does not announce itself in its
+// variable name, and the cost of over-redacting a template is that someone
+// re-enters a value; the cost of under-redacting is a published credential.
 func redactEnv(key, val string) string {
-	if redactRe.MatchString(key) {
+	if redactRe.MatchString(key) || looksSecret(val) {
 		return "<" + strings.ToUpper(key) + ">"
 	}
 	return val
+}
+
+// secretValueRes match the SHAPE of common credentials, independent of the
+// variable name they happen to be stored under.
+var secretValueRes = []*regexp.Regexp{
+	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`),
+	regexp.MustCompile(`^(sk|pk|rk)_(live|test)_[A-Za-z0-9]{8,}`), // Stripe and lookalikes
+	regexp.MustCompile(`^gh[pousr]_[A-Za-z0-9]{20,}`),             // GitHub tokens
+	regexp.MustCompile(`^github_pat_[A-Za-z0-9_]{20,}`),
+	regexp.MustCompile(`^AKIA[0-9A-Z]{16}$`),                           // AWS access key id
+	regexp.MustCompile(`^ASIA[0-9A-Z]{16}$`),                           // AWS temporary
+	regexp.MustCompile(`^sk-[A-Za-z0-9_-]{16,}`),                       // OpenAI-style
+	regexp.MustCompile(`^xox[baprs]-[A-Za-z0-9-]{10,}`),                // Slack
+	regexp.MustCompile(`^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.`), // JWT
+	regexp.MustCompile(`^glpat-[A-Za-z0-9_-]{16,}`),                    // GitLab
+	regexp.MustCompile(`^AIza[0-9A-Za-z_-]{30,}`),                      // Google API
+}
+
+// looksSecret reports whether a VALUE looks like a credential.
+func looksSecret(val string) bool {
+	v := strings.TrimSpace(val)
+	if v == "" {
+		return false
+	}
+	for _, re := range secretValueRes {
+		if re.MatchString(v) {
+			return true
+		}
+	}
+	return false
 }

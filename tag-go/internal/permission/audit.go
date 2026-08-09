@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/tag-agent/tag/internal/redact"
 )
 
 // SQLRecorder appends decisions to the permission_decisions table. It reuses
@@ -32,11 +34,19 @@ func (r *SQLRecorder) Record(req Request, d Decision) {
 	if r == nil || r.DB == nil {
 		return
 	}
+	// Redact before the row is written, not when it is displayed.
+	//
+	// Both subject and args_summary were stored raw, for ALLOWED and denied
+	// calls alike, so a `curl -H "Authorization: Bearer sk-..."` landed in the
+	// database twice and `tag permissions log` printed it. This table was the
+	// only one in the store that leaked. The DB is also world-readable, which
+	// made a display-time fix insufficient.
 	_, _ = r.DB.Exec(`INSERT INTO permission_decisions
 		(created_at, tool, subject, args_summary, verdict, via, rule, reason, run_id)
 		VALUES(?,?,?,?,?,?,?,?,?)`,
-		time.Now().UTC().Format(time.RFC3339), req.Tool, req.Subject, SummarizeArgs(req.Args),
-		string(d.Action), d.Via, d.Rule.String(), d.Reason, r.RunID)
+		time.Now().UTC().Format(time.RFC3339), req.Tool, redact.Secrets(req.Subject),
+		redact.Secrets(SummarizeArgs(req.Args)),
+		string(d.Action), d.Via, d.Rule.String(), redact.Secrets(d.Reason), r.RunID)
 }
 
 // maxSummaryBytes caps a rendered audit summary. Tool arguments are

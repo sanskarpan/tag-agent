@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -117,6 +118,18 @@ func (p *permFlags) policy(app *App, profile string) (permission.Policy, error) 
 
 		prof := app.profile(profile)
 		if profCfg, ok := app.Cfg.Data["profiles"].(map[string]any); ok {
+			// An unknown profile is a usage error, NOT a silent downgrade.
+			//
+			// This fell through when the assertion failed, so `--profile
+			// orchestratr` (one character) loaded builtin defaults and exited 0
+			// — discarding that profile's deny rules. Combined with
+			// --auto-approve, a denied command then executed while stderr
+			// reassured the operator that "deny rules still apply".
+			if _, present := profCfg[prof]; !present {
+				return permission.Policy{}, usageErr{fmt.Errorf(
+					"unknown profile %q — its permission policy would be silently skipped; "+
+						"available: %s", prof, strings.Join(sortedProfileNames(profCfg), ", "))}
+			}
 			if pm, ok := profCfg[prof].(map[string]any); ok {
 				if cfgm, ok := pm["config"].(map[string]any); ok {
 					block, _ := cfgm["permissions"].(map[string]any)
@@ -592,4 +605,14 @@ func tripwireRuleJSON(r guardrail.Rule) map[string]any {
 		m["message"] = r.Message
 	}
 	return m
+}
+
+// sortedProfileNames lists the configured profiles, for an actionable error.
+func sortedProfileNames(profCfg map[string]any) []string {
+	out := make([]string, 0, len(profCfg))
+	for k := range profCfg {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

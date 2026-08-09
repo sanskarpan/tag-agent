@@ -310,6 +310,17 @@ func registerQueue(root *cobra.Command, app *App) {
 			}
 			outJSON(map[string]any{"claimed": sum.Claimed, "done": sum.Done, "failed": sum.Failed, "skipped": sum.Skipped},
 				fmt.Sprintf("worker: %d claimed, %d done, %d failed, %d skipped", sum.Claimed, sum.Done, sum.Failed, sum.Skipped))
+			// A drain in which every job failed is not a success.
+			//
+			// This returned nil unconditionally, so `queue worker` exited 0 with
+			// "1 claimed, 0 done, 1 failed" and empty stderr. Any CI wired to it
+			// is green on total failure. Reported findings get exitFindings (3),
+			// the same code the rest of the CLI uses for "ran fine, found
+			// problems" — the work was attempted and the outcome is bad news,
+			// not a crash.
+			if sum.Failed > 0 {
+				return exitCodeErr{code: exitFindings}
+			}
 			return nil
 		}}
 	workerCmd.Flags().StringVar(&wProvider, "provider", "echo", "llm provider (echo = offline)")

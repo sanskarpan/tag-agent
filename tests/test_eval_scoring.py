@@ -144,3 +144,57 @@ def test_interrupted_run_is_marked_cancelled(tmp_path, monkeypatch):
             assert all(r[0] != "running" for r in rows), \
                 f"an interrupted run was left in 'running': {rows}"
             return
+
+
+# --- P0: the CI gate scored the submission receipt ---------------------------
+
+def test_task_record_is_not_a_model_answer():
+    """In kanban execution mode steps[].output is the created TASK, not an answer.
+
+    A case asserting any word from its own prompt — or any of ready/researcher/
+    coder/scratch — passed unconditionally, for every prompt, forever.
+    """
+    import types
+    from tag.eval_framework import extract_model_output
+
+    task_json = json.dumps({
+        "id": "t_aec680cc", "title": "mixed: What is the capital of France?",
+        "assignee": "researcher", "status": "ready", "workspace_kind": "scratch",
+    })
+    res = types.SimpleNamespace(
+        returncode=0, stderr="",
+        stdout=json.dumps({"steps": [{"role": "worker", "output": task_json}]}),
+    )
+    out, err = extract_model_output(res)
+    assert err, "a task record must not be scored as a model answer"
+    assert out == ""
+    assert "task record" in err
+
+
+def test_real_answer_still_scores():
+    import types
+    from tag.eval_framework import extract_model_output
+
+    res = types.SimpleNamespace(
+        returncode=0, stderr="",
+        stdout=json.dumps({"steps": [{"role": "worker", "output": "The capital of France is Paris."}]}),
+    )
+    out, err = extract_model_output(res)
+    assert err is None and "Paris" in out
+
+
+def test_both_scorers_share_one_implementation():
+    """eval_ci scored proc.stdout while cmd_eval scored steps[].output.
+
+    Only one was ever fixed, and eval_ci's comment claimed parity that had
+    silently stopped being true. Two implementations of one contract are two
+    contracts.
+    """
+    import inspect
+    from tag import eval_ci
+    from tag.cmd import marketplace
+
+    src = inspect.getsource(eval_ci)
+    assert "extract_model_output" in src, "eval_ci must use the shared extractor"
+    assert "output = proc.stdout" not in src, "eval_ci is scoring the receipt again"
+    assert "extract_model_output" in inspect.getsource(marketplace._extract_model_output)

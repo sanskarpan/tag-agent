@@ -220,9 +220,13 @@ func TestE2EDagStateRefFromSkippedBranchFailsJob(t *testing.T) {
 	if out, code := run(t, h, "dag", "save", "ghostrun", "--steps", steps); code != 0 {
 		t.Fatalf("dag save: exit %d: %s", code, out)
 	}
+	// exitFindings, not 0. This test asserts a job FAILED and simultaneously
+	// required exit 0 — the contradiction that let `dag run --execute` report
+	// success with every node failed. A DAG with a failed node is "ran fine,
+	// found problems".
 	out, code := run(t, h, "dag", "run", "ghostrun", "--execute", "--provider", "echo")
-	if code != 0 {
-		t.Fatalf("dag run --execute: exit %d: %s", code, out)
+	if code != 3 {
+		t.Fatalf("dag run --execute with a failing node should exit 3, got %d: %s", code, out)
 	}
 	if !strings.Contains(out, "1 failed") {
 		t.Errorf("a job whose state reference was never produced must fail, got: %s", out)
