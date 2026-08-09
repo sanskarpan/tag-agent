@@ -413,32 +413,11 @@ def cmd_profile_marketplace(args: argparse.Namespace) -> int:
 # PRD-027: Eval Framework
 # ---------------------------------------------------------------------------
 
-def _extract_model_output(result) -> tuple[str, str | None]:
-    """Pull the model's answer out of `tag submit --json`.
+def _extract_model_output(result):
+    """Delegates to the single shared implementation (see eval_framework)."""
+    from tag.eval_framework import extract_model_output
 
-    Returns (output, error_reason). A non-None error_reason means the output
-    could NOT be obtained and the case must not be scored — grading the wrong
-    text is worse than reporting that the run could not be evaluated.
-
-    The previous implementation scored ``result.stdout`` directly, which is the
-    submission acknowledgement ("run_id: … status: queued"), not the answer.
-    """
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip().splitlines()
-        first = detail[0] if detail else f"exit {result.returncode}"
-        return "", f"submit failed: {first}"
-    try:
-        payload = json.loads(result.stdout)
-    except (json.JSONDecodeError, TypeError) as exc:
-        return "", f"could not parse submit --json output: {exc}"
-    steps = payload.get("steps")
-    if not isinstance(steps, list) or not steps:
-        return "", "submit returned no steps, so there is no model output to score"
-    parts = [str(st.get("output", "")) for st in steps if isinstance(st, dict) and st.get("output")]
-    if not parts:
-        return "", "submit returned steps but none carried output"
-    return "\n\n".join(parts), None
-
+    return extract_model_output(result)
 
 def cmd_eval(args: argparse.Namespace) -> int:
     """PRD-027: Run eval suites against TAG profiles."""
