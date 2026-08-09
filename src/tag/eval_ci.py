@@ -65,15 +65,26 @@ def run_eval_ci(
     for case in cases:
         case_id = case.get("id", "?")
         input_text = case.get("input", "")
-        # Produce model output by running the case through `tag submit` — the
-        # same path the `tag eval run` command uses.
+        # Produce model output by running the case through `tag submit --json`.
+        #
+        # This used to score `proc.stdout` — the human-readable receipt
+        # ("run_id: … status: queued / researcher: ok"), so a case asserting
+        # "status: queued" passed and the CI gate reported 100%. The comment
+        # here claimed to use "the same path the `tag eval run` command uses",
+        # which had stopped being true when only that one was fixed. Both now
+        # call the same helper.
         proc = subprocess.run(
             [_sys.executable, "-m", "tag", "submit", "--task-type", "mixed",
-             "--prompt", input_text, "--master-profile", profile, "--source", "eval"],
+             "--prompt", input_text, "--master-profile", profile, "--source", "eval", "--json"],
             capture_output=True, text=True, timeout=300,
         )
-        output = proc.stdout
-        ok, score, reason = eval_framework.score_case(case, output)
+        output, extract_err = eval_framework.extract_model_output(proc)
+        if extract_err:
+            # Refuse to score rather than score the wrong text. A gate that
+            # cannot obtain the answer must fail, not pass.
+            ok, score, reason = False, 0.0, extract_err
+        else:
+            ok, score, reason = eval_framework.score_case(case, output)
         eval_framework.record_case_result(
             conn, run_id, case_id, input_text, output,
             passed=ok, score=score, failure_reason=reason,
