@@ -32,6 +32,24 @@ const slackTimestampTolerance = 5 * time.Minute
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
 
+// knownPlatforms is the closed set of platforms the receiver will verify. It is
+// closed on purpose: see the platform check in Handler.
+var knownPlatforms = []string{"github", "slack", "linear", "generic"}
+
+// KnownPlatform reports whether p is a platform this receiver handles.
+func KnownPlatform(p string) bool {
+	for _, k := range knownPlatforms {
+		if p == k {
+			return true
+		}
+	}
+	return false
+}
+
+// KnownPlatforms returns the accepted platform names, for error messages and
+// for the CLI's own validation so the two cannot drift apart.
+func KnownPlatforms() []string { return append([]string(nil), knownPlatforms...) }
+
 // VerifySignature validates an inbound webhook's HMAC-SHA256 signature. Returns
 // false when no secret is configured (callers decide whether to enforce).
 func VerifySignature(platform string, body []byte, sigHeader, secret, timestamp string) bool {
@@ -285,8 +303,17 @@ func Handler(db *store.DB, secret string, allowUnsigned bool) http.Handler {
 			return
 		}
 		platform := strings.ToLower(strings.TrimPrefix(r.URL.Path, "/webhook/"))
-		if platform == "" {
-			sendJSON(w, 404, map[string]any{"error": "unknown path"})
+		// The platform selects the signature scheme AND prefixes the replay key,
+		// so an open set here defeats both. The generic/linear branch validates a
+		// bare HMAC of the body -- byte-identical to GitHub's -- so one captured
+		// github delivery replayed freely as /webhook/linear, /webhook/attacker,
+		// /webhook/zzz, each recorded signature_valid=1. Replay protection held
+		// only within whichever string the caller chose.
+		if !KnownPlatform(platform) {
+			sendJSON(w, 404, map[string]any{
+				"error":           "unknown platform",
+				"known_platforms": KnownPlatforms(),
+			})
 			return
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
