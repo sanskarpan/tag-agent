@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/tag-agent/tag/internal/redact"
 	"io"
 	"net/http"
 	"os"
@@ -83,7 +84,13 @@ func streamOpenAICompatible(ctx context.Context, req Request, baseURL, apiKey, e
 	if resp.StatusCode != 200 {
 		defer resp.Body.Close()
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return nil, fmt.Errorf("%s API %d: %s", errLabel, resp.StatusCode, strings.TrimSpace(string(msg)))
+		// The upstream body is scrubbed before it becomes an error.
+		//
+		// Gateways that reflect the Authorization header in a 401 (LiteLLM-style
+		// proxies do) put the API key straight into this string, which then
+		// reaches stderr AND four spans.error_msg rows.
+		return nil, fmt.Errorf("%s API %d: %s", errLabel, resp.StatusCode,
+			redact.Secrets(strings.TrimSpace(string(msg))))
 	}
 	// A 200 is not proof of a stream — see checkStreamResponse.
 	if err := checkStreamResponse(resp, errLabel); err != nil {
