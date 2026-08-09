@@ -1735,13 +1735,17 @@ class TestPluginSystem:
         with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
             rc = TAG.cmd_plugin(args)
         assert rc == 0
-        env_file = tmp_path / "taghome" / "profiles" / "orchestrator" / ".env"
+        # The CANONICAL profile dir. These tests previously read
+        # taghome/profiles/… — a directory the runtime never reads — so they
+        # passed while `plugin enable` had no effect whatsoever. The test was
+        # asserting the phantom-directory bug.
+        env_file = tmp_path / "taghome" / "runtime" / "home" / ".hermes" / "profiles" / "orchestrator" / ".env"
         assert env_file.exists()
         assert "TAG_PLUGIN_HERMES_WEB_SEARCH_ENABLED=true" in env_file.read_text()
 
     def test_cmd_plugin_disable_removes_env_line(self, tmp_path):
         import argparse
-        env_file = tmp_path / "taghome" / "profiles" / "orchestrator" / ".env"
+        env_file = tmp_path / "taghome" / "runtime" / "home" / ".hermes" / "profiles" / "orchestrator" / ".env"
         env_file.parent.mkdir(parents=True, exist_ok=True)
         env_file.write_text("TAG_PLUGIN_HERMES_WEB_SEARCH_ENABLED=true\n")
         args = argparse.Namespace(
@@ -2394,7 +2398,7 @@ class TestPRD011ThroughPRD020Regressions:
         with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
             rc = TAG.cmd_plugin(args)
         assert rc == 0
-        env_file = tmp_path / "taghome" / "profiles" / "orchestrator" / ".env"
+        env_file = tmp_path / "taghome" / "runtime" / "home" / ".hermes" / "profiles" / "orchestrator" / ".env"
         content = env_file.read_text()
         # Verify the key part (before '=') has no space
         for line in content.splitlines():
@@ -2412,7 +2416,7 @@ class TestPRD011ThroughPRD020Regressions:
         with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
             rc = TAG.cmd_plugin(args)
         assert rc == 0
-        env_file = tmp_path / "taghome" / "profiles" / "orchestrator" / ".env"
+        env_file = tmp_path / "taghome" / "runtime" / "home" / ".hermes" / "profiles" / "orchestrator" / ".env"
         content = env_file.read_text()
         for line in content.splitlines():
             if "=" in line and not line.startswith("#"):
