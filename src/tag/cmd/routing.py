@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 from tag.core.config import load_config, save_config, config_path, benchmark_suite_path
-from tag.core.paths import hermes_root, hermes_bin, runtime_db_path, tag_home
+from tag.core.paths import hermes_root, hermes_bin, runtime_db_path, tag_home, profile_home
 from tag.core.db import open_db
 from tag.core.run import run_hermes, run_profile_hermes, run_profile_python
 from tag.core.profile import (
@@ -690,7 +690,13 @@ def cmd_plugin(args: argparse.Namespace) -> int:
     if sub == "enable":
         name = args.plugin_name
         profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
-        profile_dir = _safe_profile_path(tag_home() / "profiles", profile)
+        # The canonical profile dir, not tag_home()/"profiles".
+        #
+        # This wrote TAG_PLUGIN_*_ENABLED into a directory the runtime never
+        # reads, so "Enabled plugin 'x'" was always true and never took effect —
+        # even for a real, installed plugin. The same phantom-directory bug was
+        # found and fixed in workflow_mgmt.py and missed here.
+        profile_dir = _safe_profile_path(profile_home(cfg, profile).parent, profile)
         env_file = profile_dir / ".env"
         # Normalise the plugin name to a valid env var identifier (replace any
         # non-alphanumeric characters with underscores, not just hyphens).
@@ -715,7 +721,7 @@ def cmd_plugin(args: argparse.Namespace) -> int:
     if sub == "disable":
         name = args.plugin_name
         profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
-        profile_dir = _safe_profile_path(tag_home() / "profiles", profile)
+        profile_dir = _safe_profile_path(profile_home(cfg, profile).parent, profile)
         env_file = profile_dir / ".env"
         if env_file.exists():
             env_key_suffix = re.sub(r"[^A-Z0-9]", "_", name.upper())
