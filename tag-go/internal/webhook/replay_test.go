@@ -190,21 +190,85 @@ func TestMarkDeliveredFailsClosed(t *testing.T) {
 }
 
 func TestDeliveryFingerprintIdentity(t *testing.T) {
-	if fp := deliveryFingerprint("github", "d-1", "sig"); fp != "github:id:d-1" {
-		t.Errorf("an explicit delivery id is authoritative, got %q", fp)
+	// NOTE: an earlier version of this test asserted "fingerprints must be
+	// namespaced per platform". That property WAS the vulnerability — the
+	// platform is the caller-controlled path segment, so namespacing by it let
+	// one captured github delivery replay as /webhook/linear. The test encoded
+	// the bug as a requirement and passed. It now asserts the opposite.
+	if fp := deliveryFingerprint("github", "d-1", "sig"); fp != "id:d-1" {
+		t.Errorf("an explicit delivery id is authoritative and platform-independent, got %q", fp)
+	}
+	if deliveryFingerprint("github", "d-1", "x") != deliveryFingerprint("linear", "d-1", "y") {
+		t.Error("the same delivery id must collide across platforms — that is the point")
 	}
 	a := deliveryFingerprint("slack", "", "v0=abc")
 	b := deliveryFingerprint("slack", "", "v0=abc")
 	if a == "" || a != b {
 		t.Errorf("the signature fingerprint must be stable, got %q / %q", a, b)
 	}
+	if deliveryFingerprint("linear", "", "v0=abc") != a {
+		t.Error("the same signature must collide across platforms — a github signature " +
+			"replayed at /webhook/linear has to be recognised as the same delivery")
+	}
 	if strings.Contains(a, "v0=abc") {
 		t.Error("the raw signature must not be stored in the fingerprint")
 	}
-	if deliveryFingerprint("linear", "", "v0=abc") == a {
-		t.Error("fingerprints must be namespaced per platform")
-	}
 	if deliveryFingerprint("generic", "", "") != "" {
 		t.Error("with no id and no signature there is nothing to key on")
+	}
+}
+
+// TestUnknownPlatformIsRejected is the ISSUE-007 regression: the platform was an
+// open set, so any string was accepted and got its own replay namespace.
+func TestUnknownPlatformIsRejected(t *testing.T) {
+	db := testDB(t)
+	secret := "topsecret"
+	srv := httptest.NewServer(Handler(db, secret, false))
+	defer srv.Close()
+
+	body := `{"action":"opened","pull_request":{"title":"T"}}`
+	hdr := map[string]string{
+		"X-Hub-Signature-256": ghSig(secret, []byte(body)),
+		"X-GitHub-Delivery":   "d-confusion",
+	}
+
+	if code := post(t, srv.URL, "github", body, hdr); code != 200 {
+		t.Fatalf("first github delivery should be 200, got %d", code)
+	}
+	// The same captured delivery, replayed by changing only the path segment.
+	//
+	// linear and generic share GitHub's bare-HMAC-of-body scheme, so the
+	// signature still verifies and the replay check is what must catch it.
+	for _, p := range []string{"linear", "generic"} {
+		if code := post(t, srv.URL, p, body, hdr); code != 409 {
+			t.Errorf("a github delivery replayed at /webhook/%s must be a duplicate (409), got %d", p, code)
+		}
+	}
+	// slack signs "v0:<ts>:<body>" and requires a timestamp header, so a github
+	// signature fails verification outright — a stronger rejection than 409,
+	// and it must stay that way.
+	if code := post(t, srv.URL, "slack", body, hdr); code != 401 {
+		t.Errorf("a github signature at /webhook/slack must fail verification (401), got %d", code)
+	}
+	for _, p := range []string{"attacker", "zzz", "GitHubb", "a/b"} {
+		if code := post(t, srv.URL, p, body, hdr); code != 404 {
+			t.Errorf("unknown platform %q must be 404, got %d", p, code)
+		}
+	}
+}
+
+func TestKnownPlatformSet(t *testing.T) {
+	for _, p := range []string{"github", "slack", "linear", "generic"} {
+		if !KnownPlatform(p) {
+			t.Errorf("%s must be accepted", p)
+		}
+	}
+	for _, p := range []string{"", "attacker", "GITHUB", "github "} {
+		if KnownPlatform(p) {
+			t.Errorf("%q must not be accepted", p)
+		}
+	}
+	if len(KnownPlatforms()) != 4 {
+		t.Errorf("KnownPlatforms drifted: %v", KnownPlatforms())
 	}
 }
