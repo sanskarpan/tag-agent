@@ -30,7 +30,17 @@ func registerWebhook(root *cobra.Command, app *App) {
 			if sec == "" && !allowUnsigned {
 				return fmt.Errorf("refusing to start without an HMAC secret: set --secret or TAG_WEBHOOK_SECRET, or pass --allow-unsigned to accept unauthenticated events")
 			}
-			return webhook.Serve(db, strOr(host, "127.0.0.1"), port, sec, allowUnsigned)
+			bind := strOr(host, "127.0.0.1")
+			// Unauthenticated + reachable is job injection: the event text
+			// becomes an agent prompt when a worker picks it up. `tag gateway`
+			// already refuses this shape, and the comment on ITS guard claims to
+			// mirror "the webhook hardening" -- which had never been written.
+			if sec == "" && allowUnsigned && !isLoopbackHost(bind) {
+				return fmt.Errorf("refusing to bind %s with --allow-unsigned: unauthenticated callers "+
+					"could enqueue agent jobs from the network. Set --secret / TAG_WEBHOOK_SECRET, "+
+					"or bind 127.0.0.1", bind)
+			}
+			return webhook.Serve(db, bind, port, sec, allowUnsigned)
 		}}
 	listen.Flags().StringVar(&host, "host", "127.0.0.1", "bind host")
 	listen.Flags().IntVar(&port, "port", 8765, "bind port")
