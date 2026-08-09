@@ -625,6 +625,16 @@ def cmd_doc(args: argparse.Namespace) -> int:
     return 2
 
 
+def _parse_pr_ref(ref: str) -> tuple[str, int]:
+    """Split "owner/repo#42" into ("owner/repo", 42)."""
+    if "#" not in ref:
+        raise ValueError(f"PR reference must look like owner/repo#42, got {ref!r}")
+    repo, _, num = ref.rpartition("#")
+    if not repo or not num.isdigit():
+        raise ValueError(f"PR reference must look like owner/repo#42, got {ref!r}")
+    return repo, int(num)
+
+
 def cmd_ci_ext(args: argparse.Namespace) -> int:
     sub = getattr(args, "ci_subcommand", None)
     try:
@@ -692,22 +702,45 @@ def cmd_ci_ext(args: argparse.Namespace) -> int:
         if unfixed and not getattr(args, "exit_zero", False):
             return 3
         return 0
+    # These three call sites had never matched their callees' signatures, so
+    # every invocation died with a TypeError. They cannot ever have been run.
     if sub in ("diagnose", "ci-diagnose"):
-        log_text = Path(args.log).read_text()
-        failure = parse_ci_failure(log_text)
-        result = diagnose_and_fix(failure, profile, cfg, dry_run=getattr(args, "dry_run", False))
-        print(result)
+        # diagnose_and_fix takes the log PATH and has no dry_run parameter; this
+        # passed a parsed failure dict and dry_run=... .
+        log_path = Path(args.log)
+        if not log_path.is_file():
+            print_error(f"log file not found: {log_path}")
+            return 2
+        result = diagnose_and_fix(
+            log_path, profile, cfg,
+            auto_fix=not getattr(args, "dry_run", False),
+        )
+        print(json.dumps(result, indent=2, default=str))
         return 0
     if sub == "review":
-        result = review_pr_with_signals(args.pr_ref, profile, cfg,
-                                        signals=getattr(args, "signals", None))
-        print(result)
+        # review_pr_with_signals takes (repo, pr_number, profile, cfg, signals);
+        # this passed the raw ref and omitted cfg entirely.
+        try:
+            repo, pr_number = _parse_pr_ref(args.pr_ref)
+        except ValueError as exc:
+            print_error(str(exc))
+            return 2
+        result = review_pr_with_signals(
+            repo, pr_number, profile, cfg,
+            getattr(args, "signals", None) or [],
+            post_comment=getattr(args, "post_comment", False),
+        )
+        print(json.dumps(result, indent=2, default=str))
+        # "ran fine and found problems" is exit 3, as the Go harness does.
+        if result.get("signals_found"):
+            return 3
         return 0
     if sub == "gen-pipeline":
+        # write_gitlab_pipeline takes (repo_root, *, force) and returns the path
+        # it wrote; this passed four positional arguments.
         repo_path = Path(getattr(args, "repo", "."))
-        out_path = Path(getattr(args, "out", ".gitlab-ci.yml"))
-        write_gitlab_pipeline(repo_path, out_path, profile, cfg)
-        print(f"Written {out_path}")
+        written = write_gitlab_pipeline(repo_path, force=getattr(args, "force", False))
+        print(f"Written {written}")
         return 0
     if sub == "flaky-fix":
         log_path = Path(args.log)
@@ -730,11 +763,12 @@ def cmd_swe_solve(args: argparse.Namespace) -> int:
         return 1
     cfg, profile = _load_cfg_and_profile(args)
     repo = getattr(args, "repo", ".")
+    # run_swe_session takes max_iterations, not max_turns, and has no dry_run.
+    # The old call raised TypeError on every invocation.
     result = run_swe_session(args.task, profile, cfg,
                              working_dir=repo,
-                             max_turns=getattr(args, "max_turns", 20),
-                             dry_run=getattr(args, "dry_run", False))
-    print(result)
+                             max_iterations=getattr(args, "max_turns", 20))
+    print(json.dumps(result, indent=2, default=str) if isinstance(result, dict) else result)
     return 0
 
 

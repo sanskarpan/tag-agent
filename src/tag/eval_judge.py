@@ -243,7 +243,7 @@ def invoke_judge(
 
     JSON output is parsed; falls back to score=0.5 on parse errors.
     """
-    from tag.context import hermes_bin  # local import to avoid circular deps
+    from tag.core.paths import hermes_bin  # local import to avoid circular deps
 
     prompt_text = _build_judge_prompt(question, output, criterion)
 
