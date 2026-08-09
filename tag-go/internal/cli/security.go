@@ -20,6 +20,16 @@ func registerSecurity(root *cobra.Command, app *App) {
 		}}
 	scan := &cobra.Command{Use: "scan [PATH]", Short: "Scan a path for secrets", Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// A non-positive budget walked ZERO files and then reported
+			// "✓ No secrets found", exit 0, and persisted a scan row with
+			// status='ok'. In CI that is a green gate over an unscanned tree —
+			// the fail-open shape this project treats as a hard bar. The sibling
+			// `workspace index --max-files` already rejects this; the guard was
+			// simply missing here.
+			if maxFiles <= 0 {
+				return usageErrorf("--max-files must be > 0 (got %d); a non-positive budget walks no "+
+					"files and would report a clean scan of nothing", maxFiles)
+			}
 			p := "."
 			if len(args) == 1 {
 				p = args[0]
@@ -63,7 +73,7 @@ func registerSecurity(root *cobra.Command, app *App) {
 			}
 			return nil
 		}}
-	scan.Flags().IntVar(&maxFiles, "max-files", 2000, "max files")
+	scan.Flags().IntVar(&maxFiles, "max-files", 2000, "max files to walk (must be > 0)")
 	list := &cobra.Command{Use: "list", Short: "List past scans",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			db, err := app.OpenDB()
