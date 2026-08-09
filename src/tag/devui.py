@@ -250,8 +250,12 @@ async function apiFetch(url) {
 
 function badge(val) {
   if (!val) return '';
-  const cls = val.toLowerCase();
-  return '<span class="badge badge-' + cls + '">' + val + '</span>';
+  // Neither the attribute nor the text was escaped here, so a DB value
+  // containing "> injected live DOM (stored XSS). The class is restricted to
+  // the charset a class name can legally use, and the text node is escaped.
+  // Mirrors badge()/cssToken() in tag-go/internal/server/devui.go.
+  const cls = String(val).toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  return '<span class="badge badge-' + cls + '">' + esc(val) + '</span>';
 }
 
 function esc(s) {
