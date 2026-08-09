@@ -166,6 +166,12 @@ def _run_restricted(
                 ' (literal "/etc/master.passwd") (literal "/private/etc/master.passwd"))\n'
                 # Deny reading the user's home tree by default (protects secrets).
                 f'(deny file-read* (subpath "{home}"))\n'
+                # …and WRITING it. This deny was read-only, so the policy was
+                # asymmetric: `ls $HOME` was blocked while
+                # `sh -c 'echo x > $HOME/.zshrc'` succeeded. Overwriting a shell
+                # rc file is code execution outside the sandbox on next login —
+                # a confinement claim that held in one direction only.
+                f'(deny file-write* (subpath "{home}"))\n'
                 # Explicitly deny sensitive credential dirs for reads AND writes.
                 f'(deny file-read* file-write* {deny_home})\n'
                 # Re-allow read/write access to the sandbox run directory so the
