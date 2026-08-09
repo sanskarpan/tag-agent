@@ -54,6 +54,12 @@ func registerBenchmark(root *cobra.Command, app *App) {
 				fmt.Printf("%-24s %s\n", truncate(cr.ID, 24), status)
 			}
 			fmt.Printf("\n%d/%d passed (%d failed)\n", res.Passed, res.Total, res.Failed)
+			// `0/3 passed` exited 0. `eval run` already uses 1 for "any case
+			// failed"; benchmark now matches its sibling rather than inventing a
+			// third convention.
+			if res.Failed > 0 {
+				return exitCodeErr{code: 1}
+			}
 			return nil
 		}}
 	run.Flags().StringVar(&provider, "provider", "echo", "llm provider (echo = offline)")

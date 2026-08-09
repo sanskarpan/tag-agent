@@ -626,6 +626,10 @@ func registerDAG(root *cobra.Command, app *App) {
 			if execSummary != nil {
 				fmt.Printf("executed: %d claimed, %d done, %d failed, %d skipped, %d pruned (branch not taken)\n",
 					execSummary.Claimed, execSummary.Done, execSummary.Failed, execSummary.Skipped, execSummary.Pruned)
+				// See queue worker: a DAG in which nodes failed must not exit 0.
+				if execSummary.Failed > 0 {
+					return exitCodeErr{code: exitFindings}
+				}
 			}
 			return nil
 		}}
