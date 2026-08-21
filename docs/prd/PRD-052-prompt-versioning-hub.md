@@ -1,6 +1,6 @@
 # PRD-052: Prompt Versioning Hub with Terminal Playground (`tag prompt`)
 
-**Status:** Shipped (Go + Python) — Python lacks `prompt versions`
+**Status:** Partial — the versioning subset (`prompt save/get/list/diff`, plus `prompt versions` in Go) shipped in both distributions, but the headline **Terminal Playground (`prompt play`)** — this PRD's own "core value proposition" (G2/FR-07, a Must, §1/§3) — and the promotion workflow (`prompt promote`, U5) **never shipped in either distribution**. Verified 2026-08-21: `tag prompt --help` lists no `play`/`promote`; Go `internal/cli/prompt.go:181` registers only `save,get,list,versions,diff`; Python `src/tag/cmd/prd_clusters.py` registers only `save/get/list/diff`.
 **Priority:** P2
 **Estimated Effort:** M (1-2 weeks)
 **Category:** Evaluation & Observability
