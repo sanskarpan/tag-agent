@@ -177,6 +177,14 @@ acp = ["agent-client-protocol==0.9.0"]
 # NOT re-added to [all] so a future quarantined release can't break fresh
 # installs (see [all] policy comment below).
 mistral = ["mistralai==2.4.8"]
+# pdf: PRD-133 Tier 2 in-process PDF extraction (`tag doc read`, read_document).
+# A 0.x Rust-built wheel on a fast-moving line (PyPI ships 0.2.6) is exactly the
+# supply-chain shape the exact-pin policy and the [all] exclusion exist for —
+# same reasoning as the mistral pin above. Lazy-installed via tools/lazy_deps.py
+# (tool.pdf) only when explicitly allowed, or `pip install 'tag-agent[pdf]'`;
+# deliberately NOT re-added to [all]. Bump here AND in src/tag/docs.py
+# PDF_INSPECTOR_PIN AND in the LAZY_DEPS allowlist in lockstep.
+pdf = ["pdf-inspector==0.2.6"]
 bedrock = ["boto3==1.42.89"]
 azure-identity = ["azure-identity==1.25.3"]
 termux = [
