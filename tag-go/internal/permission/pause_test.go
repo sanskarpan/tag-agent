@@ -26,13 +26,14 @@ func (f *funcPauser) Pause(ctx context.Context, req Request, timeout time.Durati
 // screener is a test Screener.
 type screener struct {
 	inBlocked, outBlocked bool
+	inInterrupt           bool
 	reason                string
 	inCalls, outCalls     int
 }
 
-func (s *screener) ScreenToolInput(context.Context, string, map[string]any) (bool, string) {
+func (s *screener) ScreenToolInput(context.Context, string, map[string]any) (bool, bool, string) {
 	s.inCalls++
-	return s.inBlocked, s.reason
+	return s.inBlocked, s.inInterrupt, s.reason
 }
 func (s *screener) ScreenToolResult(context.Context, string, string) (bool, string) {
 	s.outCalls++
