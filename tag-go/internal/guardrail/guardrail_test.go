@@ -41,7 +41,7 @@ func TestNilProcessorIsInert(t *testing.T) {
 	if p.Enabled() || p.HasStage(StageToolInput) {
 		t.Fatal("a nil Processor must be inert")
 	}
-	if blocked, _ := p.ScreenToolInput(context.Background(), "bash", map[string]any{"command": "rm -rf /"}); blocked {
+	if blocked, _, _ := p.ScreenToolInput(context.Background(), "bash", map[string]any{"command": "rm -rf /"}); blocked {
 		t.Fatal("a nil Processor must not block")
 	}
 	v := p.Scan(context.Background(), StageModelOutput, "", "anything")

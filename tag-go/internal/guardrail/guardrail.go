@@ -641,13 +641,23 @@ func History(db *sql.DB, limit int) ([]Event, error) {
 // primitives). That keeps internal/permission dependency-free, as its package
 // doc promises, and keeps the guardrail implementation swappable.
 
-// ScreenToolInput implements the pre-hook. A nil/inert Processor never blocks.
-func (p *Processor) ScreenToolInput(ctx context.Context, tool string, args map[string]any) (bool, string) {
+// ScreenToolInput implements the pre-hook. A nil/inert Processor never fires.
+// It reports at most one outcome, applying the verdict's own block > interrupt
+// precedence: a fail-closed/undecidable verdict is Blocked, never Interrupt, so
+// it can never be waved past at an approval gate.
+func (p *Processor) ScreenToolInput(ctx context.Context, tool string, args map[string]any) (blocked bool, interrupt bool, reason string) {
 	if !p.HasStage(StageToolInput) {
-		return false, ""
+		return false, false, ""
 	}
 	v := p.ScanArgs(ctx, tool, args)
-	return v.Blocked, v.Reason
+	switch v.Outcome() {
+	case ActionBlock:
+		return true, false, v.Reason
+	case ActionInterrupt:
+		return false, true, v.Reason
+	default:
+		return false, false, ""
+	}
 }
 
 // ScreenToolResult implements the post-hook.
