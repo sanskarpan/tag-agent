@@ -51,6 +51,11 @@ func guardrailRuntimeEditCommands(app *App) []*cobra.Command {
 			prof := ""
 			if scoped {
 				prof = app.profile(profile)
+				// A typo'd profile must be refused, not silently written into a
+				// phantom profiles.<typo> block that no run ever reads.
+				if err := ensureProfileExists(app.Cfg, prof); err != nil {
+					return jsonErrorMaybe(usageErr{err})
+				}
 			}
 
 			path, err := config.Path(flagConfig)
@@ -115,6 +120,9 @@ func guardrailRuntimeEditCommands(app *App) []*cobra.Command {
 			prof := ""
 			if scoped {
 				prof = app.profile(remProfile)
+				if err := ensureProfileExists(app.Cfg, prof); err != nil {
+					return jsonErrorMaybe(usageErr{err})
+				}
 			}
 			path, err := config.Path(flagConfig)
 			if err != nil {
