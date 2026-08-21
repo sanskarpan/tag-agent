@@ -89,3 +89,25 @@ func TestGuardrailRuntimeAddRemove(t *testing.T) {
 		t.Errorf("removing a missing rule should exit 2, got %d", code)
 	}
 }
+
+// TestGuardrailRuntimeInterruptShowsApprovalRequired: an interrupt rule that
+// fires must read "APPROVAL REQUIRED" and exit 3 — never "clean" (a fabricated
+// pass while the exit code says a rule fired).
+func TestGuardrailRuntimeInterruptShowsApprovalRequired(t *testing.T) {
+	h := newHome(t)
+	if _, code := run(t, h, "guardrail", "runtime", "add",
+		"--name", "approve-http", "--tool", "http_*", "--type", "require-approval",
+		"--message", "approve?"); code != 0 {
+		t.Fatalf("add interrupt rule failed: %d", code)
+	}
+	out, code := run(t, h, "tripwire", "test", "--tool", "http_post", "--args", `{"url":"https://x"}`)
+	if code != 3 {
+		t.Errorf("a fired interrupt rule must exit 3, got %d: %s", code, out)
+	}
+	if strings.Contains(out, "clean") {
+		t.Errorf("a fired interrupt rule must not read as clean: %q", out)
+	}
+	if !strings.Contains(out, "APPROVAL REQUIRED") {
+		t.Errorf("expected APPROVAL REQUIRED header, got: %q", out)
+	}
+}
