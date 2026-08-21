@@ -233,6 +233,7 @@ func registerGuardrail(root *cobra.Command, app *App) {
 		Short: "Runtime content guardrails: list, check, test, inspect, and edit the ruleset",
 	}
 	runtime.AddCommand(tripwireSubcommands(app)...)
+	runtime.AddCommand(guardrailRuntimeEditCommands(app)...)
 	g.AddCommand(runtime)
 	root.AddCommand(g)
 }
