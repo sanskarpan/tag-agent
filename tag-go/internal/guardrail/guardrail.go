@@ -94,6 +94,10 @@ const (
 	ActionBlock Action = "block"
 	// ActionWarn records and reports but does not halt.
 	ActionWarn Action = "warn"
+	// ActionInterrupt pauses the run for human approval (PRD-123 FR-03/FR-07)
+	// instead of halting. The tool is NOT dispatched until an operator approves;
+	// on approval it executes normally. block outranks interrupt outranks warn.
+	ActionInterrupt Action = "interrupt"
 )
 
 // ParseAction validates an action word.
@@ -103,10 +107,12 @@ func ParseAction(s string) (Action, error) {
 		return ActionBlock, nil
 	case ActionWarn:
 		return ActionWarn, nil
+	case ActionInterrupt:
+		return ActionInterrupt, nil
 	case "":
 		return ActionBlock, nil
 	}
-	return "", fmt.Errorf("invalid guardrail action %q (want block or warn)", s)
+	return "", fmt.Errorf("invalid guardrail action %q (want block, warn, or interrupt)", s)
 }
 
 // Type selects a rule's evaluation strategy.
@@ -117,6 +123,10 @@ const (
 	TypePattern Type = "pattern"
 	// TypeTripwire counts matching events per session and fires at a threshold.
 	TypeTripwire Type = "tripwire"
+	// TypeRequireApproval fires on EVERY invocation of a matched tool, regardless
+	// of content — the "this tool always needs a human" rule (PRD-123 US2). It
+	// carries no pattern/builtin; its default action is interrupt.
+	TypeRequireApproval Type = "require-approval"
 )
 
 // Rule is one configured guardrail.
@@ -165,6 +175,12 @@ type Verdict struct {
 	Findings []Finding `json:"findings"`
 	// Blocked means a block-action rule fired (the tripwire "halt").
 	Blocked bool `json:"blocked"`
+	// Interrupted means an interrupt-action rule fired: the run should pause for
+	// human approval rather than halt. It is subordinate to Blocked — if a block
+	// rule ALSO fired for the same content, Blocked wins and the call is refused
+	// outright, never paused (PRD-123 Security §10 row 3). Consumers must check
+	// Blocked before Interrupted; Outcome() encodes that precedence.
+	Interrupted bool `json:"interrupted,omitempty"`
 	// Warned means at least one warn-action rule fired.
 	Warned bool `json:"warned"`
 	// Reason is the human-readable summary; on Blocked it is what the model is
@@ -177,7 +193,24 @@ type Verdict struct {
 }
 
 // Fired reports whether anything at all triggered.
-func (v Verdict) Fired() bool { return v.Blocked || v.Warned }
+func (v Verdict) Fired() bool { return v.Blocked || v.Interrupted || v.Warned }
+
+// Outcome collapses the verdict to its single effective action, applying the
+// precedence block > interrupt > warn > pass. It is the one place consumers
+// should ask "what do I do with this call?" so the precedence is never
+// re-implemented (and mis-ordered) at a call site.
+func (v Verdict) Outcome() Action {
+	switch {
+	case v.Blocked:
+		return ActionBlock
+	case v.Interrupted:
+		return ActionInterrupt
+	case v.Warned:
+		return ActionWarn
+	default:
+		return ""
+	}
+}
 
 // Processor evaluates rules against content. A nil *Processor is inert (that is
 // the "no rules configured" case, NFR-06), which is why every method is
@@ -251,6 +284,17 @@ func (p *Processor) Scan(ctx context.Context, stage Stage, tool string, content 
 		if !matchTool(r.toolPat, tool) {
 			continue
 		}
+		if r.Type == TypeRequireApproval {
+			// Invocation-based, not content-based: the matched tool always needs a
+			// human. No pattern is evaluated.
+			v.Findings = append(v.Findings, Finding{
+				Rule: r.Name, Type: string(r.Type), Stage: string(stage), Tool: tool,
+				Detector: "require-approval", Action: string(r.Action),
+				Message: r.describe(fmt.Sprintf("tool %q requires approval before it runs", r.Tool)),
+			})
+			p.apply(&v, r)
+			continue
+		}
 		hits := r.evaluate(content)
 		if r.Type == TypeTripwire {
 			// A tripwire with a pattern counts matches; a tripwire without one
@@ -297,6 +341,9 @@ func (p *Processor) Scan(ctx context.Context, stage Stage, tool string, content 
 	if v.Blocked && v.Reason == "" {
 		v.Reason = summarise(v.Findings, ActionBlock)
 	}
+	if v.Interrupted && v.Reason == "" {
+		v.Reason = summarise(v.Findings, ActionInterrupt)
+	}
 	if v.Warned && v.Reason == "" {
 		v.Reason = summarise(v.Findings, ActionWarn)
 	}
@@ -310,11 +357,17 @@ func (p *Processor) Scan(ctx context.Context, stage Stage, tool string, content 
 }
 
 func (p *Processor) apply(v *Verdict, r Rule) {
-	if r.Action == ActionBlock {
+	// Additive: several rules may fire on one piece of content. The flags are all
+	// truthful; precedence (block > interrupt > warn) is resolved at the point of
+	// consumption via Verdict.Outcome(), never by clearing a flag here.
+	switch r.Action {
+	case ActionBlock:
 		v.Blocked = true
-		return
+	case ActionInterrupt:
+		v.Interrupted = true
+	default:
+		v.Warned = true
 	}
-	v.Warned = true
 }
 
 func summarise(fs []Finding, want Action) string {
@@ -328,8 +381,11 @@ func summarise(fs []Finding, want Action) string {
 		return ""
 	}
 	verb := "blocked"
-	if want == ActionWarn {
+	switch want {
+	case ActionWarn:
 		verb = "warned"
+	case ActionInterrupt:
+		verb = "requires approval"
 	}
 	return fmt.Sprintf("guardrail %s: %s", verb, strings.Join(names, "; "))
 }
