@@ -61,6 +61,12 @@ const MaxMarkdownBytes = 1 << 20 // 1 MiB
 // error so a caller can offer the install hint instead of reporting a failure.
 var ErrUnavailable = errors.New("pdf-inspector is not installed")
 
+// ErrBadInput marks operator-supplied path mistakes — a missing file or a
+// directory. The CLI classifies these as usage errors (exit 2), matching
+// `doc read --help` and the `fix-vuln` sibling; a genuine engine failure is a
+// run failure (exit 1) and does not carry this sentinel.
+var ErrBadInput = errors.New("bad document input")
+
 // Document is the result of reading one file.
 type Document struct {
 	Path      string `json:"path"`
@@ -161,9 +167,9 @@ func Extract(ctx context.Context, path string, opts Options) (*Document, error) 
 		opts.MaxBytes = MaxMarkdownBytes
 	}
 	if fi, err := os.Stat(path); err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, fmt.Errorf("reading %s: %w (%w)", path, err, ErrBadInput)
 	} else if fi.IsDir() {
-		return nil, fmt.Errorf("%s is a directory", path)
+		return nil, fmt.Errorf("%s is a directory (%w)", path, ErrBadInput)
 	}
 
 	res, err := runEngine(ctx, bin, opts.Timeout, path, "--json")
