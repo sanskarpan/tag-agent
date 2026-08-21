@@ -48,7 +48,22 @@ func registerTripwire(root *cobra.Command, app *App) {
 		Short:   "Content guardrails: screen model output and tool I/O, halt on policy violations",
 		GroupID: "tools",
 	}
+	c.AddCommand(tripwireSubcommands(app)...)
+	root.AddCommand(c)
 
+	// PRD-123 §6 names this surface `tag guardrail runtime`. It is a thin alias
+	// over the SAME guardrail.Processor and the SAME subcommand builders (no
+	// behavioural divergence). It can safely coexist now that the still-Proposed
+	// PRDs 121/122/124/125 will add sibling `guardrail input|output|result`
+	// verbs; `tag tripwire` stays the canonical spelling.
+	registerGuardrail(root, app)
+}
+
+// tripwireSubcommands builds a fresh set of the four read-only / dry-run
+// guardrail subcommands (list, check, test, history). It is called once per
+// parent — `tripwire` and `guardrail runtime` — so the two surfaces share
+// behaviour without sharing mutable flag state.
+func tripwireSubcommands(app *App) []*cobra.Command {
 	var profile string
 	list := &cobra.Command{
 		Use:   "list",
@@ -201,8 +216,26 @@ func registerTripwire(root *cobra.Command, app *App) {
 	}
 	history.Flags().IntVar(&histLimit, "limit", 50, "max rows")
 
-	c.AddCommand(list, check, test, history)
-	root.AddCommand(c)
+	return []*cobra.Command{list, check, test, history}
+}
+
+// registerGuardrail mounts the PRD-123 §6 `tag guardrail runtime` surface as an
+// alias over the tripwire engine, and adds the config-editing `add`/`remove`
+// verbs that only make sense under this namespace.
+func registerGuardrail(root *cobra.Command, app *App) {
+	g := &cobra.Command{
+		Use:     "guardrail",
+		Short:   "Runtime guardrails (PRD-123): the same engine as `tag tripwire`, under the guardrail namespace",
+		GroupID: "tools",
+	}
+	runtime := &cobra.Command{
+		Use:   "runtime",
+		Short: "Runtime content guardrails: list, check, test, inspect, and edit the ruleset",
+	}
+	runtime.AddCommand(tripwireSubcommands(app)...)
+	runtime.AddCommand(guardrailRuntimeEditCommands(app)...)
+	g.AddCommand(runtime)
+	root.AddCommand(g)
 }
 
 // buildProcessor resolves the guardrail ruleset for a CLI invocation.
@@ -275,6 +308,10 @@ func emitVerdict(v guardrail.Verdict, exitZero bool) error {
 			fmt.Println("  the guardrail could not evaluate this content and therefore BLOCKED it (fail-closed)")
 		case v.Blocked:
 			fmt.Printf("TRIPWIRE FIRED (%s): %s\n", v.Stage, v.Reason)
+		case v.Interrupted:
+			// An interrupt rule fired: the run would pause for human approval.
+			// This must NOT read as "clean" — the exit code is 3.
+			fmt.Printf("APPROVAL REQUIRED (%s): %s\n", v.Stage, v.Reason)
 		case v.Warned:
 			fmt.Printf("WARN (%s): %s\n", v.Stage, v.Reason)
 		default:

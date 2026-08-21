@@ -222,11 +222,15 @@ type Pauser interface {
 // no I/O or policy dependencies of its own, and the guardrail implementation
 // (internal/guardrail) must stay swappable and independently testable.
 //
-// Both methods return (blocked, reason). A Screener that CANNOT evaluate must
-// return blocked=true with a reason that says so — never (false, "").
+// A Screener that CANNOT evaluate must fail closed (blocked=true) with a reason
+// that says so — never a silent pass, and never an interrupt (which a human
+// could approve past).
 type Screener interface {
-	// ScreenToolInput runs before the tool executes. blocked=true refuses the call.
-	ScreenToolInput(ctx context.Context, tool string, args map[string]any) (bool, string)
+	// ScreenToolInput runs before the tool executes. blocked=true refuses the
+	// call outright; interrupt=true (subordinate to blocked) routes it through
+	// the approval gate as if a human must confirm before it runs. At most one
+	// is true; block takes precedence.
+	ScreenToolInput(ctx context.Context, tool string, args map[string]any) (blocked bool, interrupt bool, reason string)
 	// ScreenToolResult runs after the tool executes, before the model sees the
 	// result. The side effect has already happened, so blocked=true means "withhold
 	// this result and tell the model why" — it cannot un-run the tool.
@@ -413,8 +417,10 @@ func (g *Guard) decide(ctx context.Context, req Request) Decision {
 	// the CONTENT ("...but this particular command is `rm -rf /`"). A subject
 	// grant must not be able to smuggle content the operator banned. Only
 	// --dangerously-allow-all, which announces itself, is above it.
+	var screenInterrupt bool
 	if g.Screener != nil {
-		if blocked, reason := g.Screener.ScreenToolInput(ctx, req.Tool, req.Args); blocked {
+		blocked, interrupt, reason := g.Screener.ScreenToolInput(ctx, req.Tool, req.Args)
+		if blocked {
 			if reason == "" {
 				reason = "blocked by a content guardrail"
 			}
@@ -422,9 +428,20 @@ func (g *Guard) decide(ctx context.Context, req Request) Decision {
 				Rule:   Rule{Tool: req.Tool, Action: Deny, Source: SourceTripwire},
 				Reason: reason}
 		}
+		screenInterrupt = interrupt
 	}
 
 	rule, _ := g.resolve(req)
+	// A guardrail `interrupt` (PRD-123 FR-07: require-approval) turns a call the
+	// rules would ALLOW into one that must be confirmed by a human — it routes
+	// through the very same approval path as an Ask rule (Pauser/Prompter/
+	// session/auto-approve, with the fail-closed bounded timeout). A Deny rule
+	// stays denied (deny outranks a pause); an Ask rule already pauses. Block was
+	// handled above and outranks interrupt.
+	if screenInterrupt && rule.Action == Allow {
+		rule.Action = Ask
+		rule.Source = SourceTripwire
+	}
 	switch rule.Action {
 	case Allow:
 		return Decision{Action: Allow, Rule: rule, Via: "rule",

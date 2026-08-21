@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,8 +44,19 @@ MIN_CHARS_PER_PAGE = 8
 #: wall-clock cost stops being worth the certainty.
 MAX_VERIFY_PAGES = 64
 
+#: Exact pin for the in-process wheel (PRD-133 Tier 2). A 0.x Rust-built wheel
+#: on a fast-moving line is exactly the supply-chain shape the no-ranges policy
+#: exists for, so it is pinned here, in the `pdf` extra of pyproject.toml, and in
+#: the runtime LAZY_DEPS allowlist — bump all three in lockstep.
+PDF_INSPECTOR_PIN = "pdf-inspector==0.2.6"
+PDF_INSPECTOR_MODULE = "pdf_inspector"
+
+#: Force a backend for tests / parity checks: "subprocess" | "inprocess".
+DOC_BACKEND_ENV = "TAG_DOC_BACKEND"
+
 INSTALL_HINT = (
-    "install it with `npm install -g @firecrawl/pdf-inspector` "
+    "install the in-process engine with `pip install 'tag-agent[pdf]'`, "
+    "or the CLI with `npm install -g @firecrawl/pdf-inspector` "
     "(ships a prebuilt binary; no toolchain required), or set "
     f"{ENV_OVERRIDE} to an existing one"
 )
@@ -56,6 +68,15 @@ class DocumentUnavailable(RuntimeError):
 
 class DocumentError(RuntimeError):
     """The engine ran and failed, or returned something unusable."""
+
+
+class DocumentBadInput(DocumentError):
+    """The operator named the wrong path — a missing file or a directory.
+
+    Distinct so the CLI can classify it as a usage error (exit 2), matching the
+    Go harness's docs.ErrBadInput and `doc read --help`; a genuine engine
+    failure stays a plain DocumentError (exit 1).
+    """
 
 
 @dataclass
@@ -181,38 +202,174 @@ def extract(
 ) -> Document:
     """Read *path* and return its text.
 
-    Raises :class:`DocumentUnavailable` when the engine is absent and
-    :class:`DocumentError` when it runs and fails.
+    Selects the in-process ``pdf_inspector`` wheel when it is importable, else
+    the ``pdf-inspector`` subprocess CLI — both produce the identical Document
+    (see :func:`_finalize`). Raises :class:`DocumentUnavailable` when neither is
+    present, :class:`DocumentBadInput` for a missing file or a directory, and
+    :class:`DocumentError` when the engine runs and fails.
     """
+    backend = _select_backend()
+    if backend == "":
+        raise DocumentUnavailable(f"no document engine is available — {INSTALL_HINT}")
+    p = Path(path)
+    if not p.exists():
+        raise DocumentBadInput(f"{path}: no such file")
+    if p.is_dir():
+        raise DocumentBadInput(f"{path} is a directory")
+
+    if backend == "inprocess":
+        summary, page_md = _inprocess_backend(str(p), timeout)
+    else:
+        summary, page_md = _subprocess_backend(str(p), timeout)
+    return _finalize(str(p), summary, page_md, max_bytes=max_bytes, skip_verify=skip_verify)
+
+
+def _select_backend() -> str:
+    """Return "inprocess", "subprocess", or "" (nothing available).
+
+    ``TAG_DOC_BACKEND`` forces one, for tests and parity checks. Otherwise the
+    in-process wheel wins when it is already importable (no Node required), then
+    the CLI on PATH.
+    """
+    forced = (os.environ.get(DOC_BACKEND_ENV) or "").strip().lower()
+    if forced in ("subprocess", "inprocess"):
+        return forced
+    import importlib.util
+
+    if importlib.util.find_spec(PDF_INSPECTOR_MODULE) is not None:
+        return "inprocess"
+    if engine_path() is not None:
+        return "subprocess"
+    return ""
+
+
+def _subprocess_backend(path: str, timeout: float):
+    """The CLI backend: a summary dict + a per-page markdown reader."""
     binary = engine_path()
     if binary is None:
         raise DocumentUnavailable(f"pdf-inspector is not installed — {INSTALL_HINT}")
-    p = Path(path)
-    if not p.exists():
-        raise DocumentError(f"{path}: no such file")
-    if p.is_dir():
-        raise DocumentError(f"{path} is a directory")
+    summary = _run_engine(binary, path, timeout)
 
-    res = _run_engine(binary, str(p), timeout)
-    doc = Document(
-        path=str(p),
-        type=res.get("pdfType", ""),
-        page_count=int(res.get("pageCount") or 0),
-        title=(res.get("title") or "").strip(),
-        markdown=res.get("markdown") or "",
-        pages_with_tables=res.get("pagesWithTables") or [],
-        pages_with_columns=res.get("pagesWithColumns") or [],
-        engine_ms=int(res.get("processingTimeMs") or 0),
+    def page_md(page: int) -> str:  # page is 1-based
+        return (_run_engine(binary, path, timeout, pages=page).get("markdown") or "")
+
+    return summary, page_md
+
+
+def _inprocess_backend(path: str, timeout: float):
+    """The pyo3 wheel backend, mapped to the SAME summary shape as the CLI.
+
+    Two things, verified against pdf-inspector==0.2.6, shape this:
+
+    * ``extract_pages_markdown`` takes and reports pages **0-based** (its
+      per-page ``needs_ocr`` flag and 0-based ``page`` index are the reliable
+      signal), whereas ``process_pdf().pages_needing_ocr`` is **unreliable** — it
+      flagged every page of a plainly text-based document. So the OCR list is
+      derived from the trustworthy per-page flags, converted to the one 1-based
+      convention here, NOT from ``process_pdf``.
+    * The per-page markdown is read once and cached, so per-page verification
+      costs no extra parse (the subprocess backend re-runs the engine per page).
+    """
+    mod = _ensure_inprocess()
+    r = mod.process_pdf(path)  # doc-level metadata + concatenated markdown
+    pages = list(getattr(mod.extract_pages_markdown(path), "pages", []) or [])
+
+    md_by_page: dict[int, str] = {}  # 0-based -> markdown
+    ocr_1based: list[int] = []
+    for pg in pages:
+        idx = int(getattr(pg, "page", 0))  # 0-based
+        md_by_page[idx] = getattr(pg, "markdown", "") or ""
+        if getattr(pg, "needs_ocr", False):
+            ocr_1based.append(idx + 1)
+
+    summary = {
+        "pdfType": getattr(r, "pdf_type", "") or "",
+        "pageCount": int(getattr(r, "page_count", 0) or 0),
+        "title": getattr(r, "title", "") or "",
+        "markdown": getattr(r, "markdown", "") or "",
+        "pagesWithTables": list(getattr(r, "pages_with_tables", []) or []),
+        "pagesWithColumns": list(getattr(r, "pages_with_columns", []) or []),
+        "processingTimeMs": int(getattr(r, "processing_time_ms", 0) or 0),
+        "pagesNeedingOcr": ocr_1based,
+        "hasEncodingIssues": bool(getattr(r, "has_encoding_issues", False)),
+        "isComplexLayout": bool(getattr(r, "is_complex_layout", False)),
+    }
+
+    def page_md(page: int) -> str:  # page is 1-based; cache is 0-based
+        return md_by_page.get(page - 1, "")
+
+    return summary, page_md
+
+
+def _lazy_installs_allowed() -> bool:
+    """Auto-install is OPT-IN. A silent network install of a pinned wheel in a
+    supply-chain-cautious codebase must be asked for, not assumed."""
+    if _truthy(os.environ.get("HERMES_DISABLE_LAZY_INSTALLS")):
+        return False
+    return _truthy(os.environ.get("TAG_ALLOW_LAZY_INSTALLS"))
+
+
+def _truthy(v: str | None) -> bool:
+    return (v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _ensure_inprocess():
+    """Import the wheel, lazy-installing the exact pin only when explicitly
+    allowed. Absent and not allowed → an honest DocumentUnavailable naming the
+    manual install, never a silent pip call."""
+    import importlib
+
+    try:
+        return importlib.import_module(PDF_INSPECTOR_MODULE)
+    except ImportError:
+        pass
+    if not _lazy_installs_allowed():
+        raise DocumentUnavailable(
+            f"{PDF_INSPECTOR_MODULE} is not installed — run "
+            f"`pip install 'tag-agent[pdf]'` (or set TAG_ALLOW_LAZY_INSTALLS=1 "
+            f"to auto-install {PDF_INSPECTOR_PIN})"
+        )
+    # Exact-pin discipline: only ever install the one pinned spec.
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", PDF_INSPECTOR_PIN],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=300,
     )
-    doc.pages_needing_ocr = normalize_pages(res.get("pagesNeedingOcr"), doc.page_count)
+    return importlib.import_module(PDF_INSPECTOR_MODULE)
 
-    if res.get("hasEncodingIssues"):
+
+def _finalize(
+    path: str,
+    summary: dict,
+    page_md,
+    *,
+    max_bytes: int,
+    skip_verify: bool,
+) -> Document:
+    """Turn a backend summary into a Document, applying the honesty logic that
+    is identical for both backends: per-page verification, OCR/truncation/empty
+    notes, and the 1-place page normalisation."""
+    doc = Document(
+        path=path,
+        type=summary.get("pdfType", ""),
+        page_count=int(summary.get("pageCount") or 0),
+        title=(summary.get("title") or "").strip(),
+        markdown=summary.get("markdown") or "",
+        pages_with_tables=summary.get("pagesWithTables") or [],
+        pages_with_columns=summary.get("pagesWithColumns") or [],
+        engine_ms=int(summary.get("processingTimeMs") or 0),
+    )
+    doc.pages_needing_ocr = normalize_pages(summary.get("pagesNeedingOcr"), doc.page_count)
+
+    if summary.get("hasEncodingIssues"):
         doc.note("the engine reported encoding issues, so some characters may be wrong")
-    if res.get("isComplexLayout"):
+    if summary.get("isComplexLayout"):
         doc.note("complex layout: reading order may not match the visual order")
 
     if not skip_verify:
-        _verify_pages(doc, binary, timeout)
+        _verify_pages(doc, page_md)
 
     if doc.pages_needing_ocr:
         doc.complete = False
@@ -236,13 +393,14 @@ def extract(
     return doc
 
 
-def _verify_pages(doc: Document, binary: str, timeout: float) -> None:
+def _verify_pages(doc: Document, page_md) -> None:
     """Confirm each unflagged page actually yields text.
 
     The engine's document-level OCR list is a threshold judgement, not a fact. A
     page that produced no text was not read, whatever the summary said — and
     handing back a document with silently blank pages, labelled complete, is the
-    pattern this whole feature exists to avoid.
+    pattern this whole feature exists to avoid. ``page_md`` is the backend's
+    1-based per-page markdown reader.
     """
     if doc.page_count <= 0:
         return
@@ -266,14 +424,14 @@ def _verify_pages(doc: Document, binary: str, timeout: float) -> None:
     empty: list[int] = []
     for page in unflagged:
         try:
-            res = _run_engine(binary, doc.path, timeout, pages=page)
+            md = page_md(page)
         except DocumentError as exc:
             doc.note(
                 f"per-page verification could not run ({exc}), so the OCR list is the "
                 "engine's summary alone and has not been confirmed"
             )
             return
-        if len((res.get("markdown") or "").strip()) < MIN_CHARS_PER_PAGE:
+        if len((md or "").strip()) < MIN_CHARS_PER_PAGE:
             empty.append(page)
     if empty:
         doc.pages_needing_ocr = normalize_pages(doc.pages_needing_ocr + empty, doc.page_count)

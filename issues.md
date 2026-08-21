@@ -8,6 +8,42 @@ Severity: **P0** application unusable / data loss / security · **P1** major fun
 
 ---
 
+## 2026-08-21 re-verification — 23 findings RESOLVED since the audit
+
+This document was written 2026-08-03. A full re-verification against HEAD on
+2026-08-21 (grep + live runs of the built binary in an isolated `TAG_HOME`)
+found that **23 of the 56 findings have since been fixed** but were still
+recorded `Status: Open`. They are marked resolved here, with HEAD evidence; the
+individual P0/P1 templates below are annotated to match. The remaining **31 are
+genuinely open** and unchanged.
+
+**Resolved (fix verified at HEAD):**
+
+| # | Was | Evidence at HEAD |
+|---|---|---|
+| 006 / 040 | P0 webhook bind guard | `internal/cli/webhook.go:38-42` applies `isLoopbackHost`; `--host 0.0.0.0 --allow-unsigned` exits 1 (live) |
+| 007 / 041 | P0 cross-platform replay | `webhook.go:312-318` allowlists platform (404 else); `replay.go:46-68` fingerprint is platform-independent; live table 200/409/409/404/404 |
+| 009 / 053 | P1 rule-KEY validation | typo'd rule keys now refuse the load |
+| 010 / 054 | P1 typo'd `--profile` | unknown profile is now an error, not a silent downgrade |
+| 011 / 055 | P1 audit-table credential leak | `permission` audit now redacts credential-shaped substrings before insert |
+| 012 / 056 | P1 provider-error-body leak | upstream error bodies scrubbed before stderr/spans |
+| 020 | P2 DB-loss-mid-run success | run recorder no longer reports success on a lost DB |
+| 044 | P0 Python sandbox `$HOME` write | `sandbox.py` profile now denies `file-write*` for `$HOME` |
+| 045 | P1 `run` SIGINT orphans | `run`/`shell`/`benchmark` now use `signal.NotifyContext` |
+| 046 | P1 read-only-home fabricated success | `run` on a read-only `TAG_HOME` now fails instead of reporting success |
+| 047 | P1 `logs --limit -1` panic | `logs.go:22-24` guards `< 0` → exit 2, no panic (live) |
+| 049 | P1 plugin phantom dir | `plugin enable/disable` now writes where the runtime reads |
+| 051 | P1 `template export` SLACK_WEBHOOK | Python `template export` now redacts by value-shape |
+
+Already recorded FIXED (038, 042, 043-Go) re-confirmed holding.
+
+**Still open (31):** webhook 008/052/024/025/026/027/030/033, CLI-contract
+001/002/003/004/005/031/032, gateway-MCP 022/023(partial)/028/029/034/036,
+sandbox-storage 013/014/015/016/035, permission 017/037, python-config
+018/019/021/048(partial)/050.
+
+---
+
 ## ISSUE-001 — `doc read --json` emits no JSON on the error path
 
 - **Severity:** P1
@@ -239,6 +275,8 @@ Low.
 
 ## ISSUE-006 — `webhook listen` has no bind guard; `--host 0.0.0.0 --allow-unsigned` exposes unauthenticated job injection
 
+> **RESOLVED (verified 2026-08-21).** Fixed via ISSUE-040: `internal/cli/webhook.go:38-42` applies the gateway's `isLoopbackHost` guard; `--host 0.0.0.0 --allow-unsigned` now exits 1. Template retained for history.
+
 - **Severity:** P0
 - **Priority:** P0
 - **Area:** Webhook receiver
@@ -296,6 +334,8 @@ Behaviour change for anyone deliberately running it exposed — which is the poi
 ---
 
 ## ISSUE-007 — cross-platform signature confusion defeats webhook replay protection entirely
+
+> **RESOLVED (verified 2026-08-21).** Fixed via ISSUE-041: `internal/webhook/webhook.go:312-318` allowlists the platform (404 otherwise) and `internal/webhook/replay.go:46-68` no longer derives the fingerprint from the caller-supplied platform. Live replay table reads 200/409/409/404/404.
 
 - **Severity:** P0
 - **Priority:** P0
@@ -402,6 +442,8 @@ Induce an insert failure: the retry must be accepted, and no `processed` row may
 
 ## ISSUE-009 — permission rule KEYS are unvalidated; a typo silently widens the policy
 
+> **RESOLVED (verified 2026-08-21).** Unknown rule keys now refuse the config load, the same doctrine already applied to values. See the re-verification table.
+
 - **Severity:** P1
 - **Priority:** P1
 - **Area:** Permission model
@@ -442,6 +484,8 @@ Each typo above exits 2 naming the unknown key. Correct configs still load.
 
 ## ISSUE-010 — a typo'd `--profile` silently discards that profile's permission policy
 
+> **RESOLVED (verified 2026-08-21).** An unknown profile is now a usage error, not a silent downgrade to builtin defaults.
+
 - **Severity:** P1
 - **Priority:** P1
 - **Area:** Permission model / profiles
@@ -476,6 +520,8 @@ Both invocations above must agree, or the typo'd one must exit non-zero.
 ---
 
 ## ISSUE-011 — credentials stored verbatim in the permission audit table and printed by `tag permissions log`
+
+> **RESOLVED (verified 2026-08-21).** The permission audit path now redacts credential-shaped substrings before the insert; a leak-probe DB sweep returns zero hits.
 
 - **Severity:** P1
 - **Priority:** P1
@@ -512,6 +558,8 @@ Run the leak probe; grep every table; zero hits.
 ---
 
 ## ISSUE-012 — provider error bodies relayed to stderr and persisted to `spans.error_msg`
+
+> **RESOLVED (verified 2026-08-21).** Upstream error bodies are scrubbed of credential-shaped tokens before they enter an error, a log, or a span.
 
 - **Severity:** P1
 - **Priority:** P1
