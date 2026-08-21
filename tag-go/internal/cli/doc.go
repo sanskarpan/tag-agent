@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -22,7 +23,6 @@ func registerDoc(root *cobra.Command, app *App) {
 		GroupID: "orch",
 	}
 
-	var asJSON bool
 	var maxBytes int
 	var skipVerify bool
 
@@ -44,9 +44,15 @@ func registerDoc(root *cobra.Command, app *App) {
 				SkipVerify: skipVerify,
 			})
 			if err != nil {
+				// A missing file or a directory is the operator naming the wrong
+				// thing — a usage error (exit 2), matching this command's --help and
+				// the fix-vuln sibling. A genuine engine failure stays exit 1.
+				if errors.Is(err, docs.ErrBadInput) {
+					return jsonErrorMaybe(usageErr{err})
+				}
 				return jsonErrorMaybe(err)
 			}
-			if asJSON || flagJSON {
+			if flagJSON {
 				if err := emitJSON(doc); err != nil {
 					return err
 				}
@@ -71,7 +77,6 @@ func registerDoc(root *cobra.Command, app *App) {
 			return nil
 		},
 	}
-	read.Flags().BoolVar(&asJSON, "json", false, "emit the full result as JSON")
 	read.Flags().IntVar(&maxBytes, "max-bytes", 0, "cap the extracted text (0 = default 1 MiB)")
 	read.Flags().BoolVar(&skipVerify, "skip-verify", false,
 		"skip the per-page check that confirms each page produced text")
