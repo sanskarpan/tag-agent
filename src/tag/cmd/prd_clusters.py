@@ -564,6 +564,15 @@ def cmd_webhook_server(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # PRD-057/058/059/060/061/062/063: ci extensions command handler
 # ---------------------------------------------------------------------------
+def _doc_error(as_json: bool, msg: str) -> None:
+    """Emit a doc error: a parseable {"error": ...} on stdout under --json (so a
+    --json consumer never sees an empty read), else a plain message on stderr."""
+    if as_json:
+        print(json.dumps({"error": msg}))
+    else:
+        print_error(msg)
+
+
 def cmd_doc(args: argparse.Namespace) -> int:
     """`tag doc` — document ingestion (PRD-133).
 
@@ -603,10 +612,16 @@ def cmd_doc(args: argparse.Namespace) -> int:
                 skip_verify=getattr(args, "skip_verify", False),
             )
         except docsmod.DocumentUnavailable as exc:
-            print_error(str(exc))
+            _doc_error(getattr(args, "json", False), str(exc))
+            return 2
+        except docsmod.DocumentBadInput as exc:
+            # A missing file or a directory is the operator naming the wrong
+            # thing — a usage error (exit 2), matching the Go harness and
+            # `doc read --help`. Checked before DocumentError (its parent).
+            _doc_error(getattr(args, "json", False), str(exc))
             return 2
         except docsmod.DocumentError as exc:
-            print_error(str(exc))
+            _doc_error(getattr(args, "json", False), str(exc))
             return 1
         if getattr(args, "json", False):
             print(json.dumps(doc.to_dict(), indent=2))
@@ -1233,8 +1248,10 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
                           help="cap the extracted text (0 = default 1 MiB)")
     doc_read.add_argument("--skip-verify", action="store_true",
                           help="skip the per-page check that confirms each page produced text")
+    doc_read.add_argument("--json", action="store_true", help="emit the full result as JSON")
     doc_check = doc_sub.add_parser("check", help="Report whether document support is available")
     doc_check.add_argument("file", metavar="FILE", nargs="?")
+    doc_check.add_argument("--json", action="store_true", help="emit the result as JSON")
     for ap in [doc_cmd, doc_read, doc_check]:
         ap.set_defaults(func=cmd_doc)
 
