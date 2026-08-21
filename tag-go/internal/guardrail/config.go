@@ -92,8 +92,10 @@ func parseRule(m map[string]any, where string) (Rule, error) {
 			r.Type = TypePattern
 		case TypeTripwire:
 			r.Type = TypeTripwire
+		case TypeRequireApproval:
+			r.Type = TypeRequireApproval
 		default:
-			return r, fmt.Errorf("%s: type must be 'pattern' or 'tripwire', got %q", where, s)
+			return r, fmt.Errorf("%s: type must be 'pattern', 'tripwire', or 'require-approval', got %q", where, s)
 		}
 	}
 
@@ -148,6 +150,11 @@ func parseRule(m map[string]any, where string) (Rule, error) {
 		return r, fmt.Errorf("%s: %w", where, err)
 	}
 	r.Action = a
+	// A require-approval rule exists to pause for a human; interrupt is its
+	// natural default when the operator did not spell an action out.
+	if r.Type == TypeRequireApproval && strings.TrimSpace(act) == "" {
+		r.Action = ActionInterrupt
+	}
 	r.Message, _ = m["message"].(string)
 	return r, nil
 }
@@ -188,11 +195,17 @@ func Compile(rules []Rule) ([]Rule, error) {
 		}
 		r.toolPat = r.Tool
 
-		if r.Action == "" {
-			r.Action = ActionBlock
-		}
 		if r.Type == "" {
 			r.Type = TypePattern
+		}
+		if r.Action == "" {
+			// require-approval defaults to interrupt (its whole point is a human
+			// gate); every other rule defaults to the safe, halting block.
+			if r.Type == TypeRequireApproval {
+				r.Action = ActionInterrupt
+			} else {
+				r.Action = ActionBlock
+			}
 		}
 		if r.Builtin != "" {
 			if err := ValidateBuiltin(r.Builtin); err != nil {
@@ -220,6 +233,15 @@ func Compile(rules []Rule) ([]Rule, error) {
 		case TypeTripwire:
 			if r.Threshold <= 0 {
 				return nil, fmt.Errorf("guardrail rule %q: a tripwire needs a positive 'threshold'", r.Name)
+			}
+		case TypeRequireApproval:
+			// It matches every invocation of the tool, so a content matcher or a
+			// threshold would be silently ignored — refuse rather than mislead.
+			if r.re != nil || r.Builtin != "" {
+				return nil, fmt.Errorf("guardrail rule %q: a require-approval rule matches every invocation and takes no 'pattern'/'builtin'", r.Name)
+			}
+			if r.Threshold != 0 {
+				return nil, fmt.Errorf("guardrail rule %q: a require-approval rule takes no 'threshold'", r.Name)
 			}
 		}
 		out = append(out, r)
