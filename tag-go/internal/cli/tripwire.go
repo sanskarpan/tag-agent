@@ -308,6 +308,10 @@ func emitVerdict(v guardrail.Verdict, exitZero bool) error {
 			fmt.Println("  the guardrail could not evaluate this content and therefore BLOCKED it (fail-closed)")
 		case v.Blocked:
 			fmt.Printf("TRIPWIRE FIRED (%s): %s\n", v.Stage, v.Reason)
+		case v.Interrupted:
+			// An interrupt rule fired: the run would pause for human approval.
+			// This must NOT read as "clean" — the exit code is 3.
+			fmt.Printf("APPROVAL REQUIRED (%s): %s\n", v.Stage, v.Reason)
 		case v.Warned:
 			fmt.Printf("WARN (%s): %s\n", v.Stage, v.Reason)
 		default:
