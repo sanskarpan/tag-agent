@@ -174,3 +174,15 @@ def test_cmd_doc_json_error_path_and_exit_codes(monkeypatch, tmp_path, capsys):
     real = tmp_path / "real.pdf"
     real.write_bytes(b"%PDF-1.4 fake")
     assert cmd_doc(_doc_args(file=str(real))) == 1
+
+
+def test_negative_max_bytes_does_not_drop_the_tail(inprocess):
+    # A negative --max-bytes must be treated as "use the default", matching the
+    # Go harness — not a negative slice markdown[:-n] that silently drops the
+    # document's TAIL while reporting it truncated (#745).
+    full = "HELLO WORLD THIS IS THE FULL DOCUMENT TAIL"
+    f = inprocess(_meta(page_count=1, markdown=full),
+                  [{"page": 0, "markdown": full}])
+    d = docs.extract(f, max_bytes=-5)
+    assert d.markdown == full
+    assert d.complete is True
