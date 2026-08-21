@@ -282,6 +282,14 @@ func RunState(ctx context.Context, db *sql.DB, runID string) (map[string]string,
 	if err := ensureFlowColumn(db); err != nil {
 		return nil, err
 	}
+	// The query reads the inline `result` column, which is added lazily by the
+	// worker on the first completion. On a DB where a flow job was queued but no
+	// worker has finished one yet, that column does not exist and the whole
+	// query failed with "no such column: result" — so `dag state` crashed on
+	// every submitted-but-not-yet-run DAG. Ensure it, exactly as flow_json is.
+	if err := ensureResultColumn(db); err != nil {
+		return nil, err
+	}
 	rows, err := db.QueryContext(ctx, `SELECT COALESCE(flow_json,''), COALESCE(result,''), status
 		FROM queue_jobs WHERE flow_json IS NOT NULL AND flow_json != ''`)
 	if err != nil {
