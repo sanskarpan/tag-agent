@@ -1,43 +1,55 @@
 package cli_test
 
 import (
+	"encoding/json"
+	"math"
 	"os"
-	"strings"
 	"testing"
 
 	yaml "gopkg.in/yaml.v3"
 )
 
-// TestRunRecordsCost: a run with token usage must persist a non-zero cost, so
-// `runs show` matches `costs --run-id` instead of printing 0 (#751). RED against
-// pre-fix code, whose INSERT omitted estimated_cost_usd.
-func TestRunRecordsCost(t *testing.T) {
+// TestRunCostIsConsistentWithCosts: the cost `runs show` reports must equal what
+// `costs --run-id` computes — the run INSERT used to omit estimated_cost_usd, so
+// `runs show` printed 0 while `costs` had the real figure (#751). Asserting
+// CONSISTENCY (not a magnitude) keeps this robust to #742 (echo attribution):
+// if echo billing is later zeroed, both surfaces move to 0 together.
+func TestRunCostIsConsistentWithCosts(t *testing.T) {
 	h := newHome(t)
-	if _, code := run(t, h, "run", "hello world cost test"); code != 0 {
+	if _, code := run(t, h, "run", "cost consistency check"); code != 0 {
 		t.Fatalf("run failed: %d", code)
 	}
-	out, _ := run(t, h, "--json", "runs", "list")
-	// The run row must carry a positive estimated cost; check runs show text.
-	show, _ := run(t, h, "runs", "list")
-	_ = out
-	_ = show
-	// Find the run id from the json list.
-	var rows []map[string]any
-	if err := yaml.Unmarshal([]byte(out), &rows); err != nil || len(rows) == 0 {
-		t.Fatalf("no runs listed: %v / %s", err, out)
+	listOut, _ := run(t, h, "--json", "runs", "list")
+	var list []map[string]any
+	if err := json.Unmarshal([]byte(listOut), &list); err != nil || len(list) == 0 {
+		t.Fatalf("no runs: %v / %s", err, listOut)
 	}
-	id, _ := rows[0]["id"].(string)
-	detail, code := run(t, h, "runs", "show", id)
-	if code != 0 {
-		t.Fatalf("runs show failed: %d", code)
+	id, _ := list[0]["id"].(string)
+
+	showOut, _ := run(t, h, "--json", "runs", "show", id)
+	var show map[string]any
+	if err := json.Unmarshal([]byte(showOut), &show); err != nil {
+		t.Fatalf("runs show json: %v / %s", err, showOut)
 	}
-	// The echo provider produces token usage, so cost must not be a bare 0.
-	for _, ln := range strings.Split(detail, "\n") {
-		if strings.HasPrefix(ln, "Cost (usd):") {
-			if strings.Contains(ln, " 0\n") || strings.TrimSpace(strings.TrimPrefix(ln, "Cost (usd):")) == "0" {
-				t.Errorf("run with token usage must record a non-zero cost, got: %q", ln)
+	runCost, _ := show["estimated_cost_usd"].(float64)
+
+	costOut, _ := run(t, h, "--json", "costs", "--run-id", id)
+	var cost map[string]any
+	if err := json.Unmarshal([]byte(costOut), &cost); err != nil {
+		t.Fatalf("costs json: %v / %s", err, costOut)
+	}
+	var total float64
+	if rows, ok := cost["rows"].([]any); ok {
+		for _, r := range rows {
+			if rm, ok := r.(map[string]any); ok {
+				if c, ok := rm["cost_usd"].(float64); ok {
+					total += c
+				}
 			}
 		}
+	}
+	if math.Abs(runCost-total) > 1e-9 {
+		t.Errorf("runs show cost %v must equal costs --run-id total %v", runCost, total)
 	}
 }
 
