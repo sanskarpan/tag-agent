@@ -388,7 +388,10 @@ func registerObservability(root *cobra.Command, app *App) {
 			if err != nil {
 				return err
 			}
-			rows, err := db.Query(`SELECT DISTINCT trace_id FROM spans ORDER BY trace_id DESC LIMIT 50`)
+			// "recent traces" means most-recently-active first. Ordering by the
+			// trace_id string put a lexicographically-larger id above a newer one,
+			// so the newest trace was not first. Order by each trace's latest span.
+			rows, err := db.Query(`SELECT trace_id FROM spans GROUP BY trace_id ORDER BY MAX(started_at) DESC LIMIT 50`)
 			if err != nil {
 				return err
 			}

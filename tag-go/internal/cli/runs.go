@@ -20,6 +20,12 @@ func registerRuns(root *cobra.Command, app *App) {
 	var profile string
 	list := &cobra.Command{Use: "list", Short: "List recent runs", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// A negative limit reaches SQLite as `LIMIT -1`, which means "no
+			// limit" — so `--limit -1` silently dumped every row. Guard it, the
+			// same contract `tag logs --limit` already enforces.
+			if limit < 0 {
+				return usageErrorf("--limit must be >= 0 (got %d)", limit)
+			}
 			db, err := app.OpenDB()
 			if err != nil {
 				return err
@@ -108,12 +114,12 @@ func registerRuns(root *cobra.Command, app *App) {
 				&id, &createdAt, &kind, &taskType, &execution, &masterProfile, &board, &prompt, &status,
 				&modelID, &promptTok, &compTok, &cacheRead, &cacheCreate, &cost, &dur, &completedAt, &metadata)
 			if err == sql.ErrNoRows {
-				if flagJSON {
-					// JSON error path stays JSON (clean exit, mirrors cache cmds).
-					return emitJSON(map[string]any{"error": fmt.Sprintf("no run matching id prefix %q", prefix)})
-				}
-				// Non-JSON: return an error so Execute() prints it and exits 1.
-				return fmt.Errorf("no run matching id prefix %q", prefix)
+				// Not-found is non-zero under --json too, matching the rest of the
+				// detail family (eval/loop/swarm/queue show). jsonErrorMaybe prints
+				// the {"error":...} object to stdout AND returns the error so the
+				// exit code stays 1 — a --json consumer can tell "does not exist"
+				// from "found but empty".
+				return jsonErrorMaybe(fmt.Errorf("no run matching id prefix %q", prefix))
 			}
 			if err != nil {
 				return err
