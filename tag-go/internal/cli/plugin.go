@@ -248,6 +248,12 @@ func setPluginEnabled(app *App, profile, name string, enabled bool) error {
 	if err := validProfileName(profile); err != nil {
 		return err
 	}
+	// An unknown profile must be refused, not silently created as a phantom
+	// profiles/<name>/.env that no run reads — matching set-model and import-*,
+	// which already reject it. Otherwise plugin enable/install fabricate success.
+	if err := ensureProfileExists(app.Cfg, profile); err != nil {
+		return usageErr{err}
+	}
 	suffix := pluginEnvSanitize.ReplaceAllString(strings.ToUpper(name), "_")
 	key := "TAG_PLUGIN_" + suffix + "_ENABLED"
 	homeDir := app.Cfg.String("runtime.home_dir", "")
