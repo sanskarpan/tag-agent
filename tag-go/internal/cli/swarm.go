@@ -458,8 +458,13 @@ func swarmListCmd(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Ensure the degraded columns exist on a DB created before them.
+			if err := swarm.EnsureSchema(db.DB); err != nil {
+				return err
+			}
 			q := `SELECT swarm_id, goal, status, task_count, COALESCE(started_at,''),
-				COALESCE(completed_at,''), total_cost_usd FROM swarm_runs`
+				COALESCE(completed_at,''), total_cost_usd, COALESCE(degraded,0),
+				COALESCE(degraded_reason,'') FROM swarm_runs`
 			var qargs []any
 			if statusFilter != "" {
 				q += ` WHERE status=?`
@@ -472,21 +477,25 @@ func swarmListCmd(app *App) *cobra.Command {
 			}
 			defer rows.Close()
 			type run struct {
-				SwarmID     string  `json:"swarm_id"`
-				Goal        string  `json:"goal"`
-				Status      string  `json:"status"`
-				Tasks       int     `json:"task_count"`
-				StartedAt   string  `json:"started_at"`
-				CompletedAt string  `json:"completed_at"`
-				Cost        float64 `json:"total_cost_usd"`
+				SwarmID        string  `json:"swarm_id"`
+				Goal           string  `json:"goal"`
+				Status         string  `json:"status"`
+				Tasks          int     `json:"task_count"`
+				StartedAt      string  `json:"started_at"`
+				CompletedAt    string  `json:"completed_at"`
+				Cost           float64 `json:"total_cost_usd"`
+				Degraded       bool    `json:"degraded"`
+				DegradedReason string  `json:"degraded_reason,omitempty"`
 			}
 			out := []run{}
 			for rows.Next() {
 				var r run
 				var cost sql.NullFloat64
-				if err := rows.Scan(&r.SwarmID, &r.Goal, &r.Status, &r.Tasks, &r.StartedAt, &r.CompletedAt, &cost); err != nil {
+				var degraded int
+				if err := rows.Scan(&r.SwarmID, &r.Goal, &r.Status, &r.Tasks, &r.StartedAt, &r.CompletedAt, &cost, &degraded, &r.DegradedReason); err != nil {
 					return err
 				}
+				r.Degraded = degraded == 1
 				r.Cost = cost.Float64
 				out = append(out, r)
 			}
@@ -593,11 +602,17 @@ func swarmResultsCmd(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := swarm.EnsureSchema(db.DB); err != nil {
+				return err
+			}
 			var sid, goal, st string
 			var finalOut sql.NullString
 			var cost sql.NullFloat64
-			err = db.QueryRow(`SELECT swarm_id, goal, status, final_output, total_cost_usd FROM swarm_runs WHERE swarm_id=?`, args[0]).
-				Scan(&sid, &goal, &st, &finalOut, &cost)
+			var degraded int
+			var degradedReason string
+			err = db.QueryRow(`SELECT swarm_id, goal, status, final_output, total_cost_usd,
+				COALESCE(degraded,0), COALESCE(degraded_reason,'') FROM swarm_runs WHERE swarm_id=?`, args[0]).
+				Scan(&sid, &goal, &st, &finalOut, &cost, &degraded, &degradedReason)
 			if errors.Is(err, sql.ErrNoRows) {
 				if asJSON {
 					b, _ := json.Marshal(map[string]any{"error": fmt.Sprintf("swarm %s not found", args[0]), "swarm_id": args[0]})
@@ -649,11 +664,18 @@ func swarmResultsCmd(app *App) *cobra.Command {
 			}
 			if asJSON {
 				out := map[string]any{"swarm_id": sid, "goal": goal, "status": st,
-					"final_output": finalOut.String, "total_cost_usd": cost.Float64, "tasks": trs}
+					"final_output": finalOut.String, "total_cost_usd": cost.Float64, "tasks": trs,
+					"degraded": degraded == 1}
+				if degradedReason != "" {
+					out["degraded_reason"] = degradedReason
+				}
 				if includeContext {
 					out["context_bus"] = ctxRows
 				}
 				return emitJSON(out)
+			}
+			if degraded == 1 {
+				fmt.Printf("DEGRADED: %s\n", strOr(degradedReason, "coordinator fallback — not a decomposed swarm"))
 			}
 			fmt.Printf("Swarm:  %s  (%s)  total_cost=$%.4f\n", sid, st, cost.Float64)
 			fmt.Printf("Goal:   %s\n\n", goal)
