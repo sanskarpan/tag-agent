@@ -54,6 +54,10 @@ func registerBenchmark(root *cobra.Command, app *App) {
 				fmt.Printf("%-24s %s\n", truncate(cr.ID, 24), status)
 			}
 			fmt.Printf("\n%d/%d passed (%d failed)\n", res.Passed, res.Total, res.Failed)
+			if res.Stub {
+				fmt.Fprintln(cmd.ErrOrStderr(), "  STUB: ran against the offline `echo` provider, which parrots the prompt — "+
+					"these passes are a harness smoke test, not a real evaluation (configure a real provider to benchmark it)")
+			}
 			// `0/3 passed` exited 0. `eval run` already uses 1 for "any case
 			// failed"; benchmark now matches its sibling rather than inventing a
 			// third convention.
@@ -107,6 +111,9 @@ func registerBenchmark(root *cobra.Command, app *App) {
 				return emitJSON(r)
 			}
 			fmt.Printf("Benchmark run %s — suite %q — provider %s — %s\n", r.ID, r.Suite, r.Provider, r.CreatedAt)
+			if r.Stub {
+				fmt.Println("STUB: offline `echo` provider — a harness smoke test, not a real evaluation")
+			}
 			fmt.Printf("%d/%d passed (%d failed)\n\n", r.Passed, r.Total, r.Failed)
 			for _, cr := range r.Cases {
 				status := "PASS"
