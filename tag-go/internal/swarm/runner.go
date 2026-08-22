@@ -359,6 +359,15 @@ func (r *Runner) Run(ctx context.Context, swarmID string) (*Result, error) {
 	if err := finishRun(r.db, swarmID, status, final, totalPrompt, totalCompletion, totalCost); err != nil {
 		return out, err
 	}
+	// Persist a coordinator fallback so `swarm list/results --json` shows the run
+	// was degraded, not a real decomposed swarm — the human status already
+	// carries a "(degraded ...)" suffix, but machine consumers saw only
+	// "completed".
+	if out.Degraded {
+		if err := markDegraded(r.db, swarmID, out.DegradedReason); err != nil {
+			return out, err
+		}
+	}
 	return out, nil
 }
 
