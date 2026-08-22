@@ -79,3 +79,19 @@ func TestShowNotFound(t *testing.T) {
 		t.Fatal("expected not-found error")
 	}
 }
+
+// TestEchoRunIsMarkedStub: a run against the offline echo provider must be
+// flagged stub=true so a "3/3 passed" is never mistaken for a real evaluation
+// (#741). RED against pre-fix code, which had no Stub field.
+func TestEchoRunIsMarkedStub(t *testing.T) {
+	db := openTestDB(t)
+	r := &Runner{DB: db, Provider: llm.EchoProvider{}}
+	suite := &Suite{Name: "unit", Cases: []Case{{ID: "a", Prompt: "say ok", Expected: "ok"}}}
+	res, err := r.Run(context.Background(), suite)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Stub {
+		t.Error("an echo-provider run must be marked stub=true")
+	}
+}
