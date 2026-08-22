@@ -75,11 +75,24 @@ func registerTemplate(root *cobra.Command, app *App) {
 				}
 			}
 			tmpl["env"] = env
-			// read config.yaml
-			if b, err := os.ReadFile(filepath.Join(dir, "config.yaml")); err == nil {
-				var pcfg map[string]any
-				if yaml.Unmarshal(b, &pcfg) == nil && pcfg != nil {
-					tmpl["config"] = pcfg
+			// The profile's config lives in tag.yaml (profiles.<name>.config) —
+			// the canonical source that set-model and import write. Export used to
+			// read only the rendered <profileDir>/config.yaml, which frequently
+			// does not exist, so it always emitted `config: {}` and dropped the
+			// model/display config. Read tag.yaml first, fall back to the file.
+			if profs := app.Cfg.Section("profiles"); profs != nil {
+				if pm, ok := profs[profile].(map[string]any); ok {
+					if c, ok := pm["config"].(map[string]any); ok && len(c) > 0 {
+						tmpl["config"] = c
+					}
+				}
+			}
+			if len(asMap(tmpl["config"])) == 0 {
+				if b, err := os.ReadFile(filepath.Join(dir, "config.yaml")); err == nil {
+					var pcfg map[string]any
+					if yaml.Unmarshal(b, &pcfg) == nil && pcfg != nil {
+						tmpl["config"] = pcfg
+					}
 				}
 			}
 			out, err := yaml.Marshal(tmpl)
