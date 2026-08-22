@@ -414,7 +414,14 @@ def cmd_template(args: argparse.Namespace) -> int:
                 k, _, v = line.partition("=")
                 template["env"][k.strip()] = _redact_env(k.strip(), v.strip())
 
-        if cfg_file.exists():
+        # The profile's config lives in tag.yaml (profiles.<name>.config) — the
+        # canonical source set-model/import write. The rendered config.yaml often
+        # does not exist, so export used to emit an empty config and drop the
+        # model/display settings. Read tag.yaml first, fall back to the file.
+        prof_cfg = ((cfg.get("profiles", {}) or {}).get(profile, {}) or {}).get("config", {})
+        if prof_cfg:
+            template["config"] = prof_cfg
+        elif cfg_file.exists():
             with cfg_file.open() as fh:
                 template["config"] = yaml.safe_load(fh) or {}
 
