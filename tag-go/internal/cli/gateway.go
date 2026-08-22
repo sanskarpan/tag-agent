@@ -111,7 +111,11 @@ func gatewayResolve(app *App, defProv llm.Provider, defProvSlug, profile string,
 }
 
 // gatewayModels advertises the distinct configured primary models across all
-// profiles for GET /v1/models, plus the offline echo model.
+// profiles for GET /v1/models, plus the offline echo model. Only models the
+// gateway can actually SERVE are listed: a model whose provider prefix is not
+// in llm.Registry would be advertised but then rejected at /v1/chat/completions
+// with "no registered provider" — advertising it is a promise the gateway
+// cannot keep (an OpenAI client trusts /v1/models to pick a model).
 func gatewayModels(app *App) []string {
 	set := map[string]bool{"echo": true}
 	if profs := app.Cfg.Section("profiles"); profs != nil {
@@ -123,6 +127,12 @@ func gatewayModels(app *App) []string {
 			}
 			if p != "" && !strings.Contains(m, "/") {
 				m = p + "/" + m
+			}
+			// Drop any model whose provider prefix has no registered provider.
+			if i := strings.IndexByte(m, '/'); i > 0 {
+				if llm.Registry[m[:i]] == nil {
+					continue
+				}
 			}
 			set[m] = true
 		}

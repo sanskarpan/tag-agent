@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	yaml "gopkg.in/yaml.v3"
 
+	"github.com/tag-agent/tag/internal/config"
 	"github.com/tag-agent/tag/internal/marketplace"
 	"github.com/tag-agent/tag/internal/paths"
 )
@@ -137,11 +138,28 @@ func registerTemplate(root *cobra.Command, app *App) {
 				}
 			}
 			// config.yaml
-			if cfgData := asMap(tmpl["config"]); len(cfgData) > 0 {
+			cfgData := asMap(tmpl["config"])
+			if len(cfgData) > 0 {
 				out, _ := yaml.Marshal(cfgData)
 				if err := os.WriteFile(filepath.Join(dir, "config.yaml"), out, 0o644); err != nil {
 					return err
 				}
+			}
+			// Register the profile in tag.yaml. Without this the runtime .env /
+			// config.yaml were written but profiles.<name> never existed, so
+			// `models`/`assignments`/`route`/`set-model` could not see the profile
+			// — import claimed success for a profile nothing could use.
+			cfgPath, perr := config.Path(flagConfig)
+			if perr != nil {
+				return perr
+			}
+			if _, err := config.Update(cfgPath, func(data map[string]any) {
+				entry := childMap(childMap(data, "profiles"), profile)
+				if len(cfgData) > 0 {
+					entry["config"] = cfgData
+				}
+			}); err != nil {
+				return fmt.Errorf("wrote the profile files but could not register it in %s: %w", cfgPath, err)
 			}
 			fmt.Printf("Template imported as profile '%s'\n", profile)
 			return nil

@@ -367,7 +367,12 @@ def cmd_env(args: argparse.Namespace) -> int:
     from tag.controller import load_config, config_path, hermes_env
     cfg = load_config(config_path(args.config))
     env = hermes_env(cfg)
-    for key in ("HOME", "HERMES_HOME", "CODEX_HOME", "PATH"):
+    keys = ("HOME", "HERMES_HOME", "CODEX_HOME", "PATH")
+    if getattr(args, "json", False):
+        import json as _json
+        print(_json.dumps({k: env[k] for k in keys}))
+        return 0
+    for key in keys:
         print(f"{key}={env[key]}")
     return 0
 
@@ -398,6 +403,7 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     render.set_defaults(func=cmd_render)
 
     env_cmd = sub.add_parser("env", help="Print the isolated environment values")
+    env_cmd.add_argument("--json", action="store_true", help="emit the environment as a JSON object")
     env_cmd.set_defaults(func=cmd_env)
 
     hermes_cmd = sub.add_parser("runtime", help="Pass raw arguments through to the managed runtime binary")

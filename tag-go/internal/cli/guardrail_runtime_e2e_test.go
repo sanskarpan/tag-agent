@@ -111,3 +111,26 @@ func TestGuardrailRuntimeInterruptShowsApprovalRequired(t *testing.T) {
 		t.Errorf("expected APPROVAL REQUIRED header, got: %q", out)
 	}
 }
+
+// TestGuardrailRuntimeRejectsPhantomProfile: `guardrail runtime add/remove
+// --profile <typo>` must refuse an unknown profile, not silently write into a
+// phantom profiles.<typo> block no run reads (#747). RED against pre-fix code,
+// which created the phantom profile and exited 0.
+func TestGuardrailRuntimeRejectsPhantomProfile(t *testing.T) {
+	h := newHome(t)
+	if _, code := run(t, h, "guardrail", "runtime", "add",
+		"--name", "r1", "--tool", "http_*", "--type", "require-approval",
+		"--profile", "no-such-profile"); code != 2 {
+		t.Errorf("add with a typo'd profile should exit 2, got %d", code)
+	}
+	if _, code := run(t, h, "guardrail", "runtime", "remove",
+		"--name", "r1", "--profile", "no-such-profile"); code != 2 {
+		t.Errorf("remove with a typo'd profile should exit 2, got %d", code)
+	}
+	// A real profile still works.
+	if _, code := run(t, h, "guardrail", "runtime", "add",
+		"--name", "r1", "--tool", "http_*", "--type", "require-approval",
+		"--profile", "coder"); code != 0 {
+		t.Errorf("add to a real profile should exit 0, got %d", code)
+	}
+}
