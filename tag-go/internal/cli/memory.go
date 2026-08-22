@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
@@ -379,8 +380,14 @@ func short(s string) string {
 	return s
 }
 func truncate(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
+	if len(s) <= n {
+		return s
 	}
-	return s
+	// Cut on a rune boundary at or before n bytes. A bare s[:n] split a
+	// multibyte character in half and emitted invalid UTF-8 into table output
+	// whenever a cell held CJK/accented text.
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }

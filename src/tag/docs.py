@@ -208,6 +208,12 @@ def extract(
     present, :class:`DocumentBadInput` for a missing file or a directory, and
     :class:`DocumentError` when the engine runs and fails.
     """
+    # A non-positive cap means "use the default", matching the Go harness
+    # (opts.MaxBytes <= 0 -> MaxMarkdownBytes). Without this, a negative value
+    # became a negative slice markdown[:max_bytes] that silently dropped the
+    # TAIL of the document while reporting it as "truncated".
+    if max_bytes <= 0:
+        max_bytes = MAX_MARKDOWN_BYTES
     backend = _select_backend()
     if backend == "":
         raise DocumentUnavailable(f"no document engine is available — {INSTALL_HINT}")
