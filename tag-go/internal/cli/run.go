@@ -168,12 +168,21 @@ func registerRun(root *cobra.Command, app *App) {
 				return fmt.Errorf("cannot record the run — check that TAG_HOME is writable: %w", derr)
 			}
 			{
+				// Compute and STORE the run cost. The INSERT used to omit
+				// estimated_cost_usd, so it defaulted to 0 and `runs show` printed
+				// "Cost (usd): 0" for a run that actually cost money — while
+				// `costs --run-id` computed the real figure. Use the same rate
+				// table costs uses.
+				var estCost float64
+				if c, _, _ := resolveSpanCost(modelID, nil, res.TotalUsage.PromptTokens, res.TotalUsage.CompletionTokens); c != nil {
+					estCost = *c
+				}
 				if _, ierr := db.Exec(`INSERT INTO runs(id,created_at,kind,task_type,execution,master_profile,board,prompt,route_json,status,metadata_json,
-					model_id,prompt_tokens,completion_tokens,cache_read_tokens,duration_ms,completed_at)
-					VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+					model_id,prompt_tokens,completion_tokens,cache_read_tokens,duration_ms,completed_at,estimated_cost_usd)
+					VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 					runID, started.Format(time.RFC3339), "agent", "chat", "native", app.profile(profile), "default",
 					args[0], "{}", "completed", "{}", modelID, res.TotalUsage.PromptTokens, res.TotalUsage.CompletionTokens,
-					res.TotalUsage.CacheReadTokens, durMs, time.Now().UTC().Format(time.RFC3339)); ierr != nil {
+					res.TotalUsage.CacheReadTokens, durMs, time.Now().UTC().Format(time.RFC3339), estCost); ierr != nil {
 					return fmt.Errorf("recording run: %w", ierr)
 				}
 			}
