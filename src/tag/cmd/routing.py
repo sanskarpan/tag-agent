@@ -658,6 +658,16 @@ def cmd_plugin(args: argparse.Namespace) -> int:
     plugins_map: dict[str, Any] = registry.get("plugins", registry).get("registry", {})
     sub = getattr(args, "plugin_subcommand", None)
 
+    def _require_profile(profile: str) -> bool:
+        # An unknown profile must be refused, not silently written into a phantom
+        # profiles/<name>/ dir that no run reads (fabricated success). Mirrors
+        # set-model / import-* which already reject it with this message.
+        profiles = cfg.get("profiles", {}) if isinstance(cfg.get("profiles"), dict) else {}
+        if profile not in profiles:
+            print_error(f"Unknown profile '{profile}'. Available: {', '.join(sorted(profiles))}")
+            return False
+        return True
+
     if sub == "list" or sub is None:
         if not plugins_map:
             print("No plugins in registry.")
@@ -680,6 +690,8 @@ def cmd_plugin(args: argparse.Namespace) -> int:
             return 1
         pypi = info.get("pypi", name)
         profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
+        if not _require_profile(profile):
+            return 2
         result = _hermes_venv_pip(cfg, profile, "install", pypi)
         if result.returncode != 0:
             print_error(f"pip install failed: {result.stderr.strip()}")
@@ -697,6 +709,8 @@ def cmd_plugin(args: argparse.Namespace) -> int:
         # even for a real, installed plugin. The same phantom-directory bug was
         # found and fixed in workflow_mgmt.py and missed here.
         profile_dir = _safe_profile_path(profile_home(cfg, profile).parent, profile)
+        if not _require_profile(profile):
+            return 2
         env_file = profile_dir / ".env"
         # Normalise the plugin name to a valid env var identifier (replace any
         # non-alphanumeric characters with underscores, not just hyphens).
@@ -722,6 +736,8 @@ def cmd_plugin(args: argparse.Namespace) -> int:
         name = args.plugin_name
         profile = getattr(args, "profile", None) or cfg.get("master_profile", "orchestrator")
         profile_dir = _safe_profile_path(profile_home(cfg, profile).parent, profile)
+        if not _require_profile(profile):
+            return 2
         env_file = profile_dir / ".env"
         if env_file.exists():
             env_key_suffix = re.sub(r"[^A-Z0-9]", "_", name.upper())
