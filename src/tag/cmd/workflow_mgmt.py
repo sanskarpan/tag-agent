@@ -33,7 +33,7 @@ except Exception:
     def print_warning(msg: str) -> None:  # type: ignore[misc]
         print(f"warning: {msg}", file=sys.stderr)
 
-from tag.core.config import load_config, save_config, config_path
+from tag.core.config import load_config, save_config, config_path, update_config
 from tag.core.paths import (
     tag_home,
     hermes_root,
@@ -477,6 +477,17 @@ def cmd_template(args: argparse.Namespace) -> int:
         cfg_data = tmpl.get("config", {})
         if cfg_data:
             _write_yaml(profile_dir / "config.yaml", cfg_data, force=True)
+
+        # Register the profile in tag.yaml. Without this the runtime .env /
+        # config.yaml were written but profiles.<name> never existed, so
+        # models/assignments/route/set-model could not see the imported profile
+        # — import claimed success for a profile nothing could use.
+        def _register(c: dict) -> None:
+            entry = c.setdefault("profiles", {}).setdefault(profile, {})
+            if cfg_data:
+                entry["config"] = cfg_data
+
+        update_config(config_path(getattr(args, "config", None)), _register)
 
         print_success(f"Template imported as profile '{profile}'")
         return 0
