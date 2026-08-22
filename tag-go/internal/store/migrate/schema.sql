@@ -172,7 +172,8 @@ CREATE TABLE IF NOT EXISTS swarm_runs (
   max_agents INTEGER NOT NULL DEFAULT 4, started_at TEXT, completed_at TEXT,
   total_tokens_prompt INTEGER DEFAULT 0, total_tokens_completion INTEGER DEFAULT 0,
   total_cost_usd REAL DEFAULT 0.0, task_count INTEGER DEFAULT 0, final_output TEXT,
-  manifest_json TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  manifest_json TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  degraded INTEGER NOT NULL DEFAULT 0, degraded_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS swarm_tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT, swarm_id TEXT NOT NULL REFERENCES swarm_runs(swarm_id),

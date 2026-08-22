@@ -28,9 +28,57 @@ CREATE INDEX IF NOT EXISTS idx_swarm_tasks_swarm_id ON swarm_tasks(swarm_id);
 CREATE INDEX IF NOT EXISTS idx_swarm_ctx_swarm_key ON swarm_context(swarm_id, key);
 `
 
-// EnsureSchema creates the swarm_context table if the DB predates it.
+// EnsureSchema creates the swarm_context table if the DB predates it, and adds
+// the degraded/degraded_reason columns to swarm_runs on a DB created before they
+// existed (so `swarm list/status/results` can report a coordinator fallback).
 func EnsureSchema(db *sql.DB) error {
-	_, err := db.Exec(swarmContextSchema)
+	if _, err := db.Exec(swarmContextSchema); err != nil {
+		return err
+	}
+	return ensureSwarmDegradedColumns(db)
+}
+
+// ensureSwarmDegradedColumns adds degraded/degraded_reason to swarm_runs if
+// absent. SQLite has no ADD COLUMN IF NOT EXISTS, so check PRAGMA table_info
+// first (the same pattern internal/worker.ensureQueueColumn uses).
+func ensureSwarmDegradedColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(swarm_runs)`)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if !have["degraded"] {
+		if _, err := db.Exec(`ALTER TABLE swarm_runs ADD COLUMN degraded INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !have["degraded_reason"] {
+		if _, err := db.Exec(`ALTER TABLE swarm_runs ADD COLUMN degraded_reason TEXT`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// markDegraded records a coordinator fallback on the run row, so machine
+// consumers (swarm list/results --json) can see the run did not run as a real
+// decomposed swarm even though its status is "completed".
+func markDegraded(db *sql.DB, swarmID, reason string) error {
+	ctx, cancel := bgCtx()
+	defer cancel()
+	_, err := db.ExecContext(ctx,
+		`UPDATE swarm_runs SET degraded=1, degraded_reason=? WHERE swarm_id=?`, reason, swarmID)
 	return err
 }
 

@@ -81,15 +81,20 @@ type CaseResult struct {
 
 // RunResult is the full outcome of a suite run (also the persisted record).
 type RunResult struct {
-	ID        string       `json:"id"`
-	CreatedAt string       `json:"created_at"`
-	Provider  string       `json:"provider"`
-	Model     string       `json:"model"`
-	Suite     string       `json:"suite"`
-	Total     int          `json:"total"`
-	Passed    int          `json:"passed"`
-	Failed    int          `json:"failed"`
-	Cases     []CaseResult `json:"cases"`
+	ID        string `json:"id"`
+	CreatedAt string `json:"created_at"`
+	Provider  string `json:"provider"`
+	Model     string `json:"model"`
+	Suite     string `json:"suite"`
+	Total     int    `json:"total"`
+	Passed    int    `json:"passed"`
+	Failed    int    `json:"failed"`
+	// Stub is true when the run used the offline `echo` provider, which parrots
+	// the prompt. The substring grader then "passes" any case whose expected text
+	// appears in its own prompt — a harness smoke test, NOT a real evaluation. It
+	// is surfaced so a CI gate or consumer never mistakes it for a genuine pass.
+	Stub  bool         `json:"stub,omitempty"`
+	Cases []CaseResult `json:"cases"`
 }
 
 // Runner executes suites through the native agent loop.
@@ -132,6 +137,7 @@ func (r *Runner) Run(ctx context.Context, s *Suite) (*RunResult, error) {
 		Model:     r.Model,
 		Suite:     s.Name,
 		Total:     len(s.Cases),
+		Stub:      strings.EqualFold(r.Provider.Name(), "echo"),
 	}
 	for _, c := range s.Cases {
 		out, err := loop.Run(ctx, c.Prompt, agent.Options{Model: r.Model, MaxSteps: r.MaxSteps})
@@ -196,6 +202,7 @@ func List(db *sql.DB, limit int) ([]RunResult, error) {
 			&r.Total, &r.Passed, &r.Failed); err != nil {
 			return nil, err
 		}
+		r.Stub = strings.EqualFold(r.Provider, "echo")
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -223,6 +230,7 @@ func Show(db *sql.DB, idPrefix string) (*RunResult, error) {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(blob), &r.Cases)
+		r.Stub = strings.EqualFold(r.Provider, "echo")
 		matches = append(matches, r)
 	}
 	if err := rows.Err(); err != nil {
