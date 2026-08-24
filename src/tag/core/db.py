@@ -171,8 +171,8 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_spans_trace ON spans(trace_id, started_at);
 
         CREATE TABLE IF NOT EXISTS maintenance_state (
-          name       TEXT PRIMARY KEY,
-          last_run   TEXT NOT NULL
+          key        TEXT PRIMARY KEY,
+          value      TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS events (
@@ -223,6 +223,7 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
         """
     )
     ensure_queue_schema(conn)
+    _migrate_maintenance_state(conn)
     _migrate_runs_cost_columns(conn)
     _migrate_spans_schema(conn)
     _migrate_prd_021_032_tables(conn)
@@ -230,6 +231,48 @@ def open_db(cfg: dict[str, Any]) -> sqlite3.Connection:
     _migrate_swarm_tables(conn)
     _prune_old_spans(conn)
     return conn
+
+
+def _migrate_maintenance_state(conn: sqlite3.Connection) -> None:
+    """Converge `maintenance_state` onto the shared (key, value) shape (#737).
+
+    The table shipped with two incompatible column sets: Python's
+    (name, last_run) and the Go harness's (key, value). Both distributions share
+    runtime/tag.sqlite3, so a Python-created (name, last_run) table made every Go
+    command fail closed — Go's reconciler sees `key` missing and tries
+    `ALTER TABLE ... ADD COLUMN key TEXT PRIMARY KEY`, which SQLite forbids.
+
+    Rebuild any legacy (name, last_run) table into (key, value), carrying the one
+    bookkeeping row (`prune_spans` -> its timestamp) forward. Idempotent: a table
+    that is already (key, value) — or absent, having just been created fresh by
+    the schema above — is left untouched.
+    """
+    try:
+        cols = {row[1] for row in conn.execute(
+            "PRAGMA table_info(maintenance_state)"
+        ).fetchall()}
+    except sqlite3.OperationalError:
+        return
+    if not cols or ("key" in cols and "value" in cols):
+        return  # freshly created as (key, value), or already migrated
+    if "name" not in cols or "last_run" not in cols:
+        return  # unrecognised shape — do not guess, leave it alone
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE maintenance_state__new (
+              key   TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO maintenance_state__new(key, value)
+              SELECT name, last_run FROM maintenance_state;
+            DROP TABLE maintenance_state;
+            ALTER TABLE maintenance_state__new RENAME TO maintenance_state;
+            """
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
 
 def _migrate_spans_schema(conn: sqlite3.Connection) -> None:
@@ -635,7 +678,7 @@ def _prune_old_spans(
     now = _dt.datetime.now(_dt.timezone.utc)
     try:
         row = conn.execute(
-            "SELECT last_run FROM maintenance_state WHERE name = 'prune_spans'"
+            "SELECT value FROM maintenance_state WHERE key = 'prune_spans'"
         ).fetchone()
     except sqlite3.OperationalError:
         return
@@ -650,8 +693,8 @@ def _prune_old_spans(
     try:
         conn.execute("DELETE FROM spans WHERE started_at < ?", (cutoff,))
         conn.execute(
-            "INSERT INTO maintenance_state(name, last_run) VALUES('prune_spans', ?) "
-            "ON CONFLICT(name) DO UPDATE SET last_run = excluded.last_run",
+            "INSERT INTO maintenance_state(key, value) VALUES('prune_spans', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (now.isoformat(),),
         )
         conn.commit()
