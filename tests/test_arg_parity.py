@@ -97,6 +97,24 @@ def test_run_empty_prompt_is_a_usage_error():
     assert cmd_run(SimpleNamespace(config=None, prompt="   ", profile=None, json=False)) == 2
 
 
+def test_benchmark_group_and_flat_forms():
+    from tag.controller import build_parser
+    p = build_parser()
+    # Historical flat form still dispatches to cmd_benchmark.
+    assert p.parse_args(["benchmark", "--profile", "coder"]).func.__name__ == "cmd_benchmark"
+    # Go-style subcommand group.
+    assert p.parse_args(["benchmark", "run", "--profile", "coder"]).func.__name__ == "cmd_benchmark"
+    assert p.parse_args(["benchmark", "list", "--limit", "5"]).func.__name__ == "cmd_benchmark_list"
+    ns = p.parse_args(["benchmark", "show", "bench-x"])
+    assert ns.func.__name__ == "cmd_benchmark_show" and ns.run_id == "bench-x"
+
+
+def test_benchmark_flat_without_profile_is_usage_error():
+    from types import SimpleNamespace
+    from tag.cmd.routing import cmd_benchmark
+    assert cmd_benchmark(SimpleNamespace(config=None, profile=None, json=False)) == 2
+
+
 def test_route_worker_model_flag_alias():
     from tag.controller import build_parser
 
