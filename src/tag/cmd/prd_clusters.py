@@ -585,7 +585,9 @@ def cmd_doc(args: argparse.Namespace) -> int:
     if sub == "check":
         path = docsmod.engine_path()
         target = getattr(args, "file", None)
-        out = {"available": path is not None, "engine": path}
+        # Go emits an empty string (not null) when no engine is present; match it
+        # so the --json `engine` field has the same type in both distros (#763).
+        out = {"available": path is not None, "engine": path or ""}
         if path is None:
             out["hint"] = docsmod.INSTALL_HINT
         if target:
@@ -965,7 +967,19 @@ def cmd_entity_graph(args: argparse.Namespace) -> int:
         summary = format_graph_summary(conn, profile)
         if getattr(args, "json", False):
             graph = query_graph(conn, profile)
-            print(json.dumps(graph, indent=2, default=str))
+            # Include the `counts` summary the Go harness emits, so the --json
+            # shape matches across distributions (#763). Keys alphabetical.
+            communities = detect_communities(conn, profile)
+            out = {
+                "counts": {
+                    "communities": len(communities),
+                    "entities": len(graph.get("entities", [])),
+                    "relations": len(graph.get("relations", [])),
+                },
+                "entities": graph.get("entities", []),
+                "relations": graph.get("relations", []),
+            }
+            print(json.dumps(out, indent=2, default=str))
         else:
             print(summary)
         return 0
