@@ -510,7 +510,10 @@ func registerDAG(root *cobra.Command, app *App) {
 					}
 					depStr = " ← [" + strings.Join(short, ", ") + "]"
 				}
-				fmt.Printf("%s %-12s [%-8s] %s%s\n", icon, truncate(r.id, 12), r.status, truncate(r.task, 50), depStr)
+				// Pad the status icon to a uniform 2-cell display width: wide glyphs
+				// (⏳/⌛) are 2 cells while ✓/○/•/– are 1, so without this the id
+				// column starts a cell earlier on single-width rows (#763 tui).
+				fmt.Printf("%s %-12s [%-8s] %s%s\n", padDisplay(icon, 2), truncate(r.id, 12), r.status, truncate(r.task, 50), depStr)
 			}
 			return nil
 		}}
