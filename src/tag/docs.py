@@ -103,19 +103,28 @@ class Document:
             self.notes.append(text)
 
     def to_dict(self) -> dict:
-        return {
+        # Match the Go harness's `omitempty` fields so the --json shape agrees
+        # across distributions (#763): title, pages_with_tables/columns, notes and
+        # engine_ms are dropped when empty rather than emitted as ""/[]/0.
+        out: dict = {
             "path": self.path,
             "type": self.type,
             "page_count": self.page_count,
-            "title": self.title,
             "markdown": self.markdown,
             "pages_needing_ocr": self.pages_needing_ocr,
-            "pages_with_tables": self.pages_with_tables,
-            "pages_with_columns": self.pages_with_columns,
             "complete": self.complete,
-            "notes": self.notes,
-            "engine_ms": self.engine_ms,
         }
+        if self.title:
+            out["title"] = self.title
+        if self.pages_with_tables:
+            out["pages_with_tables"] = self.pages_with_tables
+        if self.pages_with_columns:
+            out["pages_with_columns"] = self.pages_with_columns
+        if self.notes:
+            out["notes"] = self.notes
+        if self.engine_ms:
+            out["engine_ms"] = self.engine_ms
+        return out
 
 
 def engine_path() -> str | None:

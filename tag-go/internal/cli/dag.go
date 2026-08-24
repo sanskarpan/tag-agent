@@ -672,8 +672,12 @@ func registerDAG(root *cobra.Command, app *App) {
 				}
 				if !ok {
 					// An unknown run must not print an empty state as though that
-					// were the answer.
-					return jsonErrorMaybe(fmt.Errorf("no DAG run %q (run `tag dag run <name>` to start one)", runID))
+					// were the answer. The old hint pointed at `dag run <name>` — the
+					// very command that produced the run the user is trying to inspect
+					// — which misfires when they passed a DAG NAME. `dag state` takes a
+					// RUN_ID; point them at where to find it (#763).
+					return jsonErrorMaybe(fmt.Errorf("no DAG run %q — `dag state` takes a RUN_ID, not a DAG name; "+
+						"get it from `tag dag list` or the run=<id> that `tag dag run <name> --execute` prints", runID))
 				}
 			} else {
 				runID, err = worker.LatestRunID(ctx, db.DB)

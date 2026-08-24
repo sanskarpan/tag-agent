@@ -65,6 +65,18 @@ def test_doc_check_nonexistent_file_is_not_supported(tmp_path, monkeypatch, caps
     assert out.get("file_error") == "file not found"
 
 
+def test_doc_to_dict_omits_empty_fields_like_go():
+    from tag.docs import Document
+    # Empty title / pages_with_* / notes / engine_ms are omitted (Go omitempty).
+    empty = Document(path="/x.pdf", type="pdf", page_count=1, title="", markdown="hi").to_dict()
+    for k in ("title", "pages_with_tables", "pages_with_columns", "notes", "engine_ms"):
+        assert k not in empty, f"{k} should be omitted when empty"
+    # Present values are included.
+    full = Document(path="/x.pdf", type="pdf", page_count=1, title="T", markdown="hi",
+                    pages_with_tables=[1], engine_ms=5).to_dict()
+    assert full["title"] == "T" and full["pages_with_tables"] == [1] and full["engine_ms"] == 5
+
+
 def test_graph_show_json_has_counts(tmp_path, monkeypatch, capsys):
     from tag.cmd.prd_clusters import cmd_entity_graph
     _home(tmp_path, monkeypatch)
