@@ -140,8 +140,13 @@ func TestRunEmitsSpans(t *testing.T) {
 
 // TestRunSpanCostIsAttributed covers PRD-046: a turn whose model is in the
 // pricing table must land a per-span cost_usd, and it must be > 0.
-func TestRunSpanCostIsAttributed(t *testing.T) {
+// TestEchoRunSpansAreFree: an echo (offline) run must record its llm spans with
+// model "echo" and NO cost — echo does no real inference, so billing it at the
+// profile's configured model rate is fabricated cost (#742). Priced attribution
+// for a REAL model is covered by the seeded cost-attribution tests.
+func TestEchoRunSpansAreFree(t *testing.T) {
 	h := newHome(t)
+	// A priced model is configured, but the echo provider is what actually runs.
 	if out, code := run(t, h, "set-model", "orchestrator", "openai/gpt-4o-mini"); code != 0 {
 		t.Fatalf("set-model exit=%d out=%s", code, out)
 	}
@@ -151,22 +156,21 @@ func TestRunSpanCostIsAttributed(t *testing.T) {
 		t.Fatalf("run exit=%d out=%s", code, out)
 	}
 	runID := runIDFromJSON(t, out)
-	var priced int
+	var llm int
 	for _, s := range querySpans(t, h, runID) {
 		if s.Kind != "llm" {
 			continue
 		}
-		if s.CostUSD == nil {
-			t.Errorf("llm span %s (model %q) has no cost_usd", s.ID, s.ModelID)
-			continue
+		llm++
+		if s.ModelID != "echo" {
+			t.Errorf("echo run llm span %s recorded model %q, want \"echo\"", s.ID, s.ModelID)
 		}
-		if *s.CostUSD <= 0 {
-			t.Errorf("llm span %s cost_usd = %v, want > 0", s.ID, *s.CostUSD)
+		if s.CostUSD != nil && *s.CostUSD != 0 {
+			t.Errorf("echo run llm span %s cost_usd = %v, want 0/nil (echo is free)", s.ID, *s.CostUSD)
 		}
-		priced++
 	}
-	if priced == 0 {
-		t.Fatal("no priced llm span recorded")
+	if llm == 0 {
+		t.Fatal("no llm span recorded")
 	}
 }
 
