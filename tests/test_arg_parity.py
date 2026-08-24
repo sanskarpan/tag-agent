@@ -43,3 +43,25 @@ def test_models_accepts_positional():
     assert ns.profile_pos == "coder"
     ns = build_parser().parse_args(["models", "--profile", "coder"])
     assert ns.profile == "coder"
+
+
+def test_route_accepts_positional_task_type():
+    from tag.controller import build_parser
+
+    # Go-style positional form.
+    ns = build_parser().parse_args(["route", "implementation"])
+    assert ns.task_type_pos == "implementation"
+    # Historical flag form still parses.
+    ns = build_parser().parse_args(["route", "--task-type", "implementation"])
+    assert ns.task_type == "implementation"
+
+
+def test_route_worker_model_flag_alias():
+    from tag.controller import build_parser
+
+    # Go spells it --worker-model; Python historically --worker-model-override.
+    # Both must land in the same dest so scripts written for either distro work.
+    ns = build_parser().parse_args(["route", "impl", "--worker-model", "coder=openrouter/x"])
+    assert ns.worker_model_override == ["coder=openrouter/x"]
+    ns = build_parser().parse_args(["route", "impl", "--worker-model-override", "coder=openrouter/y"])
+    assert ns.worker_model_override == ["coder=openrouter/y"]

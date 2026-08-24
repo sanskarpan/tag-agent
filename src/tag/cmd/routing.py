@@ -78,6 +78,13 @@ def _ensure_hermes_ready(cfg: dict[str, Any], *, config_arg: str | None, need_tu
 # ---------------------------------------------------------------------------
 
 def cmd_route(args: argparse.Namespace) -> int:
+    # Reconcile the positional (Go-style) and flag forms; a flag wins if both are
+    # given. This lets `route <task-type>` work like the Go harness (#761).
+    args.task_type = getattr(args, "task_type", None) or getattr(args, "task_type_pos", None)
+    if not args.task_type:
+        print_error("route needs a TASK_TYPE "
+                    "(positional `route <task-type>` or `--task-type ...`)")
+        return 2
     cfg = load_config(config_path(args.config))
     route = resolve_route(cfg, args.task_type, args.master_profile, args.worker_profile)
     route = apply_route_model_overrides(
@@ -773,13 +780,19 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
 
     # route
     route = sub.add_parser("route", help="Resolve task routing from lab policy")
-    route.add_argument("--task-type", required=True)
+    # Accept the Go harness's positional form (`route implementation`) too (#761);
+    # --task-type still works and wins. cmd_route reconciles and errors if neither.
+    route.add_argument("task_type_pos", nargs="?", metavar="TASK_TYPE",
+                       help="task type (positional; or use --task-type)")
+    route.add_argument("--task-type")
     route.add_argument("--master-profile")
     route.add_argument("--worker-profile", action="append", default=[])
     route.add_argument("--master-model", help="Override master as provider/model-id")
     route.add_argument("--verifier-model", help="Override verifier as provider/model-id")
     route.add_argument(
         "--worker-model-override",
+        "--worker-model",  # Go harness spells it --worker-model (#761 flag drift)
+        dest="worker_model_override",
         action="append",
         default=[],
         help="Override worker as profile=provider/model-id",
@@ -849,7 +862,13 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     submit.add_argument("--worker-profile", action="append", default=[])
     submit.add_argument("--master-model")
     submit.add_argument("--verifier-model")
-    submit.add_argument("--worker-model-override", action="append", default=[])
+    submit.add_argument(
+        "--worker-model-override",
+        "--worker-model",  # Go harness spelling (#761 flag drift)
+        dest="worker_model_override",
+        action="append",
+        default=[],
+    )
     submit.add_argument("--verify", action="store_true")
     submit.add_argument(
         "--wait-seconds",
