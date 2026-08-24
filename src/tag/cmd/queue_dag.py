@@ -64,6 +64,56 @@ def _dispatch_ready_jobs(cfg: dict[str, Any], db: Any, job_ids: list[str]) -> tu
     return launched, pending
 
 
+def _drain_queue(cfg: dict[str, Any], db: Any, args: argparse.Namespace) -> int:
+    """Execute queued/ready jobs in-process (parity with Go `queue worker`, #760).
+
+    Claims one runnable job at a time (status 'queued' or 'ready'), runs it with
+    the same executor the detached worker used, and records done/failed. Prints a
+    drain summary and exits 3 if any job failed (ran fine, bad outcome) — never a
+    fabricated success.
+    """
+    from tag.queue_worker import _run_job, _mark_running, _mark_done  # noqa: PLC0415
+    from tag.core.paths import runtime_db_path  # noqa: PLC0415
+
+    max_jobs = getattr(args, "max", 0) or 0
+    watch = getattr(args, "watch", False)
+    poll_seconds = 2.0
+    cfg_path = str(config_path(getattr(args, "config", None)))
+    results_dir = Path(runtime_db_path(cfg)).parent / "queue-results"
+    claimed = done = failed = skipped = 0
+    try:
+        while True:
+            row = db.execute(
+                "SELECT * FROM queue_jobs WHERE status IN ('queued','ready') "
+                "ORDER BY priority ASC, created_at ASC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                if watch:
+                    time.sleep(poll_seconds)
+                    continue
+                break
+            job = dict(row)
+            _mark_running(db, job["id"])
+            claimed += 1
+            exit_code, result_path, error = _run_job(job, cfg_path, results_dir)
+            _mark_done(db, job["id"], exit_code=exit_code,
+                       result_path=str(result_path), error=error or None)
+            if exit_code == 0:
+                done += 1
+            else:
+                failed += 1
+            if max_jobs and claimed >= max_jobs:
+                break
+    except KeyboardInterrupt:
+        pass
+    summary = {"claimed": claimed, "done": done, "failed": failed, "skipped": skipped}
+    if getattr(args, "json", False):
+        print(json.dumps(summary))
+    else:
+        print(f"worker: {claimed} claimed, {done} done, {failed} failed, {skipped} skipped")
+    return 3 if failed > 0 else 0
+
+
 def _ensure_runtime_dirs(cfg: dict[str, Any]) -> None:
     """Create required runtime directories if they don't exist."""
     from pathlib import Path as _Path
@@ -101,13 +151,13 @@ def cmd_queue(args: argparse.Namespace) -> int:
             return 1
         notify = not getattr(args, "no_notify", False)
         queue_insert_job(db, job_id, profile, task_text, task_type=task_type, priority=priority, notify=notify)
-        pid = launch_queue_worker(cfg, job_id)
-        _queue_update_pid(db, job_id, pid)
         db.close()
+        # Enqueue only — the job stays 'queued' until `tag queue worker` runs it
+        # (parity with the Go harness, #760). No worker is forked on add.
         if getattr(args, "json", False):
-            print(json.dumps({"job_id": job_id, "pid": pid, "status": "queued"}))
+            print(json.dumps({"job_id": job_id, "status": "queued"}))
         else:
-            print(f"queued: {job_id}  (worker pid {pid})")
+            print(f"queued: {job_id}")
         return 0
 
     if sub == "list":
@@ -131,7 +181,14 @@ def cmd_queue(args: argparse.Namespace) -> int:
             jobs = jobs[:limit]
         db.close()
         if getattr(args, "json", False):
-            print(json.dumps(jobs, indent=2))
+            # Compact 4-field contract, matching the Go harness (#760): id,
+            # priority, status, task (keys alphabetical, single-line JSON).
+            items = [
+                {"id": j["id"], "priority": j.get("priority"),
+                 "status": j.get("status"), "task": j.get("task")}
+                for j in jobs
+            ]
+            print(json.dumps(items, separators=(",", ":")))
             return 0
         if not jobs:
             print("No jobs in queue.")
@@ -206,6 +263,11 @@ def cmd_queue(args: argparse.Namespace) -> int:
         else:
             print(f"cleared {count} completed/failed jobs")
         return 0
+
+    if sub == "worker":
+        rc = _drain_queue(cfg, db, args)
+        db.close()
+        return rc
 
     db.close()
     return 0
@@ -395,7 +457,7 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     queue = sub.add_parser("queue", help="Background task queue")
     queue_sub = queue.add_subparsers(dest="queue_subcommand")
 
-    q_add = queue_sub.add_parser("add", help="Queue a task to run in the background")
+    q_add = queue_sub.add_parser("add", help="Enqueue a task (run it with `tag queue worker`)")
     q_add.add_argument("task", help="Task description")
     q_add.add_argument("--profile", help="Profile to use (default: orchestrator)")
     q_add.add_argument("--type", dest="task_type", default="mixed")
@@ -423,7 +485,12 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     q_clear = queue_sub.add_parser("clear", help="Remove completed/failed jobs from list")
     q_clear.add_argument("--json", action="store_true")
 
-    for qp in [queue, q_add, q_list, q_result, q_cancel, q_clear]:
+    q_worker = queue_sub.add_parser("worker", help="Execute queued/ready jobs (drains the queue)")
+    q_worker.add_argument("--max", type=int, default=0, help="max jobs to run (0 = unlimited)")
+    q_worker.add_argument("--watch", action="store_true", help="keep polling for new jobs")
+    q_worker.add_argument("--json", action="store_true")
+
+    for qp in [queue, q_add, q_list, q_result, q_cancel, q_clear, q_worker]:
         qp.set_defaults(func=cmd_queue)
 
     # ---- PRD-033: dag ----
