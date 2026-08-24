@@ -123,6 +123,10 @@ def cmd_assignments(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_models(args: argparse.Namespace) -> int:
+    args.profile = getattr(args, "profile", None) or getattr(args, "profile_pos", None)
+    if not args.profile:
+        print_error("models needs a PROFILE (positional `models <profile>` or `--profile ...`)")
+        return 2
     cfg = load_config(config_path(args.config))
     ensure_profile_exists(cfg, args.profile)
     _ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
@@ -162,6 +166,14 @@ def cmd_models(args: argparse.Namespace) -> int:
 
 def cmd_set_model(args: argparse.Namespace) -> int:
     from tag.core.config import update_config
+    # Reconcile the positional (Go-style) and flag forms; a flag wins if both are
+    # given. This lets `set-model coder prov/model` work like the Go harness.
+    args.profile = getattr(args, "profile", None) or getattr(args, "profile_pos", None)
+    args.ref = getattr(args, "ref", None) or getattr(args, "ref_pos", None)
+    if not args.profile or not args.ref:
+        print_error("set-model needs a PROFILE and a provider/model REF "
+                    "(positional `set-model <profile> <ref>` or `--profile ... --ref ...`)")
+        return 2
     path = config_path(args.config)
     cfg = load_config(path)
     ensure_profile_exists(cfg, args.profile)
@@ -786,7 +798,10 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     models = sub.add_parser(
         "models", help="List curated provider/model options for a profile"
     )
-    models.add_argument("--profile", required=True)
+    # Accept the Go harness's positional form (`models coder`) too (#761); flag wins.
+    models.add_argument("profile_pos", nargs="?", metavar="PROFILE",
+                        help="profile (positional; or use --profile)")
+    models.add_argument("--profile")
     models.add_argument("--provider", help="Filter to one provider slug")
     models.add_argument("--limit", type=nonnegative_int, default=10)
     models.add_argument("--json", action="store_true")
@@ -796,8 +811,15 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     set_model = sub.add_parser(
         "set-model", help="Persist a profile's primary or delegation model"
     )
-    set_model.add_argument("--profile", required=True)
-    set_model.add_argument("--ref", required=True, help="provider/model-id")
+    # Accept BOTH the Go harness's positional form (`set-model coder prov/model`)
+    # and the historical Python flags, so the two distributions share a CLI
+    # (#755). Flags win if both are given; cmd_set_model reconciles them.
+    set_model.add_argument("profile_pos", nargs="?", metavar="PROFILE",
+                           help="profile (positional; or use --profile)")
+    set_model.add_argument("ref_pos", nargs="?", metavar="REF",
+                           help="provider/model-id (positional; or use --ref)")
+    set_model.add_argument("--profile")
+    set_model.add_argument("--ref", help="provider/model-id")
     set_model.add_argument(
         "--target",
         choices=("primary", "delegation"),
