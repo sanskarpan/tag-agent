@@ -70,7 +70,24 @@ except Exception:
 
 def _ensure_hermes_ready(cfg: dict[str, Any], *, config_arg: str | None, need_tui: bool) -> None:
     from tag.controller import ensure_hermes_ready  # type: ignore[import]
-    ensure_hermes_ready(cfg, config_arg=config_arg, need_tui=need_tui)
+    try:
+        ensure_hermes_ready(cfg, config_arg=config_arg, need_tui=need_tui)
+    except subprocess.CalledProcessError as exc:
+        # The managed hermes runtime is built lazily the first time a command
+        # needs live model inventory. When that one-time venv build fails, the
+        # raw subprocess argv used to surface as the user-facing error
+        # ("error: Command '[.../python -m venv ...]' returned non-zero exit
+        # status 1") — an internal, non-actionable message (#763). Convert it to
+        # a clean, actionable one; TAG_DEBUG=1 still shows the underlying command.
+        if os.environ.get("TAG_DEBUG"):
+            raise
+        raise SystemExit(
+            "Could not prepare the managed hermes runtime needed to query live "
+            "model inventory (a one-time environment build failed). This is a "
+            "setup/environment issue, not a config error — check network access "
+            "and that `python -m venv` works here, then retry. Re-run with "
+            "TAG_DEBUG=1 to see the underlying command."
+        )
 
 
 # ---------------------------------------------------------------------------

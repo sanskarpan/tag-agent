@@ -65,6 +65,24 @@ def test_doc_check_nonexistent_file_is_not_supported(tmp_path, monkeypatch, caps
     assert out.get("file_error") == "file not found"
 
 
+def test_hermes_build_failure_is_a_clean_error_not_raw_argv():
+    import subprocess
+    from tag.cmd import routing
+    boom = subprocess.CalledProcessError(1, ["/x/python", "-m", "venv", "/secret/path"])
+    with patch("tag.controller.ensure_hermes_ready", side_effect=boom):
+        try:
+            routing._ensure_hermes_ready({}, config_arg=None, need_tui=False)
+            assert False, "expected SystemExit"
+        except SystemExit as exc:
+            msg = str(exc.code)
+            # The clean message must not leak the internal subprocess argv/paths
+            # or the raw CalledProcessError phrasing.
+            assert "/secret/path" not in msg
+            assert "returned non-zero exit status" not in msg
+            assert "/x/python" not in msg
+            assert "hermes runtime" in msg and "TAG_DEBUG" in msg
+
+
 def test_doc_to_dict_omits_empty_fields_like_go():
     from tag.docs import Document
     # Empty title / pages_with_* / notes / engine_ms are omitted (Go omitempty).
