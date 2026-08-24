@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"net"
 	"net/http"
 	"time"
 
@@ -91,6 +92,12 @@ func Handler(db *store.DB, profile string) http.Handler {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprintf(w, dashboardHTML, html.EscapeString(profile))
 	})
+	// /health, so liveness probes work here as they do on every sibling server
+	// (devui/web/gateway/webhook) — serve was the only one without it (#763).
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
 	mux.HandleFunc("/api/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		snap, err := ReadSnapshot(db)
 		if err != nil {
@@ -154,9 +161,16 @@ func Handler(db *store.DB, profile string) http.Handler {
 // Serve starts the HTTP server on 127.0.0.1:port (blocking).
 func Serve(db *store.DB, profile string, port int) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	srv := &http.Server{Addr: addr, Handler: Handler(db, profile)}
+	// Bind BEFORE announcing: the banner used to print unconditionally, so a
+	// failed bind (port in use) still told the user the server was live at a URL
+	// that was never bound (#763 fabricated-success). Now the error returns first.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{Handler: Handler(db, profile)}
 	fmt.Printf("TAG dashboard server: http://%s  (Ctrl+C to stop)\n", addr)
-	return srv.ListenAndServe()
+	return srv.Serve(ln)
 }
 
 const dashboardHTML = `<!doctype html><html><head><meta charset="utf-8"><title>TAG</title></head>

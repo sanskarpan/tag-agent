@@ -67,6 +67,41 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+// TestMethodEnforcement covers #763: read-only endpoints reject non-GET, and a
+// 405 carries an RFC 7231 Allow header.
+func TestMethodEnforcement(t *testing.T) {
+	srv := newTestServer(t, Options{AllowUnauthenticated: true, Resolve: nil})
+
+	// POST to a GET-only endpoint → 405 with Allow: GET.
+	for _, path := range []string{"/health", "/v1/models"} {
+		resp, err := http.Post(srv.URL+path, "application/json", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != 405 {
+			t.Errorf("POST %s = %d, want 405", path, resp.StatusCode)
+		}
+		if allow := resp.Header.Get("Allow"); allow != "GET" {
+			t.Errorf("POST %s Allow = %q, want GET", path, allow)
+		}
+		resp.Body.Close()
+	}
+
+	// A non-POST to /v1/chat/completions → 405 with Allow: POST.
+	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/v1/chat/completions", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 405 {
+		t.Errorf("DELETE /v1/chat/completions = %d, want 405", resp.StatusCode)
+	}
+	if allow := resp.Header.Get("Allow"); allow != "POST" {
+		t.Errorf("Allow = %q, want POST", allow)
+	}
+}
+
 func TestChatCompletionNonStream(t *testing.T) {
 	var gotModel string
 	srv := newTestServer(t, Options{

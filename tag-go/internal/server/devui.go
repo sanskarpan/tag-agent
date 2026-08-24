@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 
@@ -168,9 +169,14 @@ func DevUIHandler(db *store.DB, profile string) http.Handler {
 // ServeDevUI starts the DevUI HTTP server on 127.0.0.1:port (blocking).
 func ServeDevUI(db *store.DB, profile string, port int) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	srv := &http.Server{Addr: addr, Handler: DevUIHandler(db, profile)}
+	// Bind before announcing (see ServeWeb) — #763 fabricated-success.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{Handler: DevUIHandler(db, profile)}
 	fmt.Printf("TAG DevUI running at http://%s  (Ctrl+C to stop)\n", addr)
-	return srv.ListenAndServe()
+	return srv.Serve(ln)
 }
 
 func roundTo(v float64, places int) float64 {
