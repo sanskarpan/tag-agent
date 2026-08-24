@@ -67,6 +67,23 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+// TestJSON404 covers #763: an unmatched path returns a JSON error body, not
+// net/http's plaintext default.
+func TestJSON404(t *testing.T) {
+	srv := newTestServer(t, Options{AllowUnauthenticated: true, Resolve: nil})
+	resp, err := http.Get(srv.URL + "/no-such-path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("status %d, want 404", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+}
+
 // TestMethodEnforcement covers #763: read-only endpoints reject non-GET, and a
 // 405 carries an RFC 7231 Allow header.
 func TestMethodEnforcement(t *testing.T) {

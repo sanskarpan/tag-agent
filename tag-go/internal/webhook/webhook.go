@@ -283,6 +283,11 @@ func Handler(db *store.DB, secret string, allowUnsigned bool) http.Handler {
 	_ = EnsureReplaySchema(db)
 	pruneDeliveries(db)
 	mux := http.NewServeMux()
+	// Catch-all: JSON 404 for any unmatched path, so clients get a consistent,
+	// parseable error body instead of net/http's plaintext default (#763).
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		sendJSON(w, 404, map[string]any{"error": "not found"})
+	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, 200, map[string]any{"status": "ok"})
 	})

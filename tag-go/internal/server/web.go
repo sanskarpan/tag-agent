@@ -144,7 +144,8 @@ func WebHandler(db *store.DB) http.Handler {
 			webSendJSON(w, webFetchSpans(db, runID), http.StatusOK)
 			return
 		}
-		http.NotFound(w, r)
+		// JSON 404 for a consistent, parseable error body across servers (#763).
+		webSendJSON(w, map[string]string{"error": "not found"}, http.StatusNotFound)
 	})
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

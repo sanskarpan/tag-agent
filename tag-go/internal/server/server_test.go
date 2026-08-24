@@ -41,6 +41,31 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestJSON404(t *testing.T) {
+	db := testDB(t)
+	srv := httptest.NewServer(Handler(db, "orchestrator"))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/no-such-path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("status %d, want 404", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("404 body is not JSON: %v", err)
+	}
+	if body["error"] == "" {
+		t.Errorf("404 body missing error field: %v", body)
+	}
+}
+
 func TestSnapshotAPI(t *testing.T) {
 	db := testDB(t)
 	db.Exec(`INSERT INTO runs(id,created_at,kind,task_type,execution,master_profile,board,prompt,route_json,status) VALUES('r1','2026-07-01T00:00:00Z','agent','chat','native','orchestrator','default','hi','{}','completed')`)
