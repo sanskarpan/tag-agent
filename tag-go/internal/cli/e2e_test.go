@@ -362,9 +362,12 @@ func TestE2EAnnotate(t *testing.T) {
 	if _, code := run(t, h, "annotate", "add", "x"); code == 0 {
 		t.Error("add without --question should fail")
 	}
-	// stats: 2 pending
-	if out, _ := run(t, h, "annotate", "stats"); !strings.Contains(out, `"pending": 2`) {
-		t.Errorf("stats pending: %q", out)
+	// stats: 2 pending (human output; --json still emits the JSON object)
+	if out, _ := run(t, h, "annotate", "stats"); !strings.Contains(out, "pending=2") {
+		t.Errorf("stats pending (human): %q", out)
+	}
+	if out, _ := run(t, h, "annotate", "stats", "--json"); !strings.Contains(out, `"pending": 2`) {
+		t.Errorf("stats pending (json): %q", out)
 	}
 	// next claims highest priority (2+2=5)
 	out, code := run(t, h, "annotate", "next", "--assignee", "alice")

@@ -77,7 +77,9 @@ func registerGateway(root *cobra.Command, app *App) {
 		},
 	}
 	c.Flags().StringVar(&host, "host", "127.0.0.1", "bind host")
-	c.Flags().IntVar(&port, "port", 8787, "bind port")
+	// Distinct from `tag web` (8787) so the two dashboards can run side by side
+	// with defaults; serve=7880, devui=7777, webhook=8765 are all distinct (#763).
+	c.Flags().IntVar(&port, "port", 8788, "bind port")
 	c.Flags().StringVar(&key, "key", "", "bearer token required from clients (or TAG_GATEWAY_KEY)")
 	c.Flags().StringVar(&defProvider, "provider", "echo", "default provider when a request model has no provider/ prefix")
 	c.Flags().StringVar(&profile, "profile", "", "profile (for default model + fallback chain)")
