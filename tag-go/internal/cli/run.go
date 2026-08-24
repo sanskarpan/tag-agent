@@ -49,6 +49,15 @@ func registerRun(root *cobra.Command, app *App) {
 				return fmt.Errorf("unknown provider %q (available: %v)", provider, providerNames())
 			}
 			primaryModel := app.Cfg.String("profiles."+app.profile(profile)+".config.model.default", "")
+			// The model actually EXERCISED. With the offline echo provider (which
+			// parrots the prompt), no real inference happens and no cost is
+			// incurred — recording the profile's configured model would bill the
+			// run as if that model ran (fabricated cost). "echo" has no pricing
+			// entry, so both `runs show` and `costs` resolve $0, honestly.
+			effectiveModel := primaryModel
+			if provider == "echo" {
+				effectiveModel = "echo"
+			}
 			// When --fallback is set and the profile has a route_fallbacks chain for
 			// the primary model, wrap the provider so 429/401/timeout/overload during
 			// inference walks the declared chain (gap #2) instead of failing hard.
@@ -141,7 +150,7 @@ func registerRun(root *cobra.Command, app *App) {
 			// parseable and --json is unaffected.
 			stopWait := startWaitNotice(cmd.ErrOrStderr())
 			res, err := loop.Run(ctx, args[0], agent.Options{
-				Model:  app.Cfg.String("profiles."+app.profile(profile)+".config.model.default", ""),
+				Model:  effectiveModel,
 				System: system, MaxSteps: maxSteps,
 			})
 			stopWait()
@@ -154,7 +163,7 @@ func registerRun(root *cobra.Command, app *App) {
 				return err
 			}
 			// record the run with usage (best-effort; runtime tables exist from bootstrap)
-			modelID := app.Cfg.String("profiles."+app.profile(profile)+".config.model.default", "")
+			modelID := effectiveModel
 			durMs := time.Since(started).Milliseconds()
 			// A failed open is NOT best-effort.
 			//
