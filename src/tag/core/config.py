@@ -1,12 +1,25 @@
 """Configuration loading and saving utilities."""
 from __future__ import annotations
 
+import io
 import os
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
 import yaml
+
+
+def _roundtrip_yaml():
+    """A ruamel round-trip YAML that preserves comments and key order. Returned
+    lazily so a stripped install without ruamel still imports (falls back to the
+    comment-dropping pyyaml path)."""
+    from ruamel.yaml import YAML
+
+    y = YAML()
+    y.preserve_quotes = True
+    y.width = 4096  # don't reflow long scalars
+    return y
 
 try:
     import fcntl
@@ -47,6 +60,38 @@ def load_config(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise SystemExit(f"Config at {path} must be a YAML object.")
     return data
+
+
+def _overlay(dst: Any, src: dict) -> None:
+    """Recursively copy *src*'s values into *dst* (a ruamel CommentedMap),
+    preserving dst's comments/order on keys that survive. Keys only in dst are
+    removed; keys only in src are added; nested mappings recurse."""
+    for key in list(dst.keys()):
+        if key not in src:
+            del dst[key]
+    for key, val in src.items():
+        if isinstance(val, dict) and isinstance(dst.get(key), dict):
+            _overlay(dst[key], val)
+        else:
+            dst[key] = val
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """os.replace() a pre-rendered YAML string into place (used by the
+    comment-preserving update path)."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _write_config_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -114,9 +159,28 @@ def update_config(path: Path, mutate: "Callable[[dict[str, Any]], Any]") -> dict
     try:
         if fcntl is not None:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        # Comment-preserving read-modify-write (ISSUE-018): the mutate runs on a
+        # plain dict (the mutate functions are not all ruamel-round-trip-safe —
+        # e.g. render_profiles), then the result is OVERLAID onto a ruamel
+        # round-trip load of the same file. Existing keys keep their comments and
+        # order; new keys are added, removed keys deleted. So a set-model that
+        # touches one profile no longer strips the ~25-line commented
+        # `permissions:` block (the only in-product docs of the consent gate).
+        # Falls back to the plain pyyaml path if ruamel is unavailable.
         cfg = load_config(path)
         mutate(cfg)
-        _write_config_atomic(path, cfg)
+        try:
+            y = _roundtrip_yaml()
+            with open(path, encoding="utf-8") as fh:
+                commented = y.load(fh)
+            if not isinstance(commented, dict):
+                commented = {}
+            _overlay(commented, cfg)
+            buf = io.StringIO()
+            y.dump(commented, buf)
+            _write_text_atomic(path, buf.getvalue())
+        except ImportError:
+            _write_config_atomic(path, cfg)
         return cfg
     finally:
         if fcntl is not None:
