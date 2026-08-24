@@ -217,10 +217,11 @@ def cmd_loop(args: argparse.Namespace) -> int:
     sub = getattr(args, "loop_subcommand", "list")
 
     if sub == "start":
-        goal = (getattr(args, "goal", "") or "").strip()
+        # Reconcile the positional and flag goal forms; a flag wins if both given.
+        goal = (getattr(args, "goal", None) or getattr(args, "goal_pos", None) or "").strip()
         if not goal:
             db.close()
-            return _emit_error(args, "--goal TEXT is required")
+            return _emit_error(args, "a goal is required (`loop start \"<goal>\"` or --goal TEXT)")
         profile = getattr(args, "profile", None) or _master_profile(cfg)
         max_iters = getattr(args, "max_iters", 10)
         if max_iters is None:
@@ -607,9 +608,13 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     loop_cmd = sub.add_parser("loop", help="Autonomous agent loop with goal detection and iteration cap")
     loop_sub = loop_cmd.add_subparsers(dest="loop_subcommand")
     loop_start = loop_sub.add_parser("start", help="Start an autonomous loop")
-    loop_start.add_argument("--goal", required=True, help="Goal text the loop works toward")
+    # Accept the goal positionally (Go-style `loop <prompt>`) or via --goal (#763).
+    loop_start.add_argument("goal_pos", nargs="?", metavar="GOAL",
+                            help="goal text (positional; or use --goal)")
+    loop_start.add_argument("--goal", help="Goal text the loop works toward")
     loop_start.add_argument("--profile", help="Profile to run (default: orchestrator)")
-    loop_start.add_argument("--max-iters", type=int, default=10, dest="max_iters",
+    # --iterations is the Go harness's spelling; accept it as an alias (#763).
+    loop_start.add_argument("--max-iters", "--iterations", type=int, default=10, dest="max_iters",
                             help="Maximum number of iterations (default: 10)")
     loop_start.add_argument("--approval", choices=["auto", "human"], default="auto",
                             help="Gate mode: auto continues automatically, human pauses for approval")

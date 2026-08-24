@@ -1784,8 +1784,43 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+_LOOP_SUBCOMMANDS = {"start", "list", "status", "abort", "approve", "deny"}
+
+
+def _normalize_loop_bareform(argv: list[str]) -> list[str]:
+    """Rewrite the Go-style bare form `loop <prompt> …` to `loop start <prompt> …`.
+
+    The Go harness accepts `tag loop "<prompt>" --iterations N`; Python's `loop`
+    is a subcommand group, so a bare prompt would argparse-error as an invalid
+    choice. Insert the implicit `start` when the token after `loop` is neither a
+    known subcommand nor a flag (#763). Global flags before the command (e.g.
+    `--config X`, `--json`) are skipped so the command token is found correctly.
+    """
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--config":
+            i += 2
+            continue
+        if a.startswith("--config="):
+            i += 1
+            continue
+        if a in ("--json",):
+            i += 1
+            continue
+        break
+    if i < len(argv) and argv[i] == "loop":
+        j = i + 1
+        if j < len(argv) and argv[j] not in _LOOP_SUBCOMMANDS and not argv[j].startswith("-"):
+            return argv[:j] + ["start"] + argv[j:]
+    return argv
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = _normalize_loop_bareform(argv)
     args = parser.parse_args(argv)
     # Fold the global form into the per-command flag every handler already reads.
     if getattr(args, "global_json", False):
