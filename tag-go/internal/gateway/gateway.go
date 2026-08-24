@@ -117,10 +117,20 @@ func Handler(opts Options) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		// Read-only endpoint: reject non-GET rather than answering 200 to any
+		// method (#763). HEAD is allowed as the read-only companion to GET.
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			methodNotAllowed(w, "GET")
+			return
+		}
 		writeJSON(w, 200, map[string]any{"status": "ok"})
 	})
 
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			methodNotAllowed(w, "GET")
+			return
+		}
 		if !authOK(opts, r) {
 			writeErr(w, 401, "invalid_api_key", "missing or invalid bearer token")
 			return
@@ -134,7 +144,7 @@ func Handler(opts Options) http.Handler {
 
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			writeErr(w, 405, "method_not_allowed", "use POST")
+			methodNotAllowed(w, "POST")
 			return
 		}
 		if !authOK(opts, r) {
@@ -364,6 +374,13 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code int, typ, msg string) {
 	writeJSON(w, code, map[string]any{"error": map[string]any{"message": msg, "type": typ}})
+}
+
+// methodNotAllowed sends a 405 with the RFC 7231 Allow header naming the
+// permitted methods (#763). The header is set before writeErr writes the status.
+func methodNotAllowed(w http.ResponseWriter, allow string) {
+	w.Header().Set("Allow", allow)
+	writeErr(w, 405, "method_not_allowed", "method not allowed; use "+allow)
 }
 
 // randID derives a short, non-cryptographic id for response ids by combining the

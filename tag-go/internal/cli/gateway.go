@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -60,12 +61,18 @@ func registerGateway(root *cobra.Command, app *App) {
 			}
 
 			addr := fmt.Sprintf("%s:%d", bindHost, port)
+			// Bind BEFORE announcing: the banner (and the UNAUTHENTICATED warning)
+			// used to print even when the bind failed, telling the user the gateway
+			// was live at a URL that was never bound (#763 fabricated-success).
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				return err
+			}
 			fmt.Printf("TAG gateway: http://%s/v1  (OpenAI-compatible; Ctrl+C to stop)\n", addr)
 			if k == "" {
 				fmt.Println("WARNING: no auth key set — accepting UNAUTHENTICATED requests (loopback only unless --allow-unauthenticated).")
 			}
 			srv := &http.Server{
-				Addr:    addr,
 				Handler: gateway.Handler(opts),
 				// Defend the accept path against slow-header (Slowloris) exhaustion
 				// on a publicly-bindable server. WriteTimeout stays 0 so long-lived
@@ -73,7 +80,7 @@ func registerGateway(root *cobra.Command, app *App) {
 				ReadHeaderTimeout: 10 * time.Second,
 				IdleTimeout:       120 * time.Second,
 			}
-			return srv.ListenAndServe()
+			return srv.Serve(ln)
 		},
 	}
 	c.Flags().StringVar(&host, "host", "127.0.0.1", "bind host")

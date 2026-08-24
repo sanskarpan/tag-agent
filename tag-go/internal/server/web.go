@@ -8,6 +8,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -214,9 +215,15 @@ func WebHandler(db *store.DB) http.Handler {
 // ServeWeb starts the web dashboard on 127.0.0.1:port (blocking).
 func ServeWeb(db *store.DB, port int) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	srv := &http.Server{Addr: addr, Handler: WebHandler(db)}
+	// Bind before announcing so a failed bind doesn't print a "live at <url>"
+	// banner for a URL that was never bound (#763 fabricated-success).
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{Handler: WebHandler(db)}
 	fmt.Printf("TAG web dashboard: http://%s  (Ctrl+C to stop)\n", addr)
-	return srv.ListenAndServe()
+	return srv.Serve(ln)
 }
 
 func derefStr(s *string) string {

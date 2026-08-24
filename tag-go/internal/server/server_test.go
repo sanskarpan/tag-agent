@@ -21,6 +21,26 @@ func testDB(t *testing.T) *store.DB {
 	return db
 }
 
+func TestHealthEndpoint(t *testing.T) {
+	db := testDB(t)
+	srv := httptest.NewServer(Handler(db, "orchestrator"))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("/health status %d, want 200", resp.StatusCode)
+	}
+	var body map[string]string
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body["status"] != "ok" {
+		t.Errorf("/health body = %v, want status=ok", body)
+	}
+}
+
 func TestSnapshotAPI(t *testing.T) {
 	db := testDB(t)
 	db.Exec(`INSERT INTO runs(id,created_at,kind,task_type,execution,master_profile,board,prompt,route_json,status) VALUES('r1','2026-07-01T00:00:00Z','agent','chat','native','orchestrator','default','hi','{}','completed')`)
