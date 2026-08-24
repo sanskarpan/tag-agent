@@ -41,7 +41,10 @@ func TestParityBacklogPolish763(t *testing.T) {
 	}
 
 	// empty-state messages for sibling list commands.
-	for _, tc := range []struct{ args []string; want string }{
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
 		{[]string{"alert", "list"}, "No alert rules."},
 		{[]string{"alert", "firings"}, "No firings."},
 		{[]string{"prompt", "list"}, "No prompts saved."},
