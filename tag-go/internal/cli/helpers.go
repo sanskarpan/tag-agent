@@ -5,7 +5,21 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/mattn/go-runewidth"
 )
+
+// padDisplay left-aligns s in a field of display width w (terminal cells),
+// truncating with an ellipsis if it is wider. Unlike fmt's "%-Ns" — which pads
+// and truncates by BYTE length — this keeps table columns aligned when a cell
+// holds CJK/accented text, where one rune occupies two cells or zero (#763 tui).
+func padDisplay(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	s = runewidth.Truncate(s, w, "…")
+	return runewidth.FillRight(s, w)
+}
 
 // usageErr marks an error as a usage/validation failure so that isUsageError
 // classifies it as exit code 2 (parity with Python argparse), regardless of its

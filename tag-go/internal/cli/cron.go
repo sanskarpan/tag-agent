@@ -115,8 +115,11 @@ func registerCron(root *cobra.Command, app *App) {
 				if s, ok := it["last_run_at"].(string); ok && s != "" {
 					last = s
 				}
-				fmt.Printf("%s %s  %-24s [%s]  %-14s runs=%d  last=%s\n",
-					st, it["id"], it["name"], it["schedule"], it["profile"], it["run_count"], last)
+				// Pad name/profile by display width so accented/CJK cells stay
+				// aligned (byte-width %-Ns would drift) (#763 tui).
+				fmt.Printf("%s %s  %s [%s]  %s runs=%d  last=%s\n",
+					st, it["id"], padDisplay(fmt.Sprint(it["name"]), 24), it["schedule"],
+					padDisplay(fmt.Sprint(it["profile"]), 14), it["run_count"], last)
 			}
 			return nil
 		}}

@@ -89,9 +89,11 @@ func registerRuns(root *cobra.Command, app *App) {
 				if r.DurationMs != nil {
 					dur = fmt.Sprintf("%dms", *r.DurationMs)
 				}
-				fmt.Printf("%-14s %-40s %-10s %-24s %8d %8d %10s %s\n",
-					truncate(r.ID, 14), truncate(oneLine(r.Prompt), 40), truncate(r.Status, 10),
-					truncate(strOr(r.ModelID, "-"), 24), r.PromptTok, r.CompTok, dur, r.CreatedAt)
+				// Pad the string columns by DISPLAY width so rows with CJK/accented
+				// cells stay aligned with the ASCII header (#763 tui).
+				fmt.Printf("%s %s %s %s %8d %8d %10s %s\n",
+					padDisplay(r.ID, 14), padDisplay(oneLine(r.Prompt), 40), padDisplay(r.Status, 10),
+					padDisplay(strOr(r.ModelID, "-"), 24), r.PromptTok, r.CompTok, dur, r.CreatedAt)
 			}
 			return nil
 		}}

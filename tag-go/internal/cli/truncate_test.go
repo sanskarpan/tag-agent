@@ -3,7 +3,27 @@ package cli
 import (
 	"testing"
 	"unicode/utf8"
+
+	"github.com/mattn/go-runewidth"
 )
+
+// TestPadDisplayAlignsByCell: padDisplay must produce a field of exactly w
+// display cells regardless of CJK/accented content, so table columns line up
+// (#763 tui). RED against byte-width "%-Ns" padding.
+func TestPadDisplayAlignsByCell(t *testing.T) {
+	for _, s := range []string{"", "ab", "日本語", "café", "⏳", "○"} {
+		for _, w := range []int{2, 8, 14} {
+			got := padDisplay(s, w)
+			if gw := runewidth.StringWidth(got); gw != w {
+				t.Errorf("padDisplay(%q, %d) width = %d, want %d (%q)", s, w, gw, w, got)
+			}
+		}
+	}
+	// ASCII shorter than the field is right-padded with spaces.
+	if got := padDisplay("ab", 5); got != "ab   " {
+		t.Errorf("padDisplay ASCII pad = %q, want %q", got, "ab   ")
+	}
+}
 
 // TestTruncateRuneSafe: truncate must never split a multibyte character and emit
 // invalid UTF-8 into table output. RED against pre-fix code, which did a bare
