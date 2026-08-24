@@ -461,6 +461,16 @@ func registerDAG(root *cobra.Command, app *App) {
 			if err := rows.Err(); err != nil {
 				return err
 			}
+			// Explicit args that match nothing must not read as a clean empty
+			// result. `dag show` takes JOB IDs; a DAG NAME (what `dag run`/`state`
+			// key on) matches none, so `dag show <name>` used to print
+			// "No jobs found." / [] with exit 0 — a silent miss. Point at the
+			// right command instead.
+			if len(args) > 0 && len(recs) == 0 {
+				return jsonErrorMaybe(fmt.Errorf("no jobs match %s — `dag show` takes job ids; "+
+					"run `dag show` with no args to list jobs, or `dag state <name>` for a DAG run",
+					strings.Join(args, ", ")))
+			}
 			if flagJSON {
 				items := []map[string]any{}
 				for _, r := range recs {

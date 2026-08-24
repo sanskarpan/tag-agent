@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/gofrs/flock"
 	"github.com/tag-agent/tag/internal/paths"
@@ -144,6 +145,73 @@ func Save(path string, data map[string]any) error {
 	return os.Rename(tmpName, path)
 }
 
+// marshalCommentPreserving renders data while keeping the comments and key order
+// of the original file at path. It overlays data onto a yaml.Node parse of the
+// file; if the file is missing/empty/unparseable it falls back to a plain marshal.
+func marshalCommentPreserving(path string, data map[string]any) ([]byte, error) {
+	orig, err := os.ReadFile(path)
+	if err != nil {
+		return yaml.Marshal(data)
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(orig, &root); err != nil || len(root.Content) == 0 {
+		return yaml.Marshal(data)
+	}
+	overlayNode(root.Content[0], data)
+	return yaml.Marshal(&root)
+}
+
+// overlayNode copies data's values into node (a yaml.Node), preserving node's
+// comments/order on keys that survive. Keys only in node are removed; keys only
+// in data are appended (sorted, for deterministic output); nested maps recurse.
+func overlayNode(node *yaml.Node, data any) {
+	dm, ok := data.(map[string]any)
+	if !ok || node.Kind != yaml.MappingNode {
+		setNodeValue(node, data)
+		return
+	}
+	// Keep only pairs whose key still exists in data; update those in place.
+	kept := node.Content[:0:0]
+	seen := map[string]bool{}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		k := node.Content[i].Value
+		v, in := dm[k]
+		if !in {
+			continue
+		}
+		seen[k] = true
+		overlayNode(node.Content[i+1], v)
+		kept = append(kept, node.Content[i], node.Content[i+1])
+	}
+	node.Content = kept
+	// Append new keys, sorted so output is stable.
+	var newKeys []string
+	for k := range dm {
+		if !seen[k] {
+			newKeys = append(newKeys, k)
+		}
+	}
+	sort.Strings(newKeys)
+	for _, k := range newKeys {
+		keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: k}
+		var valNode yaml.Node
+		_ = valNode.Encode(dm[k])
+		node.Content = append(node.Content, keyNode, &valNode)
+	}
+}
+
+// setNodeValue replaces node's value with an encoding of val, preserving node's
+// existing comments.
+func setNodeValue(node *yaml.Node, val any) {
+	var tmp yaml.Node
+	if err := tmp.Encode(val); err != nil {
+		return
+	}
+	hc, lc, fc := node.HeadComment, node.LineComment, node.FootComment
+	*node = tmp
+	node.HeadComment, node.LineComment, node.FootComment = hc, lc, fc
+}
+
 // Update performs a locked read-modify-write cycle (Go port of update_config).
 func Update(path string, mutate func(map[string]any)) (map[string]any, error) {
 	lock := flock.New(path + ".lock")
@@ -156,8 +224,12 @@ func Update(path string, mutate func(map[string]any)) (map[string]any, error) {
 		return nil, err
 	}
 	mutate(cfg.Data)
-	// write within the same lock (reuse Save body without re-locking)
-	out, err := yaml.Marshal(cfg.Data)
+	// write within the same lock (reuse Save body without re-locking).
+	// Comment-preserving (ISSUE-018): overlay the mutated map onto a yaml.Node
+	// parse of the original file, so editing one key (set-model, guardrail
+	// runtime add) no longer strips the seeded commented `permissions:` block or
+	// reorders every other key.
+	out, err := marshalCommentPreserving(path, cfg.Data)
 	if err != nil {
 		return nil, err
 	}
