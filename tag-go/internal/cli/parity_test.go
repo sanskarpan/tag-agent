@@ -164,6 +164,16 @@ func TestParityPersona(t *testing.T) {
 	if out, code := run(t, h, "persona", "show", "does-not-exist"); code == 0 {
 		t.Fatalf("persona show missing should fail: %q %d", out, code)
 	}
+	// persona list --json carries id/inject/tags too (parity with Python, #763).
+	out, code := run(t, h, "persona", "list", "--json")
+	if code != 0 {
+		t.Fatalf("persona list --json: %q %d", out, code)
+	}
+	for _, k := range []string{`"id"`, `"inject"`, `"tags"`, `"name"`, `"description"`, `"source"`} {
+		if !strings.Contains(out, k) {
+			t.Errorf("persona list --json missing %s: %s", k, out)
+		}
+	}
 }
 
 // TestParityBudgetCheck exercises budget check unlimited and configured paths.

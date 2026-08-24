@@ -106,21 +106,31 @@ func registerPersona(root *cobra.Command, app *App) {
 				return err
 			}
 			seedBuiltinPersonas(db)
-			rows, err := db.Query(`SELECT name,description,source FROM personas ORDER BY name`)
+			// Project id/inject/tags too, so `persona list --json` has the same
+			// shape as the Python distribution (#763 parity).
+			rows, err := db.Query(`SELECT id,name,description,inject,COALESCE(tags_json,'[]'),source FROM personas ORDER BY name`)
 			if err != nil {
 				return err
 			}
 			defer rows.Close()
 			type persona struct {
-				Name        string `json:"name"`
-				Description string `json:"description"`
-				Source      string `json:"source"`
+				ID          string   `json:"id"`
+				Name        string   `json:"name"`
+				Description string   `json:"description"`
+				Inject      string   `json:"inject"`
+				Tags        []string `json:"tags"`
+				Source      string   `json:"source"`
 			}
 			var out []persona
 			for rows.Next() {
 				var pp persona
-				if err := rows.Scan(&pp.Name, &pp.Description, &pp.Source); err != nil {
+				var tagsJSON string
+				if err := rows.Scan(&pp.ID, &pp.Name, &pp.Description, &pp.Inject, &tagsJSON, &pp.Source); err != nil {
 					return err
+				}
+				json.Unmarshal([]byte(tagsJSON), &pp.Tags) //nolint:errcheck // a corrupt row shows no tags
+				if pp.Tags == nil {
+					pp.Tags = []string{}
 				}
 				out = append(out, pp)
 			}
