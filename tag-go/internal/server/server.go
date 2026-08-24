@@ -86,7 +86,12 @@ func Handler(db *store.DB, profile string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" && r.URL.Path != "/index.html" {
-			http.NotFound(w, r)
+			// JSON 404 so every local server returns a consistent, parseable
+			// error body (devui already does); the plaintext net/http default
+			// left clients unable to parse errors uniformly (#763).
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

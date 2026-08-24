@@ -116,6 +116,12 @@ func Handler(opts Options) http.Handler {
 	}
 	mux := http.NewServeMux()
 
+	// Catch-all: a JSON 404 for any unmatched path, so clients get a consistent,
+	// parseable error body instead of net/http's plaintext default (#763).
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, 404, "not_found", "not found")
+	})
+
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		// Read-only endpoint: reject non-GET rather than answering 200 to any
 		// method (#763). HEAD is allowed as the read-only companion to GET.
