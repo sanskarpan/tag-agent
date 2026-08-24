@@ -541,6 +541,12 @@ func registerObservability(root *cobra.Command, app *App) {
 			if err := rows.Err(); err != nil {
 				return err
 			}
+			// A --trace-id that matches nothing must not emit a valid-looking
+			// empty OTLP envelope with exit 0 — a typo'd id would read as a
+			// successful export of nothing. Error like `costs --run-id bogus` (#763).
+			if exportTrace != "" && len(spans) == 0 {
+				return jsonErrorMaybe(fmt.Errorf("no spans recorded for trace %q", exportTrace))
+			}
 			// Live OTLP POST to a collector requires the network export backend,
 			// which is out of scope for the offline Go build (same stance as
 			// otel-export): emit the OTLP/JSON payload to stdout instead.
