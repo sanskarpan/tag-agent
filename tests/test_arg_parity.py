@@ -65,6 +65,30 @@ def test_run_command_parses_and_dispatches():
     assert ns.func.__name__ == "cmd_run"
 
 
+def test_loop_bareform_normalizes_to_start():
+    from tag.controller import _normalize_loop_bareform as norm
+
+    # Go-style bare prompt gets an implicit `start`.
+    assert norm(["loop", "fix the bug", "--iterations", "3"]) == \
+        ["loop", "start", "fix the bug", "--iterations", "3"]
+    # Explicit subcommands are untouched.
+    assert norm(["loop", "list"]) == ["loop", "list"]
+    assert norm(["loop", "start", "--goal", "x"]) == ["loop", "start", "--goal", "x"]
+    # Global flags before the command are skipped when locating it.
+    assert norm(["--json", "loop", "do it"]) == ["--json", "loop", "start", "do it"]
+    assert norm(["--config", "/x", "loop", "hi"]) == ["--config", "/x", "loop", "start", "hi"]
+
+
+def test_loop_start_accepts_positional_goal_and_iterations_alias():
+    from tag.controller import build_parser
+
+    ns = build_parser().parse_args(["loop", "start", "improve tests", "--iterations", "5"])
+    assert ns.goal_pos == "improve tests"
+    assert ns.max_iters == 5  # --iterations aliases --max-iters
+    ns = build_parser().parse_args(["loop", "start", "--goal", "g", "--max-iters", "7"])
+    assert ns.goal == "g" and ns.max_iters == 7
+
+
 def test_run_empty_prompt_is_a_usage_error():
     from types import SimpleNamespace
     from tag.cmd.routing import cmd_run
