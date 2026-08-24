@@ -51,9 +51,8 @@ generic`, `serve`/`web` `/health` + JSON 404).
 > `swarm` surface is now complete (run/list/status/abort) — the previously-noted "no
 > `swarm run`/`abort`" gap no longer exists.
 
-**At a glance:** ~74 features implemented across the Python edition's 107 commands
-(PRD-001–072 + PRD-123 + PRD-133) · 3 partially delivered (PRD-121/122/124) ·
-~53 planned (PRD-073–122, 124–132).
+**At a glance:** ~77 features implemented across the Python edition's 107 commands
+(PRD-001–072 + PRD-121/122/123/124 + PRD-133) · ~50 planned (PRD-073–120, 125–132).
 
 ---
 
@@ -157,6 +156,9 @@ generic`, `serve`/`web` `/health` + JSON 404).
 | ✅ | `sandbox` | Isolated code execution (restricted / Docker) | PRD-028 | ✅ | `run 'echo hi'` → hi, exit 0 |
 | ✅ | `context` | Context-window management | PRD-018 | ✅ | show/compress/trim both |
 | ✅ | `tripwire`, `guardrail runtime` | Runtime content guardrails + tripwire | **PRD-123** | ✅ | list/check/test/history/add/remove; fires (exit 3), secrets **fully redacted** — **both editions** |
+| ✅ | `guardrail input` | Input guardrails: prompt-injection/pii/secret/length-limit; block/sanitize/warn | **PRD-122** | ✅ | add/list/remove/test/history; PII sanitize; **both editions** |
+| ✅ | `guardrail output` | Output guardrails: pii/secret/json-schema/profanity; block/rewrite/warn | **PRD-121** | ✅ | add/list/remove/test/history; **both editions** |
+| ✅ | (library) | GuardrailResult shared result type | **PRD-124** | ✅ | Go `internal/guardrail` + Python `content_guardrail` |
 
 ## 9. CI/CD & agentic dev workflows
 
@@ -198,19 +200,22 @@ structured tool-call child spans (PRD-048).
 
 ---
 
-## 12. 🔶 Partially delivered — guardrail siblings (cluster J)
+## 12. ✅ Guardrail siblings (cluster J) — now implemented
 
-The PRD-123 runtime guardrail engine (`guardrail.Processor`, both distributions) already
-screens every stage, which partially delivers three sibling PRDs even though they have **no
-dedicated command** yet:
+The guardrail cluster is now built out on **both distributions**:
 
 | Status | PRD | Feature | Evidence |
 |---|---|---|---|
-| 🔶 | PRD-121 | Output guardrail processor | Processor screens `tool_output`/`model_output` stages (`core/guardrail.py`); no `guardrail output` command |
-| 🔶 | PRD-122 | Input guardrail validator | Processor screens `tool_input`/`user_input`; `tripwire test` dry-runs tool-input; no `guardrail input` command |
-| 🔶 | PRD-124 | Guardrail result dataclass | Internal result dataclasses with `.to_dict()` (rule/type/stage/reason) exist; no `guardrail result` command |
+| ✅ | PRD-121 | Output guardrail processor | `tag guardrail output add/list/remove/test/history` — pii/secret/json-schema/topic-filter/profanity/toxicity |
+| ✅ | PRD-122 | Input guardrail validator | `tag guardrail input …` — prompt-injection/pii/secret/topic-filter/length-limit; block/sanitize/warn |
+| ✅ | PRD-123 | Runtime guardrail hooks | `tripwire` + `guardrail runtime` (see §8) |
+| ✅ | PRD-124 | GuardrailResult type | shared value type in Go `internal/guardrail` + Python `content_guardrail` |
 
 `PRD-125` (constitutional-AI policy) remains 📋 planned (deliberately unbuilt).
+
+> **Runtime-integration note:** the input/output chains are fully operable via the CLI + engine
+> + config + audit log; wiring them into the *live* agent loop as pre/post-model middleware
+> (PRD-121 FR-08 / PRD-122 FR-09) is the remaining enforcement step.
 
 ---
 
@@ -252,8 +257,7 @@ generic `workflow interrupt()`/resume of PRD-109 is not built.)*
 desktop-GUI sandbox (VNC).
 
 ### J · Security & guardrails (PRD-121–125)
-✅ **PRD-123 runtime guardrail hooks — IMPLEMENTED** (`tripwire` + `guardrail runtime`, both editions).
-🔶 PRD-121/122/124 partially delivered by the shared Processor (see §12). 📋 PRD-125 constitutional policy.
+✅ **PRD-121 (`guardrail output`), PRD-122 (`guardrail input`), PRD-123 (`tripwire`/`guardrail runtime`), PRD-124 (GuardrailResult) — all IMPLEMENTED** on both editions (see §8, §12). 📋 PRD-125 constitutional policy remains planned.
 
 ### K · Sakana-gap features (PRD-126–127) + newer PRDs (128–132)
 📋 `tag solve` — inference-time multi-model tree search (AB-MCTS) · `tag evolve` — evolutionary
@@ -270,11 +274,11 @@ breadth + model catalog.
 
 | | Count |
 |---|---|
-| ✅ Implemented features | ~74 (PRD-001–072 + PRD-123 + PRD-133) |
-| 🔶 Partially delivered | 3 (PRD-121/122/124 — engine, no command) |
+| ✅ Implemented features | ~77 (PRD-001–072 + PRD-121/122/123/124 + PRD-133) |
+| 🔶 Partially delivered | 0 (PRD-121/122/124 now fully implemented) |
 | ✅ Live CLI commands — **Python** edition | **107** top-level |
 | ✅ Live CLI commands — **Go** harness | ~90 top-level |
-| 📋 Planned features (PRD-073–122, 124–132) | ~53 |
+| 📋 Planned features (PRD-073–120, 125–132) | ~50 |
 | **Total PRDs cataloged** | **133** |
 
 *Verified 2026-08-24 by exercising every command on both editions (7 parallel audit agents) and

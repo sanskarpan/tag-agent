@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed — no `guardrail` command in either CLI
+**Status:** ✅ Implemented (2026-08-24) — GuardrailResult type (Go internal/guardrail + Python tag.core.content_guardrail)
 **Priority:** P1
 **Estimated Effort:** S (1-2 days)
 **Category:** Security/Guardrails
