@@ -113,7 +113,9 @@ def cmd_route(args: argparse.Namespace) -> int:
 
 def cmd_assignments(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
-    rows = collect_assignments(cfg)
+    # Sort by profile name so the order matches the Go harness (which sorts) rather
+    # than config-declaration order (#763 parity).
+    rows = sorted(collect_assignments(cfg), key=lambda r: r.get("profile", ""))
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
@@ -561,6 +563,11 @@ def cmd_runs(args: argparse.Namespace) -> int:
     payload = [dict(row) for row in rows]
     if args.json:
         print(json.dumps(payload, indent=2))
+        return 0
+    if not payload:
+        # Match the Go harness's empty-state so a user can tell "no runs" from a
+        # silent no-op (#763).
+        print("No runs found.")
         return 0
     for row in payload:
         print(
