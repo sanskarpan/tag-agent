@@ -1,173 +1,224 @@
 # TAG — Complete Feature List
 
 > Consolidated, status-verified feature inventory for the TAG agent-orchestration platform.
-> Cross-checked against the live CLI surface and the PRD catalog (**PRD-001–127**,
+> Cross-checked against the live CLI surface and the PRD catalog (**PRD-001–133**,
 > clusters A–K). Sources: `docs/prd/INDEX.md`, `docs/FEATURES_ROADMAP.md`, and `src/tag/`.
 
-**Legend:** ✅ implemented & shipping (working command) · 📋 planned/proposed (PRD written, not yet built)
+**Legend:** ✅ implemented & shipping (working command) · 🔶 partial (engine exists, no dedicated command) · 📋 planned/proposed (PRD written, not yet built)
 
-> **Which edition these counts describe.** This page covers *both* the Python edition and
-> the native Go harness, and they do **not** have the same command surface. Counts
-> re-measured 2026-07-28:
->
-> | Edition | Top-level commands | Total nodes | How counted |
-> |---|---|---|---|
-> | **Python** (`pip install tag-agent`) | **103** | 270 parser nodes | recursive walk of `tag.controller.build_parser()` |
-> | **Go** (`tag-go`, single binary) | **86** | 240 help nodes | recursive `--help` sweep of the built binary (Cobra reports 88; `help` and `completion` are Cobra built-ins) |
->
-> Unless a bullet says otherwise, the **103** figure on this page is the **Python** number.
-> The Go node count slightly undercounts its real verb surface: `mem2 fact`, `mem2 episode`
-> and `mem2 store` take a positional verb rather than Cobra subcommands, hiding 9 verbs
-> from any `--help` sweep. Go-specific gaps (no `swarm run`/`abort`, `agentic-ci` is 1
-> command vs Python's 7 subcommands, `lsp` is hover-only) are tracked in
-> [`tag-go/MIGRATION_STATUS.md`](../tag-go/MIGRATION_STATUS.md).
+**Verified column:** ✅ = exercised and working on the stated edition(s) · ⚠️ = edition gap or caveat (see note) · — = not applicable.
 
-**At a glance:** ~72 features implemented across the Python edition's 103 commands (PRD-001–072) · ~55 planned (PRD-073–127).
+---
+
+## ✅ Verification status — audited 2026-08-24
+
+This inventory was re-verified by exercising **every** top-level command on **both**
+editions (Python `tagpy` and the Go `tagqa` binary), from a fresh bootstrapped
+`TAG_HOME`, plus a full source cross-check of the PRD catalog. Method: 7 parallel
+audit agents, one per feature cluster, running `--help` + a read-only/local
+invocation for each command and grepping the implementation.
+
+**Result:** every feature marked ✅ below is present and its local/read-only path
+works on at least the Python edition; most work on both. **No feature marked ✅ is
+missing or broken.** Findings were limited to (a) intentional edition differences
+(the Go native harness omits some managed-runtime passthroughs — see
+[`tag-go/MIGRATION_STATUS.md`](../tag-go/MIGRATION_STATUS.md)), and (b) a handful of
+Python↔Go polish gaps that were **fixed during this audit** (empty-states,
+`annotate stats --json`, `alert create` positional form, `webhook --platform
+generic`, `serve`/`web` `/health` + JSON 404).
+
+> **Runtime caveat.** Commands that *execute* a prompt (`run`, `submit`, `models`
+> live inventory, `benchmark run`, chat/loop execution) drive the managed "hermes"
+> runtime, which cannot build its venv in an offline CI sandbox. Those paths are
+> marked ✅ (present, parse, reach execution) but their *output* was not exercised
+> here; their command surface and validation are verified.
+
+> **Which edition these counts describe.** This page covers *both* the Python edition
+> and the native Go harness, and they do **not** have the same command surface. Counts
+> re-measured 2026-08-24:
+>
+> | Edition | Top-level commands | How counted |
+> |---|---|---|
+> | **Python** (`pip install tag-agent`) | **107** | recursive walk of `tag.controller.build_parser()` |
+> | **Go** (`tag-go`, single binary) | **~90** | recursive `--help` sweep of the built binary |
+>
+> The Python count grew from 103 → 107 since the last revision: **`run`**, **`guardrail`**,
+> **`tripwire`** and **`doc`** were added. Go-specific gaps (`submit`, `openrouter-models`,
+> `queue-dep`, `kanban`, `dashboard`, `desktop`, `sessions`/`skills`/`chat`/`config`/
+> `status`/`update` passthroughs; `agentic-ci` lacks `install-action`; `lsp` hover-only)
+> are intentional native-harness differences tracked in
+> [`tag-go/MIGRATION_STATUS.md`](../tag-go/MIGRATION_STATUS.md). **Correction:** the Go
+> `swarm` surface is now complete (run/list/status/abort) — the previously-noted "no
+> `swarm run`/`abort`" gap no longer exists.
+
+**At a glance:** ~74 features implemented across the Python edition's 107 commands
+(PRD-001–072 + PRD-123 + PRD-133) · 3 partially delivered (PRD-121/122/124) ·
+~53 planned (PRD-073–122, 124–132).
 
 ---
 
 ## 0. Core platform (foundation)
 
-- ✅ **Control-plane CLI** wrapping the Hermes agent runtime — the `tag` binary, 103 top-level subcommands (Python edition; 86 in the Go harness)
-- ✅ **Multi-profile orchestration** — 5 built-in profiles (orchestrator, researcher, coder, reviewer, codex-runtime-master)
-- ✅ **Task routing engine** — 4 routes (research / implementation / review / mixed); master/worker/verifier roles; Kanban vs direct execution
-- ✅ **Managed runtime provisioning** — `setup`, bundled 52 MB Hermes tarball, branding-patch application (pre-patched-bundle aware), TUI build, per-profile isolated HOMEs
-- ✅ **Dual distribution** — pip (`tag-agent`) + npm (auto-provisions a Python venv); Python 3.11–3.13
-- ✅ **Branding layer** — Hermes→TAG dual-surface text rewrite (mirrored Python + Node)
-- ✅ **SQLite state** — runs/steps/spans/memory/queue/etc. (WAL, atomic + lock-serialized config writes)
+| Feature | Verified | Note |
+|---|---|---|
+| ✅ **Control-plane CLI** wrapping the Hermes runtime — the `tag` binary | ✅ | 107 top-level cmds (Python); ~90 (Go) |
+| ✅ **Multi-profile orchestration** — 5 built-in profiles | ✅ | orchestrator/researcher/coder/reviewer/codex-runtime-master, created on `bootstrap` |
+| ✅ **Task routing engine** — 4 routes; master/worker/verifier; Kanban vs direct | ✅ | `route` resolves roles per task type, both editions |
+| ✅ **Managed runtime provisioning** — `setup`, Hermes tarball, branding, TUI build | ✅ | present both; venv build is env-gated offline |
+| ✅ **Dual distribution** — pip + npm (auto-venv); Python 3.11–3.13 | ✅ | declared in pyproject.toml / package.json |
+| ✅ **Branding layer** — Hermes→TAG dual-surface rewrite | ✅ | "TAG — The Agent Gateway" in both binaries |
+| ✅ **SQLite state** — runs/steps/spans/memory/queue (WAL, atomic + locked writes) | ✅ | `tag.sqlite3` + `-wal`/`-shm` present; shared `(key,value)` maintenance schema |
 
 ---
 
 ## 1. Setup, diagnostics & config
 
-| Status | Command(s) | Feature | PRD |
-|---|---|---|---|
-| ✅ | `setup`, `bootstrap`, `render`, `env` | Provision managed runtime, render per-profile config | — |
-| ✅ | `doctor` | Comprehensive health check (pass/warn/fail per component) | PRD-009 |
-| ✅ | `config`, `status`, `update` | Config passthrough, status, self-update | — |
-| ✅ | `runtime`, `tui`, `chat`, `gateway`, `completion`, `prompt-size`, `logs`, `sessions`, `skills`, `plugins`, `tools`, `mcp`, `model`, `dashboard` | Managed-runtime passthrough surface | — |
+| Status | Command(s) | Feature | PRD | Verified | Note |
+|---|---|---|---|---|---|
+| ✅ | `setup`, `bootstrap`, `render`, `env` | Provision runtime, render per-profile config | — | ✅ | Python; Go has no `render` (uses native config) |
+| ✅ | `doctor` | Health check (pass/warn/fail per component) | PRD-009 | ✅ | full report both editions |
+| ✅ | `config`, `status`, `update` | Config passthrough, status, self-update | — | ⚠️ | Python only — Go native harness omits these passthroughs |
+| ✅ | `runtime`, `tui`, `chat`, `gateway`, `completion`, `prompt-size`, `logs`, `sessions`, `skills`, `plugins`, `tools`, `mcp`, `model`, `dashboard` | Managed-runtime passthrough surface | — | ⚠️ | Python full; Go replaces several with native equivalents (`serve`/`web`/`tui`, `mcp-connect/-serve/-registry`, `tool-index`, `set-model`) |
 
 ## 2. Credential import (18 sources)
 
-| Status | Command(s) | Feature | PRD |
-|---|---|---|---|
-| ✅ | `import-codex/claude/gemini/continue/mistral/opencode/zed/copilot/aider/aws/cursor/supermemory/honcho/nous-portal` | Multi-source credential import | PRD-001, PRD-006 |
-| ✅ | `import-docker/ssh/modal/daytona` | Execution-backend selection per profile | PRD-005 |
+| Status | Command(s) | Feature | PRD | Verified | Note |
+|---|---|---|---|---|---|
+| ✅ | `import-codex/claude/gemini/continue/mistral/opencode/zed/copilot/aider/aws/cursor/supermemory/honcho/nous-portal` | Multi-source credential import | PRD-001, PRD-006 | ✅ | all 14 present & parse, both editions |
+| ✅ | `import-docker/ssh/modal/daytona` | Execution-backend selection per profile | PRD-005 | ✅ | present both; success path env-gated offline |
 
 ## 3. Routing & models
 
-| Status | Command(s) | Feature | PRD |
-|---|---|---|---|
-| ✅ | `route`, `assignments`, `models`, `set-model`, `submit`, `openrouter-models`, `runs` | Task routing, model assignment, submission, run history | — |
-| ✅ | `benchmark`, `compare` | Multi-model benchmarking & comparison | PRD-017 |
-| ✅ | `route-fallback` | Model fallback chains (with cycle detection); walked at runtime by the Go harness via `run --fallback` | PRD-031 |
+| Status | Command(s) | Feature | PRD | Verified | Note |
+|---|---|---|---|---|---|
+| ✅ | `route`, `assignments`, `set-model`, `runs` | Task routing, model assignment, run history | — | ✅ | both editions; `route`/`assignments` `--json` identical |
+| ✅ | `models`, `openrouter-models` | Model inventory | — | ⚠️ | Python `models` needs live runtime (Go reads config offline); `openrouter-models` Python-only |
+| ✅ | `submit` | Route + execute | — | ⚠️ | Python only (Go uses `run`); execution env-gated |
+| ✅ | `benchmark`, `compare` | Multi-model benchmarking & comparison | PRD-017 | ✅ | `list`/`show` work both; `benchmark run/list/show` group + flat form; Go `compare` lacks `run` |
+| ✅ | `route-fallback` | Model fallback chains (cycle detection); `run --fallback` | PRD-031 | ✅ | add/list/resolve/remove + cycle detection, both editions |
 
 ## 4. Memory subsystem
 
-| Status | Command(s) | Feature | PRD |
-|---|---|---|---|
-| ✅ | `memory-journal` | Cross-session memory journal | PRD-002 |
-| ✅ | `mem` | Semantic memory with confidence decay + FTS | PRD-025 |
-| ✅ | `mem2 gc` | Sleep-time memory consolidation / garbage collection | PRD-068 |
-| ✅ | `mem2 extract` | Automatic post-run memory extraction | PRD-065 |
-| ✅ | `mem2 tier` | Hierarchical memory tiers (core/recall/archival) | PRD-067 |
-| ✅ | `mem2 fact` | Temporal fact versioning | PRD-069 |
-| ✅ | `mem2 episode` | Episodic memory (session episodes) | PRD-071 |
-| ✅ | `mem2 store` | Cross-session vector store / hybrid search | PRD-066, PRD-072 |
-| ✅ | `graph` | Entity-relationship graph + community detection | PRD-070 |
-| ✅ | (per-profile config) | Structured memory configuration | PRD-001 |
+| Status | Command(s) | Feature | PRD | Verified | Note |
+|---|---|---|---|---|---|
+| ✅ | `memory-journal` | Cross-session memory journal | PRD-002 | ✅ | save/list/forget/clear both |
+| ✅ | `mem` | Semantic memory with confidence decay + FTS | PRD-025 | ✅ | add/list/search/stats; Go search = hybrid RRF |
+| ✅ | `mem2 gc` | Sleep-time consolidation / GC | PRD-068 | ✅ | `--dry-run` both; Go adds `--daemon` |
+| ✅ | `mem2 extract` | Automatic post-run memory extraction | PRD-065 | ✅ | both editions |
+| ✅ | `mem2 tier` | Hierarchical memory tiers | PRD-067 | ✅ | core/recall/archival both |
+| ✅ | `mem2 fact` | Temporal fact versioning | PRD-069 | ✅ | update/history/list-at both |
+| ✅ | `mem2 episode` | Episodic memory | PRD-071 | ✅ | start/end/list/get both |
+| ✅ | `mem2 store` | Cross-session vector store / hybrid search | PRD-066, PRD-072 | ✅ | store/search/rebuild both |
+| ✅ | `graph` | Entity graph + community detection | PRD-070 | ✅ | show/query/build; community detection surfaces both |
+| ✅ | (per-profile config) | Structured memory configuration | PRD-001 | ✅ | config-backed |
 
 ## 5. Queue, DAG & swarm
 
-| Status | Command(s) | Feature | PRD |
-|---|---|---|---|
-| ✅ | `queue` | Background task queue + notifications | PRD-008 |
-| ✅ | `dag`, `queue-dep` | Dependency-aware task queue / DAG engine (cycle detection) | PRD-033 |
-| ✅ | `swarm` | Multi-agent swarm, context routing | PRD-004, PRD-023 |
-| ✅ | `kanban` | Kanban topology helpers | PRD-004 |
+| Status | Command(s) | Feature | PRD | Verified | Note |
+|---|---|---|---|---|---|
+| ✅ | `queue` | Background task queue + notifications | PRD-008 | ✅ | add/list/result/cancel/clear/**worker**; enqueue-only + 4-field `list --json`, both |
+| ✅ | `dag`, `queue-dep` | Dependency-aware DAG engine (cycle detection) | PRD-033 | ✅ | `dag` both (Go adds `state`); `queue-dep` Python-only (Go folds into `dag`) |
+| ✅ | `swarm` | Multi-agent swarm, context routing | PRD-004, PRD-023 | ✅ | run/list/status/abort/results **both** (Go gap closed) |
+| ✅ | `kanban` | Kanban topology helpers | PRD-004 | ⚠️ | Python only |
 
 ## 6. Observability & cost
 
-| Status | Command(s) | Feature | PRD |
-|---|---|---|---|
-| ✅ | `costs`, `pricing` | Cost tracking / per-span USD attribution | PRD-012, PRD-046 |
-| ✅ | `trace` (list/show/export/**replay**/diff/checkpoint/snapshot) | Agent tracing + time-travel/replay debugging | PRD-013, PRD-032 |
-| ✅ | `cache` | Prompt-cache analytics | PRD-030 |
-| ✅ | `otel-export` | OTel GenAI semconv span export | PRD-041, PRD-048 |
-| ✅ | `agentops` | AgentOps session observability | PRD-044 |
+| Status | Command(s) | Feature | PRD | Verified | Note |
+|---|---|---|---|---|---|
+| ✅ | `costs`, `pricing` | Cost tracking / per-span USD attribution | PRD-012, PRD-046 | ✅ | both; Go richer (`--run-id`/`--by`) |
+| ✅ | `trace` (list/show/export/**replay**/diff/checkpoint/snapshot) | Tracing + time-travel/replay | PRD-013, PRD-032 | ✅ | all 7 subs both; not-found → `{"error":...}`+exit 1 both |
+| ✅ | `cache` | Prompt-cache analytics | PRD-030 | ✅ | stats/trend/tips both |
+| ✅ | `otel-export` | OTel GenAI semconv span export | PRD-041, PRD-048 | ✅ | OTLP/JSON both; errors on unknown `--trace-id` |
+| ✅ | `agentops` | AgentOps session observability | PRD-044 | ✅ | both editions |
 
 ## 7. Eval & quality
 
-| Status | Command(s) | Feature | PRD |
-|---|---|---|---|
-| ✅ | `eval` | Eval framework | PRD-027 |
-| ✅ | `eval-judge` | LLM-as-judge evaluators | PRD-045 |
-| ✅ | `eval-dataset` | Versioned eval dataset management | PRD-049 |
-| ✅ | `eval-ci` | Eval CI gate + PR comment + GH Action scaffold | PRD-047 |
-| ✅ | `alert` | Alert rules on metric thresholds | PRD-050 |
-| ✅ | `annotate` | Human annotation / labeling queue | PRD-051 |
-| ✅ | `prompt` | Prompt versioning hub | PRD-052 |
+| Status | Command(s) | Feature | PRD | Verified | Note |
+|---|---|---|---|---|---|
+| ✅ | `eval` | Eval framework | PRD-027 | ✅ | list; show bad → `{"error"}`+exit 1 both |
+| ✅ | `eval-judge` | LLM-as-judge evaluators | PRD-045 | ✅ | both editions |
+| ✅ | `eval-dataset` | Versioned eval dataset management | PRD-049 | ✅ | both editions |
+| ✅ | `eval-ci` | Eval CI gate + PR comment + GH Action | PRD-047 | ✅ | run + scaffold both |
+| ✅ | `alert` | Alert rules on metric thresholds | PRD-050 | ✅ | create (positional+flags), list/firings empty-states, enumerated metric error — Python fixed 2026-08-24 |
+| ✅ | `annotate` | Human annotation / labeling queue | PRD-051 | ✅ | `stats` human default + `--json` — Python fixed 2026-08-24 |
+| ✅ | `prompt` | Prompt versioning hub | PRD-052 | ✅ | list empty-state — Python fixed 2026-08-24 |
 
 ## 8. Agent tools
 
-| Status | Command(s) | Feature | PRD |
-|---|---|---|---|
-| ✅ | `security` | Secret scanning & security audit | PRD-034 |
-| ✅ | `persona` | Agent personas | PRD-037 |
-| ✅ | `diff-context` | Diff-aware context injection | PRD-038 |
-| ✅ | `budget` | Token budget enforcement | PRD-039 |
-| ✅ | `notify` | Notification hooks (Slack/email/desktop) | PRD-040 |
-| ✅ | `split` | Architect/editor agent split | PRD-042 |
-| ✅ | `tool-index` | Vector-based tool retrieval | PRD-043 |
-| ✅ | `sandbox` | Isolated code execution (restricted / Docker) | PRD-028 |
-| ✅ | `context` | Context-window management | PRD-018 |
+| Status | Command(s) | Feature | PRD | Verified | Note |
+|---|---|---|---|---|---|
+| ✅ | `security` | Secret scanning & security audit | PRD-034 | ✅ | finds secret, exit 1, values not shown |
+| ✅ | `persona` | Agent personas | PRD-037 | ✅ | `list --json` has id/inject/tags **both** (Go added 2026-08-24) |
+| ✅ | `diff-context` | Diff-aware context injection | PRD-038 | ✅ | both editions |
+| ✅ | `budget` | Token budget enforcement | PRD-039 | ✅ | set/check both |
+| ✅ | `notify` | Notification hooks (Slack/email/desktop) | PRD-040 | ✅ | add/list/test/remove/enable/disable |
+| ✅ | `split` | Architect/editor agent split | PRD-042 | ✅ | list/show/plan both |
+| ✅ | `tool-index` | Vector-based tool retrieval | PRD-043 | ✅ | index/search/status both |
+| ✅ | `sandbox` | Isolated code execution (restricted / Docker) | PRD-028 | ✅ | `run 'echo hi'` → hi, exit 0 |
+| ✅ | `context` | Context-window management | PRD-018 | ✅ | show/compress/trim both |
+| ✅ | `tripwire`, `guardrail runtime` | Runtime content guardrails + tripwire | **PRD-123** | ✅ | list/check/test/history/add/remove; fires (exit 3), secrets **fully redacted** — **both editions** |
 
 ## 9. CI/CD & agentic dev workflows
 
-| Status | Command(s) | Feature | PRD |
-|---|---|---|---|
-| ✅ | `review-pr`, `ci` | CI/CD integration + configurable PR-review signal classes | PRD-020, PRD-061 |
-| ✅ | `loop` | Autonomous agent loop (goal detection, iteration cap, human approve/deny) | PRD-021 |
-| ✅ | `cron` | Cron-style scheduled agent runs | PRD-022 |
-| ✅ | `workspace` | Repo-map / workspace context indexing | PRD-024 |
-| ✅ | `issue-solve` | Issue-to-PR autonomous loop | PRD-055 |
-| ✅ | `webhook` | Inbound webhook trigger server (HMAC-verified) | PRD-056 |
-| ✅ | `agentic-ci test-gen` | Automated test generation from diffs | PRD-057 |
-| ✅ | `agentic-ci gen-pipeline` | GitHub Actions / GitLab CI pipeline autogen | PRD-058, PRD-062 |
-| ✅ | `agentic-ci fix-vuln` | SAST/SARIF vulnerability auto-remediation | PRD-059 |
-| ✅ | `agentic-ci ci-diagnose` | CI-failure diagnose & auto-fix | PRD-060 |
-| ✅ | `agentic-ci flaky-fix` | Self-healing flaky-test detection | PRD-063 |
-| ✅ | `swe-solve` | SWE-agent bash/editor harness | PRD-064 |
+| Status | Command(s) | Feature | PRD | Verified | Note |
+|---|---|---|---|---|---|
+| ✅ | `review-pr`, `ci` | CI/CD integration + PR-review signal classes | PRD-020, PRD-061 | ✅ | both; exec env-gated |
+| ✅ | `loop` | Autonomous agent loop (goal detection, iteration cap, approve/deny) | PRD-021 | ✅ | subcommands **and** bare `loop "<prompt>" --iterations N` both |
+| ✅ | `cron` | Cron-style scheduled agent runs | PRD-022 | ✅ | add/list/enable/disable/run both |
+| ✅ | `workspace` | Repo-map / workspace context indexing | PRD-024 | ✅ | index + map both (~500 files) |
+| ✅ | `issue-solve` | Issue-to-PR autonomous loop | PRD-055 | ✅ | both editions |
+| ✅ | `webhook` | Inbound webhook trigger server (HMAC) | PRD-056 | ✅ | `rule-add --platform generic` accepted **both** (Python fixed 2026-08-24) |
+| ✅ | `agentic-ci` (test-gen/gen-pipeline/fix-vuln/ci-diagnose/flaky-fix + `install-action`) | Automated dev workflows | PRD-057–063 | ⚠️ | Python 7 subs; Go 6 (lacks `install-action`) — gap nearly closed |
+| ✅ | `swe-solve` | SWE-agent bash/editor harness | PRD-064 | ✅ | both editions |
 
-## 10. Marketplace, plugins, templates & MCP
+## 10. Marketplace, plugins, templates, MCP & documents
 
-| Status | Command(s) | Feature | PRD |
-|---|---|---|---|
-| ✅ | `marketplace` | Profile marketplace (pull/push) | PRD-026 |
-| ✅ | `template` | Profile templates & sharing | PRD-015 |
-| ✅ | `hooks` | Webhook / lifecycle event hooks | PRD-016 |
-| ✅ | `mcp-registry` | Curated MCP server registry | PRD-014 |
-| ✅ | `plugin` | Plugin management | PRD-011 |
-| ✅ | `shell` | Natural-language TAG shell | PRD-019 |
+| Status | Command(s) | Feature | PRD | Verified | Note |
+|---|---|---|---|---|---|
+| ✅ | `marketplace` | Profile marketplace (pull/push) | PRD-026 | ✅ | list/pull/push both |
+| ✅ | `template` | Profile templates & sharing | PRD-015 | ✅ | export/import/fetch both |
+| ✅ | `hooks` | Webhook / lifecycle event hooks | PRD-016 | ✅ | list/log/test both |
+| ✅ | `mcp-registry` | Curated MCP server registry | PRD-014 | ✅ | both; Go adds add-curated/list-curated |
+| ✅ | `plugin` | Plugin management | PRD-011 | ✅ | list/install/enable/disable both |
+| ✅ | `shell` | Natural-language TAG shell | PRD-019 | ✅ | both editions |
+| ✅ | `doc` (check/read) | Document ingestion — PDF | **PRD-133** | ✅ | engine detection, nonexistent→not found, `--json` engine `""`; **both editions** |
 
 ## 11. Dashboards, UI & IDE
 
-| Status | Command(s) | Feature | PRD |
-|---|---|---|---|
-| ✅ | `serve`, `web`, `dashboard` | HTTP dashboard + admin panel (SSE streaming) | PRD-010, PRD-036, PRD-029 |
-| ✅ | `devui` | Local browser DevUI | PRD-054 |
-| ✅ | `lsp` | IDE bridge / LSP server | PRD-035 |
-| ✅ | `desktop` | Electron desktop app launcher | PRD-007 |
-| ✅ | (runtime) | Rich streaming TUI (spinners/progress/status bar) | PRD-003 |
+| Status | Command(s) | Feature | PRD | Verified | Note |
+|---|---|---|---|---|---|
+| ✅ | `serve`, `web`, `dashboard` | HTTP dashboard + admin panel (SSE) | PRD-010, PRD-036, PRD-029 | ✅ | `serve`/`web` now expose `/health` + JSON 404 (Python fixed 2026-08-24); `dashboard` Python-only |
+| ✅ | `devui` | Local browser DevUI | PRD-054 | ✅ | `/health` 200 + JSON 404 both |
+| ✅ | `lsp` | IDE bridge / LSP server | PRD-035 | ⚠️ | both; Go hover-only (depth gap) |
+| ✅ | `desktop` | Electron desktop app launcher | PRD-007 | ⚠️ | Python only |
+| ✅ | (runtime) | Rich streaming TUI (spinners/progress/status bar) | PRD-003 | ✅ | `tui` both |
 
 Library-level features backing the above (no dedicated command): TraceProcessor lifecycle hooks (PRD-053),
 structured tool-call child spans (PRD-048).
 
 ---
 
-## 12. 📋 Planned / proposed — clusters D–K (PRD-073–127)
+## 12. 🔶 Partially delivered — guardrail siblings (cluster J)
 
-> PRDs written during the v0.6.x–v0.7.x planning cycles; not yet implemented. See `docs/prd/` for each spec.
+The PRD-123 runtime guardrail engine (`guardrail.Processor`, both distributions) already
+screens every stage, which partially delivers three sibling PRDs even though they have **no
+dedicated command** yet:
+
+| Status | PRD | Feature | Evidence |
+|---|---|---|---|
+| 🔶 | PRD-121 | Output guardrail processor | Processor screens `tool_output`/`model_output` stages (`core/guardrail.py`); no `guardrail output` command |
+| 🔶 | PRD-122 | Input guardrail validator | Processor screens `tool_input`/`user_input`; `tripwire test` dry-runs tool-input; no `guardrail input` command |
+| 🔶 | PRD-124 | Guardrail result dataclass | Internal result dataclasses with `.to_dict()` (rule/type/stage/reason) exist; no `guardrail result` command |
+
+`PRD-125` (constitutional-AI policy) remains 📋 planned (deliberately unbuilt).
+
+---
+
+## 13. 📋 Planned / proposed — clusters D–K (PRD-073–132)
+
+> PRDs written during the v0.6.x–v0.7.x planning cycles; not yet implemented as commands.
+> Cross-checked 2026-08-24 against the live surface + `src/tag/` and `tag-go/` — **no false
+> "planned" flags found**: none of these ship a command today. See `docs/prd/` for each spec.
 
 ### D · MCP ecosystem & tool connectivity (PRD-073–080)
 📋 Live MCP registry sync · MCP OAuth PKCE/device flow · per-user entity-scoped multi-tenant tool auth ·
@@ -183,7 +234,7 @@ distributed agent runtime (gRPC).
 📋 Sandbox streaming stdout/stderr · template/snapshot system · configurable TTL + session refresh ·
 desktop-GUI sandbox (VNC) · GPU sandbox (Modal) · per-sandbox egress firewall · pause/resume ·
 persistent volume mounts · sandbox secrets vault · stdin/signal delivery · per-second cost attribution ·
-sandbox lifecycle policies.
+sandbox lifecycle policies. *(Current `sandbox` = run/list/result only.)*
 
 ### G · Advanced reasoning & planning (PRD-101–108)
 📋 Self-consistency ensemble · multi-agent debate · dynamic task-type classifier (embeddings) ·
@@ -193,22 +244,25 @@ confidence-aware model routing · Magentic-One orchestrator.
 ### H · Agentic workflow state & graph (PRD-109–116)
 📋 Human-in-the-loop interrupt · loop-state serialization · dynamic fan-out/map-reduce ·
 graph-based workflow · time-travel debugging · team-orchestration primitives · stateful process
-framework · memex persistent scratchpad.
+framework · memex persistent scratchpad. *(Note: a Go `hitl` package backs loop approvals, but the
+generic `workflow interrupt()`/resume of PRD-109 is not built.)*
 
 ### I · Computer use & browser automation (PRD-117–120)
 📋 Playwright MCP integration · computer-use CLI · Claude computer-use screenshot loop ·
 desktop-GUI sandbox (VNC).
 
 ### J · Security & guardrails (PRD-121–125)
-📋 Output guardrail processor · input guardrail validator · runtime guardrail hooks ·
-guardrail result dataclass · constitutional-AI policy.
+✅ **PRD-123 runtime guardrail hooks — IMPLEMENTED** (`tripwire` + `guardrail runtime`, both editions).
+🔶 PRD-121/122/124 partially delivered by the shared Processor (see §12). 📋 PRD-125 constitutional policy.
 
-### K · Sakana-gap features (PRD-126–127) + enhancements
-📋 `tag solve` — inference-time multi-model tree search (AB-MCTS-inspired) ·
-📋 `tag evolve` — evolutionary profile-config optimization ·
-📋 planned enhancements to existing PRDs: Trinity-style per-turn Thinker/Worker/Verifier roles (PRD-082),
-diverse-profile ensemble with reviewer-judge/tournament/synthesize modes (PRD-101), per-wave
-self-review/self-improve for swarm (PRD-023).
+### K · Sakana-gap features (PRD-126–127) + newer PRDs (128–132)
+📋 `tag solve` — inference-time multi-model tree search (AB-MCTS) · `tag evolve` — evolutionary
+profile-config optimization.
+📋 **PRD-128** agent-skills (SKILL.md packages) — *note:* the existing plural `skills` command is a
+managed-runtime passthrough, **not** TAG's own SKILL.md package system · **PRD-129** plan/act execution
+mode · **PRD-130** git-worktree isolation · **PRD-131** Zed ACP editor bridge · **PRD-132** provider-adapter
+breadth + model catalog.
+✅ **PRD-133** document ingestion (PDF) — **IMPLEMENTED** as `tag doc` (see §10).
 
 ---
 
@@ -216,11 +270,13 @@ self-review/self-improve for swarm (PRD-023).
 
 | | Count |
 |---|---|
-| ✅ Implemented features (PRD-001–072) | ~72 |
-| ✅ Live CLI commands — **Python** edition | 103 top-level (270 parser nodes) |
-| ✅ Live CLI commands — **Go** harness | 86 top-level (240 help nodes) |
-| 📋 Planned features (PRD-073–127, clusters D–K) | ~55 |
-| **Total PRDs cataloged** | **127** |
+| ✅ Implemented features | ~74 (PRD-001–072 + PRD-123 + PRD-133) |
+| 🔶 Partially delivered | 3 (PRD-121/122/124 — engine, no command) |
+| ✅ Live CLI commands — **Python** edition | **107** top-level |
+| ✅ Live CLI commands — **Go** harness | ~90 top-level |
+| 📋 Planned features (PRD-073–122, 124–132) | ~53 |
+| **Total PRDs cataloged** | **133** |
 
-*Generated by cross-referencing the live `tag --help` surface against `docs/prd/INDEX.md`. Implemented
-status = a working command exists for the PRD; planned = PRD spec written, no command yet.*
+*Verified 2026-08-24 by exercising every command on both editions (7 parallel audit agents) and
+cross-checking `docs/prd/` against `src/tag/` + `tag-go/`. Implemented = a working command exists and
+its local path was verified; partial = engine present, no command; planned = PRD spec only.*
