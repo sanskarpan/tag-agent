@@ -65,9 +65,12 @@ def test_secrets_builtin_detects_aws_key_and_redacts():
     v = p.scan(gr.STAGE_TOOL_OUTPUT, "", "tok=AKIAIOSFODNN7EXAMPLE")
     assert v.blocked and v.fired()
     assert v.findings[0].detector == "secrets:aws-access-key-id"
-    # The raw secret must never appear in the excerpt.
-    assert "AKIAIOSFODNN7EXAMPLE" not in v.findings[0].excerpt
-    assert "redacted" in v.findings[0].excerpt
+    # The secret must be FULLY masked — not even the first characters may leak
+    # into the excerpt or the persisted history (#763 security).
+    exc = v.findings[0].excerpt
+    assert "AKIAIOSFODNN7EXAMPLE" not in exc
+    assert "AKIAIO" not in exc  # no 6-char prefix leak
+    assert "redacted" in exc
 
 
 def test_destructive_builtin_detects_rm_rf_root():

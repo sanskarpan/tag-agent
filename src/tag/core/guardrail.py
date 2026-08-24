@@ -189,10 +189,12 @@ def _finditer_capped(pat: re.Pattern[str], content: str, cap: int) -> list[re.Ma
 def redact(s: str) -> str:
     """Render a match safely for logs: only a short prefix and the length survive."""
     s = s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
-    keep = 6
-    if len(s) <= keep:
-        return "*" * len(s)
-    return s[:keep] + f"…[redacted, {len(s)} chars]"
+    # Mask the match ENTIRELY — do not echo any of the caught secret into stdout
+    # or the persisted history log (#763 security). Length is not sensitive and
+    # helps an operator recognise the hit. Matches the Go harness.
+    if not s:
+        return ""
+    return f"[redacted, {len(s)} chars]"
 
 
 def match_tool(pattern: str, tool: str) -> bool:

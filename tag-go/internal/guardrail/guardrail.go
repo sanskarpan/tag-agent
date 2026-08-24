@@ -446,11 +446,14 @@ func Redact(s string) string {
 		}
 		return r
 	}, s)
-	const keep = 6
-	if len(s) <= keep {
-		return strings.Repeat("*", len(s))
+	// Mask the match ENTIRELY. This used to reveal the first 6 characters, but a
+	// guardrail whose job is to stop secret disclosure must not echo any of the
+	// caught secret into stdout or the persisted history log (#763 security). The
+	// length is not itself sensitive and helps an operator recognise the hit.
+	if len(s) == 0 {
+		return ""
 	}
-	return s[:keep] + fmt.Sprintf("…[redacted, %d chars]", len(s))
+	return fmt.Sprintf("[redacted, %d chars]", len(s))
 }
 
 // ---- persistence -----------------------------------------------------------
