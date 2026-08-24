@@ -91,6 +91,47 @@ def _ensure_hermes_ready(cfg: dict[str, Any], *, config_arg: str | None, need_tu
 
 
 # ---------------------------------------------------------------------------
+# cmd_run — execute a prompt directly on the master profile (parity with Go's
+# top-level `run`, #763). Go drives a native in-process agent loop; the Python
+# distribution runs through the profile's managed runtime, so this reuses
+# run_chat_step (the same executor `submit --execution direct` uses).
+# ---------------------------------------------------------------------------
+
+def cmd_run(args: argparse.Namespace) -> int:
+    prompt = (getattr(args, "prompt", None) or "").strip()
+    if not prompt:
+        print_error('run needs a prompt (`tag run "<prompt>"`)')
+        return 2
+    cfg = load_config(config_path(args.config))
+    profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
+    ensure_profile_exists(cfg, profile)
+    # A failed runtime build surfaces as the clean, actionable message (#763),
+    # not a raw subprocess argv.
+    _ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    run_id = f"run-{uuid.uuid4().hex[:12]}"
+    step = run_chat_step(cfg, profile_name=profile, prompt=prompt)
+    conn = open_db(cfg)
+    try:
+        insert_run(
+            conn, run_id=run_id, kind="agent", task_type="chat", execution="direct",
+            master_profile=profile, board="default", prompt=prompt,
+            route={"profile": profile}, status=step["status"],
+            metadata={"model_ref": step.get("model_ref", "")},
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "run_id": run_id, "profile": profile, "status": step["status"],
+            "model_ref": step.get("model_ref", ""), "output": step["output"],
+        }, indent=2))
+    else:
+        print(step["output"])
+    return 0 if step["status"] == "ok" else 1
+
+
+# ---------------------------------------------------------------------------
 # cmd_route
 # ---------------------------------------------------------------------------
 
@@ -801,6 +842,13 @@ def cmd_plugin(args: argparse.Namespace) -> int:
 
 def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     """Register all routing-related sub-commands onto *sub*."""
+
+    # run — execute a prompt directly on the master profile (parity with Go).
+    run = sub.add_parser("run", help="Run the agent on a prompt (direct execution)")
+    run.add_argument("prompt", help="the prompt to run")
+    run.add_argument("--profile", help="profile to run as (default: master profile)")
+    run.add_argument("--json", action="store_true")
+    run.set_defaults(func=cmd_run)
 
     # route
     route = sub.add_parser("route", help="Resolve task routing from lab policy")
