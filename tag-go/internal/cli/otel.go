@@ -64,6 +64,12 @@ func registerOtelExport(root *cobra.Command, app *App) {
 			if err := rows.Err(); err != nil {
 				return err
 			}
+			// A --trace-id matching nothing must not emit a valid-looking empty
+			// OTLP envelope with exit 0 — a typo'd id would read as a successful
+			// export of nothing. Error like `costs --run-id bogus` (#763).
+			if traceID != "" && len(spans) == 0 {
+				return jsonErrorMaybe(fmt.Errorf("no spans recorded for trace %q", traceID))
+			}
 			payload := otelPayload(spans)
 			b, _ := json.MarshalIndent(payload, "", "  ")
 			fmt.Println(string(b))

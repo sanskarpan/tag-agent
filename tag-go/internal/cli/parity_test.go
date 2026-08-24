@@ -68,6 +68,34 @@ func TestParityBacklogPolish763(t *testing.T) {
 	}
 }
 
+// TestParityBacklogPolish763b covers the second #763 batch: webhook rule-add
+// accepts every platform the receiver serves (incl. generic), otel-export errors
+// on a trace-id that matches nothing, and `runs list --limit 0` does not read as
+// "no data exists".
+func TestParityBacklogPolish763b(t *testing.T) {
+	h := newHome(t)
+
+	// webhook rule-add --platform generic is accepted (the receiver serves it).
+	if out, code := run(t, h, "webhook", "rule-add", "--platform", "generic", "--event", "e", "--profile", "orchestrator"); code != 0 || !strings.Contains(out, "generic") {
+		t.Errorf("webhook rule-add generic should succeed: %q code=%d", out, code)
+	}
+	// an unknown platform is still rejected, and the error lists the valid set.
+	if out, code := run(t, h, "webhook", "rule-add", "--platform", "nope", "--event", "e", "--profile", "orchestrator"); code == 0 || !strings.Contains(out, "generic") {
+		t.Errorf("webhook rule-add bad platform should list valid ones: %q code=%d", out, code)
+	}
+
+	// otel-export --trace-id that matches nothing errors (not a silent empty export).
+	if out, code := run(t, h, "otel-export", "--trace-id", "does-not-exist"); code == 0 || !strings.Contains(out, "no spans recorded") {
+		t.Errorf("otel-export bad trace should error: %q code=%d", out, code)
+	}
+
+	// runs list --limit 0 with data present must not read as "no data".
+	run(t, h, "run", "hello")
+	if out, code := run(t, h, "runs", "list", "--limit", "0"); code != 0 || strings.Contains(out, "No runs found.") {
+		t.Errorf("runs list --limit 0 should not say 'No runs found.': %q code=%d", out, code)
+	}
+}
+
 // TestParityNoArgsValidators verifies flag-only commands reject stray
 // positionals (Python argparse errors; Go must too via cobra.NoArgs).
 func TestParityNoArgsValidators(t *testing.T) {

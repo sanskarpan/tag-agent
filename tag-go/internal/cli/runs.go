@@ -71,7 +71,14 @@ func registerRuns(root *cobra.Command, app *App) {
 				return emitJSON(out)
 			}
 			if len(out) == 0 {
-				fmt.Println("No runs found.")
+				// Distinguish a genuinely empty store from `--limit 0`, which asks
+				// for zero rows — printing "No runs found." there implies no data
+				// exists when there may be plenty (#763).
+				if limit == 0 {
+					fmt.Println("No rows shown (--limit 0).")
+				} else {
+					fmt.Println("No runs found.")
+				}
 				return nil
 			}
 			fmt.Printf("%-14s %-40s %-10s %-24s %8s %8s %10s %s\n",

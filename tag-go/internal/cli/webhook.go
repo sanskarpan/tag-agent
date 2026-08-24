@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -54,10 +55,20 @@ func registerWebhook(root *cobra.Command, app *App) {
 			if rPlatform == "" || rEvent == "" || rProfile == "" {
 				return fmt.Errorf("--platform, --event, and --profile are required")
 			}
-			switch rPlatform {
-			case "github", "linear", "slack":
-			default:
-				return fmt.Errorf("--platform must be github|linear|slack")
+			// Accept every platform the RECEIVER serves. `generic` was omitted
+			// here even though webhook.KnownPlatforms() includes it and
+			// POST /webhook/generic is accepted, so generic events could be
+			// received but never routed to a job (#763).
+			known := webhook.KnownPlatforms()
+			valid := false
+			for _, p := range known {
+				if rPlatform == p {
+					valid = true
+					break
+				}
+			}
+			if !valid {
+				return fmt.Errorf("--platform must be one of %s", strings.Join(known, "|"))
 			}
 			db, err := app.OpenDB()
 			if err != nil {
@@ -70,7 +81,7 @@ func registerWebhook(root *cobra.Command, app *App) {
 			fmt.Printf("Added trigger rule %s: %s %s -> %s (%s)\n", rule.ID, rPlatform, rEvent, rProfile, rule.Action)
 			return nil
 		}}
-	ruleAdd.Flags().StringVar(&rPlatform, "platform", "", "github|linear|slack")
+	ruleAdd.Flags().StringVar(&rPlatform, "platform", "", "github|slack|linear|generic")
 	ruleAdd.Flags().StringVar(&rEvent, "event", "", "event pattern (supports globs)")
 	ruleAdd.Flags().StringVar(&rProfile, "profile", "", "profile to run")
 	ruleAdd.Flags().StringVar(&rAction, "action", "run", "action")
