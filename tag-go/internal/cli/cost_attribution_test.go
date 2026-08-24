@@ -323,17 +323,20 @@ func TestStatsCostAggregation(t *testing.T) {
 // with zero tokens, and must not be counted as a span whose rate is missing.
 func TestStatsCostIncludesJustWrittenSpans(t *testing.T) {
 	h := newHome(t)
-	if out, code := run(t, h, "set-model", "orchestrator", "openai/gpt-4o-mini"); code != 0 {
-		t.Fatalf("set-model: exit=%d out=%s", code, out)
-	}
-	out, code := runEnv(t, h, nil, "--json", "run", "price this now",
-		"--provider", "echo", "--profile", "orchestrator")
-	if code != 0 {
-		t.Fatalf("run: exit=%d out=%s", code, out)
-	}
-	runID := runIDFromJSON(t, out)
+	// Seed a trace with a PRICED llm span (gpt-4o-mini, tokens, cost left NULL so
+	// the pipeline must price it) plus a root span on the same priced model but
+	// with zero tokens (which must NOT count as a missing rate). This formerly
+	// ran the echo provider, which is now correctly free (#742), so priced
+	// attribution is exercised with a real model via a seeded span instead.
+	runID := "tr-just"
+	seedSpans(t, h,
+		`INSERT INTO spans(id,trace_id,parent_id,name,profile,model_id,started_at,finished_at,duration_ms,status,prompt_tokens,completion_tokens,kind,cost_usd)
+		 VALUES('r0','tr-just',NULL,'agent.run','orchestrator','openai/gpt-4o-mini','2026-07-01T00:00:00Z','2026-07-01T00:00:10Z',10000,'ok',0,0,'agent',NULL)`,
+		`INSERT INTO spans(id,trace_id,parent_id,name,profile,model_id,started_at,finished_at,duration_ms,status,prompt_tokens,completion_tokens,kind,cost_usd)
+		 VALUES('r1','tr-just','r0','llm.call','orchestrator','openai/gpt-4o-mini','2026-07-01T00:00:01Z','2026-07-01T00:00:04Z',3000,'ok',100000,100000,'llm',NULL)`,
+	)
 
-	out, code = run(t, h, "--json", "stats", "--cost")
+	out, code := run(t, h, "--json", "stats", "--cost", "--since", "2026-06-01")
 	if code != 0 {
 		t.Fatalf("stats: exit=%d out=%s", code, out)
 	}
