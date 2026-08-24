@@ -258,7 +258,8 @@ def cmd_alert(args: argparse.Namespace) -> int:
     try:
         import sqlite3 as _sq3
         from tag.alerts import (ensure_schema, create_rule, list_rules, delete_rule,
-                                 check_alerts, compute_metric_snapshot, get_recent_firings)
+                                 check_alerts, compute_metric_snapshot, get_recent_firings,
+                                 AlertMetric)
     except ImportError as e:
         print_error(f"alerts not available: {e}")
         return 1
@@ -267,8 +268,32 @@ def cmd_alert(args: argparse.Namespace) -> int:
     conn = _sq3.connect(str(db_path))
     ensure_schema(conn)
     if sub == "create":
-        rule = create_rule(conn, args.name, args.metric, args.condition,
-                           args.threshold, args.severity,
+        # Reconcile the positional (Go-style) and flag forms; a flag wins.
+        metric = getattr(args, "metric", None) or getattr(args, "metric_pos", None)
+        condition = getattr(args, "condition", None) or getattr(args, "condition_pos", None)
+        threshold_raw = getattr(args, "threshold", None)
+        if threshold_raw is None:
+            threshold_raw = getattr(args, "threshold_pos", None)
+        if not metric or not condition or threshold_raw is None:
+            print_error("alert create needs NAME METRIC CONDITION THRESHOLD "
+                        "(positional `alert create <name> <metric> <condition> <threshold>` "
+                        "or --metric/--condition/--threshold)")
+            return 2
+        try:
+            threshold = float(threshold_raw)
+        except (TypeError, ValueError):
+            print_error(f"invalid threshold {threshold_raw!r}")
+            return 2
+        valid = sorted(m.value for m in AlertMetric)
+        if metric not in valid:
+            # Enumerate the accepted metrics, matching the Go harness's error.
+            print_error(f"unknown metric: {metric!r}; must be one of {'/'.join(valid)}")
+            return 2
+        if condition not in ("lt", "gt", "lte", "gte"):
+            print_error(f"unknown condition: {condition!r}; must be lt/gt/lte/gte")
+            return 2
+        rule = create_rule(conn, args.name, metric, condition,
+                           threshold, args.severity,
                            profile=getattr(args, "profile", None))
         print(f"Created rule '{rule.name}' (id={rule.id})")
         return 0
@@ -277,6 +302,8 @@ def cmd_alert(args: argparse.Namespace) -> int:
         if getattr(args, "json", False):
             print(json.dumps([vars(r) if hasattr(r, "__dict__") else dict(r) for r in rules], indent=2, default=str))
         else:
+            if not rules:
+                print("No alert rules.")  # empty-state, matching the Go harness
             for r in rules:
                 print(f"{r.id[:8]}  {r.name:<30} {r.metric} {r.condition} {r.threshold} [{r.severity}]")
         return 0
@@ -299,6 +326,9 @@ def cmd_alert(args: argparse.Namespace) -> int:
                 [vars(f) if hasattr(f, "__dict__") else dict(f) for f in firings],
                 indent=2, default=str,
             ))
+            return 0
+        if not firings:
+            print("No firings.")  # empty-state, matching the Go harness
             return 0
         for f in firings:
             print(f"[{f.severity}] {f.rule_name}: {f.actual_value:.4f} at {f.fired_at}")
@@ -341,7 +371,18 @@ def cmd_annotate(args: argparse.Namespace) -> int:
         return 0 if ok else 1
     if sub == "stats":
         stats = queue_stats(conn)
-        print(json.dumps(stats, indent=2))
+        if getattr(args, "json", False):
+            print(json.dumps(stats, indent=2))
+            return 0
+        # Human default; --json is the opt-in that switches to JSON. Previously
+        # this printed raw JSON unconditionally, so --json was a no-op (matches
+        # the Go harness fix).
+        print(f"annotation queue: {stats.get('total', 0)} task(s)")
+        print(f"  pending={stats.get('pending', 0)} in_progress={stats.get('in_progress', 0)} "
+              f"completed={stats.get('completed', 0)} skipped={stats.get('skipped', 0)}")
+        avg = stats.get("avg_latency_hours")
+        if avg is not None:
+            print(f"  avg latency: {avg:.2f} hours")
         return 0
     if sub == "export":
         fmt = getattr(args, "format", "jsonl")
@@ -403,6 +444,8 @@ def cmd_prompt_hub(args: argparse.Namespace) -> int:
         if getattr(args, "json", False):
             print(json.dumps([vars(p) if hasattr(p, "__dict__") else dict(p) for p in prompts], indent=2, default=str))
         else:
+            if not prompts:
+                print("No prompts saved.")  # empty-state, matching the Go harness
             for p in prompts:
                 print(f"{p['name']:<40} v{p['latest_version']} ({p['versions_count']} versions)")
         return 0
@@ -1125,12 +1168,22 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     alert_cmd = sub.add_parser("alert", help="Alert rules and firing management")
     alert_sub = alert_cmd.add_subparsers(dest="alert_subcommand")
     alert_create = alert_sub.add_parser("create", help="Create an alert rule")
+    # Accept the Go harness's positional form
+    # (`alert create <name> <metric> <condition> <threshold>`) as well as the
+    # historical flags (#763 parity). cmd_alert reconciles and validates.
     alert_create.add_argument("name", metavar="NAME")
-    alert_create.add_argument("--metric", required=True)
-    alert_create.add_argument("--condition", required=True, choices=["lt", "gt", "lte", "gte"])
-    alert_create.add_argument("--threshold", type=float, required=True)
+    alert_create.add_argument("metric_pos", nargs="?", metavar="METRIC",
+                              help="metric (positional; or use --metric)")
+    alert_create.add_argument("condition_pos", nargs="?", metavar="CONDITION",
+                              help="lt|gt|lte|gte (positional; or use --condition)")
+    alert_create.add_argument("threshold_pos", nargs="?", metavar="THRESHOLD",
+                              help="threshold (positional; or use --threshold)")
+    alert_create.add_argument("--metric")
+    alert_create.add_argument("--condition", choices=["lt", "gt", "lte", "gte"])
+    alert_create.add_argument("--threshold", type=float)
     alert_create.add_argument("--severity", default="warning", choices=["info", "warning", "critical"])
     alert_create.add_argument("--profile", default=None)
+    alert_create.add_argument("--json", action="store_true")
     alert_list = alert_sub.add_parser("list", help="List alert rules")
     alert_list.add_argument("--json", action="store_true")
     alert_check = alert_sub.add_parser("check", help="Check alerts against current metrics")
@@ -1216,7 +1269,11 @@ def register(sub: argparse._SubParsersAction) -> None:  # noqa: SLF001
     wh_listen.add_argument("--allow-remote", action="store_true", dest="allow_remote",
                            help="permit a non-loopback --host (INSECURE)")
     wh_rule_add = wh_sub.add_parser("rule-add", help="Add a trigger rule")
-    wh_rule_add.add_argument("--platform", required=True, choices=["github", "linear", "slack"])
+    # Accept every platform the receiver serves — `generic` was omitted even
+    # though the receiver handles POST /webhook/generic, so generic events could
+    # be received but never routed to a job (#763 parity with the Go harness).
+    wh_rule_add.add_argument("--platform", required=True,
+                             choices=["github", "linear", "slack", "generic"])
     wh_rule_add.add_argument("--event", required=True)
     wh_rule_add.add_argument("--profile", required=True)
     wh_rule_add.add_argument("--action", default="run")

@@ -717,10 +717,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
             def do_GET(self):
                 if self.path == "/events":
                     self._serve_sse()
+                elif self.path == "/health":
+                    # Liveness probe, so `serve` matches the sibling servers
+                    # (devui/web/gateway/webhook) and the Go harness (#763).
+                    self._serve_json(200, {"status": "ok"})
                 elif self.path == "/" or self.path == "/index.html":
                     self._serve_html()
                 else:
-                    self.send_error(404)
+                    # JSON 404 for a consistent, parseable error body (#763).
+                    self._serve_json(404, {"error": "not found"})
+
+            def _serve_json(self, code, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
             def _serve_html(self):
                 html = _dashboard_html(profile)

@@ -223,6 +223,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/":
             self._send_html(_DASHBOARD_HTML)
+        elif path == "/health":
+            # Liveness probe, matching the sibling servers and the Go harness (#763).
+            self._send_json({"status": "ok"})
         elif path == "/api/runs":
             conn = self._get_conn()
             self._send_json(_fetch_runs(conn))
@@ -243,8 +246,8 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/stream":
             self._sse_loop()
         else:
-            self.send_response(404)
-            self.end_headers()
+            # JSON 404 for a consistent, parseable error body across servers (#763).
+            self._send_json({"error": "not found"}, status=404)
 
     def _send_html(self, html: str) -> None:
         body = html.encode("utf-8")
@@ -254,9 +257,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_json(self, data: Any) -> None:
+    def _send_json(self, data: Any, status: int = 200) -> None:
         body = json.dumps(data).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         # No wildcard CORS: these endpoints expose local run/cost/trace data.
         # A `*` ACAO lets any visited web page fetch() this localhost server and
