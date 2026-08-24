@@ -53,6 +53,18 @@ def test_assignments_json_sorted_by_profile(tmp_path, monkeypatch, capsys):
     assert profiles == sorted(profiles)
 
 
+def test_doc_check_nonexistent_file_is_not_supported(tmp_path, monkeypatch, capsys):
+    from tag.cmd.prd_clusters import cmd_doc
+    _home(tmp_path, monkeypatch)
+    missing = str(tmp_path / "nope.pdf")
+    rc = cmd_doc(SimpleNamespace(config=None, doc_subcommand="check", file=missing, json=True))
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    # A file that does not exist must never be reported as supported (#763).
+    assert out["supported"] is False
+    assert out.get("file_error") == "file not found"
+
+
 def test_graph_show_json_has_counts(tmp_path, monkeypatch, capsys):
     from tag.cmd.prd_clusters import cmd_entity_graph
     _home(tmp_path, monkeypatch)
