@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 
 	"github.com/spf13/cobra"
@@ -91,9 +92,19 @@ func registerDoc(root *cobra.Command, app *App) {
 			if !ok {
 				out["hint"] = docs.InstallHint
 			}
+			// For a file arg, `supported` must reflect a file that actually
+			// exists AND has a supported type — reporting `supported: true` for a
+			// nonexistent path reads as a direct contradiction of 'NOT available'
+			// (#763).
+			exists := false
 			if len(args) == 1 {
+				_, statErr := os.Stat(args[0])
+				exists = statErr == nil
 				out["file"] = args[0]
-				out["supported"] = docs.Supported(args[0])
+				out["supported"] = exists && docs.Supported(args[0])
+				if !exists {
+					out["file_error"] = "file not found"
+				}
 			}
 			if flagJSON {
 				return emitJSON(out)
@@ -104,8 +115,14 @@ func registerDoc(root *cobra.Command, app *App) {
 				fmt.Fprintf(cmd.OutOrStdout(), "document support: available (%s)\n", path)
 			}
 			if len(args) == 1 {
-				fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", args[0],
-					map[bool]string{true: "supported", false: "not a supported document type"}[docs.Supported(args[0])])
+				switch {
+				case !exists:
+					fmt.Fprintf(cmd.OutOrStdout(), "%s: not found\n", args[0])
+				case docs.Supported(args[0]):
+					fmt.Fprintf(cmd.OutOrStdout(), "%s: supported\n", args[0])
+				default:
+					fmt.Fprintf(cmd.OutOrStdout(), "%s: not a supported document type\n", args[0])
+				}
 			}
 			// Absence is information, not failure: a caller scripting around
 			// this needs to branch on it, not catch it.

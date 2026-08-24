@@ -590,9 +590,15 @@ def cmd_doc(args: argparse.Namespace) -> int:
         out = {"available": path is not None, "engine": path or ""}
         if path is None:
             out["hint"] = docsmod.INSTALL_HINT
+        # `supported` must reflect a file that exists AND has a supported type —
+        # reporting supported=true for a nonexistent path contradicts the
+        # 'NOT available' line (#763).
+        exists = bool(target) and Path(target).exists()
         if target:
             out["file"] = target
-            out["supported"] = docsmod.supported(target)
+            out["supported"] = exists and docsmod.supported(target)
+            if not exists:
+                out["file_error"] = "file not found"
         if getattr(args, "json", False):
             print(json.dumps(out, indent=2))
         elif path is None:
@@ -600,8 +606,12 @@ def cmd_doc(args: argparse.Namespace) -> int:
         else:
             print(f"document support: available ({path})")
         if target and not getattr(args, "json", False):
-            print(f"{target}: " + ("supported" if docsmod.supported(target)
-                                   else "not a supported document type"))
+            if not exists:
+                print(f"{target}: not found")
+            elif docsmod.supported(target):
+                print(f"{target}: supported")
+            else:
+                print(f"{target}: not a supported document type")
         # Absence is information, not failure: a caller scripting around this
         # needs to branch on it, not catch it.
         return 0
