@@ -56,6 +56,23 @@ def test_route_accepts_positional_task_type():
     assert ns.task_type == "implementation"
 
 
+def test_run_command_parses_and_dispatches():
+    from tag.controller import build_parser
+
+    ns = build_parser().parse_args(["run", "do a thing", "--profile", "coder"])
+    assert ns.prompt == "do a thing"
+    assert ns.profile == "coder"
+    assert ns.func.__name__ == "cmd_run"
+
+
+def test_run_empty_prompt_is_a_usage_error():
+    from types import SimpleNamespace
+    from tag.cmd.routing import cmd_run
+
+    # Empty prompt returns 2 before touching config/runtime.
+    assert cmd_run(SimpleNamespace(config=None, prompt="   ", profile=None, json=False)) == 2
+
+
 def test_route_worker_model_flag_alias():
     from tag.controller import build_parser
 
