@@ -184,7 +184,7 @@ class TestDAG:
         args = make_args(dag_subcommand="list", config=None)
         with patch.dict(os.environ, {"TAG_HOME": str(tmp_path / "taghome")}):
             TAG.cmd_dag(args)
-        assert "No saved DAGs" in capsys.readouterr().out
+        assert "No DAGs." in capsys.readouterr().out  # matches the Go harness (#763)
 
 
 # ===========================================================================
