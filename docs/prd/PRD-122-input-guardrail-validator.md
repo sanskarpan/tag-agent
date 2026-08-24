@@ -2,7 +2,7 @@
 
 > **Stack: Go** (native single-binary; see docs/GO_MIGRATION_RESEARCH.md). This PRD was re-framed from Python to Go.
 
-**Status:** Proposed — no `guardrail` command in either CLI
+**Status:** ✅ Implemented (2026-08-24) — `tag guardrail input` (both editions)
 **Priority:** P1
 **Estimated Effort:** M (5-8 days)
 **Category:** Security/Guardrails
