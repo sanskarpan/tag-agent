@@ -191,7 +191,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
             print(json.dumps(items, separators=(",", ":")))
             return 0
         if not jobs:
-            print("No jobs in queue.")
+            print("Queue is empty.")  # match the Go harness's wording (#763)
             return 0
         print(f"  {'ID':<10} {'STATUS':<12} {'PROFILE':<16} {'TASK'}")
         print("  " + "─" * 70)
@@ -357,7 +357,7 @@ def cmd_dag(args: argparse.Namespace) -> int:
             print(json.dumps(dags, indent=2))
             return 0
         if not dags:
-            print("No saved DAGs.")
+            print("No DAGs.")  # match the Go harness's wording (#763)
             return 0
         for d in dags:
             print(f"{d['id'][:8]}  {d['name']:<30}  {d['step_count']} steps  {d['created_at'][:19]}")
