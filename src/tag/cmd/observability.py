@@ -437,6 +437,16 @@ def cmd_trace(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(getattr(args, "config", None)))
     db_path = runtime_db_path(cfg)
     if not db_path.exists():
+        # `show <id>` on a store with no spans is a NOT-FOUND (exit 1, shared
+        # error shape), not a clean empty — matching the Go harness and the
+        # in-DB no-rows path below (#763). `list` stays an empty result (exit 0).
+        if getattr(args, "trace_subcommand", None) == "show":
+            msg = f'no spans found for trace "{getattr(args, "trace_id", "")}"'
+            if getattr(args, "json", False):
+                print(json.dumps({"error": msg}))
+            else:
+                print_error(msg)
+            return 1
         if getattr(args, "json", False):
             print(json.dumps([]))
         else:
@@ -471,10 +481,14 @@ def cmd_trace(args: argparse.Namespace) -> int:
                 (trace_id,),
             ).fetchall()
             if not rows:
+                # Shared not-found shape: {"error":...} on stdout under --json,
+                # "error: ..." on stderr otherwise, exit 1 — matching the Go
+                # harness and sibling detail commands (was "[]"/stdout) (#763).
+                msg = f'no spans found for trace "{trace_id}"'
                 if getattr(args, "json", False):
-                    print(json.dumps([]))
+                    print(json.dumps({"error": msg}))
                 else:
-                    print(f"No spans found for trace {trace_id}")
+                    print_error(msg)
                 return 1
             if getattr(args, "json", False):
                 col = ["id","trace_id","parent_id","name","profile","model_id","started_at",

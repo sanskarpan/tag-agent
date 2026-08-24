@@ -437,15 +437,12 @@ func registerObservability(root *cobra.Command, app *App) {
 				return jsonErrorMaybe(err)
 			}
 			if len(spans) == 0 {
-				// Python parity: an empty ARRAY plus exit 1, never `null`. The
-				// status is carried out as an error value rather than os.Exit so
-				// deferred cleanup (db handles, temp state) still runs.
-				if flagJSON {
-					fmt.Println("[]")
-				} else {
-					fmt.Printf("No spans found for trace %s\n", args[0])
-				}
-				return exitCodeErr{code: 1}
+				// A not-found detail lookup returns the shared error shape:
+				// {"error":...} on stdout under --json, "error: ..." on stderr
+				// otherwise, exit 1 — matching eval/loop/swarm/queue show (#763).
+				// (Previously this printed "[]"/stdout, indistinguishable from a
+				// found-but-empty result and inconsistent with its siblings.)
+				return jsonErrorMaybe(fmt.Errorf("no spans found for trace %q", args[0]))
 			}
 			// Captured before filtering so a filter that removes every row still
 			// names the trace's profile.

@@ -66,6 +66,18 @@ func TestParityBacklogPolish763(t *testing.T) {
 	if out, code := run(t, h, "alert", "create", "r", "cost_usd", "gt", "10"); code == 0 || !strings.Contains(out, "eval_score") {
 		t.Errorf("alert create bad metric should list metrics: %q code=%d", out, code)
 	}
+
+	// not-found detail lookups use the shared {"error":...} JSON shape + exit 1
+	// (compare show previously returned plaintext only) (#763).
+	for _, args := range [][]string{
+		{"--json", "compare", "show", "nope"},
+		{"--json", "trace", "show", "nope"},
+	} {
+		out, code := run(t, h, args...)
+		if code != 1 || !strings.Contains(out, `"error"`) {
+			t.Errorf("%v: want {\"error\":...} + exit 1, got %q code=%d", args, out, code)
+		}
+	}
 }
 
 // TestParityBacklogPolish763b covers the second #763 batch: webhook rule-add

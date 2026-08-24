@@ -577,7 +577,14 @@ def cmd_eval(args: argparse.Namespace) -> int:
         detail = get_eval_run_detail(db, run_id)
         db.close()
         if not detail:
-            print_error(f"Eval run '{run_id}' not found")
+            # Shared not-found shape: {"error":...} on stdout under --json (was
+            # plaintext on stderr only), "error: ..." on stderr otherwise, exit 1
+            # — matching the Go harness and sibling detail commands (#763).
+            msg = f'eval run "{run_id}" not found'
+            if getattr(args, "json", False):
+                print(json.dumps({"error": msg}))
+            else:
+                print_error(msg)
             return 1
         if getattr(args, "json", False):
             print(json.dumps(detail, indent=2))
