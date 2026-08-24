@@ -110,6 +110,12 @@ func registerPrompt(root *cobra.Command, app *App) {
 				}
 				return emitJSON(out)
 			}
+			if len(out) == 0 {
+				// A friendly empty-state like every sibling list command, instead
+				// of zero bytes that read as a hung/no-op command (#763).
+				fmt.Println("No prompts saved.")
+				return nil
+			}
 			for _, s := range out {
 				fmt.Printf("%-40s v%d (%d versions)\n", s.Name, s.LatestVersion, s.VersionsCount)
 			}

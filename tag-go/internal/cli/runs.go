@@ -91,6 +91,12 @@ func registerRuns(root *cobra.Command, app *App) {
 	list.Flags().IntVar(&limit, "limit", 20, "max rows to return")
 	list.Flags().StringVar(&profile, "profile", "", "filter by master_profile")
 
+	// Bare `tag runs` runs the list (like the Python distribution), so
+	// `runs --json` emits a JSON array instead of printing help text with exit 0
+	// — a --json contract violation and a parity gap (#763).
+	c.RunE = list.RunE
+	c.Flags().AddFlagSet(list.Flags())
+
 	show := &cobra.Command{Use: "show <id>", Short: "Show full detail for a run (accepts an id prefix)", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			db, err := app.OpenDB()

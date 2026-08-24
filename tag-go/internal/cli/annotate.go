@@ -180,11 +180,22 @@ func registerAnnotate(root *cobra.Command, app *App) {
 				avg = &v
 			}
 			total := counts["pending"] + counts["in_progress"] + counts["completed"] + counts["skipped"]
-			return emitJSON(map[string]any{
-				"pending": counts["pending"], "in_progress": counts["in_progress"],
-				"completed": counts["completed"], "skipped": counts["skipped"],
-				"total": total, "avg_latency_hours": avg,
-			})
+			if flagJSON {
+				return emitJSON(map[string]any{
+					"pending": counts["pending"], "in_progress": counts["in_progress"],
+					"completed": counts["completed"], "skipped": counts["skipped"],
+					"total": total, "avg_latency_hours": avg,
+				})
+			}
+			// Human default: a readable summary. Previously this printed raw JSON
+			// unconditionally, so --json was a no-op (#763).
+			fmt.Printf("annotation queue: %d task(s)\n", total)
+			fmt.Printf("  pending=%d in_progress=%d completed=%d skipped=%d\n",
+				counts["pending"], counts["in_progress"], counts["completed"], counts["skipped"])
+			if avg != nil {
+				fmt.Printf("  avg latency: %.2f hours\n", *avg)
+			}
+			return nil
 		}}
 
 	var format, out string

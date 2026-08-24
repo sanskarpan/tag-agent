@@ -3,6 +3,7 @@ package cli
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +28,17 @@ var (
 	alertCooldownSec = 3600.0
 )
 
+// sortedAlertMetrics lists the accepted metric names, so a bad --metric error can
+// enumerate them the way the condition error lists lt/gt/lte/gte (#763).
+func sortedAlertMetrics() []string {
+	out := make([]string, 0, len(alertMetrics))
+	for m := range alertMetrics {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func registerAlert(root *cobra.Command, app *App) {
 	a := &cobra.Command{Use: "alert", Short: "Alert rules and firing management", GroupID: "obs"}
 
@@ -39,7 +51,7 @@ func registerAlert(root *cobra.Command, app *App) {
 				return fmt.Errorf("alert rule name must not be empty")
 			}
 			if !alertMetrics[metric] {
-				return fmt.Errorf("unknown metric: %q", metric)
+				return fmt.Errorf("unknown metric: %q; must be one of %s", metric, strings.Join(sortedAlertMetrics(), "/"))
 			}
 			if !alertConditions[condition] {
 				return fmt.Errorf("unknown condition: %q; must be lt/gt/lte/gte", condition)
@@ -87,6 +99,12 @@ func registerAlert(root *cobra.Command, app *App) {
 					rules = []alertRule{}
 				}
 				return emitJSON(rules)
+			}
+			if len(rules) == 0 {
+				// Print a friendly empty-state like every sibling list command,
+				// rather than zero bytes that read as a silent failure (#763).
+				fmt.Println("No alert rules.")
+				return nil
 			}
 			for _, r := range rules {
 				fmt.Printf("%s  %-30s %s %s %g [%s]\n", short(r.ID), r.Name, r.Metric, r.Condition, r.Threshold, r.Severity)
@@ -162,6 +180,10 @@ func registerAlert(root *cobra.Command, app *App) {
 			}
 			if flagJSON {
 				return emitJSON(out)
+			}
+			if len(out) == 0 {
+				fmt.Println("No firings.")
+				return nil
 			}
 			for _, f := range out {
 				fmt.Printf("[%s] %s: %.4f at %s\n", f.Severity, f.RuleName, f.ActualValue, f.FiredAt)

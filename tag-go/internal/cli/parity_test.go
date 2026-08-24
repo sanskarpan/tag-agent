@@ -28,6 +28,43 @@ func TestParityEmptyJSONLists(t *testing.T) {
 	}
 }
 
+// TestParityBacklogPolish763 covers the #763 polish items: bare `runs --json`
+// emits a JSON array (not help text), empty list commands print a friendly
+// empty-state, `annotate stats` honours --json, and a bad alert metric error
+// enumerates the accepted metrics.
+func TestParityBacklogPolish763(t *testing.T) {
+	h := newHome(t)
+
+	// runs --json emits a JSON array, not help text with exit 0.
+	if out, code := run(t, h, "runs", "--json"); code != 0 || !strings.Contains(out, "[]") || strings.Contains(out, "Inspect recorded runs") {
+		t.Errorf("runs --json should emit JSON: %q code=%d", out, code)
+	}
+
+	// empty-state messages for sibling list commands.
+	for _, tc := range []struct{ args []string; want string }{
+		{[]string{"alert", "list"}, "No alert rules."},
+		{[]string{"alert", "firings"}, "No firings."},
+		{[]string{"prompt", "list"}, "No prompts saved."},
+	} {
+		if out, code := run(t, h, tc.args...); code != 0 || !strings.Contains(out, tc.want) {
+			t.Errorf("%v empty-state: want %q, got %q code=%d", tc.args, tc.want, out, code)
+		}
+	}
+
+	// annotate stats: human default is NOT raw JSON; --json is.
+	if out, _ := run(t, h, "annotate", "stats"); strings.HasPrefix(strings.TrimSpace(out), "{") {
+		t.Errorf("annotate stats default should be human, got JSON: %q", out)
+	}
+	if out, _ := run(t, h, "annotate", "stats", "--json"); !strings.HasPrefix(strings.TrimSpace(out), "{") {
+		t.Errorf("annotate stats --json should be JSON: %q", out)
+	}
+
+	// alert create unknown-metric error enumerates the accepted metrics.
+	if out, code := run(t, h, "alert", "create", "r", "cost_usd", "gt", "10"); code == 0 || !strings.Contains(out, "eval_score") {
+		t.Errorf("alert create bad metric should list metrics: %q code=%d", out, code)
+	}
+}
+
 // TestParityNoArgsValidators verifies flag-only commands reject stray
 // positionals (Python argparse errors; Go must too via cobra.NoArgs).
 func TestParityNoArgsValidators(t *testing.T) {
