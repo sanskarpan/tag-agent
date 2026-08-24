@@ -135,6 +135,7 @@ def cmd_memory_semantic(args: argparse.Namespace) -> int:
         from tag.semantic_memory import (
             add_memory,
             search_memories,
+            search_memories_hybrid,
             list_memories,
             forget_memory,
             memory_stats,
@@ -182,7 +183,10 @@ def cmd_memory_semantic(args: argparse.Namespace) -> int:
         if limit is None:
             limit = 10
         mtype = getattr(args, "memory_type", None)
-        results = search_memories(db, profile, query, limit=limit, memory_type=mtype)
+        # Use the hybrid search (FTS5 + BM25 via RRF) — the same path the Go
+        # harness uses — so `mem search --json` carries the dense_score/
+        # sparse_score/hybrid_score fields Go exposes (parity).
+        results = search_memories_hybrid(db, profile, query, limit=limit, memory_type=mtype)
         db.close()
         if getattr(args, "json", False):
             print(json.dumps(results, indent=2))

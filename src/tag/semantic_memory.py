@@ -240,6 +240,10 @@ def list_memories(
         effective = compute_confidence(conf_base, mtype, created)
         results.append({
             "id": mem_id,
+            # profile is part of the Go harness's `mem list --json` item; include
+            # it so a consumer can tell which profile a memory belongs to when
+            # results are aggregated (parity with Go).
+            "profile": profile,
             "content": content,
             "memory_type": mtype,
             "confidence_base": conf_base,
@@ -465,6 +469,15 @@ def search_memories_hybrid(
 
     memories.sort(key=_rrf, reverse=True)
     selected = memories[:limit]
+
+    # Attach the per-result scores the Go harness exposes in `mem search --json`
+    # (dense_score/sparse_score/hybrid_score), so the two distributions agree.
+    # dense_score is 0.0 with no vector backend configured — the same value the
+    # Go side reports when no embedder is active.
+    for mem in selected:
+        mem["dense_score"] = 0.0
+        mem["sparse_score"] = round(bm25_scores.get(mem["id"], 0.0), 6)
+        mem["hybrid_score"] = round(_rrf(mem), 6)
 
     # Update access timestamps
     if selected:
