@@ -235,6 +235,9 @@ func registerGuardrail(root *cobra.Command, app *App) {
 	runtime.AddCommand(tripwireSubcommands(app)...)
 	runtime.AddCommand(guardrailRuntimeEditCommands(app)...)
 	g.AddCommand(runtime)
+	// PRD-122 input + PRD-121 output content guardrails.
+	g.AddCommand(guardrailContentCommand(app, "input"))
+	g.AddCommand(guardrailContentCommand(app, "output"))
 	root.AddCommand(g)
 }
 
