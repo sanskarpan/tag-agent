@@ -106,6 +106,10 @@ func TestBuiltinSecretDetectorsAndRedaction(t *testing.T) {
 			if strings.Contains(f.Excerpt, s) {
 				t.Errorf("the excerpt leaked the secret verbatim: %q", f.Excerpt)
 			}
+			// Not even a prefix may leak: the excerpt is fully masked (#763).
+			if len(s) >= 6 && strings.Contains(f.Excerpt, s[:6]) {
+				t.Errorf("the excerpt leaked a %q prefix of the secret: %q", s[:6], f.Excerpt)
+			}
 			if !strings.Contains(f.Excerpt, "redacted") {
 				t.Errorf("excerpt %q is not marked redacted", f.Excerpt)
 			}
