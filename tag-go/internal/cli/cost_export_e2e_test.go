@@ -78,3 +78,29 @@ func TestTemplateExportIncludesConfig(t *testing.T) {
 		t.Errorf("exported config must include the model, got: %v", cfg)
 	}
 }
+
+// TestEchoRunIsFree: a run against the offline echo provider must record model
+// "echo" and cost 0 — not the profile's configured model billed as if it ran
+// (#742). RED against pre-fix code, which recorded the config model and its
+// rate.
+func TestEchoRunIsFree(t *testing.T) {
+	h := newHome(t)
+	if _, code := run(t, h, "run", "echo billing check"); code != 0 {
+		t.Fatalf("run failed: %d", code)
+	}
+	listOut, _ := run(t, h, "--json", "runs", "list")
+	var list []map[string]any
+	if err := json.Unmarshal([]byte(listOut), &list); err != nil || len(list) == 0 {
+		t.Fatalf("no runs: %v", err)
+	}
+	id, _ := list[0]["id"].(string)
+	showOut, _ := run(t, h, "--json", "runs", "show", id)
+	var show map[string]any
+	json.Unmarshal([]byte(showOut), &show)
+	if m, _ := show["model_id"].(string); m != "echo" {
+		t.Errorf("an echo run must record model_id=echo, got %q", m)
+	}
+	if c, _ := show["estimated_cost_usd"].(float64); c != 0 {
+		t.Errorf("an echo run must cost 0, got %v", c)
+	}
+}
