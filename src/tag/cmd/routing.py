@@ -512,7 +512,58 @@ def cmd_submit(args: argparse.Namespace) -> int:
 # cmd_benchmark
 # ---------------------------------------------------------------------------
 
+def cmd_benchmark_list(args: argparse.Namespace) -> int:
+    """`benchmark list` — recent benchmark runs (parity with the Go group, #763)."""
+    cfg = load_config(config_path(args.config))
+    conn = open_db(cfg)
+    limit = getattr(args, "limit", 20) or 20
+    rows = conn.execute(
+        "SELECT id, created_at, master_profile, status FROM runs "
+        "WHERE kind='benchmark' ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    payload = [dict(r) for r in rows]
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2))
+        return 0
+    if not payload:
+        print("No benchmark runs found.")
+        return 0
+    print(f"{'ID':<32} {'CREATED':<22} {'PROFILE':<16} STATUS")
+    for r in payload:
+        print(f"{r['id']:<32} {r['created_at']:<22} {r['master_profile']:<16} {r['status']}")
+    return 0
+
+
+def cmd_benchmark_show(args: argparse.Namespace) -> int:
+    """`benchmark show <id>` — one benchmark run's detail (parity, #763)."""
+    cfg = load_config(config_path(args.config))
+    conn = open_db(cfg)
+    row = conn.execute(
+        "SELECT id, created_at, master_profile, status, route_json, metadata_json "
+        "FROM runs WHERE id=? AND kind='benchmark'",
+        (args.run_id,),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        print_error(f"no benchmark run {args.run_id!r}")
+        return 1
+    rec = dict(row)
+    if getattr(args, "json", False):
+        print(json.dumps(rec, indent=2))
+        return 0
+    print(f"id:      {rec['id']}")
+    print(f"created: {rec['created_at']}")
+    print(f"profile: {rec['master_profile']}")
+    print(f"status:  {rec['status']}")
+    return 0
+
+
 def cmd_benchmark(args: argparse.Namespace) -> int:
+    if not getattr(args, "profile", None):
+        print_error("benchmark needs --profile")
+        return 2
     cfg = load_config(config_path(args.config))
     ensure_profile_exists(cfg, args.profile)
     _ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
@@ -951,16 +1002,37 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     submit.add_argument("--json", action="store_true")
     submit.set_defaults(func=cmd_submit)
 
-    # benchmark
+    # benchmark — a subcommand group (run/list/show) matching the Go harness,
+    # while the historical FLAT form (`benchmark --profile X`) keeps working
+    # (#763). --profile is validated in cmd_benchmark, not required by argparse,
+    # so `benchmark list`/`show` don't demand it.
+    def _add_benchmark_run_flags(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--profile")
+        p.add_argument("--suite", help="Path to benchmark suite YAML")
+        p.add_argument("--model-ref", action="append", default=[])
+        p.add_argument("--case", action="append", default=[])
+        p.add_argument("--json", action="store_true")
+
     benchmark = sub.add_parser(
-        "benchmark", help="Run a prompt-contract benchmark across one or more models"
+        "benchmark", help="Run and inspect prompt-contract benchmark suites"
     )
-    benchmark.add_argument("--profile", required=True)
-    benchmark.add_argument("--suite", help="Path to benchmark suite YAML")
-    benchmark.add_argument("--model-ref", action="append", default=[])
-    benchmark.add_argument("--case", action="append", default=[])
-    benchmark.add_argument("--json", action="store_true")
+    _add_benchmark_run_flags(benchmark)
     benchmark.set_defaults(func=cmd_benchmark)
+    bench_sub = benchmark.add_subparsers(dest="benchmark_subcommand")
+
+    bench_run = bench_sub.add_parser("run", help="Run a benchmark suite")
+    _add_benchmark_run_flags(bench_run)
+    bench_run.set_defaults(func=cmd_benchmark)
+
+    bench_list = bench_sub.add_parser("list", help="List recent benchmark runs")
+    bench_list.add_argument("--limit", type=positive_int, default=20)
+    bench_list.add_argument("--json", action="store_true")
+    bench_list.set_defaults(func=cmd_benchmark_list)
+
+    bench_show = bench_sub.add_parser("show", help="Show a benchmark run")
+    bench_show.add_argument("run_id", metavar="RUN_ID")
+    bench_show.add_argument("--json", action="store_true")
+    bench_show.set_defaults(func=cmd_benchmark_show)
 
     # runs
     runs = sub.add_parser("runs", help="Show recent submit and benchmark runs")
