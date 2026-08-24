@@ -135,13 +135,14 @@ func TestTraceJSONErrorPaths(t *testing.T) {
 		}
 	}
 
-	// A trace with no spans still returns 1 and an empty ARRAY (Python parity),
-	// never `null` and never a panic.
+	// A not-found trace returns 1 and the shared {"error":...} shape on stdout
+	// (matching sibling detail commands and the Python distribution, #763), never
+	// `[]`/`null` and never a panic.
 	out, code := run(t, h, "--json", "trace", "show", "no-such-trace")
 	if code != 1 {
 		t.Errorf("trace show unknown exit=%d, want 1\n%s", code, out)
 	}
-	if strings.TrimSpace(out) != "[]" {
-		t.Errorf("trace show --json on an unknown trace = %q, want []", strings.TrimSpace(out))
+	if !strings.Contains(out, `"error"`) || strings.Contains(out, "[]") {
+		t.Errorf("trace show --json on an unknown trace = %q, want an {\"error\":...} object", out)
 	}
 }

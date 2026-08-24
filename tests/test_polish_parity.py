@@ -65,6 +65,24 @@ def test_doc_check_nonexistent_file_is_not_supported(tmp_path, monkeypatch, caps
     assert out.get("file_error") == "file not found"
 
 
+def test_trace_show_not_found_uses_shared_error_shape(tmp_path, monkeypatch, capsys):
+    from tag.cmd.observability import cmd_trace
+    _home(tmp_path, monkeypatch)
+    args = SimpleNamespace(config=None, trace_subcommand="show", trace_id="bad", json=True)
+    assert cmd_trace(args) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert "error" in out and "bad" in out["error"]
+
+
+def test_eval_show_not_found_uses_shared_error_shape(tmp_path, monkeypatch, capsys):
+    from tag.cmd.marketplace import cmd_eval
+    _home(tmp_path, monkeypatch)
+    args = SimpleNamespace(config=None, eval_subcommand="show", run_id="bad", json=True)
+    assert cmd_eval(args) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert "error" in out and "bad" in out["error"]
+
+
 def test_hermes_build_failure_is_a_clean_error_not_raw_argv():
     import subprocess
     from tag.cmd import routing

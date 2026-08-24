@@ -76,7 +76,9 @@ func registerCompare(root *cobra.Command, app *App) {
 			err = db.QueryRow(`SELECT id, suite_path, created_at, status, models FROM benchmark_comparisons WHERE id=?`, args[0]).
 				Scan(&id, &suite, &created, &status, &models)
 			if err == sql.ErrNoRows {
-				return fmt.Errorf("comparison %q not found", args[0])
+				// Shared not-found shape: {"error":...} on stdout under --json
+				// (previously only plaintext on stderr), exit 1 (#763).
+				return jsonErrorMaybe(fmt.Errorf("comparison %q not found", args[0]))
 			}
 			if err != nil {
 				return err
