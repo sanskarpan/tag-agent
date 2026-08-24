@@ -20,6 +20,7 @@ _MODULE_NAMES = [
     "marketplace",
     "agent_tools",
     "prd_clusters",
+    "guardrail",
 ]
 
 
