@@ -142,6 +142,11 @@ func registerRun(root *cobra.Command, app *App) {
 				defer cancel()
 			}
 			started := time.Now().UTC()
+			// PRD-121/122: wire the content-guardrail chains into the loop as
+			// input (pre-model) and output (post-model) middleware. The hooks are
+			// only installed when the profile actually has guardrails configured,
+			// so a run with none pays nothing.
+			screenInput, screenOutput := buildContentScreeners(app, app.profile(profile), runID)
 			// A provider that accepts the connection and then stalls produces NO
 			// output until ResponseHeaderTimeout (60s by default) fires. That is
 			// bounded and it does fail honestly — but a full minute of silence
@@ -152,6 +157,7 @@ func registerRun(root *cobra.Command, app *App) {
 			res, err := loop.Run(ctx, args[0], agent.Options{
 				Model:  effectiveModel,
 				System: system, MaxSteps: maxSteps,
+				ScreenInput: screenInput, ScreenOutput: screenOutput,
 			})
 			stopWait()
 			if err != nil {
@@ -218,6 +224,11 @@ func registerRun(root *cobra.Command, app *App) {
 			fmt.Println(res.FinalText)
 			fmt.Printf("\n(run %s: %s in %d step(s), %d prompt + %d completion tokens)\n",
 				runID, res.Stopped, len(res.Steps), res.TotalUsage.PromptTokens, res.TotalUsage.CompletionTokens)
+			// A content guardrail that blocked the run is a RESULT (exit 3), not a
+			// crash — distinguishable from a clean run and from a provider error.
+			if res.Stopped == "input_guardrail_blocked" || res.Stopped == "output_guardrail_blocked" {
+				return exitCodeErr{code: exitFindings}
+			}
 			return nil
 		},
 	}

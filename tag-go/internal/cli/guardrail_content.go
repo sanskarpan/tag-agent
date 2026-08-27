@@ -287,6 +287,55 @@ func guardrailContentCommand(app *App, direction string) *cobra.Command {
 	return c
 }
 
+// buildContentScreeners returns the input/output screening hooks for the agent
+// loop (PRD-122 FR-09 pre-model, PRD-121 FR-08 post-model), or nil when the
+// profile has no guardrails of that direction configured — so a run without
+// guardrails installs no hook and pays nothing. Decisions are persisted to the
+// shared guardrail_events audit log (persist=true).
+func buildContentScreeners(app *App, profile, runID string) (input, output func(string) (bool, string, string)) {
+	db, err := app.OpenDB()
+	if err != nil {
+		return nil, nil
+	}
+	if cfgs, _ := guardrail.ListContentConfigs(db.DB, "input", profile); len(cfgs) > 0 {
+		input = func(text string) (bool, string, string) {
+			v, err := guardrail.RunContentChain(db.DB, "input", profile, text, runID, true)
+			if err != nil {
+				return false, "", ""
+			}
+			switch v.FinalAction {
+			case guardrail.GActionBlock, guardrail.GActionInterrupt:
+				return true, "", "input guardrail blocked: " + firstContentReason(v)
+			case guardrail.GActionSanitize:
+				return false, v.Text, ""
+			}
+			return false, "", ""
+		}
+	}
+	if cfgs, _ := guardrail.ListContentConfigs(db.DB, "output", profile); len(cfgs) > 0 {
+		output = func(text string) (bool, string, string) {
+			v, err := guardrail.RunContentChain(db.DB, "output", profile, text, runID, true)
+			if err != nil {
+				return false, "", ""
+			}
+			if v.FinalAction == guardrail.GActionBlock || v.FinalAction == guardrail.GActionInterrupt {
+				return true, "", "output guardrail blocked: " + firstContentReason(v)
+			}
+			return false, "", ""
+		}
+	}
+	return input, output
+}
+
+func firstContentReason(v guardrail.ContentVerdict) string {
+	for _, r := range v.Results {
+		if r.Fired() {
+			return r.Reason
+		}
+	}
+	return string(v.FinalAction)
+}
+
 func splitCSV(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ",") {

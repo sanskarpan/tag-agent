@@ -97,6 +97,13 @@ def _ensure_hermes_ready(cfg: dict[str, Any], *, config_arg: str | None, need_tu
 # run_chat_step (the same executor `submit --execution direct` uses).
 # ---------------------------------------------------------------------------
 
+def _first_content_reason(verdict) -> str:
+    for r in verdict.results:
+        if r.fired():
+            return r.reason or r.action
+    return verdict.final_action
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     prompt = (getattr(args, "prompt", None) or "").strip()
     if not prompt:
@@ -105,29 +112,61 @@ def cmd_run(args: argparse.Namespace) -> int:
     cfg = load_config(config_path(args.config))
     profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
     ensure_profile_exists(cfg, profile)
-    # A failed runtime build surfaces as the clean, actionable message (#763),
-    # not a raw subprocess argv.
-    _ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+    from tag.core import content_guardrail as cg  # noqa: PLC0415
     run_id = f"run-{uuid.uuid4().hex[:12]}"
-    step = run_chat_step(cfg, profile_name=profile, prompt=prompt)
     conn = open_db(cfg)
     try:
+        # PRD-122: screen the input BEFORE the model — a block short-circuits the
+        # run without even building the runtime (works offline); a sanitize
+        # rewrites the prompt sent to the model.
+        in_v = cg.run_chain(conn, "input", profile, prompt, run_id=run_id, persist=True)
+        if in_v.final_action in (cg.ACTION_BLOCK, cg.ACTION_INTERRUPT):
+            reason = "input guardrail blocked: " + _first_content_reason(in_v)
+            insert_run(conn, run_id=run_id, kind="agent", task_type="chat", execution="direct",
+                       master_profile=profile, board="default", prompt=prompt,
+                       route={"profile": profile}, status="blocked",
+                       metadata={"stopped": "input_guardrail_blocked", "reason": reason})
+            conn.commit()
+            if getattr(args, "json", False):
+                print(json.dumps({"run_id": run_id, "profile": profile,
+                                  "status": "input_guardrail_blocked", "output": reason}, indent=2))
+            else:
+                print(reason)
+            return 3
+        prompt = in_v.text  # sanitized copy if a sanitize guardrail fired
+
+        # A failed runtime build surfaces as the clean, actionable message (#763),
+        # not a raw subprocess argv.
+        _ensure_hermes_ready(cfg, config_arg=args.config, need_tui=False)
+        step = run_chat_step(cfg, profile_name=profile, prompt=prompt)
+        output = step["output"]
+        stopped = None
+
+        # PRD-121: screen the output AFTER the model, before returning it.
+        out_v = cg.run_chain(conn, "output", profile, output, run_id=run_id, persist=True)
+        if out_v.final_action in (cg.ACTION_BLOCK, cg.ACTION_INTERRUPT):
+            output = "output guardrail blocked: " + _first_content_reason(out_v)
+            stopped = "output_guardrail_blocked"
+
+        status = "blocked" if stopped else step["status"]
         insert_run(
             conn, run_id=run_id, kind="agent", task_type="chat", execution="direct",
             master_profile=profile, board="default", prompt=prompt,
-            route={"profile": profile}, status=step["status"],
-            metadata={"model_ref": step.get("model_ref", "")},
+            route={"profile": profile}, status=status,
+            metadata={"model_ref": step.get("model_ref", ""), "stopped": stopped or "done"},
         )
         conn.commit()
     finally:
         conn.close()
     if getattr(args, "json", False):
         print(json.dumps({
-            "run_id": run_id, "profile": profile, "status": step["status"],
-            "model_ref": step.get("model_ref", ""), "output": step["output"],
+            "run_id": run_id, "profile": profile, "status": stopped or step["status"],
+            "model_ref": step.get("model_ref", ""), "output": output,
         }, indent=2))
     else:
-        print(step["output"])
+        print(output)
+    if stopped:
+        return 3
     return 0 if step["status"] == "ok" else 1
 
 
