@@ -65,7 +65,7 @@ type Result struct {
 	Steps      []Step
 	FinalText  string
 	TotalUsage llm.Usage
-	Stopped    string // "done" | "max_steps"
+	Stopped    string // "done" | "max_steps" | "input_guardrail_blocked" | "output_guardrail_blocked"
 }
 
 // Options configures a Run.
@@ -74,6 +74,18 @@ type Options struct {
 	System    string
 	MaxSteps  int
 	CacheHint bool
+
+	// ScreenInput, when non-nil, validates the user message BEFORE the first
+	// provider call (PRD-122 input guardrails). It returns (blocked, replacement,
+	// reason): blocked short-circuits the run (Stopped="input_guardrail_blocked");
+	// a non-empty replacement (sanitize) replaces the user message. Expressed as a
+	// primitive-typed hook so internal/agent stays decoupled from the guardrail
+	// package (the CLI wires it), mirroring the permission.Screener adapter.
+	ScreenInput func(text string) (blocked bool, replacement, reason string)
+	// ScreenOutput, when non-nil, validates the model's final text AFTER the loop
+	// produces it (PRD-121 output guardrails). blocked replaces the returned text
+	// with the reason and sets Stopped="output_guardrail_blocked".
+	ScreenOutput func(text string) (blocked bool, replacement, reason string)
 }
 
 // Loop drives a provider through tool-calling turns.
@@ -131,6 +143,22 @@ func (l *Loop) Run(ctx context.Context, userMessage string, opts Options) (*Resu
 		l.Tracer.Attr(root, "tag.steps", len(res.Steps))
 		l.Tracer.Attr(root, "tag.stopped", res.Stopped)
 		l.Tracer.End(root, trace.StatusOK, "", 0, 0)
+	}
+	// PRD-122: screen the user input BEFORE the first provider call. A block
+	// short-circuits the run; a sanitize replaces the user message content.
+	if opts.ScreenInput != nil {
+		blocked, replacement, reason := opts.ScreenInput(userMessage)
+		if blocked {
+			res.Stopped = "input_guardrail_blocked"
+			res.FinalText = reason
+			l.Tracer.Attr(root, "tag.guardrail_input", reason)
+			closeRoot(nil)
+			return res, nil
+		}
+		if replacement != "" && replacement != userMessage {
+			userMessage = replacement
+			msgs[len(msgs)-1].Content = replacement // last message is the user turn
+		}
 	}
 	for step := 0; step < opts.MaxSteps; step++ {
 		req := llm.Request{Model: opts.Model, Messages: msgs, CacheHint: opts.CacheHint}
@@ -193,6 +221,15 @@ func (l *Loop) Run(ctx context.Context, userMessage string, opts Options) (*Resu
 			res.Steps = append(res.Steps, s)
 			res.FinalText = text
 			res.Stopped = "done"
+			// PRD-121: screen the final output before returning it. A block
+			// replaces the text with the guardrail's reason.
+			if opts.ScreenOutput != nil {
+				if blocked, _, reason := opts.ScreenOutput(res.FinalText); blocked {
+					res.FinalText = reason
+					res.Stopped = "output_guardrail_blocked"
+					l.Tracer.Attr(root, "tag.guardrail_output", reason)
+				}
+			}
 			closeRoot(nil)
 			return res, nil
 		}
