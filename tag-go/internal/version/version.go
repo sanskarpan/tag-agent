@@ -2,4 +2,4 @@
 package version
 
 // Version is the current TAG version (kept in lockstep with the Python line).
-const Version = "0.16.0-go"
+const Version = "0.16.1-go"
