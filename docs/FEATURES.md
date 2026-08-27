@@ -213,9 +213,11 @@ The guardrail cluster is now built out on **both distributions**:
 
 `PRD-125` (constitutional-AI policy) remains 📋 planned (deliberately unbuilt).
 
-> **Runtime-integration note:** the input/output chains are fully operable via the CLI + engine
-> + config + audit log; wiring them into the *live* agent loop as pre/post-model middleware
-> (PRD-121 FR-08 / PRD-122 FR-09) is the remaining enforcement step.
+> **Runtime enforcement (live).** The input/output chains gate an actual `tag run`: input guardrails
+> screen the prompt **before** the model (a block short-circuits the run; a sanitize threads the
+> redacted prompt onward), output guardrails screen the response **after** (a block replaces it), and a
+> fired guardrail exits 3. Go wires this into the native agent loop (`internal/agent`); Python screens
+> around `run_chat_step` (the input path works fully offline). PRD-121 FR-08 / PRD-122 FR-09 satisfied.
 
 ---
 
