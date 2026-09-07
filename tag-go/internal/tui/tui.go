@@ -8,44 +8,43 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/tag-agent/tag/internal/server"
 	"github.com/tag-agent/tag/internal/store"
 )
 
-var (
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	okStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-)
+var titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
 
 // refreshMsg triggers a snapshot reload.
 type refreshMsg struct{}
 
 // Model is the dashboard bubbletea model.
 type Model struct {
-	db       *store.DB
-	profile  string
-	snap     *server.Snapshot
-	err      error
-	lastLoad time.Time
-	quitting bool
+	db                    *store.DB
+	profile               string
+	snap                  *server.Snapshot
+	err                   error
+	lastLoad              time.Time
+	quitting              bool
+	width, height, offset int
 }
 
 // New builds a dashboard model for a profile.
 func New(db *store.DB, profile string) Model {
-	m := Model{db: db, profile: profile}
+	m := Model{db: db, profile: profile, width: 80, height: 24}
 	m.reload()
 	return m
 }
 
 func (m *Model) reload() {
-	snap, err := server.ReadSnapshot(m.db)
+	snap, err := server.ReadProfileSnapshot(m.db, m.profile)
 	m.snap, m.err, m.lastLoad = snap, err, time.Now()
+	m.clamp()
 }
 
 // Init loads the first snapshot and starts the refresh ticker.
@@ -58,6 +57,9 @@ func tick() tea.Cmd {
 // Update handles key presses and refresh ticks.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		m.clamp()
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
@@ -66,12 +68,69 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.reload()
 			return m, nil
+		case "down", "j":
+			m.offset++
+		case "up", "k":
+			m.offset--
+		case "pgdown", "ctrl+f", " ":
+			m.offset += m.pageSize()
+		case "pgup", "ctrl+b":
+			m.offset -= m.pageSize()
+		case "home", "g":
+			m.offset = 0
+		case "end", "G":
+			m.offset = len(m.lines())
+		case "tab":
+			lines := m.lines()
+			for i := m.offset + 1; i < len(lines); i++ {
+				if strings.HasPrefix(lines[i], "Queue (") || strings.HasPrefix(lines[i], "Journal entries:") {
+					m.offset = i
+					break
+				}
+			}
 		}
 	case refreshMsg:
 		m.reload()
 		return m, tick()
 	}
+	m.clamp()
 	return m, nil
+}
+
+func (m Model) pageSize() int { return max(1, m.height-4) }
+func (m *Model) clamp()       { m.offset = max(0, min(m.offset, len(m.lines())-m.pageSize())) }
+
+// Sanitize untrusted stored text before rendering it in a terminal. Escape/control
+// bytes must never become terminal instructions or extra physical screen lines.
+func display(v any) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, fmt.Sprint(v))
+}
+
+func (m Model) lines() []string {
+	var b strings.Builder
+	if m.err != nil {
+		b.WriteString("error: " + display(m.err))
+	} else {
+		snap := m.snap
+		if snap == nil {
+			snap = &server.Snapshot{}
+		}
+		fmt.Fprintf(&b, "Runs (%d)\n", len(snap.Runs))
+		for _, r := range snap.Runs {
+			fmt.Fprintf(&b, "  %s  %s  %s\n", display(r["run_id"]), display(r["master_profile"]), display(r["status"]))
+		}
+		fmt.Fprintf(&b, "\nQueue (%d)\n", len(snap.Queue))
+		for _, q := range snap.Queue {
+			fmt.Fprintf(&b, "  %s  %s  %s  %s\n", display(q["id"]), display(q["status"]), display(q["profile"]), display(q["task"]))
+		}
+		fmt.Fprintf(&b, "\nJournal entries: %d", snap.JournalCount)
+	}
+	return strings.Split(ansi.Hardwrap(b.String(), max(1, m.width), true), "\n")
 }
 
 // View renders the dashboard.
@@ -79,40 +138,23 @@ func (m Model) View() string {
 	if m.quitting {
 		return "Goodbye.\n"
 	}
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("TAG — native control plane") + "\n")
-	b.WriteString(dimStyle.Render(fmt.Sprintf("profile: %s   updated: %s", m.profile, m.lastLoad.Format("15:04:05"))) + "\n\n")
-	if m.err != nil {
-		b.WriteString("error: " + m.err.Error() + "\n")
-		return b.String()
+	if m.width < 20 || m.height < 6 {
+		return ansi.Truncate("Resize to 20x6; q quits", max(0, m.width), "…")
 	}
-	snap := m.snap
-	if snap == nil {
-		snap = &server.Snapshot{}
+	lines := m.lines()
+	end := min(len(lines), m.offset+m.pageSize())
+	body := append([]string{}, lines[m.offset:end]...)
+	for len(body) < m.pageSize() {
+		body = append(body, "")
 	}
-	b.WriteString(headerStyle.Render(fmt.Sprintf("Runs (%d)", len(snap.Runs))) + "\n")
-	for i, r := range snap.Runs {
-		if i >= 8 {
-			b.WriteString(dimStyle.Render(fmt.Sprintf("  … %d more", len(snap.Runs)-8)) + "\n")
-			break
-		}
-		status := fmt.Sprint(r["status"])
-		line := fmt.Sprintf("  %-12v %-8v %v", r["run_id"], r["master_profile"], status)
-		if status == "completed" {
-			line = okStyle.Render(line)
-		}
-		b.WriteString(line + "\n")
-	}
-	b.WriteString("\n" + headerStyle.Render(fmt.Sprintf("Queue (%d)", len(snap.Queue))) + "\n")
-	for i, q := range snap.Queue {
-		if i >= 5 {
-			break
-		}
-		b.WriteString(fmt.Sprintf("  %-8v %-8v %v\n", q["status"], q["profile"], q["task"]))
-	}
-	b.WriteString("\n" + headerStyle.Render(fmt.Sprintf("Journal entries: %d", snap.JournalCount)) + "\n")
-	b.WriteString("\n" + dimStyle.Render("[r] refresh   [q] quit") + "\n")
-	return b.String()
+	clip := func(s string) string { return ansi.Truncate(s, m.width, "…") }
+	return strings.Join([]string{
+		clip(titleStyle.Render("TAG — native control plane")),
+		clip("profile: " + display(m.profile)),
+		strings.Join(body, "\n"),
+		clip(fmt.Sprintf("q quit · r refresh · %d-%d/%d", m.offset+1, end, len(lines))),
+		clip("↑↓/jk · Tab · PgUp/Dn · g/G Home/End"),
+	}, "\n")
 }
 
 // Run launches the interactive TUI (needs a TTY).

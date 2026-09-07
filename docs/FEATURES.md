@@ -193,7 +193,8 @@ generic`, `serve`/`web` `/health` + JSON 404).
 | ✅ | `devui` | Local browser DevUI | PRD-054 | ✅ | `/health` 200 + JSON 404 both |
 | ✅ | `lsp` | IDE bridge / LSP server | PRD-035 | ⚠️ | both; Go hover-only (depth gap) |
 | ✅ | `desktop` | Electron desktop app launcher | PRD-007 | ⚠️ | Python only |
-| ✅ | (runtime) | Rich streaming TUI (spinners/progress/status bar) | PRD-003 | ✅ | `tui` both |
+| ✅ | (runtime) | Rich streaming chat TUI (spinners/progress/status bar) | PRD-003 | — | Python managed `tui`; native Go `tui` is a read-only, profile-scoped control-plane dashboard, not a streaming chat UI |
+| ✅ | `tui` | Native dashboard: complete profile runs/queue, journal count, wrapped scrolling, resize, refresh | — | ✅ | Go: ↑↓/j/k, PgUp/PgDn, Home/End, Tab sections; r refresh; q quit |
 
 Library-level features backing the above (no dedicated command): TraceProcessor lifecycle hooks (PRD-053),
 structured tool-call child spans (PRD-048).
