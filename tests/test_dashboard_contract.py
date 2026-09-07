@@ -46,7 +46,7 @@ def test_snapshot_filters_before_limit_and_filters_every_panel(config, monkeypat
 
 @pytest.mark.parametrize("overrides", [{"port": -1}, {"port": 3333},
                                      {"open_browser": False}, {"refresh_seconds": 0},
-                                     {"profile": "absent"}])
+                                     {"profile": "absent"}, {"refresh_seconds": 10**100}])
 def test_invalid_contract_rejected_before_live_view(config, monkeypatch, capsys, overrides):
     monkeypatch.setattr(session, "load_config", lambda _: config)
     args = argparse.Namespace(config=None, profile="coder", port=None,

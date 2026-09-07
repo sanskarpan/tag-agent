@@ -386,8 +386,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
               "Use --refresh-seconds for refresh timing or tag serve for a web dashboard.", file=sys.stderr)
         return 2
     refresh_secs = getattr(args, "refresh_seconds", 3)
-    if refresh_secs <= 0:
-        print("error: --refresh-seconds must be positive", file=sys.stderr)
+    if not 1 <= refresh_secs <= 86400:
+        print("error: --refresh-seconds must be between 1 and 86400", file=sys.stderr)
         return 2
 
     try:
@@ -638,7 +638,7 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
                               description="Terminal-only dashboard; no HTTP server or browser is opened.")
     dashboard.add_argument("--profile", default=None, help="TAG profile (default: configured master profile)")
     dashboard.add_argument("--refresh-seconds", type=positive_int, default=3, metavar="N",
-                           help="Refresh interval in seconds (default: 3)")
+                           help="Refresh interval in seconds, 1–86400 (default: 3)")
     dashboard.add_argument("--port", type=int, metavar="N", help="Unsupported legacy option; use tag serve for HTTP")
     dashboard.add_argument("--no-browser", action="store_false", dest="open_browser",
                            help="Unsupported legacy option; this dashboard is terminal-only")
