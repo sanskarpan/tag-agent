@@ -210,6 +210,24 @@ def hermes_patch_path() -> Path:
     return resource_path("patches", "hermes-ui.patch")
 
 
+def _bundled_patch_is_applied(root: Path, patch: Path) -> bool:
+    """Verify every hunk in the reverse direction, allowing context fuzz.
+
+    A forward dry-run may skip an entire partially patched file and still
+    mention "previously applied". Only a successful forced reverse dry-run
+    proves all hunks are present. --force disables patch's direction guessing;
+    --batch keeps setup and doctor noninteractive on missing/conflicting files.
+    """
+    if hermes_checkout_kind(root) != "bundled" or not shutil.which("patch"):
+        return False
+    result = run_external(
+        ["patch", "-p1", "--reverse", "--force", "--batch", "--dry-run", "-i", str(patch)],
+        cwd=root,
+        check=False,
+    )
+    return result.returncode == 0
+
+
 def patch_status(cfg: dict[str, Any]) -> str:
     root = hermes_root(cfg)
     patch = hermes_patch_path()
@@ -229,20 +247,8 @@ def patch_status(cfg: dict[str, Any]) -> str:
     )
     if forward.returncode == 0:
         return "not-applied"
-    # Exact git checks both failed. A bundled snapshot that ships pre-patched but
-    # has drifted context reads as "diverged" to git; confirm via a fuzzy patch
-    # dry-run whether every hunk is actually already applied.
-    if hermes_checkout_kind(root) == "bundled" and shutil.which("patch"):
-        dry = run_external(
-            ["patch", "-p1", "--forward", "--dry-run", "-i", str(patch)],
-            cwd=root,
-            check=False,
-        )
-        out = (dry.stdout or "") + (dry.stderr or "")
-        if "hunk FAILED" not in out and (
-            dry.returncode == 0 or "previously applied" in out.lower()
-        ):
-            return "prepatched"
+    if _bundled_patch_is_applied(root, patch):
+        return "prepatched"
     return "diverged"
 
 
@@ -412,24 +418,8 @@ def apply_hermes_patch(cfg: dict[str, Any]) -> dict[str, Any]:
     if forward.returncode == 0:
         run_external(["git", "apply", str(patch)], cwd=root)
         return {"patch": str(patch), "status": "applied"}
-    # Neither exact git check passed. The bundled runtime ships pre-patched, but
-    # its snapshot can be a slightly newer upstream than the patch was generated
-    # against, so the *context* around each hunk drifts and `git apply` (exact)
-    # rejects it even though the branding changes are already present. Fall back
-    # to a fuzzy `patch --dry-run` check: if every hunk is recognized as already
-    # applied (no genuine "hunk FAILED"), trust the pre-patched bundle instead of
-    # aborting setup.
-    if hermes_checkout_kind(root) == "bundled" and shutil.which("patch"):
-        dry = run_external(
-            ["patch", "-p1", "--forward", "--dry-run", "-i", str(patch)],
-            cwd=root,
-            check=False,
-        )
-        out = (dry.stdout or "") + (dry.stderr or "")
-        if "hunk FAILED" not in out and (
-            dry.returncode == 0 or "previously applied" in out.lower()
-        ):
-            return {"patch": str(patch), "status": "prepatched"}
+    if _bundled_patch_is_applied(root, patch):
+        return {"patch": str(patch), "status": "prepatched"}
     message = forward.stderr.strip() or forward.stdout.strip() or "TAG patch check failed."
     raise SystemExit(message)
 
