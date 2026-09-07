@@ -151,19 +151,24 @@ def _queue_list_jobs(
     return [dict(r) for r in db.execute(query, params).fetchall()]
 
 
-def _dashboard_snapshot(cfg: dict[str, Any]) -> dict[str, Any]:
+def _dashboard_snapshot(cfg: dict[str, Any], profile: str | None = None) -> dict[str, Any]:
     """Read current TAG state for dashboard display — pure SQLite, no hermes."""
     snap: dict[str, Any] = {"runs": [], "queue": [], "journal_count": 0, "kanban": {}}
     try:
         db = open_db(cfg)
         rows = db.execute(
             "SELECT id AS run_id, kind, task_type, master_profile, status, "
-            "created_at FROM runs ORDER BY created_at DESC LIMIT 20"
+            "created_at FROM runs "
+            + ("WHERE master_profile = ? " if profile else "")
+            + "ORDER BY created_at DESC LIMIT 20",
+            (profile,) if profile else (),
         ).fetchall()
         snap["runs"] = [dict(r) for r in rows]
-        snap["queue"] = _queue_list_jobs(db, status=None)
+        snap["queue"] = _queue_list_jobs(db, status=None, profile=profile)
         snap["journal_count"] = db.execute(
             "SELECT COUNT(*) FROM memory_journal"
+            + (" WHERE profile = ?" if profile else ""),
+            (profile,) if profile else (),
         ).fetchone()[0]
         db.close()
     except Exception:
@@ -172,6 +177,8 @@ def _dashboard_snapshot(cfg: dict[str, Any]) -> dict[str, Any]:
     import tag.kanban as _kanban  # type: ignore[import]
     kanban_by_profile: dict[str, Any] = {}
     for pname in cfg.get("profiles", {}):
+        if profile is not None and pname != profile:
+            continue
         try:
             kpath = _kanban.profile_kanban_db_path(cfg, pname)
             if not kpath.exists():
@@ -367,19 +374,21 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     """TAG-native live dashboard — reads directly from TAG's SQLite state (PRD-010).
 
     No hermes binary dependency. Shows runs, queue, journal, and kanban
-    board status for all profiles. Refreshes every few seconds.
-    Use --no-browser to suppress the browser open (legacy flag, kept for
-    CLI compat; dashboard is terminal-only).
+    board status for the selected profile. This is a terminal-only interface.
     """
     cfg = load_config(config_path(args.config))
     profile = getattr(args, "profile", None) or cfg["defaults"]["master_profile"]
     if profile not in cfg.get("profiles", {}):
-        print(f"warning: unknown profile '{profile}'", file=sys.stderr)
-    refresh_secs = getattr(args, "port", None) or 3  # --port reused as refresh interval
-    # Note: --port is repurposed here as refresh_seconds for the live view.
-    # A value >=10 is assumed to be a port (legacy hermes mode); <=9 is refresh rate.
-    if isinstance(refresh_secs, int) and refresh_secs >= 10:
-        refresh_secs = 3
+        print(f"error: unknown profile '{profile}'", file=sys.stderr)
+        return 2
+    if getattr(args, "port", None) is not None or not getattr(args, "open_browser", True):
+        print("error: dashboard is terminal-only; --port and --no-browser are unsupported. "
+              "Use --refresh-seconds for refresh timing or tag serve for a web dashboard.", file=sys.stderr)
+        return 2
+    refresh_secs = getattr(args, "refresh_seconds", 3)
+    if refresh_secs <= 0:
+        print("error: --refresh-seconds must be positive", file=sys.stderr)
+        return 2
 
     try:
         from rich.console import Console
@@ -392,7 +401,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         console = Console()
 
         def make_layout() -> Panel:
-            snap = _dashboard_snapshot(cfg)
+            snap = _dashboard_snapshot(cfg, profile)
 
             run_table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan",
                               expand=True, min_width=60)
@@ -467,7 +476,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         pass
     except ImportError:
         # Rich not available — static snapshot
-        snap = _dashboard_snapshot(cfg)
+        snap = _dashboard_snapshot(cfg, profile)
         _render_dashboard_plain(snap, profile)
     return 0
 
@@ -625,11 +634,14 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     logs.set_defaults(func=cmd_logs)
 
     # dashboard
-    dashboard = sub.add_parser("dashboard", help="Run dashboard inside a TAG profile")
-    dashboard.add_argument("--profile", default="orchestrator", help="TAG profile to use")
-    dashboard.add_argument("--port", type=int, metavar="N", help="Dashboard port (default: 3333)")
+    dashboard = sub.add_parser("dashboard", help="Monitor a TAG profile in the terminal",
+                              description="Terminal-only dashboard; no HTTP server or browser is opened.")
+    dashboard.add_argument("--profile", default=None, help="TAG profile (default: configured master profile)")
+    dashboard.add_argument("--refresh-seconds", type=positive_int, default=3, metavar="N",
+                           help="Refresh interval in seconds (default: 3)")
+    dashboard.add_argument("--port", type=int, metavar="N", help="Unsupported legacy option; use tag serve for HTTP")
     dashboard.add_argument("--no-browser", action="store_false", dest="open_browser",
-                           help="Print URL only; don't open browser tab")
+                           help="Unsupported legacy option; this dashboard is terminal-only")
     dashboard.add_argument("hermes_args", nargs=argparse.REMAINDER, metavar="...")
     dashboard.set_defaults(func=cmd_dashboard)
 
