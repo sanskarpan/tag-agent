@@ -1,6 +1,8 @@
 """Real patch-tool regression coverage for partial bundled-runtime patches."""
 import shutil
 import subprocess
+import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -81,3 +83,31 @@ def test_failure_words_cannot_override_failed_exit_status(bundled, monkeypatch):
     assert controller.patch_status({}) == "diverged"
     with pytest.raises(SystemExit):
         controller.apply_hermes_patch({})
+
+
+def test_shipped_runtime_satisfies_current_patch(tmp_path, monkeypatch):
+    """Check packaged bytes, not just a developer's patched checkout."""
+    if not shutil.which("patch"):
+        pytest.skip("patch executable required")
+    patch = controller.hermes_patch_path()
+    paths = {
+        line[6:]
+        for line in patch.read_text(encoding="utf-8").splitlines()
+        if line.startswith("+++ b/")
+    }
+    with tarfile.open(controller.bundled_hermes_archive(), "r:gz") as archive:
+        for member in archive:
+            relative = member.name.removeprefix("./")
+            if relative not in paths:
+                continue
+            assert member.isfile(), relative
+            path = Path(relative)
+            assert not path.is_absolute() and ".." not in path.parts
+            destination = tmp_path / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            data = archive.extractfile(member)
+            assert data is not None
+            destination.write_bytes(data.read())
+    monkeypatch.setattr(controller, "hermes_root", lambda _cfg=None: tmp_path)
+    assert controller.patch_status({}) == "prepatched"
+    assert controller.apply_hermes_patch({})["status"] == "prepatched"
