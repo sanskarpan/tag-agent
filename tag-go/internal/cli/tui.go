@@ -15,11 +15,15 @@ func registerTUI(root *cobra.Command, app *App) {
 		GroupID: "obs",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			selected := app.profile(profile)
+			if err := ensureProfileExists(app.Cfg, selected); err != nil {
+				return err
+			}
 			db, err := app.OpenDB()
 			if err != nil {
 				return err
 			}
-			return tui.Run(db, app.profile(profile))
+			return tui.Run(db, selected)
 		},
 	}
 	c.Flags().StringVar(&profile, "profile", "", "profile to view")

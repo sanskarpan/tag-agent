@@ -29,8 +29,21 @@ type Snapshot struct {
 // corrupt tables must be distinguishable from a healthy-but-empty one (the
 // latter still returns a snapshot with empty slices and no error).
 func ReadSnapshot(db *store.DB) (*Snapshot, error) {
+	return readSnapshot(db, "", 20, 50)
+}
+
+// ReadProfileSnapshot reads the complete selected profile for the scrollable TUI.
+// HTTP snapshots retain their bounded, global window for backwards compatibility.
+func ReadProfileSnapshot(db *store.DB, profile string) (*Snapshot, error) {
+	if profile == "" {
+		return nil, fmt.Errorf("profile is required")
+	}
+	return readSnapshot(db, profile, -1, -1)
+}
+
+func readSnapshot(db *store.DB, profile string, runsLimit, queueLimit int) (*Snapshot, error) {
 	snap := &Snapshot{Runs: []map[string]any{}, Queue: []map[string]any{}}
-	rows, err := db.Query(`SELECT id, kind, task_type, master_profile, status, created_at FROM runs ORDER BY created_at DESC LIMIT 20`)
+	rows, err := db.Query(`SELECT id, kind, task_type, master_profile, status, created_at FROM runs WHERE (? = '' OR master_profile = ?) ORDER BY created_at DESC, id DESC LIMIT ?`, profile, profile, runsLimit)
 	if err != nil {
 		return nil, fmt.Errorf("read runs: %w", err)
 	}
@@ -50,7 +63,7 @@ func ReadSnapshot(db *store.DB) (*Snapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read runs: %w", err)
 	}
-	qrows, err := db.Query(`SELECT id, task, status, profile, created_at FROM queue_jobs ORDER BY created_at DESC LIMIT 50`)
+	qrows, err := db.Query(`SELECT id, task, status, profile, created_at FROM queue_jobs WHERE (? = '' OR profile = ?) ORDER BY created_at DESC, id DESC LIMIT ?`, profile, profile, queueLimit)
 	if err != nil {
 		return nil, fmt.Errorf("read queue: %w", err)
 	}
@@ -69,7 +82,7 @@ func ReadSnapshot(db *store.DB) (*Snapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read queue: %w", err)
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM memory_journal`).Scan(&snap.JournalCount); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM memory_journal WHERE (? = '' OR profile = ?)`, profile, profile).Scan(&snap.JournalCount); err != nil {
 		return nil, fmt.Errorf("read journal: %w", err)
 	}
 	return snap, nil
