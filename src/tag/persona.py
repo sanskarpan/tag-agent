@@ -139,7 +139,7 @@ def load_persona_file(path: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Persona file not found: {path}")
     try:
-        with path.open() as fh:
+        with path.open(encoding="utf-8") as fh:
             data = yaml.safe_load(fh)
     except yaml.YAMLError as exc:
         # Surface a friendly validation message instead of the raw parser dump.
@@ -329,4 +329,3 @@ def build_merged_prompt(
         parts.append("\n\n".join(append_parts))
 
     return "\n\n".join(parts)
-

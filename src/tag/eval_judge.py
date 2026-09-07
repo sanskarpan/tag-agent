@@ -33,14 +33,15 @@ except ImportError:
     _HAS_YAML = False
 
 try:
-    from tag.cost_table import compute_cost  # type: ignore[import]
+    from tag.cost_table import compute_cost
     _HAS_COST = True
 except ImportError:
     compute_cost = None  # type: ignore[assignment]
     _HAS_COST = False
 
 try:
-    import deepeval  # noqa: F401 – optional integration
+    import importlib
+    importlib.import_module("deepeval")
     _HAS_DEEPEVAL = True
 except ImportError:
     _HAS_DEEPEVAL = False
@@ -275,9 +276,9 @@ def invoke_judge(
     if _HAS_COST and compute_cost is not None:
         try:
             cost = compute_cost(
-                model=judge_model,
-                prompt_tokens=tokens_prompt_est,
-                completion_tokens=tokens_completion_est,
+                model_id=judge_model,
+                input_tokens=tokens_prompt_est,
+                output_tokens=tokens_completion_est,
             )
         except Exception:
             cost = None

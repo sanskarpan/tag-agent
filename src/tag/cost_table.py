@@ -160,7 +160,7 @@ def _try_load_yaml(path: Path) -> Optional[dict]:
     if not path.exists():
         return None
     try:
-        import yaml  # type: ignore[import-untyped]
+        import yaml
         with path.open("r", encoding="utf-8") as fh:
             data = yaml.safe_load(fh)
         if isinstance(data, dict):

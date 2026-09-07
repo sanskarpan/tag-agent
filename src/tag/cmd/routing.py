@@ -69,7 +69,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 def _ensure_hermes_ready(cfg: dict[str, Any], *, config_arg: str | None, need_tui: bool) -> None:
-    from tag.controller import ensure_hermes_ready  # type: ignore[import]
+    from tag.controller import ensure_hermes_ready
     try:
         ensure_hermes_ready(cfg, config_arg=config_arg, need_tui=need_tui)
     except subprocess.CalledProcessError as exc:
@@ -930,7 +930,7 @@ def cmd_plugin(args: argparse.Namespace) -> int:
 # Parser registration
 # ---------------------------------------------------------------------------
 
-def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def register(sub: argparse._SubParsersAction) -> None:
     """Register all routing-related sub-commands onto *sub*."""
 
     # run — execute a prompt directly on the master profile (parity with Go).

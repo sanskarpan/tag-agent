@@ -1225,7 +1225,7 @@ def cmd_agentops(args: argparse.Namespace) -> int:
 # Parser registration
 # ---------------------------------------------------------------------------
 
-def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def register(sub: argparse._SubParsersAction) -> None:
     """Register all observability subcommands onto *sub*."""
 
     # ---- PRD-012: costs ----

@@ -380,7 +380,7 @@ def schedule_gc(interval_hours: float = 6.0) -> None:
     interval_seconds = interval_hours * 3600.0
 
     try:
-        from tag import cron_scheduler  # type: ignore[import]
+        from tag import cron_scheduler
 
         def _cron_job() -> None:
             try:

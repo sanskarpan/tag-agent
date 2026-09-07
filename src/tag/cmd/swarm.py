@@ -101,7 +101,7 @@ def _now_utc() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-class _AnyChoices:
+class _AnyChoices(dict):
     """Choices container that accepts any value.
 
     Used so the swarm subparser does not reject a legacy free-text task
@@ -122,7 +122,7 @@ class _AnyChoices:
         return self._mapping[key]
 
 
-class _LegacyFallbackSubParsers(argparse._SubParsersAction):  # type: ignore[name-defined]
+class _LegacyFallbackSubParsers(argparse._SubParsersAction):
     """Subparsers action that falls back to a legacy positional task.
 
     ``tag swarm run|list|status|abort|results`` dispatch to the PRD-023
@@ -621,7 +621,7 @@ def _cmd_swarm_results(args: argparse.Namespace) -> int:
 # register(sub) — called by the CLI harness
 # ---------------------------------------------------------------------------
 
-def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[name-defined]
+def register(sub: argparse._SubParsersAction) -> None:
     """Register the swarm command and its subcommands onto *sub*."""
     # ---- PRD-004: swarm ----
     swarm = sub.add_parser(

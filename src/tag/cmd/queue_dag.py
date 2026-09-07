@@ -215,7 +215,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
         result_path = job.get("result_path")
         content = None
         if result_path and Path(result_path).exists():
-            content = Path(result_path).read_text()
+            content = Path(result_path).read_text(encoding="utf-8")
         if as_json:
             print(json.dumps({
                 "job_id": args.job_id,
@@ -450,7 +450,7 @@ def cmd_queue_extended(args: argparse.Namespace) -> int:
 # Parser registration
 # ---------------------------------------------------------------------------
 
-def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def register(sub: argparse._SubParsersAction) -> None:
     """Register queue, queue-dep, and dag subcommands."""
 
     # ---- PRD-008: queue ----

@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, cast
 
 from tag.core.config import load_config, config_path, benchmark_suite_path
 from tag.core.paths import (
@@ -48,7 +48,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     needs_git = bool(args.refresh or not bundled_hermes_archive().exists())
     ensure_setup_prereqs(cfg, need_npm=not args.skip_tui_build, need_git=needs_git)
     ensure_runtime_dirs(cfg)
-    steps = {
+    steps: dict[str, Any] = {
         "config": {"config": str(config_path(args.config)), "benchmark_suite": str(benchmark_path)},
         "prerequisites": doctor_prerequisites(cfg),
         "clone": clone_or_update_hermes(cfg, refresh=args.refresh),
@@ -150,7 +150,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
             hermes_args=["--help"],
             hermes_version=False,
         )
-        return _cmd_hermes_passthrough(passthrough)
+        return cast(Callable[[argparse.Namespace], int], _cmd_hermes_passthrough)(passthrough)
     if not can_launch_interactive_tui() and os.environ.get("TAG_FORCE_TUI", "").strip() not in {"1", "true", "yes"}:
         print(
             "TAG TUI requires an interactive terminal. Use `tag doctor`, `tag setup`, "
@@ -165,7 +165,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
         hermes_args=forwarded,
         hermes_version=False,
     )
-    return _cmd_hermes_passthrough(passthrough)
+    return cast(Callable[[argparse.Namespace], int], _cmd_hermes_passthrough)(passthrough)
 
 
 def cmd_hermes_command(args: argparse.Namespace, command_name: str) -> int:
@@ -377,7 +377,7 @@ def cmd_env(args: argparse.Namespace) -> int:
     return 0
 
 
-def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def register(sub: argparse._SubParsersAction) -> None:
     """Register all system/setup commands in the given subparsers action."""
 
     setup = sub.add_parser("setup", help="Provision the managed runtime, apply TAG patches, build the TUI, and bootstrap profiles")

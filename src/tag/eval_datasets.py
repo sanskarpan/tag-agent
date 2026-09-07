@@ -71,6 +71,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def _row_to_dataset(row: sqlite3.Row | tuple, keys: list[str] | None = None) -> EvalDataset:
+    d: dict[str, Any]
     if isinstance(row, sqlite3.Row):
         d = dict(row)
     else:

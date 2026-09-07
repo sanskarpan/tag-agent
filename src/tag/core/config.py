@@ -129,7 +129,7 @@ def save_config(path: Path, payload: dict[str, Any]) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
-    lock_fh = open(lock_path, "w")
+    lock_fh = open(lock_path, "w", encoding="utf-8")
     try:
         if fcntl is not None:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
@@ -155,7 +155,7 @@ def update_config(path: Path, mutate: "Callable[[dict[str, Any]], Any]") -> dict
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
-    lock_fh = open(lock_path, "w")
+    lock_fh = open(lock_path, "w", encoding="utf-8")
     try:
         if fcntl is not None:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)

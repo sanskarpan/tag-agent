@@ -103,7 +103,7 @@ def run_eval_ci(
         try:
             from tag import eval_judge
             judge_result = eval_judge.run_judge_on_eval(
-                conn, run_id, judge_model, None, cfg
+                conn, run_id, judge_model, [], cfg
             )
             judge_pass_rate = judge_result.pass_rate
         except Exception:

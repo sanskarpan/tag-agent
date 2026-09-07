@@ -415,7 +415,7 @@ def _needs_subcommand(_args: argparse.Namespace) -> int:
     return 2
 
 
-def _add_common_subcommands(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def _add_common_subcommands(sub: argparse._SubParsersAction) -> None:
     stages_help = f"which screening point to evaluate {gr.stages()}"
 
     lst = sub.add_parser("list", help="Print the resolved guardrail ruleset")
@@ -451,7 +451,7 @@ def _add_common_subcommands(sub: argparse._SubParsersAction) -> None:  # type: i
     hist.set_defaults(func=cmd_tripwire_history)
 
 
-def _add_edit_subcommands(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def _add_edit_subcommands(sub: argparse._SubParsersAction) -> None:
     add = sub.add_parser("add", help="Add a guardrail rule to tag.yaml (effective NEXT run)")
     add.add_argument("--profile", default="", help="profile whose tripwire block to edit (default: top-level)")
     add.add_argument("--name", default="", help="rule name (required, unique)")
@@ -643,7 +643,7 @@ def _content_history(cg, conn, args, direction: str) -> int:
     return 0
 
 
-def _add_content_subcommands(sub: argparse._SubParsersAction, direction: str) -> None:  # type: ignore[type-arg]
+def _add_content_subcommands(sub: argparse._SubParsersAction, direction: str) -> None:
     types = "prompt-injection|pii|secret|topic-filter|length-limit|custom" if direction == "input" \
         else "pii|secret|json-schema|topic-filter|profanity|toxicity|custom"
     actions = "block|sanitize|warn" if direction == "input" else "block|rewrite|warn"
@@ -694,7 +694,7 @@ def _add_content_subcommands(sub: argparse._SubParsersAction, direction: str) ->
     hist.set_defaults(func=cmd_guardrail_content)
 
 
-def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def register(sub: argparse._SubParsersAction) -> None:
     # tripwire — the canonical spelling.
     tw = sub.add_parser(
         "tripwire",

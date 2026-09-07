@@ -959,7 +959,7 @@ def cmd_import_daytona(args: argparse.Namespace) -> int:
     return 0
 
 
-def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def register(sub: argparse._SubParsersAction) -> None:
     """Register all import-* subcommands onto *sub*."""
 
     import_codex = sub.add_parser(

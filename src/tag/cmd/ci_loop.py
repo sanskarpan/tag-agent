@@ -581,7 +581,7 @@ def cmd_workspace(args: argparse.Namespace) -> int:
 # Parser registration
 # ---------------------------------------------------------------------------
 
-def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def register(sub: argparse._SubParsersAction) -> None:
     """Register review-pr, ci, loop, cron, and workspace subcommands."""
 
     # ---- PRD-020: review-pr / ci ----

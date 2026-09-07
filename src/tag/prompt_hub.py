@@ -375,7 +375,7 @@ def promote_to_profile(
     """
     import os
 
-    import yaml  # type: ignore[import-untyped]
+    import yaml
 
     conn.row_factory = sqlite3.Row
     row = conn.execute(

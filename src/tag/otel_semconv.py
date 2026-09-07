@@ -26,7 +26,7 @@ SEMCONV_VERSION = "1.28.0"
 try:
     from tag import __version__ as _tag_version
 except Exception:
-    _tag_version = "0.0.0"
+    _tag_version: str = "0.0.0"
 
 def _build_scope(semconv_version: str = SEMCONV_VERSION) -> dict:
     """Build an instrumentation scope dict for the given semconv version."""
@@ -272,4 +272,3 @@ def _iso_to_ns(iso: str) -> int:
         return int(dt.timestamp() * 1_000_000_000)
     except Exception:
         return 0
-

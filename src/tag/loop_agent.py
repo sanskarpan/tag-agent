@@ -213,13 +213,13 @@ def _request_approval(
         "iteration": iteration,
         "output_preview": output[:500],
         "decision": "pending",
-    }))
+    }), encoding="utf-8")
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         if conn is not None and _is_aborted(conn, loop_id):
             return False
         try:
-            data = json.loads(approval_file.read_text())
+            data = json.loads(approval_file.read_text(encoding="utf-8"))
             decision = data.get("decision")
             if decision in ("continue", "approve", "approved"):
                 return True
@@ -324,4 +324,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

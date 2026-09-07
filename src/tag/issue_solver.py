@@ -158,7 +158,7 @@ def _fetch_linear_issue(issue_ref: str, *, token: str | None = None) -> Issue:
 
 def _create_pr(
     issue: Issue, branch: str, plan: str, changes: str
-) -> tuple[str, int] | None:
+) -> tuple[str, int | None] | None:
     body = f"""## Summary
 {changes[:500]}
 

@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, cast
 
 from tag.core.config import load_config, save_config, config_path
 from tag.core.paths import (
@@ -57,7 +57,7 @@ def _ensure_hermes_ready(
     if hermes_bin(cfg).exists():
         return
     # Lazy import to avoid circular dependency
-    from tag.controller import cmd_setup  # type: ignore[import]
+    from tag.controller import cmd_setup
     setup_args = argparse.Namespace(
         config=config_arg,
         refresh=False,
@@ -65,7 +65,7 @@ def _ensure_hermes_ready(
         skip_tui_build=not need_tui,
         json=False,
     )
-    cmd_setup(setup_args)
+    cast(Callable[[argparse.Namespace], int], cmd_setup)(setup_args)
 
 
 def _cmd_hermes_passthrough(args: argparse.Namespace) -> int:
@@ -174,7 +174,7 @@ def _dashboard_snapshot(cfg: dict[str, Any], profile: str | None = None) -> dict
     except Exception:
         pass
 
-    import tag.kanban as _kanban  # type: ignore[import]
+    import tag.kanban as _kanban
     kanban_by_profile: dict[str, Any] = {}
     for pname in cfg.get("profiles", {}):
         if profile is not None and pname != profile:
@@ -241,7 +241,7 @@ def _render_dashboard_plain(snap: dict[str, Any], profile: str) -> None:
 def _desktop_app_path(cfg: dict[str, Any]) -> Path | None:
     """Return the built Electron app binary path, or None if not built."""
     import platform
-    from tag.controller import desktop_build_root  # type: ignore[import]
+    from tag.controller import desktop_build_root
     build_root = desktop_build_root(cfg)
     system = platform.system()
 
@@ -489,8 +489,15 @@ def cmd_desktop(args: argparse.Namespace) -> int:
 
     if sub == "build":
         print("Building Electron desktop app (this may take 2-3 minutes)...")
-        from tag.controller import build_desktop_app  # type: ignore[import]
-        result = build_desktop_app(cfg, force=getattr(args, "force", False))
+        try:
+            from tag.controller import build_desktop_app
+        except ImportError:
+            print("Desktop builder is unavailable in this installation", file=sys.stderr)
+            return 1
+        if not callable(build_desktop_app):
+            raise RuntimeError("Desktop builder is unavailable")
+        result = cast(Callable[..., dict[str, Any]], build_desktop_app)(
+            cfg, force=getattr(args, "force", False))
         if getattr(args, "json", False):
             print(json.dumps(result, indent=2))
             return 0
@@ -534,22 +541,22 @@ def cmd_default(args: argparse.Namespace) -> int:
             skip_tui_build=False,
             json=False,
         )
-        from tag.controller import cmd_setup  # type: ignore[import]
-        cmd_setup(setup_args)
+        from tag.controller import cmd_setup
+        cast(Callable[[argparse.Namespace], int], cmd_setup)(setup_args)
     else:
-        from tag.controller import bootstrap_profiles, render_profiles  # type: ignore[import]
+        from tag.controller import bootstrap_profiles, render_profiles
         bootstrap_profiles(cfg)
         render_profiles(cfg, force=False)
-    from tag.controller import cmd_tui  # type: ignore[import]
+    from tag.controller import cmd_tui
     tui_args = argparse.Namespace(config=args.config, profile="orchestrator", hermes_args=[])
-    return cmd_tui(tui_args)
+    return cast(Callable[[argparse.Namespace], int], cmd_tui)(tui_args)
 
 
 # ---------------------------------------------------------------------------
 # Parser registration
 # ---------------------------------------------------------------------------
 
-def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def register(sub: argparse._SubParsersAction) -> None:
     """Register all session/UI subcommands onto the given subparser action."""
 
     # chat
