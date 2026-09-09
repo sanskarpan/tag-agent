@@ -129,6 +129,18 @@ diff -urN -x *.rej -x *.orig -x node_modules -x dist a/ui-tui/src/__tests__/fixt
 +  [#A88BFF]  │   ╭────┴────╮   │  │[/]
 +  [#66D7A1]  ╰───┤ AGENTS  ├───╯  │[/]
 +  [#7587B3]      ╰─────────╯      │[/]
+diff -urN -x *.rej -x *.orig -x node_modules -x dist a/ui-tui/src/__tests__/textInputPassThrough.test.ts b/ui-tui/src/__tests__/textInputPassThrough.test.ts
+--- a/ui-tui/src/__tests__/textInputPassThrough.test.ts
++++ b/ui-tui/src/__tests__/textInputPassThrough.test.ts
+@@ -51,6 +51,8 @@
+   it('always passes through non-voice global control keys', () => {
+     expect(shouldPassThroughToGlobalHandler('c', key({ ctrl: true }))).toBe(true)
+     expect(shouldPassThroughToGlobalHandler('x', key({ ctrl: true }))).toBe(true)
++    expect(shouldPassThroughToGlobalHandler('d', key({ ctrl: true }))).toBe(true)
++    expect(shouldPassThroughToGlobalHandler('l', key({ ctrl: true }))).toBe(true)
+     expect(shouldPassThroughToGlobalHandler('', key({ escape: true }))).toBe(true)
+     expect(shouldPassThroughToGlobalHandler('', key({ tab: true }))).toBe(true)
+     expect(shouldPassThroughToGlobalHandler('', key({ pageUp: true }))).toBe(true)
 diff -urN -x *.rej -x *.orig -x node_modules -x dist a/ui-tui/src/__tests__/virtualHeights.test.ts b/ui-tui/src/__tests__/virtualHeights.test.ts
 --- a/ui-tui/src/__tests__/virtualHeights.test.ts
 +++ b/ui-tui/src/__tests__/virtualHeights.test.ts
@@ -266,3 +278,14 @@ diff -urN -x *.rej -x *.orig -x node_modules -x dist a/ui-tui/src/components/bra
  const HIDE_BELOW = 34
  const COMPACT_FROM = 58
  
+diff -urN -x *.rej -x *.orig -x node_modules -x dist a/ui-tui/src/components/textInput.tsx b/ui-tui/src/components/textInput.tsx
+--- a/ui-tui/src/components/textInput.tsx
++++ b/ui-tui/src/components/textInput.tsx
+@@ -1325,6 +1325,7 @@
+   voiceRecordKey: ParsedVoiceRecordKey = DEFAULT_VOICE_RECORD_KEY
+ ): boolean =>
+   (key.ctrl && input === 'c') ||
++  (key.ctrl && (input === 'd' || input === 'l')) ||
+   (key.ctrl && input === 'x') ||
+   key.tab ||
+   (key.shift && key.tab) ||
