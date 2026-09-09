@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import NoReturn
 
 
 def _read_input() -> dict:
@@ -20,7 +21,7 @@ def _read_input() -> dict:
     if not input_path:
         _fail_exit("TAG_SWARM_TASK_INPUT not set")
     try:
-        return json.loads(Path(input_path).read_text())
+        return json.loads(Path(input_path).read_text(encoding="utf-8"))
     except Exception as exc:
         _fail_exit(f"Cannot read input file: {exc}")
 
@@ -28,13 +29,13 @@ def _read_input() -> dict:
 def _write_result(result_path: str, envelope: dict) -> None:
     try:
         p = Path(result_path)
-        p.write_text(json.dumps(envelope))
+        p.write_text(json.dumps(envelope), encoding="utf-8")
         p.chmod(0o600)
     except Exception:
         pass
 
 
-def _fail_exit(message: str) -> None:
+def _fail_exit(message: str) -> NoReturn:
     result_path = os.environ.get("TAG_SWARM_RESULT_OUTPUT", "")
     envelope = {"status": "failure", "error_message": message, "output": ""}
     if result_path:
@@ -117,7 +118,7 @@ def main() -> None:
             }
             try:
                 p = Path(ctx_out_path)
-                p.write_text(json.dumps(ctx_payload))
+                p.write_text(json.dumps(ctx_payload), encoding="utf-8")
                 p.chmod(0o600)
             except Exception:
                 pass

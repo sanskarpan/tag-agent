@@ -273,7 +273,7 @@ def _validate_json_schema(obj: Any, schema: dict[str, Any]) -> str | None:
         try:
             jsonschema.validate(obj, schema)
             return None
-        except jsonschema.ValidationError as exc:  # type: ignore[attr-defined]
+        except jsonschema.ValidationError as exc:
             return str(exc.message)
     except ImportError:
         return _validate_json_schema_builtin(obj, schema)

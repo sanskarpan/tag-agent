@@ -66,7 +66,7 @@ def load_suite(suite_path: Path) -> dict[str, Any]:
     """Load and validate an eval suite YAML file."""
     if not suite_path.exists():
         raise FileNotFoundError(f"Suite not found: {suite_path}")
-    with suite_path.open() as fh:
+    with suite_path.open(encoding="utf-8") as fh:
         data = yaml.safe_load(fh)
     if not isinstance(data, dict):
         raise ValueError(f"Suite must be a YAML mapping, got: {type(data)}")
@@ -220,8 +220,8 @@ def record_case_result(
     input_text: str,
     output: str,
     *,
-    passed: bool,
-    score: float,
+    passed: bool | None,
+    score: float | None,
     failure_reason: str | None = None,
 ) -> None:
     """Record a single case result."""

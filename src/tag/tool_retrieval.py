@@ -9,21 +9,24 @@ Install: pip install chromadb sentence-transformers
 from __future__ import annotations
 
 import json
+import importlib
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 _CHROMA_AVAILABLE = False
 _ST_AVAILABLE = False
+chromadb: Any = None
+SentenceTransformer: Any = None
 
 try:
-    import chromadb
+    chromadb = importlib.import_module("chromadb")
     _CHROMA_AVAILABLE = True
 except ImportError:
     pass
 
 try:
-    from sentence_transformers import SentenceTransformer
+    SentenceTransformer = importlib.import_module("sentence_transformers").SentenceTransformer
     _ST_AVAILABLE = True
 except ImportError:
     pass
@@ -41,7 +44,7 @@ def is_available() -> bool:
 
 def get_chroma_client(persist_dir: Path):
     """Return a ChromaDB PersistentClient pointed at *persist_dir*."""
-    if not _CHROMA_AVAILABLE:
+    if not _CHROMA_AVAILABLE or chromadb is None:
         raise ImportError("chromadb is required. Install with: pip install chromadb")
     persist_dir.mkdir(parents=True, exist_ok=True)
     return chromadb.PersistentClient(path=str(persist_dir))
@@ -49,7 +52,7 @@ def get_chroma_client(persist_dir: Path):
 
 def get_embed_model(cache_dir: Path | None = None):
     """Load sentence-transformers embedding model."""
-    if not _ST_AVAILABLE:
+    if not _ST_AVAILABLE or not callable(SentenceTransformer):
         raise ImportError(
             "sentence-transformers is required. Install with: pip install sentence-transformers"
         )
@@ -226,4 +229,3 @@ def keyword_search_tools(
             scored.append((score, tool))
     scored.sort(key=lambda x: -x[0])
     return [t for _, t in scored[:top_k]]
-

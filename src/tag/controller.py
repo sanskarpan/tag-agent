@@ -22,7 +22,7 @@ import yaml
 try:
     from tag import __version__
 except Exception:  # pragma: no cover — fallback for direct file loading in tests
-    __version__ = "0.1.0"
+    __version__: str = "0.1.0"
 
 
 try:
@@ -41,19 +41,19 @@ try:
 except Exception:  # pragma: no cover — tui_output not importable in all test environments
     _TUI_OUTPUT_AVAILABLE = False
 
-    def get_console():  # type: ignore[misc]
+    def get_console():
         return None
 
-    def print_error(msg: str) -> None:  # type: ignore[misc]
+    def print_error(msg: str) -> None:
         print(f"error: {msg}", file=sys.stderr)
 
-    def print_success(msg: str) -> None:  # type: ignore[misc]
+    def print_success(msg: str) -> None:
         print(msg)
 
-    def print_warning(msg: str) -> None:  # type: ignore[misc]
+    def print_warning(msg: str) -> None:
         print(f"warning: {msg}", file=sys.stderr)
 
-    def print_doctor_report(groups: dict) -> None:  # type: ignore[misc]
+    def print_doctor_report(groups: dict) -> None:
         for group, checks in groups.items():
             print(f"\n{group.upper()}")
             for c in checks:
@@ -61,17 +61,17 @@ except Exception:  # pragma: no cover — tui_output not importable in all test 
                 icon = {"pass": "✓", "warn": "⚠", "fail": "✗"}.get(st, "?")
                 print(f"  {icon} {c.get('name', '?'):<28} {c.get('message', '')}")
 
-    def send_desktop_notification(title: str, message: str) -> None:  # type: ignore[misc]
+    def send_desktop_notification(title: str, message: str) -> None:
         pass
 
-    def chat_spinner(*a, **kw):  # type: ignore[misc]
+    def chat_spinner(*a, **kw):
         import contextlib
         return contextlib.nullcontext()
 
-    def make_benchmark_progress():  # type: ignore[misc]
+    def make_benchmark_progress():
         return None
 
-    def make_submit_progress():  # type: ignore[misc]
+    def make_submit_progress():
         return None
 
 
@@ -127,7 +127,7 @@ from tag.core.run import run_hermes, run_profile_hermes, run_profile_python  # n
 import datetime as _dt  # noqa: E402
 
 
-def run_chat_step(  # type: ignore[misc]
+def run_chat_step(
     cfg: dict[str, Any],
     *,
     profile_name: str,
@@ -1909,7 +1909,7 @@ try:
             _canonical = _existing
             _old_ga = _self_module.__dict__.pop("__getattr__", None)
 
-            def __getattr__(name: str, _c=_canonical, _orig=_old_ga) -> object:  # type: ignore[misc]
+            def __getattr__(name: str, _c=_canonical, _orig=_old_ga) -> object:
                 try:
                     return getattr(_c, name)
                 except AttributeError:
@@ -1918,7 +1918,7 @@ try:
                     return _orig(name)
                 raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-            _self_module.__getattr__ = __getattr__  # type: ignore[attr-defined]
+            _self_module.__getattr__ = __getattr__
     del _gc, _my_dict, _self_module
 except Exception:
     pass

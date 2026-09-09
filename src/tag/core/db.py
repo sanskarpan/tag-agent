@@ -21,7 +21,7 @@ try:
     from tag.core.paths import runtime_db_path, ensure_runtime_dirs
     from tag.core.config import config_path
 except Exception:
-    from tag.controller import (  # type: ignore[no-redef]
+    from tag.controller import (
         runtime_db_path,
         ensure_runtime_dirs,
         config_path,
@@ -32,7 +32,7 @@ try:
 except Exception:
     import datetime as _dt
 
-    def utc_now() -> str:  # type: ignore[misc]
+    def utc_now() -> str:
         return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 

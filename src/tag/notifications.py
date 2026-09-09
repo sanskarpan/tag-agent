@@ -22,7 +22,7 @@ import urllib.request
 import uuid
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 VALID_CHANNELS = {"slack", "email", "desktop", "webhook"}
@@ -198,7 +198,8 @@ def _validate_outbound_url(url: str) -> str | None:
     except OSError:
         return None
     for info in infos:
-        if _blocked(info[4][0]):
+        address = info[4][0]
+        if not isinstance(address, str) or _blocked(address):
             return f"refusing to connect to non-public address {info[4][0]} (SSRF protection)"
     return None
 
@@ -225,11 +226,13 @@ def _safe_urlopen(url, *, timeout: int = 10):
     IPs at connect time.
     """
     import http.client
+    import ssl
 
     def _connect_pinned(conn):
         infos = socket.getaddrinfo(conn.host, conn.port, 0, socket.SOCK_STREAM)
         for info in infos:
-            if _ip_is_blocked(info[4][0]):
+            address = info[4][0]
+            if not isinstance(address, str) or _ip_is_blocked(address):
                 raise OSError(
                     f"refusing to connect to non-public address {info[4][0]} (SSRF protection)"
                 )
@@ -238,7 +241,7 @@ def _safe_urlopen(url, *, timeout: int = 10):
             sock = None
             try:
                 sock = socket.socket(family, socktype, proto)
-                if conn.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                if conn.timeout is not getattr(socket, "_GLOBAL_DEFAULT_TIMEOUT"):
                     sock.settimeout(conn.timeout)
                 if getattr(conn, "source_address", None):
                     sock.bind(conn.source_address)
@@ -251,12 +254,19 @@ def _safe_urlopen(url, *, timeout: int = 10):
         raise last_err if last_err is not None else OSError("connection failed")
 
     class _PinnedHTTPConnection(http.client.HTTPConnection):
+        _tunnel_host: str | None
+        _tunnel: Callable[[], None]
+
         def connect(self):
             self.sock = _connect_pinned(self)
             if self._tunnel_host:
                 self._tunnel()
 
     class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+        _tunnel_host: str | None
+        _tunnel: Callable[[], None]
+        _context: ssl.SSLContext
+
         def connect(self):
             self.sock = _connect_pinned(self)
             if self._tunnel_host:
@@ -482,4 +492,3 @@ def fire_event_notifications(
              "ok" if ok else "failed", http_status, attempt, now),
         )
     conn.commit()
-

@@ -141,7 +141,7 @@ def cmd_eval_judge(args: argparse.Namespace) -> int:
             from tag.eval_judge import run_judge_on_eval
             result = run_judge_on_eval(conn, args.eval_run_id,
                                        judge_model=getattr(args, "judge_model", "claude-sonnet-4-6"),
-                                       criteria=getattr(args, "criteria", None),
+                                       criteria=getattr(args, "criteria", None) or [],
                                        cfg=cfg)
             if getattr(args, "json", False):
                 print(json.dumps(
@@ -197,7 +197,7 @@ def cmd_eval_dataset(args: argparse.Namespace) -> int:
             yaml_str = export_to_yaml(conn, ds.id)
             out = getattr(args, "out", None)
             if out:
-                Path(out).write_text(yaml_str)
+                Path(out).write_text(yaml_str, encoding="utf-8")
                 print(f"Exported to {out}")
             else:
                 print(yaml_str)
@@ -231,7 +231,7 @@ def cmd_eval_ci(args: argparse.Namespace) -> int:
         yaml_str = scaffold_github_action(wf_type)
         out = getattr(args, "out", None)
         if out:
-            Path(out).write_text(yaml_str)
+            Path(out).write_text(yaml_str, encoding="utf-8")
             print(f"Wrote {out}")
         else:
             print(yaml_str)
@@ -389,7 +389,7 @@ def cmd_annotate(args: argparse.Namespace) -> int:
         data = export_labeled(conn, format=fmt)
         out = getattr(args, "out", None)
         if out:
-            Path(out).write_text(data)
+            Path(out).write_text(data, encoding="utf-8")
             print(f"Exported to {out}")
         else:
             print(data)
@@ -422,7 +422,7 @@ def cmd_prompt_hub(args: argparse.Namespace) -> int:
         if not p.exists():
             print_error(f"Prompt file not found: {args.file}")
             return 1
-        content = p.read_text()
+        content = p.read_text(encoding="utf-8")
         pv = save_prompt(conn, args.name, content, message=getattr(args, "notes", None))
         print(f"Saved '{pv.name}' v{pv.version} (id={pv.id})")
         return 0
@@ -725,7 +725,7 @@ def cmd_ci_ext(args: argparse.Namespace) -> int:
         diff = ""
         if diff_arg:
             p = Path(diff_arg)
-            diff = p.read_text() if p.exists() else diff_arg
+            diff = p.read_text(encoding="utf-8") if p.exists() else diff_arg
         out_path = getattr(args, "out", None)
         result = generate_tests(diff, profile, cfg,
                                 output_path=Path(out_path) if out_path else None)
@@ -859,7 +859,15 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
             return 1
         db_path = _db_for_profile(profile, cfg)
         conn = _sq3.connect(str(db_path))
-        config = GCConfig(dry_run=getattr(args, "dry_run", False))
+        config = GCConfig()
+        # Execute the same GC algorithm on a disposable snapshot, including
+        # schema changes and internal commits, without modifying the live DB.
+        if getattr(args, "dry_run", False):
+            preview = _sq3.connect(":memory:")
+            conn.backup(preview)
+            conn.close()
+            conn = preview
+            print("GC dry run (preview only; no changes saved)")
         if getattr(args, "all_profiles", False):
             results = run_gc_all_profiles(conn, config=config)
             for r in results:
@@ -867,6 +875,7 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
         else:
             result = run_gc(conn, profile, config=config)
             print(f"GC done: evicted={result.evicted_count} merged={result.merged_count} promoted={result.promoted_count}")
+        conn.close()
         return 0
 
     if sub == "extract":
@@ -886,7 +895,7 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
             print_error(f"Run not found: {args.run_id!r}")
             return 1
         memories = auto_extract_post_run(conn, args.run_id, row[0], profile, cfg)
-        print(f"Extracted {len(memories)} memories")
+        print(f"Extracted {memories} memories")
         return 0
 
     if sub == "tier":
@@ -932,7 +941,11 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
             hist = get_fact_history(conn, args.fact_id)
             print(json.dumps(hist, indent=2, default=str))
         elif action == "list-at":
-            facts = list_facts_at(conn, profile, at=getattr(args, "at", None))
+            at_time = getattr(args, "at", None)
+            if not at_time:
+                print_error("--at is required for fact list-at")
+                return 1
+            facts = list_facts_at(conn, profile, at_time)
             print(json.dumps(facts, indent=2, default=str))
         return 0
 
@@ -957,7 +970,7 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
             if not getattr(args, "episode_id", None):
                 print_error("--id required")
                 return 1
-            end_episode(conn, args.episode_id, summary=getattr(args, "summary", None))
+            end_episode(conn, args.episode_id, summary=getattr(args, "summary", None) or "")
             print("Episode ended")
         elif action == "list":
             episodes = list_episodes(conn, profile)

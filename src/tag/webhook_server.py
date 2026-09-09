@@ -17,7 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 # Maximum allowed age (or clock skew) of a Slack request timestamp. Slack
 # mandates rejecting stale timestamps so a captured signed payload cannot be
@@ -341,7 +341,7 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
     # Cap inbound webhook bodies to avoid unbounded reads/memory (10 MiB).
     _MAX_BODY_BYTES = 10 * 1024 * 1024
 
-    def log_message(self, *args: Any) -> None:
+    def log_message(self, format: str, *args: Any) -> None:
         pass
 
     def _send_json(self, code: int, data: Any) -> None:
@@ -367,7 +367,7 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
         return hmac.compare_digest(token, secret)
 
     def do_GET(self) -> None:
-        db_path = self.server._db_path
+        db_path = cast(_ThreadingWebhookServer, self.server)._db_path
         conn = sqlite3.connect(str(db_path))
         try:
             if self.path == "/health":
@@ -430,7 +430,7 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
         body_bytes = self.rfile.read(length)
 
         # Signature verification
-        secret = self.server._secret or ""
+        secret = cast(_ThreadingWebhookServer, self.server)._secret or ""
         sig_header = (
             self.headers.get("X-Hub-Signature-256", "")
             or self.headers.get("X-Linear-Signature", "")
@@ -475,7 +475,7 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
         event_info = parse_event(platform, payload)
         event_type = event_info.get("type", "unknown")
 
-        db_path = self.server._db_path
+        db_path = cast(_ThreadingWebhookServer, self.server)._db_path
         conn = sqlite3.connect(str(db_path))
         try:
             rules = match_rules(conn, platform, event_type, payload)
@@ -572,6 +572,11 @@ class _ThreadingWebhookServer(http.server.ThreadingHTTPServer):
 
     daemon_threads = True
     timeout = 30
+    _db_path: Path
+    _secret: str | None
+    _allow_unsigned: bool
+    _deliveries: DeliveryCache
+    _cfg: dict | None
 
 
 class _TimeoutWebhookHandler(_WebhookHandler):

@@ -523,7 +523,7 @@ def generate_tests(
         If the TAG runtime invocation fails.
     """
     # Import lazily to avoid circular imports at module level.
-    from tag.controller import hermes_bin, profile_exec_env  # type: ignore[import]
+    from tag.controller import hermes_bin, profile_exec_env
 
     prompt = textwrap.dedent(
         f"""\
@@ -1126,7 +1126,7 @@ def fix_sarif_vulns(
         One dict per vulnerability with keys ``vuln``, ``fix_applied``
         (bool), and ``commit_sha`` (str or ``None``).
     """
-    from tag.controller import hermes_bin, profile_exec_env  # type: ignore[import]
+    from tag.controller import hermes_bin, profile_exec_env
 
     vulns = parse_sarif(sarif_path)
     results: list[dict] = []
@@ -1358,7 +1358,7 @@ def diagnose_and_fix(
         Keys: ``diagnosis`` (str), ``fix_applied`` (bool), ``pr_url`` (str
         or ``None``).
     """
-    from tag.controller import hermes_bin, profile_exec_env  # type: ignore[import]
+    from tag.controller import hermes_bin, profile_exec_env
 
     log_content = read_ci_log(log_path)
     failure = parse_ci_failure(log_content)
@@ -1641,7 +1641,7 @@ def review_pr_with_signals(
         Keys: ``review_text`` (str), ``signals_found`` (list of str found in
         output), ``posted`` (bool).
     """
-    from tag.controller import hermes_bin, profile_exec_env  # type: ignore[import]
+    from tag.controller import hermes_bin, profile_exec_env
 
     diff = fetch_pr_diff(repo, pr_number)
     metadata = fetch_pr_metadata(repo, pr_number)
@@ -2135,7 +2135,7 @@ def fix_flaky_test(
         Keys: ``original_code`` (str), ``fixed_code`` (str), ``fix_applied``
         (bool), ``explanation`` (str).
     """
-    from tag.controller import hermes_bin, profile_exec_env  # type: ignore[import]
+    from tag.controller import hermes_bin, profile_exec_env
 
     test_file = Path(test_file)
     original_code = test_file.read_text(encoding="utf-8", errors="replace")

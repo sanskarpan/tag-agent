@@ -10,7 +10,7 @@ import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from tag.core.config import load_config, config_path
 from tag.core.paths import runtime_db_path, hermes_root, tag_home, runtime_home, profile_home, ensure_runtime_dirs
@@ -116,12 +116,14 @@ def _safe_urlopen(url, *, timeout: int = 15):
       flip to loopback/metadata between validate and fetch.
     """
     import http.client
+    import ssl
     import socket as _socket
 
     def _connect_pinned(conn):
         infos = _socket.getaddrinfo(conn.host, conn.port, 0, _socket.SOCK_STREAM)
         for info in infos:
-            if _ip_is_blocked(info[4][0]):
+            address = info[4][0]
+            if not isinstance(address, str) or _ip_is_blocked(address):
                 raise OSError(
                     f"refusing to connect to non-public address {info[4][0]} (SSRF protection)"
                 )
@@ -130,7 +132,7 @@ def _safe_urlopen(url, *, timeout: int = 15):
             sock = None
             try:
                 sock = _socket.socket(family, socktype, proto)
-                if conn.timeout is not _socket._GLOBAL_DEFAULT_TIMEOUT:
+                if conn.timeout is not getattr(_socket, "_GLOBAL_DEFAULT_TIMEOUT"):
                     sock.settimeout(conn.timeout)
                 if getattr(conn, "source_address", None):
                     sock.bind(conn.source_address)
@@ -143,12 +145,19 @@ def _safe_urlopen(url, *, timeout: int = 15):
         raise last_err if last_err is not None else OSError("connection failed")
 
     class _PinnedHTTPConnection(http.client.HTTPConnection):
+        _tunnel_host: str | None
+        _tunnel: Callable[[], None]
+
         def connect(self):
             self.sock = _connect_pinned(self)
             if self._tunnel_host:
                 self._tunnel()
 
     class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+        _tunnel_host: str | None
+        _tunnel: Callable[[], None]
+        _context: ssl.SSLContext
+
         def connect(self):
             self.sock = _connect_pinned(self)
             if self._tunnel_host:
@@ -711,7 +720,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     try:
         class _Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, fmt, *a):
+            def log_message(self, format: str, *args: Any) -> None:
                 pass  # Silence default access log
 
             def do_GET(self):
@@ -869,7 +878,7 @@ def cmd_web(args: argparse.Namespace) -> int:
 # Parser registration
 # ---------------------------------------------------------------------------
 
-def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def register(sub: argparse._SubParsersAction) -> None:
     """Register marketplace, eval, sandbox, serve, lsp, and web subcommands."""
 
     # ---- PRD-026: marketplace ----

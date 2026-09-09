@@ -769,7 +769,7 @@ def cmd_tool_retrieval(args: argparse.Namespace) -> int:
 # Parser registration
 # ---------------------------------------------------------------------------
 
-def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def register(sub: argparse._SubParsersAction) -> None:
     """Register agent infrastructure and tooling subcommands onto *sub*."""
 
     # ---- PRD-034: security ----

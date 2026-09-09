@@ -30,6 +30,12 @@ jobs:
       - name: Install TAG in editable mode
         run: python -m pip install -e .[dev]
 
+      - name: Check types with the project-pinned checker
+        run: ty check src/tag
+
+      - name: Lint TAG with the project-pinned checker
+        run: ruff check src/tag
+
       # The WHOLE suite, not one file.
       #
       # This ran `pytest -q tests/test_controller.py` and nothing else, so ~840
@@ -201,4 +207,3 @@ jobs:
             fail=1
           fi
           exit $fail
-

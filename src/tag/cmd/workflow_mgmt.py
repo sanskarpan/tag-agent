@@ -17,20 +17,20 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
 try:
     from tag.tui_output import print_error, print_success, print_warning
 except Exception:
-    def print_error(msg: str) -> None:  # type: ignore[misc]
+    def print_error(msg: str) -> None:
         print(f"error: {msg}", file=sys.stderr)
 
-    def print_success(msg: str) -> None:  # type: ignore[misc]
+    def print_success(msg: str) -> None:
         print(msg)
 
-    def print_warning(msg: str) -> None:  # type: ignore[misc]
+    def print_warning(msg: str) -> None:
         print(f"warning: {msg}", file=sys.stderr)
 
 from tag.core.config import load_config, save_config, config_path, update_config
@@ -145,12 +145,14 @@ def _safe_urlopen(url, *, timeout: int = 15):
       loopback/metadata between validate and fetch.
     """
     import http.client
+    import ssl
     import socket as _socket
 
     def _connect_pinned(conn):
         infos = _socket.getaddrinfo(conn.host, conn.port, 0, _socket.SOCK_STREAM)
         for info in infos:
-            if _ip_is_blocked(info[4][0]):
+            address = info[4][0]
+            if not isinstance(address, str) or _ip_is_blocked(address):
                 raise OSError(
                     f"refusing to connect to non-public address {info[4][0]} (SSRF protection)"
                 )
@@ -159,7 +161,7 @@ def _safe_urlopen(url, *, timeout: int = 15):
             sock = None
             try:
                 sock = _socket.socket(family, socktype, proto)
-                if conn.timeout is not _socket._GLOBAL_DEFAULT_TIMEOUT:
+                if conn.timeout is not getattr(_socket, "_GLOBAL_DEFAULT_TIMEOUT"):
                     sock.settimeout(conn.timeout)
                 if getattr(conn, "source_address", None):
                     sock.bind(conn.source_address)
@@ -172,12 +174,19 @@ def _safe_urlopen(url, *, timeout: int = 15):
         raise last_err if last_err is not None else OSError("connection failed")
 
     class _PinnedHTTPConnection(http.client.HTTPConnection):
+        _tunnel_host: str | None
+        _tunnel: Callable[[], None]
+
         def connect(self):
             self.sock = _connect_pinned(self)
             if self._tunnel_host:
                 self._tunnel()
 
     class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+        _tunnel_host: str | None
+        _tunnel: Callable[[], None]
+        _context: ssl.SSLContext
+
         def connect(self):
             self.sock = _connect_pinned(self)
             if self._tunnel_host:
@@ -428,7 +437,7 @@ def cmd_template(args: argparse.Namespace) -> int:
         out_path = getattr(args, "output", None)
         yaml_text = yaml.dump(template, default_flow_style=False, sort_keys=False)
         if out_path:
-            Path(out_path).write_text(yaml_text)
+            Path(out_path).write_text(yaml_text, encoding="utf-8")
             print_success(f"Template exported to {out_path}")
         else:
             print(yaml_text)
@@ -436,7 +445,7 @@ def cmd_template(args: argparse.Namespace) -> int:
 
     if sub == "import":
         tmpl_path = args.template_file
-        with open(tmpl_path) as fh:
+        with open(tmpl_path, encoding="utf-8") as fh:
             tmpl = yaml.safe_load(fh)
         if not isinstance(tmpl, dict):
             print_error(f"Template file '{tmpl_path}' does not contain a valid YAML mapping")
@@ -750,7 +759,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         if not suite_path:
             print_error("Provide --suite <path>")
             return 1
-        with open(suite_path) as fh:
+        with open(suite_path, encoding="utf-8") as fh:
             suite = yaml.safe_load(fh) or {}
         cases = suite.get("cases", [])
         if not cases:
@@ -1077,7 +1086,7 @@ def cmd_route_fallback(args: argparse.Namespace) -> int:
 # Subparser registration
 # ---------------------------------------------------------------------------
 
-def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+def register(sub: argparse._SubParsersAction) -> None:
     """Register workflow management subcommands onto *sub*."""
 
     # ---- PRD-014: mcp-registry ----

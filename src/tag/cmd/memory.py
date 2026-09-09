@@ -23,13 +23,13 @@ from tag.core.utils import nonnegative_int
 try:
     from tag.tui_output import print_error, print_success, print_warning
 except Exception:
-    def print_error(msg: str) -> None:  # type: ignore[misc]
+    def print_error(msg: str) -> None:
         print(f"error: {msg}", file=sys.stderr)
 
-    def print_success(msg: str) -> None:  # type: ignore[misc]
+    def print_success(msg: str) -> None:
         print(msg)
 
-    def print_warning(msg: str) -> None:  # type: ignore[misc]
+    def print_warning(msg: str) -> None:
         print(f"warning: {msg}", file=sys.stderr)
 
 
@@ -54,7 +54,7 @@ def _db_for_profile(profile: str, cfg: dict[str, Any]) -> Path:
 # ---------------------------------------------------------------------------
 
 def cmd_memory(args: argparse.Namespace) -> int:
-    from tag.controller import cmd_hermes_command
+    from tag.cmd.system import cmd_hermes_command
     return cmd_hermes_command(args, "memory")
 
 
@@ -503,7 +503,7 @@ def cmd_mem_ext(args: argparse.Namespace) -> int:
 # register(sub) — attach all four commands to the CLI subparsers
 # ---------------------------------------------------------------------------
 
-def register(sub: argparse.Action) -> None:
+def register(sub: argparse._SubParsersAction) -> None:
     # ---- memory (hermes passthrough) ----
     memory = sub.add_parser("memory", help="Run memory inside a TAG profile")
     memory.add_argument("--profile", default="orchestrator", help="TAG profile to use")
